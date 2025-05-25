@@ -1,0 +1,23 @@
+---
+description: Anything code-related
+globs: .cs
+alwaysApply: false
+---
+
+# UdonSharp limitations
+Local method declarations are not currently supported by UdonSharp.
+Multidimensional arrays are not yet supported by UdonSharp, consider using jagged arrays instead, OR one-dimensional arrays with smart logic to distinguish each axis.
+Method is not exposed to Udon: 'new List<Vector3>()'.
+Method is not exposed to Udon: 'gameObject.AddComponent<>()'
+Method is not exposed to Udon: 'gameObject.AddComponent(typeof())'
+Try/Catch/Finally is not supported by UdonSharp since Udon does not have a way to handle exceptions
+Most low-level stuff like coroutines, direct memory, etc. are not accessible by UdonSharp.
+
+# Chunk-related information
+We are using individual materials for blocks
+Chunks are 16x64x16
+The world height goes from 0 to 256
+
+# Performance Considerations
+The Quest 2 has 6GB of total RAM, 4GB of actual usable memory for games.
+The Quest 2 runs a weaker mobile SoC

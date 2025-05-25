@@ -1,0 +1,21 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+*.csproj
+ClientSimStorage/
+UserSettings/
+.vscode/
+Library/
+Logs/
+*.meta
+*.unitypackage
+*.unity
+*.fbx
+*.mat
+*.png
+*.jpg
+*.jpeg
+*.mp3
+*.wav
+*.ogg
+*.blend
+*.blend1
+*.asset
