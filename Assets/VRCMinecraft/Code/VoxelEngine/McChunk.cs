@@ -79,6 +79,9 @@ public class McChunk : UdonSharpBehaviour
     private int buildMesh_currentY = 0;
     private int buildMesh_currentZ = 0;
 
+    // Cached array for mesh processing directions
+    private readonly Vector3[] processMeshDirections = { Vector3.right, Vector3.left, Vector3.up, Vector3.down, Vector3.forward, Vector3.back };
+
     public void InitializeChunk()
     {
         if (isInitialized || template) return;
@@ -166,10 +169,10 @@ public class McChunk : UdonSharpBehaviour
                     else if (blockTypeManager.IsAnyCutoutType(currentVisibility)) targetMeshTypeForCurrentBlock = McChunk_MeshTarget.Cutout; // Updated to use helper
                     else targetMeshTypeForCurrentBlock = McChunk_MeshTarget.Transparent; // Covers all Transparent_* types
 
-                    Vector3[] directions = { Vector3.right, Vector3.left, Vector3.up, Vector3.down, Vector3.forward, Vector3.back };
+                    // Vector3[] directions = { Vector3.right, Vector3.left, Vector3.up, Vector3.down, Vector3.forward, Vector3.back }; // Replaced by cached version
                     for (int i = 0; i < 6; i++)
                     {
-                        Vector3 dir = directions[i];
+                        Vector3 dir = processMeshDirections[i]; // Use cached array
                         byte neighborBlockID = world.GetBlock(currentGlobalX + (int)dir.x, currentGlobalY + (int)dir.y, currentGlobalZ + (int)dir.z);
                         bool drawFace = false;
 
