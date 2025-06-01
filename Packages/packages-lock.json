@@ -1,5 +1,28 @@
 {
   "dependencies": {
+    "blueamulet.udonsharpoptimizer": {
+      "version": "file:blueamulet.udonsharpoptimizer",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
+    "com.boxqkrtm.ide.cursor": {
+      "version": "https://github.com/boxqkrtm/com.unity.ide.cursor.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {
+        "com.unity.test-framework": "1.1.9"
+      },
+      "hash": "38fecf55e4fd94ccfe58a92ed8ad1a529ba1694e"
+    },
+    "com.caeden117.udoncoroutines": {
+      "version": "file:com.caeden117.udoncoroutines",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {
+        "com.vrchat.worlds": "3.4.0"
+      }
+    },
     "com.livedimensions.vrrefassist": {
       "version": "https://github.com/LiveDimensions/VRRefAssist.git?path=/Packages/com.livedimensions.vrrefassist",
       "depth": 0,
@@ -69,19 +92,12 @@
       "url": "https://packages.unity.com"
     },
     "com.unity.ide.visualstudio": {
-      "version": "2.0.22",
+      "version": "2.0.23",
       "depth": 0,
       "source": "registry",
       "dependencies": {
         "com.unity.test-framework": "1.1.9"
       },
-      "url": "https://packages.unity.com"
-    },
-    "com.unity.ide.vscode": {
-      "version": "1.2.5",
-      "depth": 0,
-      "source": "registry",
-      "dependencies": {},
       "url": "https://packages.unity.com"
     },
     "com.unity.inputsystem": {
@@ -242,6 +258,12 @@
       "source": "git",
       "dependencies": {},
       "hash": "2590c6a14a7230b8571383c379124c32d0712090"
+    },
+    "si.iwa.udontask": {
+      "version": "file:si.iwa.udontask",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
     },
     "com.unity.modules.ai": {
       "version": "1.0.0",

@@ -1,762 +1,400 @@
-﻿using UdonSharp;
+﻿﻿using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
-using VRC.Udon;
-using Varneon.VUdon.ArrayExtensions;
-using UnityEditor;
-using VRC.Udon.Serialization.OdinSerializer.Utilities;
+using VRRefAssist; // Required for [FindObjectOfType] attribute
+
+// Ensure BlockVisibilityType enum is accessible
+// It MUST be defined outside the McBlockTypeManager class in its .cs file, or in its own .cs file.
+
+// Enum to specify which mesh data set to target (moved outside class)
+internal enum McChunk_MeshTarget { Opaque, Transparent, Cutout } // Renamed slightly to avoid global conflicts if any
 
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McChunk : UdonSharpBehaviour
 {
-    [SerializeField] private MinecraftGame minecraftGame;
-    public bool template = false;
-    
-    // Profiling variables
-    private float blockCacheTime;
-    private float blockScanTime;
-    private float blockCheckTime;
-    private float faceCheckTime;
-    private float vertexGenTime;
-    private float uvGenTime;
-    private float collisionMaskTime;
-    private float collisionGreedyTime;
-    private float collisionVertexTime;
-    private float meshFinalizationTime;
-    private float meshNormalsTime;
-    private float collisionNormalsTime;
-    private float totalTime;
-    private int totalBlockChecks;
-    private int totalFacesGenerated;
-    private int totalCollisionFaces;
+    [HideInInspector] public McWorld world;
+    [HideInInspector] public GameObject worldGO; 
 
-    Vector3[] newVertices = new Vector3[0];
-    int[] newTriangles = new int[0];
-    Vector2[] newUV = new Vector2[0];
+    public int chunkSizeXZ = 16;
+    public int chunkSizeY = 16;
+    [HideInInspector] public int voxelsPerSlice = 256; 
 
-    float tUnit = 0.0625f;
-    float uvPadding = 0.00015f;
-    Vector2 tStone = new Vector2(1,0);
-    Vector2 tGrass = new Vector2(3,0);
-    Vector2 tGrassTop = new Vector2(0,0);
-
-    Mesh mesh;
-    Mesh collisionMesh;
-    MeshCollider col;
-
-    int faceCount;
-
-
-    public GameObject worldGO;
-    private McWorld world;
-
-    public int chunkSizeXZ = 32;
-    public int chunkSizeY = 32;
-
-    // Pre-allocated arrays to avoid constant resizing
-    private const int MAX_FACES = 32 * 32 * 32 * 6; // Maximum possible faces
-    private const int VERTICES_PER_FACE = 4;
-    private Vector3[] vertexPool;
-    private int[] trianglePool;
-    private Vector2[] uvPool;
-    private int vertexCount = 0;
-    private int triangleCount = 0;
-    private int uvCount = 0;
-
-    // Pre-allocated arrays for collision mesh
-    private Vector3[] collisionVertexPool;
-    private int[] collisionTrianglePool;
-    private int collisionVertexCount = 0;
-    private int collisionTriangleCount = 0;
-    private bool[] collisionMask;
-    private bool[] sectionMask; // 4x4x4 sections for quick empty space skipping
-    private const int SECTION_SIZE = 8; // Size of each section for skipping
-    private int sectionsPerAxis; // Calculated based on chunkSize and SECTION_SIZE
-
-    // Cache for block data to reduce world lookups
-    private byte[] blockCache;
-    private bool isCacheValid = false;
-
-    // Pre-calculated values to avoid multiplication in loops
-    private int chunkSizeXZY; // chunkSizeXZ * chunkSizeY
-    private int chunkSizeXZXZ; // chunkSizeXZ * chunkSizeXZ
-
-    public int chunkX;
+    public int chunkX; 
     public int chunkY;
     public int chunkZ;
+    public bool template = false;
 
-    [SerializeField] public VoxelCollider basicBlockCollider;
+    [Header("Materials (Order: Opaque, Transparent, Cutout)")]
+    public Material opaqueMaterial;
+    public Material transparentMaterial;
+    public Material cutoutMaterial;
 
+    private Mesh chunkMesh; // Single mesh for this chunk
+    [SerializeField, GetComponent] private MeshCollider meshCollider; 
+    [SerializeField, GetComponent] private MeshRenderer meshRenderer;
+    [SerializeField, GetComponent] private MeshFilter meshFilter;
+    
+    private const int MAX_VERTS_PER_SUB_DATASET = 65534; // Max for temporary collection before combining
 
+    // Opaque Mesh Data (Temporary Collection)
+    private Vector3[] opaque_vertexPool;
+    private int[] opaque_trianglePool;
+    private Vector2[] opaque_uvPool;
+    private Vector3[] opaque_normalPool;
+    private int opaque_vertexCount;
+    private int opaque_triangleCount;
+    private int opaque_uvCount;
+    private int opaque_normalCount;
 
-    public bool update;
+    // Transparent Mesh Data (Temporary Collection)
+    private Vector3[] transparent_vertexPool;
+    private int[] transparent_trianglePool;
+    private Vector2[] transparent_uvPool;
+    private Vector3[] transparent_normalPool;
+    private int transparent_vertexCount;
+    private int transparent_triangleCount;
+    private int transparent_uvCount;
+    private int transparent_normalCount;
 
-    void LateUpdate()
+    // Cutout Mesh Data (Temporary Collection)
+    private Vector3[] cutout_vertexPool;
+    private int[] cutout_trianglePool;
+    private Vector2[] cutout_uvPool;
+    private Vector3[] cutout_normalPool;
+    private int cutout_vertexCount;
+    private int cutout_triangleCount;
+    private int cutout_uvCount;
+    private int cutout_normalCount;
+
+    private float tUnit;
+    private float uvPadding;
+
+    [HideInInspector] public bool isBuildingMesh = false;
+    private bool isInitialized = false;
+
+    [SerializeField, FindObjectOfType(true)] 
+    private McBlockTypeManager blockTypeManager; 
+
+    private int buildMesh_currentX = 0;
+    private int buildMesh_currentY = 0;
+    private int buildMesh_currentZ = 0;
+
+    public void InitializeChunk()
     {
-        if(update)
-        {
-            GenerateMesh();
-            update = false;
-        }
-    }
+        if (isInitialized || template) return;
 
-
-
-
-    void Start()
-    {
-        if(template) return;
-        world = worldGO.GetComponent<McWorld>();
-        mesh = GetComponent<MeshFilter>().mesh;
-        col = GetComponent<MeshCollider>();
-        collisionMesh = new Mesh();
-
-        // Pre-calculate array indices multipliers
-        chunkSizeXZY = chunkSizeXZ * chunkSizeY;
-        chunkSizeXZXZ = chunkSizeXZ * chunkSizeXZ;
-
-        // Initialize pools
-        vertexPool = new Vector3[MAX_FACES * VERTICES_PER_FACE];
-        trianglePool = new int[MAX_FACES * 6]; // 6 indices per face (2 triangles)
-        uvPool = new Vector2[MAX_FACES * VERTICES_PER_FACE];
-
-        // Initialize collision pools
-        collisionVertexPool = new Vector3[MAX_FACES * VERTICES_PER_FACE];
-        collisionTrianglePool = new int[MAX_FACES * 6];
         
-        // Ensure collisionMask is large enough for any 2D slice orientation
-        int maxCollisionDim = Mathf.Max(chunkSizeXZ, chunkSizeY);
-        collisionMask = new bool[maxCollisionDim * maxCollisionDim];
-        
-        sectionsPerAxis = chunkSizeXZ / SECTION_SIZE; // Assuming chunkSizeXZ is representative for all axes for sections.
-        sectionMask = new bool[sectionsPerAxis * sectionsPerAxis * sectionsPerAxis];
+        // Got rid of GetComponent and AddComponent, not exposed to Udon and we already know the filter, renderer and collision will never be null.
 
-        GenerateMesh();
-    }
-
-    public void OnInstance()
-    {
-        Start();
-    }
-
-    private void CacheChunkData() {
-        if (blockCache == null) {
-            blockCache = new byte[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
-            // sectionMask initialized in Start, ensure it's done if CacheChunkData is called before Start (e.g. OnInstance path)
-            if (sectionMask == null) {
-                sectionsPerAxis = chunkSizeXZ / SECTION_SIZE;
-                sectionMask = new bool[sectionsPerAxis * sectionsPerAxis * sectionsPerAxis];
-            }
+        if (blockTypeManager == null) {
+            Debug.LogError($"[{this.gameObject.name}] McBlockTypeManager instance NOT FOUND! UVs/block properties will be default.");
+            tUnit = 0.0625f; uvPadding = 0.0001f;
         } else {
-            // Clear section mask for reuse
-            for(int i = 0; i < sectionMask.Length; i++) {
-                sectionMask[i] = false;
-            }
+            tUnit = blockTypeManager.textureAtlasTUnit;
+            uvPadding = blockTypeManager.textureAtlasUVPadding;
         }
 
-        // Pre-fetch all block data in a more cache-friendly pattern
-        int index = 0;
-        for (int z = 0; z < chunkSizeXZ; z++) {
-            for (int y = 0; y < chunkSizeY; y++) {
-                for (int x = 0; x < chunkSizeXZ; x++) {
-                    byte block = world.Block(x + chunkX, y + chunkY, z + chunkZ);
-                    blockCache[index++] = block;
-                    
-                    // Mark section as non-empty if it contains any blocks
-                    if (block != 0) {
-                        int sectionX = x / SECTION_SIZE; // x / 8
-                        int sectionY = y / SECTION_SIZE;
-                        int sectionZ = z / SECTION_SIZE;
-                        sectionMask[sectionX + (sectionY * sectionsPerAxis) + (sectionZ * sectionsPerAxis * sectionsPerAxis)] = true;
-                    }
-                }
-            }
+        chunkMesh = new Mesh();
+        chunkMesh.name = $"ChunkMesh_({chunkX},{chunkY},{chunkZ})";
+        meshFilter.mesh = chunkMesh;
+
+        Material[] materials = new Material[3];
+        materials[0] = opaqueMaterial;
+        materials[1] = transparentMaterial;
+        materials[2] = cutoutMaterial;
+        meshRenderer.sharedMaterials = materials;
+
+        int poolVertexSize = MAX_VERTS_PER_SUB_DATASET;
+        int poolTriangleIndexSize = Mathf.FloorToInt(poolVertexSize * 1.5f);
+
+        opaque_vertexPool = new Vector3[poolVertexSize]; opaque_trianglePool = new int[poolTriangleIndexSize];
+        opaque_uvPool = new Vector2[poolVertexSize]; opaque_normalPool = new Vector3[poolVertexSize];
+
+        transparent_vertexPool = new Vector3[poolVertexSize]; transparent_trianglePool = new int[poolTriangleIndexSize];
+        transparent_uvPool = new Vector2[poolVertexSize]; transparent_normalPool = new Vector3[poolVertexSize];
+
+        cutout_vertexPool = new Vector3[poolVertexSize]; cutout_trianglePool = new int[poolTriangleIndexSize];
+        cutout_uvPool = new Vector2[poolVertexSize]; cutout_normalPool = new Vector3[poolVertexSize];
+
+        if (world == null && worldGO != null) world = worldGO.GetComponent<McWorld>();
+        if (world == null) { Debug.LogError($"[{this.gameObject.name}] McWorld reference not set!"); return; }
+
+        isInitialized = true;
+        if (world != null) world.RequestChunkMeshUpdate(this); 
+    }
+
+    public void StartBuildMesh() 
+    {
+        if (isBuildingMesh) return;
+        if (!isInitialized) { InitializeChunk(); if (!isInitialized) return; }
+        if (world == null || blockTypeManager == null) { 
+            Debug.LogError($"[{this.gameObject.name}] Critical reference missing in StartBuildMesh (World or BlockTypeManager).");
+            if (blockTypeManager == null) { tUnit = 0.0625f; uvPadding = 0.0001f; }
+            isBuildingMesh = false; return; 
         }
-        isCacheValid = true;
+        tUnit = blockTypeManager.textureAtlasTUnit; uvPadding = blockTypeManager.textureAtlasUVPadding;
+
+        isBuildingMesh = true; 
+        opaque_vertexCount = 0; opaque_triangleCount = 0; opaque_uvCount = 0; opaque_normalCount = 0;
+        transparent_vertexCount = 0; transparent_triangleCount = 0; transparent_uvCount = 0; transparent_normalCount = 0;
+        cutout_vertexCount = 0; cutout_triangleCount = 0; cutout_uvCount = 0; cutout_normalCount = 0;
+        buildMesh_currentX = 0; buildMesh_currentY = 0; buildMesh_currentZ = 0;
+        ProcessMeshSlice();
     }
 
-    byte Block(int x, int y, int z) {
-        // Use cached data if available and within bounds
-        if (isCacheValid && x >= 0 && x < chunkSizeXZ && y >= 0 && y < chunkSizeY && z >= 0 && z < chunkSizeXZ) {
-            return blockCache[x + y * chunkSizeXZ + z * chunkSizeXZY];
-        }
-        
-        // Convert to world coordinates
-        int worldX = x + chunkX;
-        int worldY = y + chunkY;
-        int worldZ = z + chunkZ;
-        
-        return world.Block(worldX, worldY, worldZ);
-    }
-
-    private void ResetPools()
+    public void ProcessMeshSlice()
     {
-        vertexCount = 0;
-        triangleCount = 0;
-        uvCount = 0;
-        faceCount = 0;
-        collisionVertexCount = 0;
-        collisionTriangleCount = 0;
-    }
+        if (!isBuildingMesh) return;
+        int processedThisSlice = 0;
 
-    void AddFaceVertices(Vector3 v1, Vector3 v2, Vector3 v3, Vector3 v4)
-    {
-        vertexPool[vertexCount++] = v1;
-        vertexPool[vertexCount++] = v2;
-        vertexPool[vertexCount++] = v3;
-        vertexPool[vertexCount++] = v4;
-
-        // Add triangles
-        int baseIndex = faceCount * 4;
-        trianglePool[triangleCount++] = baseIndex;
-        trianglePool[triangleCount++] = baseIndex + 1;
-        trianglePool[triangleCount++] = baseIndex + 2;
-        trianglePool[triangleCount++] = baseIndex;
-        trianglePool[triangleCount++] = baseIndex + 2;
-        trianglePool[triangleCount++] = baseIndex + 3;
-
-        faceCount++;
-    }
-
-    void AddQuadUVs_Standard() // For greedy quads using full texture space
-    {
-        float uvStart = Time.realtimeSinceStartup;
-        // Standard UVs for a quad: (0,0), (1,0), (1,1), (0,1) or similar, depending on vertex order.
-        // Assuming AddFaceVertices v0,v1,v2,v3 corresponds to bottom-left, bottom-right, top-right, top-left for a front-facing quad
-        uvPool[uvCount++] = new Vector2(0f, 0f); // For v0
-        uvPool[uvCount++] = new Vector2(1f, 0f); // For v1
-        uvPool[uvCount++] = new Vector2(1f, 1f); // For v2
-        uvPool[uvCount++] = new Vector2(0f, 1f); // For v3
-        uvGenTime += Time.realtimeSinceStartup - uvStart;
-    }
-
-    private Vector2 GetTextureForFace(byte block, int faceDirection)
-    {
-        // faceDirection: 0=+X (East), 1=-X (West), 2=+Y (Top), 3=-Y (Bottom), 4=+Z (North), 5=-Z (South)
-        if (block == 1) return tStone; // Stone is same on all sides
-        if (block == 2) { // Grass block
-            switch (faceDirection) {
-                case 2: return tGrassTop; // +Y (Top face)
-                default: return tGrass;   // Sides and Bottom
-            }
-        }
-        // Fallback for unknown or air blocks (though should not be called for air)
-        // You might want to define more textures for other block types here
-        return new Vector2(0,0); // Default texture (e.g. an error texture or first in atlas)
-    }
-
-    private void ResetTimings()
-    {
-        blockCacheTime = 0;
-        blockScanTime = 0;
-        blockCheckTime = 0;
-        faceCheckTime = 0;
-        vertexGenTime = 0;
-        uvGenTime = 0;
-        collisionMaskTime = 0;
-        collisionGreedyTime = 0;
-        collisionVertexTime = 0;
-        meshFinalizationTime = 0;
-        meshNormalsTime = 0;
-        collisionNormalsTime = 0;
-        totalTime = 0;
-        totalBlockChecks = 0;
-        totalFacesGenerated = 0;
-        totalCollisionFaces = 0;
-    }
-
-    public void GenerateMesh()
-    {
-        if(template) return;
-        
-        float startTime = Time.realtimeSinceStartup;
-        ResetPools();
-        ResetTimings();
-
-        float cacheStart = Time.realtimeSinceStartup;
-        CacheChunkData();
-        blockCacheTime = Time.realtimeSinceStartup - cacheStart;
-        
-        float scanStart = Time.realtimeSinceStartup;
-        bool hasBlocks = false;
-        for (int i = 0; i < blockCache.Length; i++) {
-            if (blockCache[i] != 0) {
-                hasBlocks = true;
-                break;
-            }
-        }
-        blockScanTime = Time.realtimeSinceStartup - scanStart;
-        
-        if (hasBlocks) {
-            float blockProcessingStart = Time.realtimeSinceStartup;
-
-            // Temporary mask for one slice. Max dimension: Mathf.Max(chunkSizeXZ, chunkSizeY)
-            int maxSliceDim = Mathf.Max(chunkSizeXZ, chunkSizeY);
-            Vector2[] faceTextureMask = new Vector2[maxSliceDim * maxSliceDim]; // Stores texturePos. Use a sentinel like (-1,-1) for no face.
-            Vector2 noFaceSentinel = new Vector2(-1, -1);
-
-            // Iterate 3 axes (d = 0:X, 1:Y, 2:Z)
-            for (int d = 0; d < 3; d++) {
-                int u = (d + 1) % 3; // Orthogonal axis 1
-                int v = (d + 2) % 3; // Orthogonal axis 2
-
-                Vector3Int q = Vector3Int.zero; // Normal direction vector for current axis d
-                q[d] = 1;
-
-                // Loop for two directions/sides along axis d (+q and -q)
-                // side 0 = +q face (e.g. +X faces of blocks at x_i, normal is +X)
-                // side 1 = -q face (e.g. -X faces of blocks at x_i, normal is -X)
-                for (int side = 0; side < 2; side++) {
-                    
-                    int dimD = (d == 1) ? chunkSizeY : chunkSizeXZ;
-                    int dimU = (u == 1) ? chunkSizeY : chunkSizeXZ; // Width of the slice
-                    int dimV = (v == 1) ? chunkSizeY : chunkSizeXZ; // Height of the slice
-
-                    Vector3Int x = Vector3Int.zero; // Current scanner position in local chunk coordinates
-
-                    // Sweep across axis d (slices of the chunk)
-                    for (x[d] = 0; x[d] < dimD; x[d]++) {
-                        
-                        // 1. Populate faceTextureMask for this slice
-                        // Clear mask with sentinel value
-                        for(int i=0; i < dimU * dimV; i++) faceTextureMask[i] = noFaceSentinel; 
-                        
-                        float faceCheckStartTime = Time.realtimeSinceStartup;
-                        for (x[u] = 0; x[u] < dimU; x[u]++) {
-                            for (x[v] = 0; x[v] < dimV; x[v]++) {
-                                byte blockCurrent;
-                                byte blockNeighbor;
-                                int faceDir;
-
-                                if (side == 0) { // Positive face relative to x (e.g. +X face of block at x)
-                                    blockCurrent = Block(x[0], x[1], x[2]);
-                                    blockNeighbor = Block(x[0] + q[0], x[1] + q[1], x[2] + q[2]);
-                                    faceDir = d * 2; // 0 (+X), 2 (+Y), 4 (+Z)
-                                } else { // Negative face relative to x (e.g. -X face of block at x)
-                                    blockCurrent = Block(x[0], x[1], x[2]); // This is the block whose -q face we consider
-                                    blockNeighbor = Block(x[0] - q[0], x[1] - q[1], x[2] - q[2]); // Block in -q direction
-                                    faceDir = d * 2 + 1; // 1 (-X), 3 (-Y), 5 (-Z)
-                                }
-                                
-                                // We need a face if current is solid and neighbor is air.
-                                if (blockCurrent != 0 && blockNeighbor == 0) {
-                                    faceTextureMask[x[u] + x[v] * dimU] = GetTextureForFace(blockCurrent, faceDir);
-                                }
-                            }
-                        }
-                        faceCheckTime += Time.realtimeSinceStartup - faceCheckStartTime;
-
-                        // 2. Perform greedy meshing on faceTextureMask
-                        float vertexGenStartTime = Time.realtimeSinceStartup;
-                        for (int vIdx = 0; vIdx < dimV; vIdx++) { // Iterate over rows (v-coordinate)
-                            for (int uIdx = 0; uIdx < dimU;) { // Iterate over columns (u-coordinate)
-                                Vector2 currentTexture = faceTextureMask[uIdx + vIdx * dimU];
-                                if (currentTexture.x < 0) { // Sentinel for no face / already processed
-                                    uIdx++;
-                                    continue;
-                                }
-
-                                // Find width of quad
-                                int width = 1;
-                                while (uIdx + width < dimU && faceTextureMask[(uIdx + width) + vIdx * dimU] == currentTexture) {
-                                    width++;
-                                }
-
-                                // Find height of quad
-                                int height = 1;
-                                bool canExpandHeight = true;
-                                while (vIdx + height < dimV && canExpandHeight) {
-                                    for (int k = 0; k < width; k++) { // Check all cells in the next row segment
-                                        if (faceTextureMask[(uIdx + k) + (vIdx + height) * dimU] != currentTexture) {
-                                            canExpandHeight = false;
-                                            break;
-                                        }
-                                    }
-                                    if (canExpandHeight) height++;
-                                }
-
-                                // 3. Add quad vertices and UVs
-                                // Define quad corners based on x, uIdx, vIdx, width, height, d, side
-                                Vector3 v0 = Vector3.zero, v1 = Vector3.zero, v2 = Vector3.zero, v3 = Vector3.zero;
-                                float planeCoord = x[d]; // The slice index along axis d
-
-                                // These are local coordinates for the quad within the slice
-                                float u_start = uIdx;
-                                float v_start = vIdx;
-                                float u_end = uIdx + width;
-                                float v_end = vIdx + height;
-
-                                // Map d, u, v and side to actual X,Y,Z coordinates and winding order
-                                // Based on old Cube functions: Y coord is actual face level.
-                                // Example: +Y face (d=1, side=0, q=(0,1,0)), planeCoord = y_level_of_block
-                                // Face is at y_level_of_block + 1.
-                                // u,v are X,Z. Quad is (X, planeCoord+1, Z)
-                                // v0 = (u_start, planeCoord+1, v_start)
-                                // v1 = (u_end, planeCoord+1, v_start)
-                                // v2 = (u_end, planeCoord+1, v_end)
-                                // v3 = (u_start, planeCoord+1, v_end)
-                                
-                                // Simplified generic vertex setup (needs careful per-axis/side adjustment)
-                                // This part is complex and needs to be exact for each of the 6 face orientations.
-
-                                // For +X face (d=0, side=0, q=(1,0,0)). Plane coord is x_slice. Face is at x_slice+1 (X value).
-                                // u (width) maps to Y, v (height) maps to Z for the face.
-                                // Vertices are (X, Y, Z)
-                                // v0_local = (u_start, v_start), v1_local = (u_end, v_start), ... on the U-V plane of the slice
-
-                                // The planeCoord is the fixed coordinate for the axis d.
-                                // Example: +Y face (Top face). d=1 (Y-axis), side=0. Normal is (0,1,0).
-                                // x[d] (which is y_block_coord) is the coordinate of the block itself.
-                                // The face is at y_block_coord + 1.
-                                // u is X, v is Z. u_start is x_local_start, v_start is z_local_start.
-                                // Quad vertices (bottom-left, bottom-right, top-right, top-left on the XZ plane at Y = y_block_coord+1):
-                                // v0 = (u_start, planeCoord + 1, v_start)  -- This was the previous thinking, let's use the AddFaceVertices convention.
-                                // AddFaceVertices takes them in order: (v_bl, v_br, v_tr, v_tl) for a CCW face. 
-
-                                // x is the current base coordinate being scanned by the loops for d, u, v.
-                                // uIdx, vIdx are offsets on the current slice plane (defined by u,v axes).
-                                // width, height are extents on that plane.
-                                
-                                // Global chunk coordinates for the start of the quad on the slice plane
-                                float gu = x[u] + uIdx;
-                                float gv = x[v] + vIdx;
-
-                                // Define the 4 corner vertices of the quad in world space
-                                // These need to map correctly based on d (axis) and side (direction)
-                                Vector3 p0 = Vector3.zero, p1 = Vector3.zero, p2 = Vector3.zero, p3 = Vector3.zero;
-                                
-                                // du and dv are vectors along the U and V axes of the slice plane, scaled by quad width/height
-                                Vector3 du_vec = Vector3.zero;
-                                Vector3 dv_vec = Vector3.zero;
-                                du_vec[u] = width;
-                                dv_vec[v] = height;
-
-                                // Base point for the quad (corner x[d], x[u]+uIdx, x[v]+vIdx)
-                                Vector3 base_pos = new Vector3(x[0], x[1], x[2]); // This x already incorporates slice and u,v iterators
-                                // Adjust base_pos to be the actual corner of the quad for uIdx, vIdx
-                                base_pos[u] = uIdx; // These should be global chunk coords
-                                base_pos[v] = vIdx; // So, use x[u_original_loop] + uIdx, x[v_original_loop] + vIdx.
-                                                // x is reset per slice, so x[u] and x[v] are 0 at start of slice's greedy pass.
-                                                // So uIdx, vIdx are direct coords on slice.
-                                                // We need to map slice u,v back to world X,Y,Z using d,u,v.
-
-                                float fixedCoord = x[d]; // This is the coordinate of the current slice along axis d.
-
-                                if (side == 0) { // Positive face (+q direction)
-                                    // p0 is the origin of the quad on the slice plane
-                                    p0[d] = fixedCoord + 1; p0[u] = uIdx;       p0[v] = vIdx;
-                                    p1[d] = fixedCoord + 1; p1[u] = uIdx + width; p1[v] = vIdx;
-                                    p2[d] = fixedCoord + 1; p2[u] = uIdx + width; p2[v] = vIdx + height;
-                                    p3[d] = fixedCoord + 1; p3[u] = uIdx;       p3[v] = vIdx + height;
-                                    // Winding for +q normal: p0,p1,p2,p3 (if u,v correspond to right,up on face)
-                                    // Need to ensure this matches AddFaceVertices: (v_bl, v_br, v_tr, v_tl)
-                                    // If d=X, u=Y, v=Z: (+X face). p0=(fixed+1, uIdx, vIdx), p1=(fixed+1, uIdx+w, vIdx), p2=(fixed+1, uIdx+w, vIdx+h), p3=(fixed+1, uIdx, vIdx+h)
-                                    // This is (X,Y,Z). If Y is right, Z is up. Then p0,p1,p2,p3 is BL,BR,TR,TL.
-                                    AddFaceVertices(p0, p1, p2, p3);
-                                } else { // Negative face (-q direction)
-                                    p0[d] = fixedCoord; p0[u] = uIdx;       p0[v] = vIdx;
-                                    p1[d] = fixedCoord; p1[u] = uIdx + width; p1[v] = vIdx;
-                                    p2[d] = fixedCoord; p2[u] = uIdx + width; p2[v] = vIdx + height;
-                                    p3[d] = fixedCoord; p3[u] = uIdx;       p3[v] = vIdx + height;
-                                    // Winding for -q normal: p0,p3,p2,p1 (reverse of above)
-                                    AddFaceVertices(p0, p3, p2, p1);
-                                }
-
-                                AddQuadUVs_Standard();
-                                totalFacesGenerated++;
-
-                                // Clear mask for processed quad to avoid reprocessing
-                                for (int h = 0; h < height; h++) {
-                                    for (int w = 0; w < width; w++) {
-                                        faceTextureMask[(uIdx + w) + (vIdx + h) * dimU] = noFaceSentinel;
-                                    }
-                                }
-                                uIdx += width; // Move past the processed quad in u-direction
-                            }
-                        }
-                        vertexGenTime += Time.realtimeSinceStartup - vertexGenStartTime;
-                    }
-                }
-            }
-            blockCheckTime = Time.realtimeSinceStartup - blockProcessingStart; // Renamed from blockCheckTime to blockProcessingStart
-            
-            float collisionStart = Time.realtimeSinceStartup;
-            GenerateGreedyCollisionMesh();
-            
-            float finalizeStart = Time.realtimeSinceStartup;
-            UpdateMesh();
-            meshFinalizationTime = Time.realtimeSinceStartup - finalizeStart;
-        } else {
-            // Empty chunk, just clear everything
-            mesh.Clear();
-            col.sharedMesh = null;
-        }
-        
-        totalTime = Time.realtimeSinceStartup - startTime;
-        
-        Debug.Log($"[CHUNK PROFILING] Chunk {chunkX},{chunkY},{chunkZ} generation complete:\n" +
-                  $"Total time: {totalTime*1000:F2}ms\n" +
-                  $"Block caching: {blockCacheTime*1000:F2}ms\n" +
-                  $"Block scanning: {blockScanTime*1000:F2}ms\n" +
-                  $"Mesh generation:\n" +
-                  $"- Block checks ({totalBlockChecks}): {blockCheckTime*1000:F2}ms\n" +
-                  $"- Face checks: {faceCheckTime*1000:F2}ms\n" +
-                  $"- Vertex gen ({totalFacesGenerated} faces): {vertexGenTime*1000:F2}ms\n" +
-                  $"- UV gen: {uvGenTime*1000:F2}ms\n" +
-                  $"Collision mesh:\n" +
-                  $"- Mask generation: {collisionMaskTime*1000:F2}ms\n" +
-                  $"- Greedy meshing: {collisionGreedyTime*1000:F2}ms\n" +
-                  $"- Vertex gen ({totalCollisionFaces} faces): {collisionVertexTime*1000:F2}ms\n" +
-                  $"Finalization:\n" +
-                  $"- Mesh: {meshFinalizationTime*1000:F2}ms\n" +
-                  $"- Mesh normals: {meshNormalsTime*1000:F2}ms\n" +
-                  $"- Collision normals: {collisionNormalsTime*1000:F2}ms");
-
-        isCacheValid = false;
-    }
-
-    void UpdateMesh()
-    {
-        mesh.Clear();
-
-        if(triangleCount > 0)
+        for (int x = buildMesh_currentX; x < chunkSizeXZ; x++)
         {
-            // Create arrays of exact size needed
-            Vector3[] finalVertices = new Vector3[vertexCount];
-            int[] finalTriangles = new int[triangleCount];
-            Vector2[] finalUVs = new Vector2[uvCount];
-
-            // Copy only the used portion of the pools
-            System.Array.Copy(vertexPool, finalVertices, vertexCount);
-            System.Array.Copy(trianglePool, finalTriangles, triangleCount);
-            System.Array.Copy(uvPool, finalUVs, uvCount);
-
-            // Set mesh data in one batch
-            mesh.vertices = finalVertices;
-            mesh.triangles = finalTriangles;
-            mesh.uv = finalUVs;
-            
-            float normalsStart = Time.realtimeSinceStartup;
-            mesh.RecalculateNormals();
-            meshNormalsTime = Time.realtimeSinceStartup - normalsStart;
-        }
-        else
-        {
-            col.sharedMesh = null;
-        }
-    }
-
-    private void GenerateGreedyCollisionMesh()
-    {
-        if(template) return;
-
-        collisionVertexCount = 0;
-        collisionTriangleCount = 0;
-
-        // Pre-calculate chunk size values
-        int maxSize = Mathf.Max(chunkSizeXZ, chunkSizeY);
-        int maskSize = maxSize * maxSize;
-        
-        // Initialize mask only once
-        if (collisionMask == null || collisionMask.Length < maskSize) {
-            collisionMask = new bool[maskSize];
-        }
-
-        // Iterate through each axis (X=0, Y=1, Z=2)
-        for (int d = 0; d < 3; d++)
-        {
-            int u = (d + 1) % 3;
-            int v = (d + 2) % 3;
-            
-            // Pre-calculate axis-specific values
-            int maxD = d == 1 ? chunkSizeY : chunkSizeXZ;
-            int maxU = u == 1 ? chunkSizeY : chunkSizeXZ;
-            int maxV = v == 1 ? chunkSizeY : chunkSizeXZ;
-            
-            // Cache coordinate arrays
-            int[] x = new int[3];
-            int[] q = new int[3];
-            q[d] = 1;
-
-            // Pre-calculate offsets for the current axis
-            Vector3 offset1 = Vector3.zero;
-            Vector3 offset2 = Vector3.zero;
-            if (u == 0) offset1.x = 1;
-            else if (u == 1) offset1.y = 1;
-            else offset1.z = 1;
-            if (v == 0) offset2.x = 1;
-            else if (v == 1) offset2.y = 1;
-            else offset2.z = 1;
-
-            // Sweep over each slice in this axis
-            for (x[d] = -1; x[d] < maxD;)
+            for (int y = buildMesh_currentY; y < chunkSizeY; y++)
             {
-                float maskStart = Time.realtimeSinceStartup;
-                
-                // Fast array clear using a single loop
-                int maskLength = maxU * maxV;
-                for (int i = 0; i < maskLength; i++) {
-                    collisionMask[i] = false;
-                }
-
-                // Generate mask for this slice - marks where faces should be generated
-                for (int sectionV = 0; sectionV < maxV; sectionV += SECTION_SIZE)
+                for (int z = buildMesh_currentZ; z < chunkSizeXZ; z++)
                 {
-                    for (int sectionU = 0; sectionU < maxU; sectionU += SECTION_SIZE)
-                    {
-                        // Check if this section needs processing
-                        int sectionX = d == 0 ? x[d] / SECTION_SIZE : (u == 0 ? sectionU / SECTION_SIZE : sectionV / SECTION_SIZE);
-                        int sectionY = d == 1 ? x[d] / SECTION_SIZE : (u == 1 ? sectionU / SECTION_SIZE : sectionV / SECTION_SIZE);
-                        int sectionZ = d == 2 ? x[d] / SECTION_SIZE : (u == 2 ? sectionU / SECTION_SIZE : sectionV / SECTION_SIZE);
-                        
-                        if (sectionX >= 0 && sectionX < sectionsPerAxis && 
-                            sectionY >= 0 && sectionY < sectionsPerAxis && 
-                            sectionZ >= 0 && sectionZ < sectionsPerAxis)
-                        {
-                            int sectionIdx = sectionX + (sectionY * sectionsPerAxis) + (sectionZ * sectionsPerAxis * sectionsPerAxis);
-                            if (!sectionMask[sectionIdx]) continue;
-                        }
+                    int currentGlobalX = chunkX + x; int currentGlobalY = chunkY + y; int currentGlobalZ = chunkZ + z;
+                    byte currentBlockID = world.GetBlock(currentGlobalX, currentGlobalY, currentGlobalZ);
 
-                        // Process blocks in this section
-                        int endV = Mathf.Min(sectionV + SECTION_SIZE, maxV);
-                        int endU = Mathf.Min(sectionU + SECTION_SIZE, maxU);
-                        for (x[v] = sectionV; x[v] < endV; x[v]++)
-                        {
-                            for (x[u] = sectionU; x[u] < endU; x[u]++)
-                            {
-                                // Check if we need a face between current voxel and next voxel
-                                bool blockCurrent = x[d] >= 0 && Block(x[0], x[1], x[2]) != 0;
-                                bool blockCompare = x[d] < maxD - 1 && Block(x[0] + q[0], x[1] + q[1], x[2] + q[2]) != 0;
-                                
-                                // Only set mask if we have a transition between solid and air
-                                if (blockCurrent != blockCompare) {
-                                    collisionMask[x[u] + x[v] * maxU] = true;
+                    if (currentBlockID == 0) { processedThisSlice++; if (ShouldScheduleNextSlice(processedThisSlice,x,y,z)) return; continue; }
+
+                    BlockVisibilityType currentVisibility = blockTypeManager.GetBlockVisibilityType(currentBlockID);
+                    if (currentVisibility == BlockVisibilityType.Invisible) { processedThisSlice++; if (ShouldScheduleNextSlice(processedThisSlice,x,y,z)) return; continue; }
+
+                    McChunk_MeshTarget targetMeshTypeForCurrentBlock; 
+                    if (currentVisibility == BlockVisibilityType.Opaque) targetMeshTypeForCurrentBlock = McChunk_MeshTarget.Opaque;
+                    else if (blockTypeManager.IsAnyCutoutType(currentVisibility)) targetMeshTypeForCurrentBlock = McChunk_MeshTarget.Cutout; // Updated to use helper
+                    else targetMeshTypeForCurrentBlock = McChunk_MeshTarget.Transparent; // Covers all Transparent_* types
+
+                    Vector3[] directions = { Vector3.right, Vector3.left, Vector3.up, Vector3.down, Vector3.forward, Vector3.back };
+                    for (int i = 0; i < 6; i++)
+                    {
+                        Vector3 dir = directions[i];
+                        byte neighborBlockID = world.GetBlock(currentGlobalX + (int)dir.x, currentGlobalY + (int)dir.y, currentGlobalZ + (int)dir.z);
+                        bool drawFace = false;
+
+                        if (neighborBlockID == 0) drawFace = true; // Neighbor is Air
+                        else {
+                            BlockVisibilityType neighborVisibility = blockTypeManager.GetBlockVisibilityType(neighborBlockID);
+                            if (neighborVisibility == BlockVisibilityType.Invisible) drawFace = true; // Neighbor is Invisible
+                            else {
+                                // Common culling: All non-Opaque types are culled by Opaque neighbors
+                                if (currentVisibility != BlockVisibilityType.Opaque && neighborVisibility == BlockVisibilityType.Opaque) {
+                                    drawFace = false;
+                                } else {
+                                    // Specific culling rules
+                                    switch (currentVisibility)
+                                    {
+                                        case BlockVisibilityType.Opaque:
+                                            drawFace = (neighborVisibility != BlockVisibilityType.Opaque);
+                                            break;
+                                        // Transparent types (all already culled by Opaque above if current is not Opaque)
+                                        case BlockVisibilityType.Transparent_NoCull:
+                                            drawFace = true; // No further culling for this type beyond Opaque neighbor
+                                            break;
+                                        case BlockVisibilityType.Transparent_CullSelf:
+                                        case BlockVisibilityType.Transparent_CullSelfAndOpaque: // Logic is same: cull self, Opaque already handled
+                                            drawFace = (neighborBlockID != currentBlockID);
+                                            break;
+                                        
+                                        // Cutout types (all already culled by Opaque above if current is not Opaque)
+                                        case BlockVisibilityType.Cutout_CullOpaqueOnly:
+                                            drawFace = true; // No further culling beyond Opaque neighbor
+                                            break;
+                                        case BlockVisibilityType.Cutout_CullSelf:
+                                            drawFace = !(neighborBlockID == currentBlockID && blockTypeManager.IsSelfCullingCutout(neighborVisibility));
+                                            break;
+                                        case BlockVisibilityType.Cutout_CullSelfAndOtherCutout:
+                                            if (blockTypeManager.IsAnyCutoutType(neighborVisibility)) drawFace = false; // Cull against any cutout (includes self)
+                                            else drawFace = true;
+                                            break;
+                                    }
                                 }
                             }
                         }
+                        if (drawFace) AddFaceDataToPool(x, y, z, dir, currentBlockID, targetMeshTypeForCurrentBlock);
                     }
+                    processedThisSlice++;
+                    if (ShouldScheduleNextSlice(processedThisSlice, x, y, z)) return;
                 }
-                collisionMaskTime += Time.realtimeSinceStartup - maskStart;
-
-                x[d]++;
-
-                float greedyStart = Time.realtimeSinceStartup;
-
-                // Greedy meshing algorithm - merge quads in both U and V directions
-                for (int vIdx = 0; vIdx < maxV; vIdx++)
-                {
-                    for (int uIdx = 0; uIdx < maxU;)
-                    {
-                        int idx = uIdx + vIdx * maxU;
-                        if (!collisionMask[idx]) {
-                            uIdx++;
-                            continue;
-                        }
-
-                        // Find max width - how far we can expand in U direction
-                        int width = 1;
-                        while (uIdx + width < maxU && collisionMask[idx + width] &&
-                               Block(x[0], x[1], x[2]) == Block(x[0] + width * q[0], x[1] + width * q[1], x[2] + width * q[2])) {
-                            width++;
-                        }
-
-                        // Find max height - how far we can expand in V direction
-                        int height = 1;
-                        bool canExpand = true;
-                        while (vIdx + height < maxV && canExpand)
-                        {
-                            // Check if we can add another row
-                            for (int k = 0; k < width; k++)
-                            {
-                                int nextIdx = (uIdx + k) + (vIdx + height) * maxU;
-                                if (!collisionMask[nextIdx] ||
-                                    Block(x[0], x[1], x[2]) != Block(x[0] + k * q[0], x[1] + k * q[1], x[2] + k * q[2])) {
-                                    canExpand = false;
-                                        break;
-                                }
-                            }
-                            if (canExpand) height++;
-                        }
-
-                        float vertexStart = Time.realtimeSinceStartup;
-
-                        // Generate vertices for this quad
-                        x[u] = uIdx;
-                        x[v] = vIdx;
-                        
-                        // Create base vertex with correct Y position (subtract 1 to match visual mesh)
-                        Vector3 v0 = new Vector3(x[0], x[1] - 1, x[2]);
-                        
-                        // Add vertices using pre-calculated offsets
-                        collisionVertexPool[collisionVertexCount] = v0;
-                        collisionVertexPool[collisionVertexCount + 1] = v0 + offset1 * width;
-                        collisionVertexPool[collisionVertexCount + 2] = v0 + offset2 * height;
-                        collisionVertexPool[collisionVertexCount + 3] = v0 + offset1 * width + offset2 * height;
-
-                        // Add triangles with correct winding order based on face direction
-                        bool isBackFace = x[d] >= 0 && Block(x[0] - q[0], x[1] - q[1], x[2] - q[2]) == 0;
-                        int triIdx = collisionTriangleCount;
-                            if (isBackFace)
-                            {
-                            collisionTrianglePool[triIdx] = collisionVertexCount;
-                            collisionTrianglePool[triIdx + 1] = collisionVertexCount + 2;
-                            collisionTrianglePool[triIdx + 2] = collisionVertexCount + 1;
-                            collisionTrianglePool[triIdx + 3] = collisionVertexCount + 1;
-                            collisionTrianglePool[triIdx + 4] = collisionVertexCount + 2;
-                            collisionTrianglePool[triIdx + 5] = collisionVertexCount + 3;
-                        }
-                        else
-                        {
-                            collisionTrianglePool[triIdx] = collisionVertexCount;
-                            collisionTrianglePool[triIdx + 1] = collisionVertexCount + 1;
-                            collisionTrianglePool[triIdx + 2] = collisionVertexCount + 2;
-                            collisionTrianglePool[triIdx + 3] = collisionVertexCount + 1;
-                            collisionTrianglePool[triIdx + 4] = collisionVertexCount + 3;
-                            collisionTrianglePool[triIdx + 5] = collisionVertexCount + 2;
-                        }
-
-                        collisionVertexCount += 4;
-                        collisionTriangleCount += 6;
-                        totalCollisionFaces++;
-                        collisionVertexTime += Time.realtimeSinceStartup - vertexStart;
-
-                        // Clear the mask for the quad we just generated
-                        for (int h = 0; h < height; h++) {
-                            for (int w = 0; w < width; w++) {
-                                collisionMask[(uIdx + w) + (vIdx + h) * maxU] = false;
-                            }
-                        }
-
-                        // Skip past the quad we just processed
-                        uIdx += width;
-                    }
-                }
-                collisionGreedyTime += Time.realtimeSinceStartup - greedyStart;
+                buildMesh_currentZ = 0;
             }
+            buildMesh_currentY = 0;
         }
-
-        // Create final mesh only if we have vertices
-        if (collisionVertexCount > 0)
-        {
-            Vector3[] finalVertices = new Vector3[collisionVertexCount];
-            int[] finalTriangles = new int[collisionTriangleCount];
-            System.Array.Copy(collisionVertexPool, finalVertices, collisionVertexCount);
-            System.Array.Copy(collisionTrianglePool, finalTriangles, collisionTriangleCount);
-
-        collisionMesh.Clear();
-            collisionMesh.vertices = finalVertices;
-            collisionMesh.triangles = finalTriangles;
-            
-            float normalsStart = Time.realtimeSinceStartup;
-        collisionMesh.RecalculateNormals();
-            collisionNormalsTime = Time.realtimeSinceStartup - normalsStart;
-
-        col.sharedMesh = null;
-        col.sharedMesh = collisionMesh;
+        FinalizeMeshBuild();
     }
-        else
-        {
-            col.sharedMesh = null;
+
+    private bool ShouldScheduleNextSlice(int processedCount, int curX, int curY, int curZ) {
+        if (voxelsPerSlice > 0 && processedCount >= voxelsPerSlice) {
+            buildMesh_currentX = curX; buildMesh_currentY = curY; buildMesh_currentZ = curZ + 1;
+            SendCustomEventDelayedFrames(nameof(ProcessMeshSlice), 1);
+            return true;
         }
+        return false;
+    }
+
+    void AddFaceDataToPool(int x, int y, int z, Vector3 direction, byte blockType, McChunk_MeshTarget targetMesh)
+    {
+        if (blockTypeManager == null) { 
+            Debug.LogError($"[{gameObject.name}] AddFaceDataToPool: McBlockTypeManager is null. Aborting face.");
+            isBuildingMesh = false; 
+            return;
+        }
+
+        Vector3[] selectedVertexPool;
+        int[] selectedTrianglePool;
+        Vector2[] selectedUvPool;
+        Vector3[] selectedNormalPool;
+        
+        int currentVertexPoolLength = 0;
+        int currentTrianglePoolLength = 0;
+        int vCount = 0, tCount = 0, uCount = 0, nC = 0; 
+
+        switch (targetMesh) // Use renamed enum McChunk_MeshTarget
+        {
+            case McChunk_MeshTarget.Opaque:
+                selectedVertexPool = opaque_vertexPool; selectedTrianglePool = opaque_trianglePool; selectedUvPool = opaque_uvPool; selectedNormalPool = opaque_normalPool;
+                currentVertexPoolLength = opaque_vertexPool.Length; currentTrianglePoolLength = opaque_trianglePool.Length;
+                vCount = opaque_vertexCount; tCount = opaque_triangleCount; uCount = opaque_uvCount; nC = opaque_normalCount;
+                break;
+            case McChunk_MeshTarget.Transparent:
+                selectedVertexPool = transparent_vertexPool; selectedTrianglePool = transparent_trianglePool; selectedUvPool = transparent_uvPool; selectedNormalPool = transparent_normalPool;
+                currentVertexPoolLength = transparent_vertexPool.Length; currentTrianglePoolLength = transparent_trianglePool.Length;
+                vCount = transparent_vertexCount; tCount = transparent_triangleCount; uCount = transparent_uvCount; nC = transparent_normalCount;
+                break;
+            case McChunk_MeshTarget.Cutout:
+                selectedVertexPool = cutout_vertexPool; selectedTrianglePool = cutout_trianglePool; selectedUvPool = cutout_uvPool; selectedNormalPool = cutout_normalPool;
+                currentVertexPoolLength = cutout_vertexPool.Length; currentTrianglePoolLength = cutout_trianglePool.Length;
+                vCount = cutout_vertexCount; tCount = cutout_triangleCount; uCount = cutout_uvCount; nC = cutout_normalCount;
+                break;
+            default: 
+                Debug.LogError("Invalid McChunk_MeshTarget in AddFaceDataToPool"); return;
+        }
+
+        if (vCount + 4 > currentVertexPoolLength || tCount + 6 > currentTrianglePoolLength)
+        { Debug.LogError($"[{gameObject.name}] Mesh data pool overflow for {targetMesh}! Aborting face add."); isBuildingMesh = false; return; }
+
+        Vector3 p0, p1, p2, p3; Vector3 faceNormal = direction; float fx = (float)x, fy = (float)y, fz = (float)z;
+        int faceIndex = 0; 
+        if(direction == Vector3.right) faceIndex = 0;
+        else if(direction == Vector3.left) faceIndex = 1;
+        else if(direction == Vector3.up) faceIndex = 2;
+        else if(direction == Vector3.down) faceIndex = 3;
+        else if(direction == Vector3.forward) faceIndex = 4;
+        else if(direction == Vector3.back) faceIndex = 5;
+        Vector2 uv_atlas_origin = blockTypeManager.GetFinalBlockTextureUV(blockType, faceIndex);
+
+        if (direction == Vector3.right) { p0=new Vector3(fx+1,fy,fz); p1=new Vector3(fx+1,fy,fz+1); p2=new Vector3(fx+1,fy+1,fz+1); p3=new Vector3(fx+1,fy+1,fz); }
+        else if (direction == Vector3.left) { p0=new Vector3(fx,fy,fz+1); p1=new Vector3(fx,fy,fz); p2=new Vector3(fx,fy+1,fz); p3=new Vector3(fx,fy+1,fz+1); }
+        else if (direction == Vector3.up) { p0=new Vector3(fx,fy+1,fz); p1=new Vector3(fx+1,fy+1,fz); p2=new Vector3(fx+1,fy+1,fz+1); p3=new Vector3(fx,fy+1,fz+1); }
+        else if (direction == Vector3.down) { p0=new Vector3(fx,fy,fz+1); p1=new Vector3(fx+1,fy,fz+1); p2=new Vector3(fx+1,fy,fz); p3=new Vector3(fx,fy,fz); }
+        else if (direction == Vector3.forward) { p0=new Vector3(fx+1,fy,fz+1); p1=new Vector3(fx,fy,fz+1); p2=new Vector3(fx,fy+1,fz+1); p3=new Vector3(fx+1,fy+1,fz+1); }
+        else { p0=new Vector3(fx,fy,fz); p1=new Vector3(fx+1,fy,fz); p2=new Vector3(fx+1,fy+1,fz); p3=new Vector3(fx,fy+1,fz); } 
+
+        selectedVertexPool[vCount + 0] = p0; selectedVertexPool[vCount + 1] = p1; selectedVertexPool[vCount + 2] = p2; selectedVertexPool[vCount + 3] = p3;
+        selectedNormalPool[nC + 0] = faceNormal; selectedNormalPool[nC + 1] = faceNormal; selectedNormalPool[nC + 2] = faceNormal; selectedNormalPool[nC + 3] = faceNormal;
+        
+        // Standardized triangle winding for all faces (CCW when viewed from outside)
+        selectedTrianglePool[tCount + 0] = vCount + 0; selectedTrianglePool[tCount + 1] = vCount + 2; selectedTrianglePool[tCount + 2] = vCount + 1;
+        selectedTrianglePool[tCount + 3] = vCount + 0; selectedTrianglePool[tCount + 4] = vCount + 3; selectedTrianglePool[tCount + 5] = vCount + 2;
+        
+        float u_start = uv_atlas_origin.x * tUnit + uvPadding; float u_end = (uv_atlas_origin.x + 1) * tUnit - uvPadding;
+        float v_start_flipped = 1.0f - (uv_atlas_origin.y + 1) * tUnit + uvPadding; float v_end_flipped = 1.0f - uv_atlas_origin.y * tUnit - uvPadding;
+        selectedUvPool[uCount + 0] = new Vector2(u_start, v_start_flipped); selectedUvPool[uCount + 1] = new Vector2(u_end, v_start_flipped);
+        selectedUvPool[uCount + 2] = new Vector2(u_end, v_end_flipped); selectedUvPool[uCount + 3] = new Vector2(u_start, v_end_flipped);
+        
+        switch (targetMesh) // Use renamed enum McChunk_MeshTarget
+        {
+            case McChunk_MeshTarget.Opaque:
+                opaque_vertexCount += 4; opaque_triangleCount += 6; opaque_uvCount += 4; opaque_normalCount += 4;
+                break;
+            case McChunk_MeshTarget.Transparent:
+                transparent_vertexCount += 4; transparent_triangleCount += 6; transparent_uvCount += 4; transparent_normalCount += 4;
+                break;
+            case McChunk_MeshTarget.Cutout:
+                cutout_vertexCount += 4; cutout_triangleCount += 6; cutout_uvCount += 4; cutout_normalCount += 4;
+                break;
+        }
+    }
+
+    void FinalizeMeshBuild()
+    {
+        if (chunkMesh == null) { Debug.LogError("ChunkMesh is null in Finalize!"); isBuildingMesh = false; return; }
+        chunkMesh.Clear();
+
+        int totalVertices = opaque_vertexCount + transparent_vertexCount + cutout_vertexCount;
+        if (totalVertices == 0)
+        { // No visible blocks in this chunk
+            if (meshCollider != null) meshCollider.sharedMesh = null;
+            isBuildingMesh = false;
+            return;
+        }
+        if (totalVertices > 65534) {
+             Debug.LogError($"[{gameObject.name}] Combined mesh for chunk would exceed 65534 vertices ({totalVertices}). This is not supported by Unity for a single mesh. Consider smaller chunks or fewer details.");
+             // Potentially clear pools and set collider to null to prevent further errors.
+             if (meshCollider != null) meshCollider.sharedMesh = null; 
+             isBuildingMesh = false;
+             return;
+        }
+
+        Vector3[] finalVertices = new Vector3[totalVertices];
+        Vector2[] finalUVs = new Vector2[totalVertices];
+        Vector3[] finalNormals = new Vector3[totalVertices];
+
+        int currentOffset = 0;
+        if (opaque_vertexCount > 0) {
+            System.Array.Copy(opaque_vertexPool, 0, finalVertices, currentOffset, opaque_vertexCount);
+            System.Array.Copy(opaque_uvPool, 0, finalUVs, currentOffset, opaque_uvCount);
+            System.Array.Copy(opaque_normalPool, 0, finalNormals, currentOffset, opaque_normalCount);
+            currentOffset += opaque_vertexCount;
+        }
+        if (transparent_vertexCount > 0) {
+            System.Array.Copy(transparent_vertexPool, 0, finalVertices, currentOffset, transparent_vertexCount);
+            System.Array.Copy(transparent_uvPool, 0, finalUVs, currentOffset, transparent_uvCount);
+            System.Array.Copy(transparent_normalPool, 0, finalNormals, currentOffset, transparent_normalCount);
+            currentOffset += transparent_vertexCount;
+        }
+        if (cutout_vertexCount > 0) {
+            System.Array.Copy(cutout_vertexPool, 0, finalVertices, currentOffset, cutout_vertexCount);
+            System.Array.Copy(cutout_uvPool, 0, finalUVs, currentOffset, cutout_uvCount);
+            System.Array.Copy(cutout_normalPool, 0, finalNormals, currentOffset, cutout_normalCount);
+        }
+
+        chunkMesh.vertices = finalVertices;
+        chunkMesh.uv = finalUVs;
+        chunkMesh.normals = finalNormals;
+
+        chunkMesh.subMeshCount = 3; // Always 3 for Opaque, Transparent, Cutout order
+
+        // Opaque triangles
+        int[] finalOpaqueTriangles = new int[opaque_triangleCount];
+        if (opaque_triangleCount > 0) System.Array.Copy(opaque_trianglePool, finalOpaqueTriangles, opaque_triangleCount);
+        chunkMesh.SetTriangles(finalOpaqueTriangles, 0);
+
+        // Transparent triangles (offset by opaque vertex count)
+        int[] finalTransparentTriangles = new int[transparent_triangleCount];
+        for (int i = 0; i < transparent_triangleCount; i++) finalTransparentTriangles[i] = transparent_trianglePool[i] + opaque_vertexCount;
+        chunkMesh.SetTriangles(finalTransparentTriangles, 1);
+
+        // Cutout triangles (offset by opaque + transparent vertex count)
+        int[] finalCutoutTriangles = new int[cutout_triangleCount];
+        int transparentOffset = opaque_vertexCount + transparent_vertexCount;
+        for (int i = 0; i < cutout_triangleCount; i++) finalCutoutTriangles[i] = cutout_trianglePool[i] + transparentOffset;
+        chunkMesh.SetTriangles(finalCutoutTriangles, 2);
+
+        chunkMesh.RecalculateBounds(); // Important for culling and performance
+        // Normals are set per-face, RecalculateNormals() might smooth them if that's desired, but usually not for blocky style.
+
+        if (meshCollider != null) meshCollider.sharedMesh = chunkMesh; 
+        // If only opaque should collide, a separate mesh would be needed for the collider, 
+        // or the collider could be configured to ignore transparent/cutout layers if possible (not standard with MeshCollider).
+
+        isBuildingMesh = false; 
+    }
+
+    public void SetWorld(McWorld newWorld)
+    {
+        world = newWorld;
+        if (!isInitialized && !template) InitializeChunk();
     }
 }
