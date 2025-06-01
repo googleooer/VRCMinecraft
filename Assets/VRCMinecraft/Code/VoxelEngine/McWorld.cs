@@ -72,7 +72,10 @@ public class McWorld : UdonSharpBehaviour
 
     // --- State Variables ---
     private McChunk[] chunkRebuildQueue;
-    private int chunkRebuildQueueCount = 0;
+    // private int chunkRebuildQueueCount = 0; // Replaced by circular buffer variables
+    private int chunkRebuildQueue_head = 0;
+    private int chunkRebuildQueue_tail = 0;
+    private int chunkRebuildQueue_count = 0;
     private const int MAX_REBUILD_QUEUE_SIZE = 256;
 
     // Unified World Processing State (Radial Iteration for Chunks)
@@ -122,7 +125,9 @@ public class McWorld : UdonSharpBehaviour
         terrainGenerator.InitializeGenerator(actualWorldSeed); // Modified to pass only actualWorldSeed
 
         chunkRebuildQueue = new McChunk[MAX_REBUILD_QUEUE_SIZE];
-        chunkRebuildQueueCount = 0;
+        chunkRebuildQueue_head = 0;
+        chunkRebuildQueue_tail = 0;
+        chunkRebuildQueue_count = 0;
 
         Debug.Log("[McWorld] Start(): Beginning Interleaved Radial World Processing.");
         StartWorldProcessing(); 
@@ -416,38 +421,60 @@ public class McWorld : UdonSharpBehaviour
         } else { Debug.LogError($"[McWorld] Failed to get McChunk script for C_array({array_cx},{array_cy},{array_cz}) from GO {newChunkGO.name}."); if(newChunkGO != null) Destroy(newChunkGO); }
     }
 
-    public void RequestChunkMeshUpdate(McChunk chunkToUpdate) 
+    public void RequestChunkMeshUpdate(McChunk chunkToUpdate)
     {
         if (chunkToUpdate == null || chunkToUpdate.isBuildingMesh) return;
-        for (int i = 0; i < chunkRebuildQueueCount; i++) if (chunkRebuildQueue[i] == chunkToUpdate) return;
-        
-        if (chunkRebuildQueueCount < MAX_REBUILD_QUEUE_SIZE) { 
-            chunkRebuildQueue[chunkRebuildQueueCount] = chunkToUpdate; 
-            chunkRebuildQueueCount++; 
+
+        // Duplicate check for circular buffer
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int index = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[index] == chunkToUpdate) return;
         }
+
+        if (chunkRebuildQueue_count < MAX_REBUILD_QUEUE_SIZE)
+        {
+            chunkRebuildQueue[chunkRebuildQueue_tail] = chunkToUpdate;
+            chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+            chunkRebuildQueue_count++;
+        }
+        // Else: Queue is full, request is dropped. Consider logging if important.
     }
-    
+
     private void RequestChunkMeshUpdate_Prioritized(McChunk chunkToUpdate)
     {
         if (chunkToUpdate == null || chunkToUpdate.isBuildingMesh) return;
-        for (int i = 0; i < chunkRebuildQueueCount; i++) if (chunkRebuildQueue[i] == chunkToUpdate) return;
 
-        if (chunkRebuildQueueCount < MAX_REBUILD_QUEUE_SIZE) {
-            for (int i = chunkRebuildQueueCount; i > 0; i--) {
-                chunkRebuildQueue[i] = chunkRebuildQueue[i-1];
-            }
-            chunkRebuildQueue[0] = chunkToUpdate;
-            chunkRebuildQueueCount++;
+        // Duplicate check for circular buffer
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int index = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[index] == chunkToUpdate) return;
         }
+
+        if (chunkRebuildQueue_count < MAX_REBUILD_QUEUE_SIZE)
+        {
+            chunkRebuildQueue_head = (chunkRebuildQueue_head - 1 + MAX_REBUILD_QUEUE_SIZE) % MAX_REBUILD_QUEUE_SIZE;
+            chunkRebuildQueue[chunkRebuildQueue_head] = chunkToUpdate;
+            chunkRebuildQueue_count++;
+        }
+        // Else: Queue is full, request is dropped. Consider logging if important.
     }
 
-    public void ProcessChunkRebuildQueue() 
+    // Cached offset arrays for neighbor checking
+    private static readonly int[] neighbor_dx_offsets = { 1, -1, 0,  0, 0,  0 };
+    private static readonly int[] neighbor_dy_offsets = { 0,  0, 1, -1, 0,  0 };
+    private static readonly int[] neighbor_dz_offsets = { 0,  0, 0,  0, 1, -1 };
+
+    public void ProcessChunkRebuildQueue()
     {
         int processedThisCall = 0;
-        for(int k=0; k < chunkRebuildQueueCount && processedThisCall < maxChunksToRebuildPerInterval; )
+        int itemsToPotentiallyCheck = chunkRebuildQueue_count; // Store initial count for the loop limit
+
+        for (int i = 0; i < itemsToPotentiallyCheck && processedThisCall < maxChunksToRebuildPerInterval && chunkRebuildQueue_count > 0; i++)
         {
-            McChunk chunkToBuild = chunkRebuildQueue[k]; 
-            
+            McChunk chunkToBuild = chunkRebuildQueue[chunkRebuildQueue_head]; // Peek
+
             bool canBuild = false;
             switch (neighboringChunksProcessingMode)
             {
@@ -466,13 +493,11 @@ public class McWorld : UdonSharpBehaviour
                     break;
             }
 
-            if (canBuild) 
+            if (canBuild)
             {
-                for (int j = k; j < chunkRebuildQueueCount - 1; j++) {
-                    chunkRebuildQueue[j] = chunkRebuildQueue[j + 1];
-                }
-                chunkRebuildQueue[chunkRebuildQueueCount - 1] = null;
-                chunkRebuildQueueCount--;
+                chunkRebuildQueue[chunkRebuildQueue_head] = null; // Clear reference
+                chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
+                chunkRebuildQueue_count--;
 
                 if (chunkToBuild != null && !chunkToBuild.isBuildingMesh) {
                     chunkToBuild.StartBuildMesh();
@@ -484,9 +509,21 @@ public class McWorld : UdonSharpBehaviour
                     }
                 }
             }
-            else 
+            else
             {
-                k++; 
+                // Item at head cannot be processed now. Move it to the tail.
+                // This ensures items that are not ready don't stall the queue if there are other ready items behind them.
+                if (chunkRebuildQueue_count > 1) // Only rotate if there's more than one item
+                {
+                    // No need to check if chunkToBuild is null here, as it's peeked from the queue.
+                    // If it were null somehow, it would just move a null to the tail.
+                    chunkRebuildQueue[chunkRebuildQueue_tail] = chunkToBuild; // Copy item to tail
+                    chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+                    // Head still needs to advance to complete the 'move'. Count remains the same.
+                    chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
+                }
+                // If only one item and it cannot be built, it stays at head, loop continues until itemsToPotentiallyCheck or other limits.
+                // No k++ here as head is managed directly. The loop advances with 'i'.
             }
         }
         SendCustomEventDelayedSeconds(nameof(ProcessChunkRebuildQueue), chunkRebuildInterval);
@@ -500,15 +537,15 @@ public class McWorld : UdonSharpBehaviour
         int centeredCY = chunk.chunkY / chunkSizeY;
         int centeredCZ = chunk.chunkZ / chunkSizeXZ;
 
-        int[] dx_offsets = { 1, -1, 0,  0, 0,  0 };
-        int[] dy_offsets = { 0,  0, 1, -1, 0,  0 };
-        int[] dz_offsets = { 0,  0, 0,  0, 1, -1 };
+        // int[] dx_offsets = { 1, -1, 0,  0, 0,  0 }; // Replaced by cached static readonly
+        // int[] dy_offsets = { 0,  0, 1, -1, 0,  0 }; // Replaced by cached static readonly
+        // int[] dz_offsets = { 0,  0, 0,  0, 1, -1 }; // Replaced by cached static readonly
 
         for (int i = 0; i < 6; i++) 
         {
-            int neighborCenteredX = centeredCX + dx_offsets[i];
-            int neighborCenteredY = centeredCY + dy_offsets[i];
-            int neighborCenteredZ = centeredCZ + dz_offsets[i];
+            int neighborCenteredX = centeredCX + neighbor_dx_offsets[i];
+            int neighborCenteredY = centeredCY + neighbor_dy_offsets[i];
+            int neighborCenteredZ = centeredCZ + neighbor_dz_offsets[i];
 
             int neighborArrayX = neighborCenteredX + chunkOffsetX;
             int neighborArrayY = neighborCenteredY + chunkOffsetY;
@@ -535,15 +572,15 @@ public class McWorld : UdonSharpBehaviour
         int centeredCY = chunk.chunkY / chunkSizeY;
         int centeredCZ = chunk.chunkZ / chunkSizeXZ;
 
-        int[] dx_offsets = { 1, -1, 0,  0, 0,  0 };
-        int[] dy_offsets = { 0,  0, 1, -1, 0,  0 };
-        int[] dz_offsets = { 0,  0, 0,  0, 1, -1 };
+        // int[] dx_offsets = { 1, -1, 0,  0, 0,  0 }; // Replaced by cached static readonly
+        // int[] dy_offsets = { 0,  0, 1, -1, 0,  0 }; // Replaced by cached static readonly
+        // int[] dz_offsets = { 0,  0, 0,  0, 1, -1 }; // Replaced by cached static readonly
 
         for (int i = 0; i < 6; i++) 
         {
-            int neighborCenteredX = centeredCX + dx_offsets[i];
-            int neighborCenteredY = centeredCY + dy_offsets[i];
-            int neighborCenteredZ = centeredCZ + dz_offsets[i];
+            int neighborCenteredX = centeredCX + neighbor_dx_offsets[i];
+            int neighborCenteredY = centeredCY + neighbor_dy_offsets[i];
+            int neighborCenteredZ = centeredCZ + neighbor_dz_offsets[i];
 
             int neighborArrayX = neighborCenteredX + chunkOffsetX;
             int neighborArrayY = neighborCenteredY + chunkOffsetY;
@@ -617,14 +654,16 @@ public class McWorld : UdonSharpBehaviour
         }
     }
 
-    private void ProcessPlayerActionRebuildsImmediately() {
+    private void ProcessPlayerActionRebuildsImmediately()
+    {
         int processedThisCall = 0;
-        int initialQueueCount = chunkRebuildQueueCount;
-        int currentQueueIndex = 0;
+        int itemsToPotentiallyCheck = chunkRebuildQueue_count;
+        int playerActionMaxRebuilds = Mathf.Min(maxChunksToRebuildPerInterval, 2); // Example: limit player actions to 2 immediate rebuilds
 
-        while(currentQueueIndex < initialQueueCount && chunkRebuildQueueCount > 0 && processedThisCall < maxChunksToRebuildPerInterval) {
-            McChunk chunkToBuild = chunkRebuildQueue[0]; 
-            
+        for (int i = 0; i < itemsToPotentiallyCheck && processedThisCall < playerActionMaxRebuilds && chunkRebuildQueue_count > 0; i++)
+        {
+            McChunk chunkToBuild = chunkRebuildQueue[chunkRebuildQueue_head]; // Peek
+
             bool canBuildPlayerAction = false;
             switch (neighboringChunksProcessingMode)
             {
@@ -643,13 +682,11 @@ public class McWorld : UdonSharpBehaviour
                     break;
             }
             
-            if (canBuildPlayerAction) { 
-                for (int j = 0; j < chunkRebuildQueueCount - 1; j++) {
-                    chunkRebuildQueue[j] = chunkRebuildQueue[j + 1];
-                }
-                chunkRebuildQueue[chunkRebuildQueueCount - 1] = null;
-                chunkRebuildQueueCount--; 
-                initialQueueCount--; 
+            if (canBuildPlayerAction)
+            {
+                chunkRebuildQueue[chunkRebuildQueue_head] = null; // Clear reference
+                chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
+                chunkRebuildQueue_count--;
 
                 if (chunkToBuild != null && !chunkToBuild.isBuildingMesh) {
                     chunkToBuild.StartBuildMesh();
@@ -660,15 +697,22 @@ public class McWorld : UdonSharpBehaviour
                         TriggerNeighborMeshRebuilds(chunkToBuild);
                     }
                 }
-            } else {
-                if (chunkRebuildQueueCount > 1) { 
-                    McChunk tempChunk = chunkRebuildQueue[0];
-                    for (int j = 0; j < chunkRebuildQueueCount - 1; j++) {
-                        chunkRebuildQueue[j] = chunkRebuildQueue[j + 1];
-                    }
-                    chunkRebuildQueue[chunkRebuildQueueCount - 1] = tempChunk;
+            }
+            else
+            {
+                // Item at head cannot be processed now.
+                if (chunkRebuildQueue_count > 1) // Only rotate if there are other items
+                {
+                    // Move it to the tail.
+                    chunkRebuildQueue[chunkRebuildQueue_tail] = chunkToBuild;
+                    chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+                    chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
+                    // Count remains the same. Loop continues with 'i'.
                 }
-                currentQueueIndex++; 
+                else // Only one item and it can't be built immediately.
+                {
+                    break; // Exit loop, don't try to process this item further now.
+                }
             }
         }
     }
