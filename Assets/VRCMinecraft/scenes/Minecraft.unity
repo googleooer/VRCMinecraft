@@ -13573,9 +13573,9 @@ MonoBehaviour:
   terrainGenerator: {fileID: 660800870}
   voxelsPerChunkDataProcessingSlice: 256
   worldProcessingStepDelay: 0
-  chunkRebuildInterval: 0.03
+  chunkRebuildInterval: 0.05
   maxChunksToRebuildPerInterval: 4
-  neighboringChunksProcessingMode: 2
+  neighboringChunksProcessingMode: 1
   voxelsPerSliceInChunks: 256
 --- !u!4 &1596987941
 Transform:
