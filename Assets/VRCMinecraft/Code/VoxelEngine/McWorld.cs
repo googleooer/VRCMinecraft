@@ -18,8 +18,10 @@ public class McWorld : UdonSharpBehaviour
     [Header("Chunk Management")]
     [Tooltip("Prefab for McChunk. Must have McChunk script attached.")]
     public GameObject chunkPrefab;
-    private McChunk[][][] chunks; 
-    private bool[][][] chunkDataFinalized; 
+    // private McChunk[][][] chunks; // Replaced by 1D array
+    // private bool[][][] chunkDataFinalized; // Replaced by 1D array
+    private McChunk[] chunks_1D;
+    private bool[] chunkDataFinalized_1D;
 
     [Header("Voxel Data")]
     public byte[] data; 
@@ -157,21 +159,33 @@ public class McWorld : UdonSharpBehaviour
         totalWorldChunks = worldDimensionX * worldDimensionY * worldDimensionZ;
     }
 
-    void InitializeChunkStorageAndFlags() 
+    void InitializeChunkStorageAndFlags()
     {
-        chunks = new McChunk[worldDimensionX][][]; 
-        chunkDataFinalized = new bool[worldDimensionX][][]; 
-
-        for (int x = 0; x < worldDimensionX; x++)
-        {
-            chunks[x] = new McChunk[worldDimensionY][];
-            chunkDataFinalized[x] = new bool[worldDimensionY][];
-            for (int y = 0; y < worldDimensionY; y++) 
-            {
-                chunks[x][y] = new McChunk[worldDimensionZ];
-                chunkDataFinalized[x][y] = new bool[worldDimensionZ]; 
-            }
+        // totalWorldChunks is already calculated in InitializeWorldParameters()
+        if (totalWorldChunks <= 0) {
+            Debug.LogError("[McWorld] totalWorldChunks is zero or negative. Cannot initialize chunk storage.");
+            this.enabled = false; // Critical error, disable script
+            return;
         }
+        chunks_1D = new McChunk[totalWorldChunks];
+        chunkDataFinalized_1D = new bool[totalWorldChunks];
+        // The bool array is initialized to false by default, which is desired.
+    }
+
+    private int ChunkArrayCoordsTo1D(int arrayX, int arrayY, int arrayZ)
+    {
+        if (arrayX < 0 || arrayX >= worldDimensionX ||
+            arrayY < 0 || arrayY >= worldDimensionY ||
+            arrayZ < 0 || arrayZ >= worldDimensionZ)
+        {
+            // LogError can be spammy if this is called frequently with invalid coords.
+            // Consider how often this boundary check is truly needed vs. ensuring callers provide valid coords.
+            // For now, keeping the error for easier debugging if an invalid access occurs.
+            // Debug.LogError($"Chunk array coordinates out of bounds: ({arrayX},{arrayY},{arrayZ}) for dimensions ({worldDimensionX},{worldDimensionY},{worldDimensionZ})");
+            return -1; // Indicates an out-of-bounds access
+        }
+        // Order: Y (layers), then Z (rows per layer), then X (columns per row)
+        return arrayY * (worldDimensionX * worldDimensionZ) + arrayZ * worldDimensionX + arrayX;
     }
 
     void InitializeAndAllocateVoxelData()
@@ -234,12 +248,17 @@ public class McWorld : UdonSharpBehaviour
             bool dataForThisChunkCompleted = PopulateDataSliceForCurrentTargetChunk();
             if (dataForThisChunkCompleted)
             {
-                terrainGenerator.PlaceFeaturesInChunk(currentArrayCX, currentArrayCY, currentArrayCZ); 
-                chunkDataFinalized[currentArrayCX][currentArrayCY][currentArrayCZ] = true; 
+                terrainGenerator.PlaceFeaturesInChunk(currentArrayCX, currentArrayCY, currentArrayCZ);
+                int chunk1DIndex_current = ChunkArrayCoordsTo1D(currentArrayCX, currentArrayCY, currentArrayCZ);
+                if (chunk1DIndex_current != -1) {
+                    chunkDataFinalized_1D[chunk1DIndex_current] = true;
 
-                if (chunks[currentArrayCX][currentArrayCY][currentArrayCZ] == null) 
-                {
-                    InstantiateAndConfigureChunk(currentArrayCX, currentArrayCY, currentArrayCZ, proc_dx, proc_dy, proc_dz);
+                    if (chunks_1D[chunk1DIndex_current] == null)
+                    {
+                        InstantiateAndConfigureChunk(currentArrayCX, currentArrayCY, currentArrayCZ, proc_dx, proc_dy, proc_dz);
+                    }
+                } else {
+                    Debug.LogError($"ProcessNextWorldStep: Invalid chunk index for Arr({currentArrayCX},{currentArrayCY},{currentArrayCZ})");
                 }
                 chunksProcessedAndInstantiatedCount++;
                 currentChunkDataBeingPopulated = false; 
@@ -383,13 +402,14 @@ public class McWorld : UdonSharpBehaviour
                 int array_cy = proc_dy + chunkOffsetY;
                 int array_cz = proc_dz + chunkOffsetZ;
 
-                if (array_cx >= 0 && array_cx < worldDimensionX &&
+                if (array_cx >= 0 && array_cx < worldDimensionX && // These checks are technically redundant if ChunkArrayCoordsTo1D handles bounds
                     array_cy >= 0 && array_cy < worldDimensionY &&
                     array_cz >= 0 && array_cz < worldDimensionZ)
                 {
-                    if (!chunkDataFinalized[array_cx][array_cy][array_cz]) 
+                    int chunk1DIndex_radial = ChunkArrayCoordsTo1D(array_cx, array_cy, array_cz);
+                    if (chunk1DIndex_radial != -1 && !chunkDataFinalized_1D[chunk1DIndex_radial])
                     {
-                        return true; 
+                        return true;
                     }
                 }
             }
@@ -398,18 +418,24 @@ public class McWorld : UdonSharpBehaviour
 
     void InstantiateAndConfigureChunk(int array_cx, int array_cy, int array_cz, int centered_dx, int centered_dy, int centered_dz)
     {
-        if (chunks[array_cx][array_cy][array_cz] != null) { RequestChunkMeshUpdate(chunks[array_cx][array_cy][array_cz]); return; }
+        int chunk1DIndex = ChunkArrayCoordsTo1D(array_cx, array_cy, array_cz);
+        if (chunk1DIndex == -1) {
+            Debug.LogError($"InstantiateAndConfigureChunk: Invalid chunk index for Arr({array_cx},{array_cy},{array_cz})");
+            return;
+        }
 
-        GameObject newChunkGO = (GameObject)Instantiate(chunkPrefab); 
+        if (chunks_1D[chunk1DIndex] != null) { RequestChunkMeshUpdate(chunks_1D[chunk1DIndex]); return; }
+
+        GameObject newChunkGO = (GameObject)Instantiate(chunkPrefab);
         if (newChunkGO == null) { Debug.LogError($"[McWorld] Instantiate FAILED for chunkPrefab at C_array({array_cx},{array_cy},{array_cz})."); return; }
-        
+
         newChunkGO.name = $"Chunk_arr({array_cx},{array_cy},{array_cz})_cen({centered_dx},{centered_dy},{centered_dz})";
         newChunkGO.transform.SetParent(this.transform, false);
         newChunkGO.transform.localPosition = new Vector3(centered_dx * chunkSizeXZ, centered_dy * chunkSizeY, centered_dz * chunkSizeXZ);
         newChunkGO.transform.localRotation = Quaternion.identity;
         McChunk newChunkScript = newChunkGO.GetComponent<McChunk>();
         if (newChunkScript != null) {
-            chunks[array_cx][array_cy][array_cz] = newChunkScript; 
+            chunks_1D[chunk1DIndex] = newChunkScript;
             newChunkScript.chunkSizeXZ = this.chunkSizeXZ; newChunkScript.chunkSizeY = this.chunkSizeY;
             newChunkScript.voxelsPerSlice = this.voxelsPerSliceInChunks;
             newChunkScript.chunkX = centered_dx * this.chunkSizeXZ; 
@@ -462,9 +488,9 @@ public class McWorld : UdonSharpBehaviour
     }
 
     // Cached offset arrays for neighbor checking
-    private int[] neighbor_dx_offsets = { 1, -1, 0,  0, 0,  0 };
-    private int[] neighbor_dy_offsets = { 0,  0, 1, -1, 0,  0 };
-    private int[] neighbor_dz_offsets = { 0,  0, 0,  0, 1, -1 };
+    private static readonly int[] neighbor_dx_offsets = { 1, -1, 0,  0, 0,  0 };
+    private static readonly int[] neighbor_dy_offsets = { 0,  0, 1, -1, 0,  0 };
+    private static readonly int[] neighbor_dz_offsets = { 0,  0, 0,  0, 1, -1 };
 
     public void ProcessChunkRebuildQueue()
     {
@@ -551,17 +577,18 @@ public class McWorld : UdonSharpBehaviour
             int neighborArrayY = neighborCenteredY + chunkOffsetY;
             int neighborArrayZ = neighborCenteredZ + chunkOffsetZ;
 
-            if (neighborArrayX >= 0 && neighborArrayX < worldDimensionX &&
-                neighborArrayY >= 0 && neighborArrayY < worldDimensionY &&
-                neighborArrayZ >= 0 && neighborArrayZ < worldDimensionZ)
+            // Boundary checks for neighborArrayX,Y,Z are implicitly handled by ChunkArrayCoordsTo1D
+            int neighbor1DIndex = ChunkArrayCoordsTo1D(neighborArrayX, neighborArrayY, neighborArrayZ);
+            if (neighbor1DIndex != -1) // If neighbor is within world bounds
             {
-                if (!chunkDataFinalized[neighborArrayX][neighborArrayY][neighborArrayZ])
+                if (!chunkDataFinalized_1D[neighbor1DIndex])
                 {
-                    return false; 
+                    return false;
                 }
             }
+            // If neighbor is outside world bounds (neighbor1DIndex == -1), it's considered 'finalized' for culling.
         }
-        return true; 
+        return true;
     }
 
     private void TriggerNeighborMeshRebuilds(McChunk chunk)
@@ -586,16 +613,15 @@ public class McWorld : UdonSharpBehaviour
             int neighborArrayY = neighborCenteredY + chunkOffsetY;
             int neighborArrayZ = neighborCenteredZ + chunkOffsetZ;
 
-            if (neighborArrayX >= 0 && neighborArrayX < worldDimensionX &&
-                neighborArrayY >= 0 && neighborArrayY < worldDimensionY &&
-                neighborArrayZ >= 0 && neighborArrayZ < worldDimensionZ)
+            int neighbor1DIndex = ChunkArrayCoordsTo1D(neighborArrayX, neighborArrayY, neighborArrayZ);
+            if (neighbor1DIndex != -1) // If neighbor is within world bounds
             {
-                if (chunkDataFinalized[neighborArrayX][neighborArrayY][neighborArrayZ])
+                if (chunkDataFinalized_1D[neighbor1DIndex])
                 {
-                    McChunk neighborChunk = chunks[neighborArrayX][neighborArrayY][neighborArrayZ];
+                    McChunk neighborChunk = chunks_1D[neighbor1DIndex];
                     if (neighborChunk != null && !neighborChunk.isBuildingMesh)
                     {
-                        RequestChunkMeshUpdate(neighborChunk); 
+                        RequestChunkMeshUpdate(neighborChunk);
                     }
                 }
             }
@@ -724,9 +750,16 @@ public class McWorld : UdonSharpBehaviour
         if (neighborChunk != null) RequestChunkMeshUpdate_Prioritized(neighborChunk);
     }
 
-    public McChunk GetChunkScript(int array_cx, int array_cy, int array_cz) 
+    public McChunk GetChunkScript(int array_cx, int array_cy, int array_cz)
     {
-        if (array_cx < 0 || array_cx >= worldDimensionX || array_cy < 0 || array_cy >= worldDimensionY || array_cz < 0 || array_cz >= worldDimensionZ) return null;
-        return chunks[array_cx][array_cy][array_cz];
+        int index = ChunkArrayCoordsTo1D(array_cx, array_cy, array_cz);
+        if (index == -1) return null;
+        // The check `index < chunks_1D.Length` is implicitly handled if array_cx,y,z are within worldDimensionX,Y,Z
+        // and totalWorldChunks was calculated correctly. However, a direct check is safest.
+        if (index < 0 || index >= totalWorldChunks) { // Should be redundant if ChunkArrayCoordsTo1D is correct
+             //Debug.LogError($"GetChunkScript: Calculated index {index} is out of bounds for chunks_1D length {chunks_1D.Length}. Input: ({array_cx},{array_cy},{array_cz})");
+             return null;
+        }
+        return chunks_1D[index];
     }
 }

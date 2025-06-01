@@ -13575,7 +13575,7 @@ MonoBehaviour:
   worldProcessingStepDelay: 0
   chunkRebuildInterval: 0.03
   maxChunksToRebuildPerInterval: 4
-  neighboringChunksProcessingMode: 1
+  neighboringChunksProcessingMode: 2
   voxelsPerSliceInChunks: 256
 --- !u!4 &1596987941
 Transform:
