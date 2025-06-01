@@ -462,9 +462,9 @@ public class McWorld : UdonSharpBehaviour
     }
 
     // Cached offset arrays for neighbor checking
-    private static readonly int[] neighbor_dx_offsets = { 1, -1, 0,  0, 0,  0 };
-    private static readonly int[] neighbor_dy_offsets = { 0,  0, 1, -1, 0,  0 };
-    private static readonly int[] neighbor_dz_offsets = { 0,  0, 0,  0, 1, -1 };
+    private int[] neighbor_dx_offsets = { 1, -1, 0,  0, 0,  0 };
+    private int[] neighbor_dy_offsets = { 0,  0, 1, -1, 0,  0 };
+    private int[] neighbor_dz_offsets = { 0,  0, 0,  0, 1, -1 };
 
     public void ProcessChunkRebuildQueue()
     {
