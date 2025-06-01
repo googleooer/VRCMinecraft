@@ -1,4 +1,5 @@
-﻿﻿using UdonSharp;
+﻿using System.Collections.Generic;
+using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using VRRefAssist; 
@@ -682,6 +683,7 @@ public class McWorld : UdonSharpBehaviour
 
     public McChunk GetChunkScript(int array_cx, int array_cy, int array_cz) 
     {
+        //List<int> array_coords = new List<int> { array_cx, array_cy, array_cz };
         if (array_cx < 0 || array_cx >= worldDimensionX || array_cy < 0 || array_cy >= worldDimensionY || array_cz < 0 || array_cz >= worldDimensionZ) return null;
         return chunks[array_cx][array_cy][array_cz];
     }
