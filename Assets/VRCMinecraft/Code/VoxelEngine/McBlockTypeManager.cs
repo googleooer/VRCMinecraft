@@ -1,225 +1,355 @@
 ﻿using UdonSharp;
 using UnityEngine;
-using VRC.SDKBase; 
-using VRRefAssist; 
+using VRC.SDKBase;
+using VRRefAssist;
+using System.Text; 
 
-// Enum for texture mapping, should be accessible by McChunk and the Editor script
-public enum McBlockTextureMappingType 
+// Enums McBlockTextureMappingType and BlockVisibilityType should be defined globally or accessible.
+
+/// <summary>
+/// Defines how block textures are mapped to faces.
+/// </summary>
+public enum McBlockTextureMappingType
 {
-    AllFacesSame, 
-    TopBottomSides, 
-    // UniquePerFace // Future consideration
+    AllFacesSame,
+    TopBottomSides,
 }
 
-// Enum for Block Visibility
+/// <summary>
+/// Defines how a block is rendered and how it affects face culling of itself and neighbors.
+/// </summary>
 public enum BlockVisibilityType
 {
-    Opaque,                             // Standard solid block, culls neighbors.
-    Transparent_NoCull,                 // Transparent, never culls itself or neighbors (except Opaque).
-    Transparent_CullSelf,               // Transparent, culls faces against same block type AND Opaque blocks (e.g., water).
-    Transparent_CullSelfAndOpaque,      // Transparent, culls against same block type AND Opaque blocks (e.g., glass).
-    
-    Cutout_CullOpaqueOnly,              // Default Cutout: Only culls against Opaque blocks.
-    Cutout_CullSelf,                    // Cutout: Culls against Opaque AND itself (if neighbor is same type).
-    Cutout_CullSelfAndOtherCutout,      // Cutout: Culls against Opaque, itself, AND any other Cutout type.
-
-    Invisible                           // No mesh generated, but still occupies space.
+    Opaque,                             
+    Transparent_NoCull,                 
+    Transparent_CullSelf,               
+    Transparent_CullSelfAndOpaque,      
+    Cutout_CullOpaqueOnly,              
+    Cutout_CullSelf,                    
+    Cutout_CullSelfAndOtherCutout,      
+    Invisible                           
 }
 
-[Singleton] // VRRefAssist attribute
+/// <summary>
+/// Defines the basic mesh shape of a block.
+/// </summary>
+public enum McBlockShapeType
+{
+    Cube,   
+    Cross   
+}
+
+// REMOVED: AudioClipArrayWrapper class
+
+[Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
-// Uses McBlockTypeManagerEditor.cs for the inspector
 public class McBlockTypeManager : UdonSharpBehaviour
 {
-    [Header("Global Atlas Settings")]
-    [Tooltip("Texture unit size for the atlas (e.g., 1/16 = 0.0625 for a 16x16 grid of textures in the atlas).")]
-    public float textureAtlasTUnit = 0.0625f;
-    [Tooltip("Small padding to prevent texture bleeding from adjacent textures in the atlas.")]
-    public float textureAtlasUVPadding = 0.0001f;
+    [Header("Texture Array for Editor Preview")]
+    [Tooltip("Assign the Texture 2D Array used for block textures here to enable slice previews in the editor.")]
+    public Texture2DArray previewTextureArray;
 
     [Header("Block Definitions (Parallel Arrays)")]
-    [Tooltip("Set the total number of block types. All arrays below should match this size.")]
-    public int numberOfBlockTypes = 1; 
-
-    [Tooltip("Names for each block type.")]
-    public string[] blockNames; 
-    
-    [Tooltip("Is the block solid? (Affects physics, interaction, light passage if not generating mesh)")]
+    public int numberOfBlockTypes = 1;
+    public string[] blockNames;
     public bool[] isSolidData;
-    [Tooltip("Defines how the block is rendered and culled. See BlockVisibilityType enum.")]
-    public int[] blockVisibilityTypeData; // Stores BlockVisibilityType as int
+    public int[] blockVisibilityTypeData;
+    public int[] blockShapeTypeData; 
 
-    // UV Atlas Coordinates (Vector2: X=column, Y=row from top-left of atlas image)
-    [Tooltip("UV coordinates if all faces use the same texture (Column, Row).")]
-    public Vector2[] uv_allFacesData;
-    [Tooltip("UV coordinates for the top face (Column, Row).")]
-    public Vector2[] uv_topFaceData;
-    [Tooltip("UV coordinates for the bottom face (Column, Row).")]
-    public Vector2[] uv_bottomFaceData;
-    [Tooltip("UV coordinates for the side faces (Column, Row).")]
-    public Vector2[] uv_sideFacesData;
-    
-    [Tooltip("Texture mapping strategy for each block type. 0=AllFacesSame, 1=TopBottomSides.")]
-    public int[] textureMappingTypeData; // Stores McBlockTextureMappingType as int
+    public int[] uv_allFacesData;
+    public int[] uv_topFaceData;
+    public int[] uv_bottomFaceData;
+    public int[] uv_sideFacesData;
+    public int[] textureMappingTypeData;
 
-    [Header("Audio (Assign one sound or leave empty)")]
-    public AudioClip[] breakSounds; 
-    public AudioClip[] placeSounds;
-    public AudioClip[] footstepSounds;
+    [Header("Audio")]
+    // MODIFIED: Reverted to AudioClip[][]
+    public AudioClip[][] breakSounds; 
+    public AudioClip[][] placeSounds; 
+    public AudioClip[][] footstepSounds; 
 
-    [Header("Particles (Assign Prefabs or leave empty)")]
+    [Header("Fallback Audio (if block-specific is not set)")]
+    public AudioClip[] fallbackBreakSounds; 
+    public AudioClip[] fallbackPlaceSounds; 
+    public AudioClip[] fallbackFootstepSounds; 
+
+    [Header("Particles")]
     public ParticleSystem[] breakParticlesPrefabData;
     public ParticleSystem[] placeParticlesPrefabData;
+    
+    [Header("Logging")]
+    public bool enableVerboseLogging = true; 
+    private StringBuilder logBuilder;
+
+    // Pre-filtered audio clips (jagged array)
+    private AudioClip[][] _prefilteredBreakSounds;
+    private AudioClip[][] _prefilteredPlaceSounds;
+    private AudioClip[][] _prefilteredFootstepSounds;
+    private AudioClip[] _prefilteredFallbackBreakSounds;
+    private AudioClip[] _prefilteredFallbackPlaceSounds;
+    private AudioClip[] _prefilteredFallbackFootstepSounds;
+
 
     void Start()
     {
-        // Rely on VRRefAssist for singleton access by other scripts.
-        // Basic validation for array lengths can be done here if needed,
-        // but the custom editor is the primary place for configuration.
-        if (blockNames == null || blockNames.Length != numberOfBlockTypes) {
-            Debug.LogError($"[McBlockTypeManager] Configuration error: 'blockNames' array size does not match 'numberOfBlockTypes'. Expected {numberOfBlockTypes}, got {(blockNames != null ? blockNames.Length : -1)}. Please use the 'Apply Number of Types' button in the Inspector.");
-        }
-        // Similar checks can be added for other arrays.
+        float startTime = Time.realtimeSinceStartup;
+        logBuilder = new StringBuilder(256); 
+
+        bool arraysValid = true;
+        if (numberOfBlockTypes < 0) numberOfBlockTypes = 0;
+
+        // Validate array sizes against numberOfBlockTypes
+        string errorFormat = "[McBlockTypeManager.Start] '{0}' array size mismatch. Expected {1}, got {2}.";
+        if (blockNames == null || blockNames.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockNames", numberOfBlockTypes, (blockNames != null ? blockNames.Length : -1))); arraysValid = false; }
+        if (isSolidData == null || isSolidData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "isSolidData", numberOfBlockTypes, (isSolidData != null ? isSolidData.Length : -1))); arraysValid = false; }
+        if (blockVisibilityTypeData == null || blockVisibilityTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockVisibilityTypeData", numberOfBlockTypes, (blockVisibilityTypeData != null ? blockVisibilityTypeData.Length : -1))); arraysValid = false; }
+        if (blockShapeTypeData == null || blockShapeTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockShapeTypeData", numberOfBlockTypes, (blockShapeTypeData != null ? blockShapeTypeData.Length : -1))); arraysValid = false; }
+        if (uv_allFacesData == null || uv_allFacesData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_allFacesData", numberOfBlockTypes, (uv_allFacesData != null ? uv_allFacesData.Length : -1))); arraysValid = false; }
+        if (uv_topFaceData == null || uv_topFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_topFaceData", numberOfBlockTypes, (uv_topFaceData != null ? uv_topFaceData.Length : -1))); arraysValid = false; }
+        if (uv_bottomFaceData == null || uv_bottomFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_bottomFaceData", numberOfBlockTypes, (uv_bottomFaceData != null ? uv_bottomFaceData.Length : -1))); arraysValid = false; }
+        if (uv_sideFacesData == null || uv_sideFacesData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_sideFacesData", numberOfBlockTypes, (uv_sideFacesData != null ? uv_sideFacesData.Length : -1))); arraysValid = false; }
+        if (textureMappingTypeData == null || textureMappingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "textureMappingTypeData", numberOfBlockTypes, (textureMappingTypeData != null ? textureMappingTypeData.Length : -1))); arraysValid = false; }
         
-        Debug.Log($"[McBlockTypeManager] Initialized. Expecting {numberOfBlockTypes} block types. Atlas tUnit: {textureAtlasTUnit}, uvPadding: {textureAtlasUVPadding}.");
+        if (breakSounds == null || breakSounds.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "breakSounds (AudioClip[][])", numberOfBlockTypes, (breakSounds != null ? breakSounds.Length : -1))); arraysValid = false; }
+        if (placeSounds == null || placeSounds.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "placeSounds (AudioClip[][])", numberOfBlockTypes, (placeSounds != null ? placeSounds.Length : -1))); arraysValid = false; }
+        if (footstepSounds == null || footstepSounds.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "footstepSounds (AudioClip[][])", numberOfBlockTypes, (footstepSounds != null ? footstepSounds.Length : -1))); arraysValid = false; }
+        
+        if (breakParticlesPrefabData == null || breakParticlesPrefabData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "breakParticlesPrefabData", numberOfBlockTypes, (breakParticlesPrefabData != null ? breakParticlesPrefabData.Length : -1))); arraysValid = false; }
+        if (placeParticlesPrefabData == null || placeParticlesPrefabData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "placeParticlesPrefabData", numberOfBlockTypes, (placeParticlesPrefabData != null ? placeParticlesPrefabData.Length : -1))); arraysValid = false; }
+
+        PreFilterAllSounds();
+
+#if UNITY_EDITOR
+        if (enableVerboseLogging)
+        {
+            logBuilder.Clear();
+            logBuilder.AppendFormat("[McBlockTypeManager.Start] Initialized. Expecting {0} block types. Arrays valid: {1}. Audio pre-filtered. Time: {2:F2} ms.",
+                numberOfBlockTypes, arraysValid, (Time.realtimeSinceStartup - startTime) * 1000f);
+            Debug.Log(logBuilder.ToString());
+        }
+#endif
     }
 
-    // --- Getter Methods for Block Properties ---
+    private void PreFilterAllSounds()
+    {
+        _prefilteredBreakSounds = new AudioClip[numberOfBlockTypes][];
+        _prefilteredPlaceSounds = new AudioClip[numberOfBlockTypes][];
+        _prefilteredFootstepSounds = new AudioClip[numberOfBlockTypes][];
 
-    public string GetBlockName(byte blockID) {
-        if (blockNames != null && blockID >= 0 && blockID < blockNames.Length) {
-            return blockNames[blockID];
+        for (int i = 0; i < numberOfBlockTypes; i++)
+        {
+            // Pre-filter breakSounds
+            // Ensure breakSounds itself is not null and index i is valid for breakSounds outer array
+            if (breakSounds != null && i < breakSounds.Length && breakSounds[i] != null)
+            {
+                _prefilteredBreakSounds[i] = _prefilterClipArray(breakSounds[i]);
+            }
+            else
+            {
+                _prefilteredBreakSounds[i] = new AudioClip[0]; // Default to empty if source is problematic
+            }
+
+            // Pre-filter placeSounds
+            if (placeSounds != null && i < placeSounds.Length && placeSounds[i] != null)
+            {
+                _prefilteredPlaceSounds[i] = _prefilterClipArray(placeSounds[i]);
+            }
+            else
+            {
+                _prefilteredPlaceSounds[i] = new AudioClip[0];
+            }
+
+            // Pre-filter footstepSounds
+            if (footstepSounds != null && i < footstepSounds.Length && footstepSounds[i] != null)
+            {
+                _prefilteredFootstepSounds[i] = _prefilterClipArray(footstepSounds[i]);
+            }
+            else
+            {
+                _prefilteredFootstepSounds[i] = new AudioClip[0];
+            }
         }
-        Debug.LogWarning($"[McBlockTypeManager] GetBlockName: Invalid ID {blockID}.");
+        
+        _prefilteredFallbackBreakSounds = _prefilterClipArray(fallbackBreakSounds);
+        _prefilteredFallbackPlaceSounds = _prefilterClipArray(fallbackPlaceSounds);
+        _prefilteredFallbackFootstepSounds = _prefilterClipArray(fallbackFootstepSounds);
+    }
+    
+    private AudioClip[] _prefilterClipArray(AudioClip[] source)
+    {
+        if (source == null || source.Length == 0) return new AudioClip[0];
+
+        int validCount = 0;
+        for (int i = 0; i < source.Length; i++)
+        {
+            if (source[i] != null) validCount++;
+        }
+
+        if (validCount == 0) return new AudioClip[0];
+        
+        AudioClip[] filtered = new AudioClip[validCount];
+        int currentIndex = 0;
+        for (int i = 0; i < source.Length; i++)
+        {
+            if (source[i] != null)
+            {
+                filtered[currentIndex] = source[i];
+                currentIndex++;
+            }
+        }
+        return filtered;
+    }
+
+
+    // --- Getter Methods ---
+
+    public string GetBlockName(byte blockID)
+    {
+        if (blockNames != null && blockID >= 0 && blockID < blockNames.Length) return blockNames[blockID];
+#if UNITY_EDITOR
+        if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockName] Invalid ID {blockID}.");
+#endif
         return "Unknown Block";
     }
 
     public bool GetBlockIsSolid(byte blockID)
     {
-        if (isSolidData != null && blockID >= 0 && blockID < isSolidData.Length)
-        {
-            return isSolidData[blockID];
-        }
-        Debug.LogWarning($"[McBlockTypeManager] GetBlockIsSolid: Invalid ID {blockID}. Defaulting to false.");
-        return false; 
+        if (isSolidData != null && blockID >= 0 && blockID < isSolidData.Length) return isSolidData[blockID];
+#if UNITY_EDITOR
+        if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockIsSolid] Invalid ID {blockID}. Defaulting to false.");
+#endif
+        return false;
     }
 
     public BlockVisibilityType GetBlockVisibilityType(byte blockID)
     {
-        if (blockVisibilityTypeData != null && blockID >= 0 && blockID < blockVisibilityTypeData.Length)
-        {
-            return (BlockVisibilityType)blockVisibilityTypeData[blockID];
-        }
-        Debug.LogWarning($"[McBlockTypeManager] GetBlockVisibilityType: Invalid ID {blockID}. Defaulting to Opaque.");
+        if (blockVisibilityTypeData != null && blockID >= 0 && blockID < blockVisibilityTypeData.Length) return (BlockVisibilityType)blockVisibilityTypeData[blockID];
+#if UNITY_EDITOR
+        if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockVisibilityType] Invalid ID {blockID}. Defaulting to Opaque.");
+#endif
         return BlockVisibilityType.Opaque;
     }
 
-    // Specific UV getters (atlas column, row)
-    public Vector2 GetBlockTextureUV_AllFaces(byte blockID) {
-        if (uv_allFacesData != null && blockID >= 0 && blockID < uv_allFacesData.Length) {
-            return uv_allFacesData[blockID];
-        }
-        return Vector2.zero;
-    }
-    public Vector2 GetBlockTextureUV_TopFace(byte blockID) {
-        if (uv_topFaceData != null && blockID >= 0 && blockID < uv_topFaceData.Length) {
-            return uv_topFaceData[blockID];
-        }
-        return Vector2.zero;
-    }
-    public Vector2 GetBlockTextureUV_BottomFace(byte blockID) {
-        if (uv_bottomFaceData != null && blockID >= 0 && blockID < uv_bottomFaceData.Length) {
-            return uv_bottomFaceData[blockID];
-        }
-        return Vector2.zero;
-    }
-    public Vector2 GetBlockTextureUV_SideFaces(byte blockID) {
-        if (uv_sideFacesData != null && blockID >= 0 && blockID < uv_sideFacesData.Length) {
-            return uv_sideFacesData[blockID];
-        }
-        return Vector2.zero;
-    }
-    
-    public int GetBlockTextureMappingTypeAsInt(byte blockID) { 
-        if (textureMappingTypeData != null && blockID >= 0 && blockID < textureMappingTypeData.Length) {
-            return textureMappingTypeData[blockID];
-        }
-        return (int)McBlockTextureMappingType.AllFacesSame; 
+    public McBlockShapeType GetBlockShapeType(byte blockID)
+    {
+        if (blockShapeTypeData != null && blockID >= 0 && blockID < blockShapeTypeData.Length) return (McBlockShapeType)blockShapeTypeData[blockID];
+#if UNITY_EDITOR
+        if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockShapeType] Invalid ID {blockID}. Defaulting to Cube.");
+#endif
+        return McBlockShapeType.Cube;
     }
 
-    // Helper to get the correct base UV atlas coordinates for a given face
-    public Vector2 GetFinalBlockTextureUV(byte blockID, int faceIndex) 
+
+    public int GetBlockTextureSlice_AllFaces(byte blockID)
     {
-        // faceIndex: 0=right(+X), 1=left(-X), 2=up(+Y), 3=down(-Y), 4=forward(+Z), 5=back(-Z)
+        if (uv_allFacesData != null && blockID >= 0 && blockID < uv_allFacesData.Length) return uv_allFacesData[blockID];
+        return 0;
+    }
+    public int GetBlockTextureSlice_TopFace(byte blockID)
+    {
+        if (uv_topFaceData != null && blockID >= 0 && blockID < uv_topFaceData.Length) return uv_topFaceData[blockID];
+        return 0;
+    }
+    public int GetBlockTextureSlice_BottomFace(byte blockID)
+    {
+        if (uv_bottomFaceData != null && blockID >= 0 && blockID < uv_bottomFaceData.Length) return uv_bottomFaceData[blockID];
+        return 0;
+    }
+    public int GetBlockTextureSlice_SideFaces(byte blockID)
+    {
+        if (uv_sideFacesData != null && blockID >= 0 && blockID < uv_sideFacesData.Length) return uv_sideFacesData[blockID];
+        return 0;
+    }
+
+    public int GetBlockTextureMappingTypeAsInt(byte blockID)
+    {
+        if (textureMappingTypeData != null && blockID >= 0 && blockID < textureMappingTypeData.Length) return textureMappingTypeData[blockID];
+        return (int)McBlockTextureMappingType.AllFacesSame;
+    }
+
+    public int GetFinalBlockTextureSlice(byte blockID, int faceIndex)
+    {
         if (blockID >= 0 && blockID < numberOfBlockTypes) 
         {
-             McBlockTextureMappingType mappingType = (McBlockTextureMappingType)GetBlockTextureMappingTypeAsInt(blockID);
-             switch (mappingType)
-             {
-                 case McBlockTextureMappingType.AllFacesSame:
-                     return GetBlockTextureUV_AllFaces(blockID);
-                 case McBlockTextureMappingType.TopBottomSides:
-                     if (faceIndex == 2) return GetBlockTextureUV_TopFace(blockID);    
-                     if (faceIndex == 3) return GetBlockTextureUV_BottomFace(blockID); 
-                     return GetBlockTextureUV_SideFaces(blockID);                      
-                 default:
-                     Debug.LogWarning($"[McBlockTypeManager] GetFinalBlockTextureUV: Unknown textureMapping type for block ID {blockID}. Defaulting to AllFaces.");
-                     return GetBlockTextureUV_AllFaces(blockID); 
-             }
+            McBlockTextureMappingType mappingType = (McBlockTextureMappingType)GetBlockTextureMappingTypeAsInt(blockID);
+            switch (mappingType)
+            {
+                case McBlockTextureMappingType.AllFacesSame: return GetBlockTextureSlice_AllFaces(blockID);
+                case McBlockTextureMappingType.TopBottomSides:
+                    if (faceIndex == 2) return GetBlockTextureSlice_TopFace(blockID); 
+                    if (faceIndex == 3) return GetBlockTextureSlice_BottomFace(blockID); 
+                    return GetBlockTextureSlice_SideFaces(blockID); 
+                default:
+#if UNITY_EDITOR
+                    if(enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetFinalBlockTextureSlice] Unknown mapping type for block ID {blockID}. Defaulting to AllFaces.");
+#endif
+                    return GetBlockTextureSlice_AllFaces(blockID);
+            }
         }
-        Debug.LogWarning($"[McBlockTypeManager] GetFinalBlockTextureUV: Invalid block ID {blockID}. Defaulting to UV (0,0).");
-        return Vector2.zero;
+#if UNITY_EDITOR
+        if(enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetFinalBlockTextureSlice] Invalid block ID {blockID} or configuration error. Defaulting to slice 0.");
+#endif
+        return 0;
     }
-
-    public AudioClip GetBreakSound(byte blockID) 
+    
+    private AudioClip GetRandomClip(AudioClip[] prefilteredClips)
     {
-        if (breakSounds != null && blockID >= 0 && blockID < breakSounds.Length) {
-            return breakSounds[blockID]; 
+        if (prefilteredClips != null && prefilteredClips.Length > 0)
+        {
+            return prefilteredClips[Random.Range(0, prefilteredClips.Length)];
         }
         return null;
     }
 
-    public AudioClip GetPlaceSound(byte blockID) 
+    public AudioClip GetBreakSound(byte blockID)
     {
-        if (placeSounds != null && blockID >= 0 && blockID < placeSounds.Length) {
-            return placeSounds[blockID];
+        // Use prefiltered arrays. _prefilteredBreakSounds is guaranteed to have numberOfBlockTypes elements.
+        if (blockID >= 0 && blockID < numberOfBlockTypes && _prefilteredBreakSounds[blockID] != null)
+        {
+             AudioClip clip = GetRandomClip(_prefilteredBreakSounds[blockID]);
+             if (clip != null) return clip;
         }
-        return null;
+        return GetRandomClip(_prefilteredFallbackBreakSounds);
     }
 
-     public AudioClip GetFootstepSound(byte blockID) 
+    public AudioClip GetPlaceSound(byte blockID)
     {
-        if (footstepSounds != null && blockID >= 0 && blockID < footstepSounds.Length) {
-            return footstepSounds[blockID];
+        if (blockID >= 0 && blockID < numberOfBlockTypes && _prefilteredPlaceSounds[blockID] != null)
+        {
+            AudioClip clip = GetRandomClip(_prefilteredPlaceSounds[blockID]);
+            if (clip != null) return clip;
         }
-        return null;
+        return GetRandomClip(_prefilteredFallbackPlaceSounds);
+    }
+
+    public AudioClip GetFootstepSound(byte blockID)
+    {
+        if (blockID >= 0 && blockID < numberOfBlockTypes && _prefilteredFootstepSounds[blockID] != null)
+        {
+            AudioClip clip = GetRandomClip(_prefilteredFootstepSounds[blockID]);
+            if (clip != null) return clip;
+        }
+        return GetRandomClip(_prefilteredFallbackFootstepSounds);
     }
 
     public ParticleSystem GetBreakParticlesPrefab(byte blockID)
     {
-        if (breakParticlesPrefabData != null && blockID >= 0 && blockID < breakParticlesPrefabData.Length) {
-            return breakParticlesPrefabData[blockID];
-        }
+        if (breakParticlesPrefabData != null && blockID >= 0 && blockID < breakParticlesPrefabData.Length) return breakParticlesPrefabData[blockID];
         return null;
     }
-    
     public ParticleSystem GetPlaceParticlesPrefab(byte blockID)
     {
-        if (placeParticlesPrefabData != null && blockID >= 0 && blockID < placeParticlesPrefabData.Length) {
-            return placeParticlesPrefabData[blockID];
-        }
+        if (placeParticlesPrefabData != null && blockID >= 0 && blockID < placeParticlesPrefabData.Length) return placeParticlesPrefabData[blockID];
         return null;
     }
 
-    // Helper methods for culling logic in McChunk
     public bool IsAnyCutoutType(BlockVisibilityType visibilityType)
     {
-        return visibilityType == BlockVisibilityType.Cutout_CullOpaqueOnly || 
-               visibilityType == BlockVisibilityType.Cutout_CullSelf || 
+        return visibilityType == BlockVisibilityType.Cutout_CullOpaqueOnly ||
+               visibilityType == BlockVisibilityType.Cutout_CullSelf ||
                visibilityType == BlockVisibilityType.Cutout_CullSelfAndOtherCutout;
     }
 
-    // Helper to check if a cutout type is one that culls against itself
     public bool IsSelfCullingCutout(BlockVisibilityType visibilityType)
     {
         return visibilityType == BlockVisibilityType.Cutout_CullSelf ||
