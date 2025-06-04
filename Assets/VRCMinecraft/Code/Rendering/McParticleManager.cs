@@ -59,15 +59,30 @@ public class McParticleManager : UdonSharpBehaviour
         if (worldGO != null) {
             world = worldGO.GetComponent<McWorld>();
         }
+#if ENABLE_LOGGING
         if (world == null) {
              Debug.LogWarning("[McParticleManager] McWorld instance not found. Footstep sounds based on block type will not work.");
         }
+#endif
 
 
+#if ENABLE_LOGGING
         if (genericBreakParticles == null) Debug.LogWarning($"[McParticleManager] GenericBreakParticles not assigned.");
+#endif
+#if ENABLE_LOGGING
         if (genericPlaceParticles == null) Debug.LogWarning($"[McParticleManager] GenericPlaceParticles not assigned.");
+#endif
+#if ENABLE_LOGGING
         // if (footstepParticlePrefab == null) Debug.LogWarning($"[McParticleManager] FootstepParticlePrefab not assigned."); // Removed check
+#endif
+#if ENABLE_LOGGING
         if (persistentFootstepParticles == null) Debug.LogWarning("[McParticleManager] PersistentFootstepParticles not assigned!"); // New check
+#endif
+        else // ADDED: Set simulation space if the particle system exists
+        {
+            var mainModule = persistentFootstepParticles.main;
+            mainModule.simulationSpace = ParticleSystemSimulationSpace.World;
+        }
         
         isInitialized = true;
     }
@@ -87,40 +102,46 @@ public class McParticleManager : UdonSharpBehaviour
 
     private void HandleFootsteps()
     {
-        if (persistentFootstepParticles == null || !localPlayer.IsValid() || !localPlayer.IsPlayerGrounded()) return;
+        if (persistentFootstepParticles == null || !localPlayer.IsValid() || !localPlayer.IsPlayerGrounded())
+        {
+            if (persistentFootstepParticles.isPlaying) persistentFootstepParticles.Stop();
+            return;
+        };
 
-        Vector3 playerVelocity = localPlayer.GetVelocity(); // Get velocity once
+        Vector3 playerVelocity = localPlayer.GetVelocity();
+        Vector3 horizontalVelocity = Vector3.ProjectOnPlane(playerVelocity, Vector3.up);
 
-        if (playerVelocity.magnitude > footstepSpeedThreshold)
+        if (horizontalVelocity.magnitude > footstepSpeedThreshold)
         {
             if (Time.time - lastFootstepTime > footstepInterval)
             {
-                Vector3 horizontalVelocity = Vector3.ProjectOnPlane(playerVelocity, Vector3.up);
+                Vector3 playerReportedPosition = localPlayer.GetPosition();
+                Vector3 footstepEffectPosition = playerReportedPosition + new Vector3(0, footstepVerticalOffset, 0);
+                
+                persistentFootstepParticles.transform.position = footstepEffectPosition;
 
-                // Only play footstep effect if there is significant horizontal movement
-                if (horizontalVelocity.sqrMagnitude > 0.01f) 
+                if (horizontalVelocity.sqrMagnitude > 0.0001f) 
                 {
-                    Vector3 playerReportedPosition = localPlayer.GetPosition();
-                    Vector3 footstepEffectPosition = playerReportedPosition + new Vector3(0, footstepVerticalOffset, 0);
-                    
-                    persistentFootstepParticles.transform.position = footstepEffectPosition;
                     persistentFootstepParticles.transform.rotation = Quaternion.LookRotation(horizontalVelocity);
-                    persistentFootstepParticles.Play();
-
-                    if (blockTypeManager != null && world != null && _audioSource != null) {
-                        Vector3 blockPosUnderPlayer = playerReportedPosition + new Vector3(0, footstepVerticalOffset - 0.1f, 0); 
-                        int globalX = Mathf.FloorToInt(blockPosUnderPlayer.x);
-                        int globalY = Mathf.FloorToInt(blockPosUnderPlayer.y);
-                        int globalZ = Mathf.FloorToInt(blockPosUnderPlayer.z);
-                        byte blockID = world.GetBlock(globalX, globalY, globalZ); 
-                        AudioClip footstepSound = blockTypeManager.GetFootstepSound(blockID); 
-                        if (footstepSound != null) _audioSource.PlayOneShot(footstepSound);
-                    }
-                    lastFootstepTime = Time.time; // Update time only if effect was played
                 }
-                // If no significant horizontal movement, we effectively skip this footstep occasion.
-                // lastFootstepTime is not updated, so if player starts moving horizontally soon, it can trigger.
+
+                if (!persistentFootstepParticles.isPlaying) persistentFootstepParticles.Play();
+
+                if (blockTypeManager != null && world != null && _audioSource != null) {
+                    Vector3 blockPosUnderPlayer = playerReportedPosition + new Vector3(0, footstepVerticalOffset - 0.1f, 0); 
+                    int globalX = Mathf.FloorToInt(blockPosUnderPlayer.x);
+                    int globalY = Mathf.FloorToInt(blockPosUnderPlayer.y);
+                    int globalZ = Mathf.FloorToInt(blockPosUnderPlayer.z);
+                    byte blockID = world.GetBlock(globalX, globalY, globalZ); 
+                    AudioClip footstepSound = blockTypeManager.GetFootstepSound(blockID);
+                    if (footstepSound != null) _audioSource.PlayOneShot(footstepSound);
+                }
+                lastFootstepTime = Time.time;
             }
+        }
+        else
+        {
+            if (persistentFootstepParticles.isPlaying) persistentFootstepParticles.Stop();
         }
     }
 

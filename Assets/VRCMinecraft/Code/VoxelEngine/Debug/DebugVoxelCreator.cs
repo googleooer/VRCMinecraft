@@ -1,5 +1,4 @@
-﻿
-using UdonSharp;
+﻿using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using VRC.Udon;
@@ -75,7 +74,9 @@ public class DebugVoxelCreator : UdonSharpBehaviour
     {
         if(uvs.Length != 3)
         {
+#if UNITY_EDITOR
             Debug.LogWarning("Attempted to rotate triangle uvs clockwise, but uv count wasn't exactly 3");
+#endif
             return uvs;
         }
         //We take in triangle UVs and rotate them clockwise.

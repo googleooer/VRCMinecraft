@@ -11,6 +11,8 @@ Shader "Unlit/MCTerrain (Transparent)"
     {
         Tags {"RenderType"="Transparent" "Queue"="Transparent" }
         LOD 100
+
+        Cull Off
         
         
 

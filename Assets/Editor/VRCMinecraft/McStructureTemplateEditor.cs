@@ -1,14 +1,17 @@
 #if UNITY_EDITOR
 using UnityEngine;
 using UnityEditor;
-using System.Collections.Generic; // For using List<T>
+using System.Collections.Generic;
+using System.Text; // Added for StringBuilder
 
 [CustomEditor(typeof(McStructureTemplate))]
 public class McStructureTemplateEditor : Editor
 {
+    private StringBuilder logBuilder = new StringBuilder(256); // Initialize once
+
     public override void OnInspectorGUI()
     {
-        DrawDefaultInspector(); // Draws all public fields from McStructureTemplate
+        DrawDefaultInspector(); 
 
         EditorGUILayout.Space();
         EditorGUILayout.HelpBox("Use the button below to bake the voxel data from this prefab's children. " +
@@ -19,21 +22,27 @@ public class McStructureTemplateEditor : Editor
 
         if (GUILayout.Button("Bake Structure From Children To Data Arrays"))
         {
+            // Editor-time profiling can use EditorApplication.timeSinceStartup
+            double editorStartTime = EditorApplication.timeSinceStartup;
             BakeStructureData(template);
+            double duration = (EditorApplication.timeSinceStartup - editorStartTime) * 1000.0;
+            logBuilder.Clear();
+            logBuilder.AppendFormat("[McStructureTemplateEditor.BakeStructureData] Operation took {0:F2} ms for '{1}'.", duration, template.structureName);
+#if ENABLE_LOGGING
+            Debug.Log(logBuilder.ToString());
+#endif
         }
         
-        // Display info about the baked data
         if (template.bakedVoxelPositions != null && template.bakedVoxelBlockIDs != null && template.bakedVoxelPositions.Length > 0)
         {
             EditorGUILayout.LabelField("Baked Data Status:", EditorStyles.boldLabel);
-            EditorGUILayout.LabelField($"  - Voxel Count: {template.bakedVoxelPositions.Length}");
+            logBuilder.Clear(); // Using StringBuilder for consistency, though simple here
+            logBuilder.AppendFormat("  - Voxel Count: {0}", template.bakedVoxelPositions.Length);
+            EditorGUILayout.LabelField(logBuilder.ToString());
+
             if (template.bakedVoxelPositions.Length != template.bakedVoxelBlockIDs.Length) {
                 EditorGUILayout.HelpBox("Warning: Baked positions and block IDs array lengths do not match! Re-bake.", MessageType.Error);
             }
-            // Optionally, list a few baked voxels for verification
-            // for (int i = 0; i < Mathf.Min(template.bakedVoxelPositions.Length, 5); i++) {
-            //    EditorGUILayout.LabelField($"    Voxel {i}: Pos={template.bakedVoxelPositions[i]}, ID={template.bakedVoxelBlockIDs[i]}");
-            // }
         } else {
             EditorGUILayout.HelpBox("This structure has not been baked yet or contains no voxel data. " +
                                    "Ensure child GameObjects have 'McStructureVoxelData' and then click 'Bake'.", MessageType.Warning);
@@ -43,10 +52,14 @@ public class McStructureTemplateEditor : Editor
     private void BakeStructureData(McStructureTemplate template)
     {
         Transform templateRoot = template.transform;
-        if (templateRoot.childCount == 0 && template.GetComponentsInChildren<McStructureVoxelData>(true).Length == 0) // Check deeper too
+        if (templateRoot.childCount == 0 && template.GetComponentsInChildren<McStructureVoxelData>(true).Length == 0)
         {
-            Debug.LogWarning($"[McStructureTemplateEditor] No child objects with McStructureVoxelData found in '{template.structureName}'. Nothing to bake.", template.gameObject);
-            template.bakedVoxelPositions = new Vector3Int[0]; // Ensure arrays are empty if nothing found
+            logBuilder.Clear();
+            logBuilder.AppendFormat("[McStructureTemplateEditor.BakeStructureData] No child objects with McStructureVoxelData found in '{0}'. Nothing to bake.", template.structureName);
+#if ENABLE_LOGGING
+            Debug.LogWarning(logBuilder.ToString(), template.gameObject);
+#endif
+            template.bakedVoxelPositions = new Vector3Int[0]; 
             template.bakedVoxelBlockIDs = new byte[0];
             EditorUtility.SetDirty(template);
             return;
@@ -56,60 +69,50 @@ public class McStructureTemplateEditor : Editor
 
         List<Vector3Int> positions = new List<Vector3Int>();
         List<byte> blockIDs = new List<byte>();
-
-        // GetComponentsInChildren will find McStructureVoxelData on any child, direct or nested.
-        // This is often desired for complex prefabs.
-        McStructureVoxelData[] childVoxels = template.GetComponentsInChildren<McStructureVoxelData>(true); // Include inactive
+        McStructureVoxelData[] childVoxels = template.GetComponentsInChildren<McStructureVoxelData>(true);
 
         if (childVoxels.Length == 0) {
-            Debug.LogWarning($"[McStructureTemplateEditor] No 'McStructureVoxelData' components found in children of '{template.structureName}'. Make sure your visual blocks have this script.", template.gameObject);
+            logBuilder.Clear();
+            logBuilder.AppendFormat("[McStructureTemplateEditor.BakeStructureData] No 'McStructureVoxelData' components found in children of '{0}'.", template.structureName);
+#if ENABLE_LOGGING
+            Debug.LogWarning(logBuilder.ToString(), template.gameObject);
+#endif
             template.bakedVoxelPositions = new Vector3Int[0];
             template.bakedVoxelBlockIDs = new byte[0];
             EditorUtility.SetDirty(template);
             return;
         }
 
-        Debug.Log($"[McStructureTemplateEditor] Found {childVoxels.Length} McStructureVoxelData components in children of '{template.structureName}'. Baking now...");
+        logBuilder.Clear();
+        logBuilder.AppendFormat("[McStructureTemplateEditor.BakeStructureData] Found {0} McStructureVoxelData components in children of '{1}'. Baking now...", childVoxels.Length, template.structureName);
+#if ENABLE_LOGGING
+        Debug.Log(logBuilder.ToString());
+#endif
 
         for (int i = 0; i < childVoxels.Length; i++)
         {
             McStructureVoxelData voxelDataScript = childVoxels[i];
             Transform childTransform = voxelDataScript.transform;
-
-            // Calculate position relative to the root template object's transform.
-            // This ensures that if the root prefab itself is moved/rotated, the relative positions remain correct.
             Vector3 relativePos = templateRoot.InverseTransformPoint(childTransform.position);
-
-            // Round to nearest integer to get voxel grid coordinates relative to the structure's origin.
             Vector3Int voxelPos = new Vector3Int(
                 Mathf.RoundToInt(relativePos.x),
                 Mathf.RoundToInt(relativePos.y),
                 Mathf.RoundToInt(relativePos.z)
             );
-            
             positions.Add(voxelPos);
             blockIDs.Add(voxelDataScript.blockID);
-            
-            // Debug.Log($"  - Baked voxel {i}: RelPos={voxelPos}, BlockID={voxelDataScript.blockID}, ChildName='{childTransform.name}'");
         }
 
         template.bakedVoxelPositions = positions.ToArray();
         template.bakedVoxelBlockIDs = blockIDs.ToArray();
-
-        // Mark the object (ScriptableObject or Prefab instance) as dirty to ensure changes are saved.
-        // If 'template' is a component on a prefab instance in the scene, this marks the instance.
-        // If 'template' is directly on a prefab asset, this marks the asset.
         EditorUtility.SetDirty(template);
-        if (PrefabUtility.IsPartOfPrefabAsset(template.gameObject)) {
-            // If it's a direct prefab asset, saving is handled by Unity.
-        } else if (PrefabUtility.IsPartOfPrefabInstance(template.gameObject)) {
-            // If it's an instance in the scene, you might need to apply overrides to the prefab asset
-            // or remind the user to do so if they want the baked data saved back to the original prefab.
-            // For simplicity, we assume user manages prefab applying if editing instances.
-            // PrefabUtility.RecordPrefabInstancePropertyModifications(template); // More granular
-        }
+        // Prefab saving logic remains the same
 
-        Debug.Log($"[McStructureTemplateEditor] Successfully baked {positions.Count} voxels for '{template.structureName}'. Please ensure you apply these changes to your Prefab asset if you baked an instance in the scene.");
+        logBuilder.Clear();
+        logBuilder.AppendFormat("[McStructureTemplateEditor.BakeStructureData] Successfully baked {0} voxels for '{1}'. Apply to Prefab if needed.", positions.Count, template.structureName);
+#if ENABLE_LOGGING
+        Debug.Log(logBuilder.ToString());
+#endif
     }
 }
 #endif

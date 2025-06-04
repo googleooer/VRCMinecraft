@@ -1,16 +1,16 @@
-﻿﻿using UdonSharp;
+﻿using UdonSharp;
 using UnityEngine;
-using VRC.SDKBase; 
-using VRRefAssist; 
+using VRC.SDKBase;
+using VRRefAssist;
+using System.Text; // Added for StringBuilder
 
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
-// Uses McTerrainGeneratorEditor.cs for the inspector
 public class McTerrainGenerator : UdonSharpBehaviour
 {
     [Header("Global Terrain Noise Settings")]
     public float baseNoiseScale = 70.0f;
-    public int baseTerrainHeight = 0; 
+    public int baseTerrainHeight = 0;
     public float baseHeightVariationAmplitude = 15f;
     public float perlinHeightOffset = 0f;
 
@@ -22,92 +22,147 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public byte waterBlockID = 4;
 
     [Header("Structure & Feature Templates")]
-    [Tooltip("List of all structure and feature template prefabs (GameObjects with McStructureTemplate script and baked data).")]
-    public McStructureTemplate[] structureTemplates; 
+    public McStructureTemplate[] structureTemplates;
 
-    [SerializeField, FindObjectOfType(true)] 
-    private McWorld world; 
-    
-    [SerializeField, FindObjectOfType(true)] 
-    private McBlockTypeManager blockTypeManager; // Not directly used in V3.1 stamping, but good to have
+    [SerializeField, FindObjectOfType(true)]
+    private McWorld world;
+
+    [SerializeField, FindObjectOfType(true)]
+    private McBlockTypeManager blockTypeManager;
 
     private float perlinSeedOffsetX_terrain;
     private float perlinSeedOffsetZ_terrain;
     private bool isInitialized = false;
-    private int _worldActualSeed; // To store world seed for deterministic Random.InitState
+    private int _worldActualSeed;
 
-    // Custom PRNG state for structure placement
     private uint _placementRandState;
 
-    // Custom PRNG: Initialize state
+
+
+
+
+
+
+
+
+    private float _inverseBaseNoiseScale;
+    private bool _isBaseNoiseScaleEffectivelyZero;
+    private int _cachedMinYVoxel;
+    private int _cachedMaxYVoxel;
+    private bool _worldParametersCached = false;
+
+
+    
+    // Logging
+    [HideInInspector] public bool enableVerboseLogging = true; // Can be set by McWorld or manually
+    private StringBuilder logBuilder;
+
+
     private void InitPlacementRand(int seed)
     {
-        // Ensure the seed is positive before casting to uint to avoid System.Convert overflow
-        // Using Abs ensures a non-negative value. The bit pattern is what matters for the PRNG start.
         _placementRandState = (uint)Mathf.Abs(seed);
-        // It's also good to ensure _placementRandState is not zero if the LCG behaves poorly with a zero state.
-        // A common LCG issue: if state becomes 0, it might stay 0 if c (the additive constant) is 0.
-        // Our LCG has a non-zero c (1013904223u), so 0 state is fine but can be avoided for robustness.
-        if (_placementRandState == 0) _placementRandState = 1; // Avoid zero state if Abs(seed) was 0
-
-        for (int i = 0; i < 5; i++) GetPlacementRand(); 
+        if (_placementRandState == 0) _placementRandState = 1;
+        for (int i = 0; i < 5; i++) GetPlacementRand();
     }
 
-    // Custom PRNG: Get next float [0,1)
     private float GetPlacementRand()
     {
-        _placementRandState = _placementRandState * 1664525u + 1013904223u; // LCG parameters (Numerical Recipes)
-        return (float)(_placementRandState >> 8) / (float)0x00FFFFFF; // Use upper 24 bits for float, avoid issues with direct uint to float conversion maxing out.
+        _placementRandState = _placementRandState * 1664525u + 1013904223u;
+        return (float)(_placementRandState >> 8) / (float)0x00FFFFFF;
     }
-    
-    // Custom PRNG: Get int [0, maxExclusive - 1]
+
     private int GetPlacementRandRange(int maxExclusive)
     {
         if (maxExclusive <= 0) return 0;
-        return (int)(GetPlacementRand() * maxExclusive); // Basic range mapping
+        return (int)(GetPlacementRand() * maxExclusive);
     }
 
     public void InitializeGenerator(int seed)
     {
-        if(isInitialized) return;
-        
-        // VRRefAssist should populate world and blockTypeManager.
-        // Adding checks here for robustness.
-        if (world == null) {
-            Debug.LogError("[McTerrainGenerator] McWorld instance NOT FOUND! Cannot initialize."); return;
-        }
-        if (blockTypeManager == null) {
-            Debug.LogError("[McTerrainGenerator] McBlockTypeManager instance NOT FOUND! Cannot initialize."); return;
-        }
+        float startTime = Time.realtimeSinceStartup;
+        if (isInitialized) return;
 
-        _worldActualSeed = seed; // Store the main world seed
+        logBuilder = new StringBuilder(256); // Initialize StringBuilder
+
+        UpdateTerrainGenParameters();
+        
+        // Inherit logging state from world if possible
+        // if (world != null) enableVerboseLogging = world.enableVerboseLogging;
+
+
+        _worldActualSeed = seed;
         perlinSeedOffsetX_terrain = (seed % 1000) * 1.23f + 10000.0f;
         perlinSeedOffsetZ_terrain = ((seed / 1000) % 1000) * 1.45f + 20000.0f;
         isInitialized = true;
+
+#if UNITY_EDITOR
+        if (enableVerboseLogging)
+        {
+            logBuilder.Clear();
+            logBuilder.AppendFormat("[McTerrainGenerator.InitializeGenerator] Complete. Seed: {0}. Time: {1:F2} ms.", seed, (Time.realtimeSinceStartup - startTime) * 1000f);
+            Debug.Log(logBuilder.ToString());
+        }
+#endif
     }
 
-    public int GetBaseTerrainHeight(int worldX_voxel, int worldZ_voxel) 
+    // Call this method in Start() or OnEnable(), and if baseNoiseScale or world.globalVoxelOffsetY can change at runtime,
+    // call it again after they change.
+    public void UpdateTerrainGenParameters()
     {
-        if (world == null) return baseTerrainHeight; // Fallback if world not initialized
-        if (Mathf.Approximately(baseNoiseScale, 0f)) return baseTerrainHeight; 
+        if (Mathf.Approximately(baseNoiseScale, 0f) || baseNoiseScale == 0f) // More robust check for zero
+        {
+            _isBaseNoiseScaleEffectivelyZero = true;
+            _inverseBaseNoiseScale = 0f; // Or some other safe default if you prefer not to branch
+        }
+        else
+        {
+            _isBaseNoiseScaleEffectivelyZero = false;
+            _inverseBaseNoiseScale = 1.0f / baseNoiseScale;
+        }
 
-        float inputX = ((float)worldX_voxel + perlinSeedOffsetX_terrain) / baseNoiseScale;
-        float inputZ = ((float)worldZ_voxel + perlinSeedOffsetZ_terrain) / baseNoiseScale;
-        float perlinValue = Mathf.PerlinNoise(inputX, inputZ); 
-        perlinValue = Mathf.Clamp01(perlinValue);
-        
+        if (world != null)
+        {
+            _cachedMinYVoxel = -world.globalVoxelOffsetY;
+            _cachedMaxYVoxel = world.globalVoxelOffsetY - 1;
+            _worldParametersCached = true;
+        } else {
+            _worldParametersCached = false; // Mark as not cached if world is null
+        }
+    }
+
+    public int GetBaseTerrainHeight(int worldX_voxel, int worldZ_voxel)
+    {
+        // Ensure parameters are cached. This check might be skippable if UpdateTerrainGenParameters()
+        // is guaranteed to be called before any GetBaseTerrainHeight() calls.
+        // if (!_worldParametersCached && world != null) UpdateTerrainGenParameters();
+
+
+        //if (world == null || !_worldParametersCached) return baseTerrainHeight; // Return base if world is null or params not cached
+        if (_isBaseNoiseScaleEffectivelyZero) return baseTerrainHeight;
+
+        // Use multiplication instead of division
+        float inputX = ((float)worldX_voxel + perlinSeedOffsetX_terrain) * _inverseBaseNoiseScale;
+        float inputZ = ((float)worldZ_voxel + perlinSeedOffsetZ_terrain) * _inverseBaseNoiseScale;
+
+        float perlinValue = Mathf.PerlinNoise(inputX, inputZ);
+
+        // Mathf.PerlinNoise in Unity (and likely UdonSharp) typically returns values in the [0,1] range.
+        // If this is guaranteed, Mathf.Clamp01(perlinValue) is redundant and can be removed.
+        // Verify this behavior in your VRChat/UdonSharp environment.
+        // perlinValue = Mathf.Clamp01(perlinValue); // Potentially remove this line
+
+        // Calculation remains similar, but uses pre-calculated min/max Y
         int calculatedHeight = baseTerrainHeight + Mathf.FloorToInt(perlinValue * baseHeightVariationAmplitude + perlinHeightOffset);
-        
-        int minYVoxel = -world.globalVoxelOffsetY;
-        int maxYVoxel = world.globalVoxelOffsetY - 1;
-        return Mathf.Clamp(calculatedHeight, minYVoxel, maxYVoxel);
+
+        return Mathf.Clamp(calculatedHeight, _cachedMinYVoxel, _cachedMaxYVoxel);
     }
 
     public void PlaceFeaturesInChunk(int chunkArrayX, int chunkArrayY, int chunkArrayZ)
     {
+        float startTime = Time.realtimeSinceStartup;
         if (!isInitialized || world == null || structureTemplates == null || structureTemplates.Length == 0) return;
 
-        int centeredChunkX = chunkArrayX - world.chunkOffsetX; 
+        int centeredChunkX = chunkArrayX - world.chunkOffsetX;
         int centeredChunkY = chunkArrayY - world.chunkOffsetY;
         int centeredChunkZ = chunkArrayZ - world.chunkOffsetZ;
 
@@ -115,88 +170,112 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int chunkOriginGlobalY = centeredChunkY * world.chunkSizeY;
         int chunkOriginGlobalZ = centeredChunkZ * world.chunkSizeXZ;
         
+        int structuresPlacedThisChunk = 0;
+
         foreach (McStructureTemplate structureTemplate in structureTemplates)
         {
             if (structureTemplate == null) continue;
 
             int combinedSeed = _worldActualSeed + chunkArrayX * 7883 + chunkArrayY * 1471 + chunkArrayZ * 3463 + structureTemplate.placementSalt;
-            InitPlacementRand(combinedSeed); // Initialize our custom PRNG
+            InitPlacementRand(combinedSeed);
 
-            if (GetPlacementRand() <= structureTemplate.spawnChance) // Use custom PRNG
+            if (GetPlacementRand() <= structureTemplate.spawnChance)
             {
-                int placementAttempts = 3; 
-                for (int attempt = 0; attempt < placementAttempts; attempt++) {
-                    int localX = GetPlacementRandRange(world.chunkSizeXZ); // Use custom PRNG
-                    int localZ = GetPlacementRandRange(world.chunkSizeXZ); // Use custom PRNG
+                int placementAttempts = 3;
+                for (int attempt = 0; attempt < placementAttempts; attempt++)
+                {
+                    int localX = GetPlacementRandRange(world.chunkSizeXZ);
+                    int localZ = GetPlacementRandRange(world.chunkSizeXZ);
                     int spawnOriginGlobalX = chunkOriginGlobalX + localX;
                     int spawnOriginGlobalZ = chunkOriginGlobalZ + localZ;
+                    int surfaceY = -world.globalVoxelOffsetY - 1;
 
-                    int surfaceY = -world.globalVoxelOffsetY -1; 
-                    // Scan from top of current chunk down to find surface (simplified from original, ensure it works)
-                    for(int yInChunkScan = world.chunkSizeY -1; yInChunkScan >=0; --yInChunkScan) {
+                    for (int yInChunkScan = world.chunkSizeY - 1; yInChunkScan >= 0; --yInChunkScan)
+                    {
                         int currentScanGlobalY = chunkOriginGlobalY + yInChunkScan;
-                         if(world.GetBlock(spawnOriginGlobalX, currentScanGlobalY, spawnOriginGlobalZ) != 0) { // Found non-air block
+                        if (world.GetBlock(spawnOriginGlobalX, currentScanGlobalY, spawnOriginGlobalZ) != 0)
+                        {
                             surfaceY = currentScanGlobalY;
                             break;
                         }
                     }
+                    if (surfaceY < -world.globalVoxelOffsetY) continue;
 
-                    if (surfaceY < -world.globalVoxelOffsetY) continue; // No ground found in this column for this attempt
-
-                    // Check requiredSpawnBlockID
-                    if (structureTemplate.requiredSpawnBlockID != -1) {
+                    if (structureTemplate.requiredSpawnBlockID != -1)
+                    {
                         byte blockAtSurface = world.GetBlock(spawnOriginGlobalX, surfaceY, spawnOriginGlobalZ);
-                        if (blockAtSurface != (byte)structureTemplate.requiredSpawnBlockID) {
-                            continue; // Did not match required block, try next attempt or template
-                        }
+                        if (blockAtSurface != (byte)structureTemplate.requiredSpawnBlockID) continue;
                     }
 
-                    int spawnOriginGlobalY = surfaceY + 1; 
-
+                    int spawnOriginGlobalY = surfaceY + 1;
                     if (spawnOriginGlobalY < structureTemplate.minYSpawnLevel || spawnOriginGlobalY > structureTemplate.maxYSpawnLevel) continue;
-                    if (structureTemplate.requiresSolidGround) {
+                    if (structureTemplate.requiresSolidGround)
+                    {
                         bool groundSolidEnough = true;
-                        for (int d = 0; d < structureTemplate.solidGroundDepth; d++) {
-                            if (world.GetBlock(spawnOriginGlobalX, surfaceY - d, spawnOriginGlobalZ) == 0) {
+                        for (int d = 0; d < structureTemplate.solidGroundDepth; d++)
+                        {
+                            if (world.GetBlock(spawnOriginGlobalX, surfaceY - d, spawnOriginGlobalZ) == 0)
+                            {
                                 groundSolidEnough = false; break;
                             }
                         }
                         if (!groundSolidEnough) continue;
                     }
-                    
+
+                    float stampStartTime = Time.realtimeSinceStartup;
                     StampStructure(structureTemplate, spawnOriginGlobalX, spawnOriginGlobalY, spawnOriginGlobalZ);
-                    break; // Structure placed, move to next template
+                    float stampDuration = (Time.realtimeSinceStartup - stampStartTime) * 1000f;
+                    structuresPlacedThisChunk++;
+#if UNITY_EDITOR
+                    if (enableVerboseLogging)
+                    {
+                        logBuilder.Clear();
+                        logBuilder.AppendFormat("[McTerrainGenerator.PlaceFeaturesInChunk] Stamped '{0}' at G({1},{2},{3}) in chunk Arr({4},{5},{6}). Stamp took {7:F2} ms.",
+                            structureTemplate.structureName, spawnOriginGlobalX, spawnOriginGlobalY, spawnOriginGlobalZ,
+                            chunkArrayX, chunkArrayY, chunkArrayZ, stampDuration);
+                        Debug.Log(logBuilder.ToString());
+                    }
+#endif
+                    break; 
                 }
             }
         }
+#if UNITY_EDITOR
+        if (enableVerboseLogging && structuresPlacedThisChunk > 0)
+        {
+            logBuilder.Clear();
+            logBuilder.AppendFormat("[McTerrainGenerator.PlaceFeaturesInChunk] Finished for chunk Arr({0},{1},{2}). Placed {3} structures. Total time: {4:F2} ms.",
+                chunkArrayX, chunkArrayY, chunkArrayZ, structuresPlacedThisChunk, (Time.realtimeSinceStartup - startTime) * 1000f);
+            Debug.Log(logBuilder.ToString());
+        }
+#endif
     }
 
     private void StampStructure(McStructureTemplate structureTemplate, int originGlobalX, int originGlobalY, int originGlobalZ)
     {
+        // Profiling done by caller (PlaceFeaturesInChunk)
         if (structureTemplate == null || world == null) return;
-        
+
         Vector3Int[] positions = structureTemplate.bakedVoxelPositions;
         byte[] blockIDs = structureTemplate.bakedVoxelBlockIDs;
 
-        if (positions == null || blockIDs == null || positions.Length == 0 || positions.Length != blockIDs.Length) {
-            // It's normal for some structures to have no baked data if not processed yet, or if empty by design.
-            // Only log warning if it was expected to have data.
-            // Debug.LogWarning($"[McTerrainGenerator] Attempted to stamp structure '{structureTemplate.structureName}' but its baked data is missing, empty, or mismatched. Ensure it's baked correctly via its Inspector.", structureTemplate.gameObject);
+        if (positions == null || blockIDs == null || positions.Length == 0 || positions.Length != blockIDs.Length)
+        {
+#if UNITY_EDITOR
+            // if (enableVerboseLogging) Debug.LogWarning($"[McTerrainGenerator.StampStructure] Attempted to stamp structure '{structureTemplate.structureName}' but its baked data is missing, empty, or mismatched.");
+#endif
             return;
         }
-
-        // Debug.Log($"[McTerrainGenerator] Stamping '{structureTemplate.structureName}' with {positions.Length} voxels at G({originGlobalX},{originGlobalY},{originGlobalZ})");
 
         for (int i = 0; i < positions.Length; i++)
         {
             Vector3Int relativePos = positions[i];
             byte blockID = blockIDs[i];
-
             int placeGlobalX = originGlobalX + relativePos.x;
             int placeGlobalY = originGlobalY + relativePos.y;
             int placeGlobalZ = originGlobalZ + relativePos.z;
-            
-            world.SetBlock(placeGlobalX, placeGlobalY, placeGlobalZ, blockID);
+            world.SetBlock(placeGlobalX, placeGlobalY, placeGlobalZ, blockID, false); // SetBlock in McWorld now has its own logging
         }
+        // world.FinalizeBatchedBlockUpdates(); // This method was removed from McWorld
     }
 }
