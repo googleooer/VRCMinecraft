@@ -79,6 +79,18 @@ public class McChunk : UdonSharpBehaviour
     private int buildMesh_currentY = 0;
     private int buildMesh_currentZ = 0;
 
+    // Timing variables
+    private float meshBuildStartTime;
+    private float meshBuildEndTime;
+    private int totalVoxelsProcessed = 0;
+    private int totalFacesGenerated = 0;
+    private int meshSliceCount = 0;
+    private float totalSliceTime = 0f;
+    private float lastSliceStartTime;
+    
+    // Fast build mode flag
+    [HideInInspector] public bool useFastBuildMode = false;
+
     public void InitializeChunk()
     {
         if (isInitialized || template) return;
@@ -139,13 +151,26 @@ public class McChunk : UdonSharpBehaviour
         transparent_vertexCount = 0; transparent_triangleCount = 0; transparent_uvCount = 0; transparent_normalCount = 0;
         cutout_vertexCount = 0; cutout_triangleCount = 0; cutout_uvCount = 0; cutout_normalCount = 0;
         buildMesh_currentX = 0; buildMesh_currentY = 0; buildMesh_currentZ = 0;
+        
+        // Reset timing variables
+        meshBuildStartTime = Time.realtimeSinceStartup;
+        totalVoxelsProcessed = 0;
+        totalFacesGenerated = 0;
+        meshSliceCount = 0;
+        totalSliceTime = 0f;
+        
         ProcessMeshSlice();
     }
 
     public void ProcessMeshSlice()
     {
         if (!isBuildingMesh) return;
+        
+        lastSliceStartTime = Time.realtimeSinceStartup;
+        meshSliceCount++;
+        
         int processedThisSlice = 0;
+        int facesGeneratedThisSlice = 0;
 
         for (int x = buildMesh_currentX; x < chunkSizeXZ; x++)
         {
@@ -156,10 +181,10 @@ public class McChunk : UdonSharpBehaviour
                     int currentGlobalX = chunkX + x; int currentGlobalY = chunkY + y; int currentGlobalZ = chunkZ + z;
                     byte currentBlockID = world.GetBlock(currentGlobalX, currentGlobalY, currentGlobalZ);
 
-                    if (currentBlockID == 0) { processedThisSlice++; if (ShouldScheduleNextSlice(processedThisSlice,x,y,z)) return; continue; }
+                    if (currentBlockID == 0) { processedThisSlice++; totalVoxelsProcessed++; if (ShouldScheduleNextSlice(processedThisSlice,x,y,z)) return; continue; }
 
                     BlockVisibilityType currentVisibility = blockTypeManager.GetBlockVisibilityType(currentBlockID);
-                    if (currentVisibility == BlockVisibilityType.Invisible) { processedThisSlice++; if (ShouldScheduleNextSlice(processedThisSlice,x,y,z)) return; continue; }
+                    if (currentVisibility == BlockVisibilityType.Invisible) { processedThisSlice++; totalVoxelsProcessed++; if (ShouldScheduleNextSlice(processedThisSlice,x,y,z)) return; continue; }
 
                     McChunk_MeshTarget targetMeshTypeForCurrentBlock; 
                     if (currentVisibility == BlockVisibilityType.Opaque) targetMeshTypeForCurrentBlock = McChunk_MeshTarget.Opaque;
@@ -212,22 +237,40 @@ public class McChunk : UdonSharpBehaviour
                                 }
                             }
                         }
-                        if (drawFace) AddFaceDataToPool(x, y, z, dir, currentBlockID, targetMeshTypeForCurrentBlock);
+                        if (drawFace) {
+                            AddFaceDataToPool(x, y, z, dir, currentBlockID, targetMeshTypeForCurrentBlock);
+                            facesGeneratedThisSlice++;
+                            totalFacesGenerated++;
+                        }
                     }
                     processedThisSlice++;
-                    if (ShouldScheduleNextSlice(processedThisSlice, x, y, z)) return;
+                    totalVoxelsProcessed++;
+                    if (ShouldScheduleNextSlice(processedThisSlice, x, y, z)) {
+                        totalSliceTime += Time.realtimeSinceStartup - lastSliceStartTime;
+                        return;
+                    }
                 }
                 buildMesh_currentZ = 0;
             }
             buildMesh_currentY = 0;
         }
+        
+        totalSliceTime += Time.realtimeSinceStartup - lastSliceStartTime;
         FinalizeMeshBuild();
     }
 
     private bool ShouldScheduleNextSlice(int processedCount, int curX, int curY, int curZ) {
-        if (voxelsPerSlice > 0 && processedCount >= voxelsPerSlice) {
+        if (voxelsPerSlice > 0 && processedCount >= voxelsPerSlice && !useFastBuildMode) {
             buildMesh_currentX = curX; buildMesh_currentY = curY; buildMesh_currentZ = curZ + 1;
-            SendCustomEventDelayedFrames(nameof(ProcessMeshSlice), 1);
+            
+            // Use time-based delay instead of frame-based for more consistent performance
+            float sliceDelay = world != null && world.worldProcessingStepDelay > 0 ? world.worldProcessingStepDelay : 0f;
+            if (sliceDelay > 0.0001f) {
+                SendCustomEventDelayedSeconds(nameof(ProcessMeshSlice), sliceDelay);
+            } else {
+                // Use immediate callback instead of frame delay for better performance
+                SendCustomEvent(nameof(ProcessMeshSlice));
+            }
             return true;
         }
         return false;
@@ -327,6 +370,7 @@ public class McChunk : UdonSharpBehaviour
         { // No visible blocks in this chunk
             if (meshCollider != null) meshCollider.sharedMesh = null;
             isBuildingMesh = false;
+            LogMeshBuildTiming(true); // Empty chunk
             return;
         }
         if (totalVertices > 65534) {
@@ -390,6 +434,34 @@ public class McChunk : UdonSharpBehaviour
         // or the collider could be configured to ignore transparent/cutout layers if possible (not standard with MeshCollider).
 
         isBuildingMesh = false; 
+        LogMeshBuildTiming(false); // Normal completion
+    }
+    
+    private void LogMeshBuildTiming(bool wasEmptyChunk)
+    {
+        if (world == null || !world.enableTimingLogs) return;
+        
+        meshBuildEndTime = Time.realtimeSinceStartup;
+        float totalMeshBuildTime = meshBuildEndTime - meshBuildStartTime;
+        
+        if (wasEmptyChunk)
+        {
+            Debug.Log($"[McChunk Timing] Empty chunk at ({chunkX},{chunkY},{chunkZ}) - Total time: {totalMeshBuildTime * 1000f:F2}ms");
+            return;
+        }
+        
+        float avgSliceTime = meshSliceCount > 0 ? totalSliceTime / meshSliceCount : 0f;
+        int totalVoxelsInChunk = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
+        float voxelsPerSecond = totalVoxelsProcessed > 0 ? totalVoxelsProcessed / totalMeshBuildTime : 0f;
+        
+        Debug.Log($"[McChunk Timing] Mesh build complete for chunk ({chunkX},{chunkY},{chunkZ})" +
+                  $"\n  Total Time: {totalMeshBuildTime * 1000f:F2}ms" +
+                  $"\n  Voxels Processed: {totalVoxelsProcessed}/{totalVoxelsInChunk}" +
+                  $"\n  Faces Generated: {totalFacesGenerated}" +
+                  $"\n  Mesh Slices: {meshSliceCount}" +
+                  $"\n  Avg Slice Time: {avgSliceTime * 1000f:F2}ms" +
+                  $"\n  Voxels per second: {voxelsPerSecond:F0}" +
+                  $"\n  Vertices: Opaque={opaque_vertexCount}, Transparent={transparent_vertexCount}, Cutout={cutout_vertexCount}");
     }
 
     public void SetWorld(McWorld newWorld)

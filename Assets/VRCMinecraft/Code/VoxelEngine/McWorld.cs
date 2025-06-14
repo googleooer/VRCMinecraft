@@ -70,6 +70,16 @@ public class McWorld : UdonSharpBehaviour
     [Header("Performance Parameters (Passed to Chunks)")]
     [Tooltip("Number of voxels each McChunk processes per slice during its mesh build.")]
     public int voxelsPerSliceInChunks = 256;
+    [Tooltip("Use fast build mode for chunks (builds entire chunk without delays). Good for initial world gen.")]
+    public bool useChunkFastBuildMode = false;
+    [Tooltip("Automatically use fast build during world generation and normal mode during runtime.")]
+    public bool useDynamicFastBuildMode = true;
+
+    [Header("Performance Monitoring")]
+    [Tooltip("Enable detailed timing logs")]
+    public bool enableTimingLogs = true;
+    [Tooltip("Log timing every N chunks processed")]
+    public int timingLogInterval = 10;
 
     // --- State Variables ---
     private McChunk[] chunkRebuildQueue;
@@ -102,6 +112,37 @@ public class McWorld : UdonSharpBehaviour
     private int inst_dy_iterator = 0;     // Renamed from proc_dy
     private int inst_dz_iterator = 0;     // Renamed from proc_dz
 
+    // --- Timing Variables ---
+    // Overall timing
+    private float worldProcessingStartTime;
+    private float worldProcessingEndTime;
+    
+    // Chunk processing timing
+    private float currentChunkStartTime;
+    private float totalChunkDataGenTime = 0f;
+    private float totalChunkInstantiationTime = 0f;
+    private float totalFeaturePlacementTime = 0f;
+    private int chunksTimingLogged = 0;
+    
+    // Step timing
+    private float lastStepStartTime;
+    private float totalStepTime = 0f;
+    private int stepTimingCount = 0;
+    
+    // Rebuild queue timing
+    private float totalRebuildQueueTime = 0f;
+    private int rebuildQueueProcessCount = 0;
+    private float lastRebuildQueueStartTime;
+    
+    // Per-chunk detailed timing
+    private float[] chunkDataGenTimes;
+    private float[] chunkInstantiationTimes;
+    private int chunkTimingIndex = 0;
+    
+    // Block modification timing
+    private float totalSetBlockTime = 0f;
+    private int setBlockCallCount = 0;
+    private float lastSetBlockTime = 0f;
 
     void Start()
     {
@@ -124,6 +165,18 @@ public class McWorld : UdonSharpBehaviour
 
         chunkRebuildQueue = new McChunk[MAX_REBUILD_QUEUE_SIZE];
         chunkRebuildQueueCount = 0;
+
+        // Initialize timing arrays
+        if (enableTimingLogs)
+        {
+            chunkDataGenTimes = new float[totalWorldChunks];
+            chunkInstantiationTimes = new float[totalWorldChunks];
+            for (int i = 0; i < totalWorldChunks; i++)
+            {
+                chunkDataGenTimes[i] = 0f;
+                chunkInstantiationTimes[i] = 0f;
+            }
+        }
 
         Debug.Log("[McWorld] Start(): Beginning Interleaved Radial World Processing.");
         StartWorldProcessing(); 
@@ -183,6 +236,19 @@ public class McWorld : UdonSharpBehaviour
         
         Debug.Log($"[McWorld] Initializing Interleaved Radial World Processing. Target chunk (Rel 0,0,0). Voxels per data slice: {voxelsPerChunkDataProcessingSlice}. Step delay: {worldProcessingStepDelay}s.");
         
+        // Reset timing variables
+        if (enableTimingLogs)
+        {
+            worldProcessingStartTime = Time.realtimeSinceStartup;
+            totalChunkDataGenTime = 0f;
+            totalChunkInstantiationTime = 0f;
+            totalFeaturePlacementTime = 0f;
+            totalStepTime = 0f;
+            stepTimingCount = 0;
+            chunksTimingLogged = 0;
+            chunkTimingIndex = 0;
+        }
+        
         isProcessingWorld = true;
         // proc_ variables are for the *current chunk being actively processed for data/instantiation*
         proc_radius = 0; proc_dx = 0; proc_dy = 0; proc_dz = 0; 
@@ -196,6 +262,12 @@ public class McWorld : UdonSharpBehaviour
 
         proc_lastLoggedPercent = -1; debug_worldStepCallCount = 0; chunksProcessedAndInstantiatedCount = 0;
         
+        // Record chunk start time
+        if (enableTimingLogs)
+        {
+            currentChunkStartTime = Time.realtimeSinceStartup;
+        }
+        
         ProcessNextWorldStep();
     }
 
@@ -203,6 +275,12 @@ public class McWorld : UdonSharpBehaviour
     {
         debug_worldStepCallCount++;
         if (!isProcessingWorld) return;
+
+        // Start timing this step
+        if (enableTimingLogs)
+        {
+            lastStepStartTime = Time.realtimeSinceStartup;
+        }
 
         int currentArrayCX = proc_dx + chunkOffsetX;
         int currentArrayCY = proc_dy + chunkOffsetY;
@@ -216,10 +294,12 @@ public class McWorld : UdonSharpBehaviour
             bool foundNext = AdvanceRadialIterator(); // This will set new proc_dx, dy, dz
             if (foundNext && isProcessingWorld) { 
                 currentChunkDataBeingPopulated = true; // Start populating for the new chunk
+                if (enableTimingLogs) currentChunkStartTime = Time.realtimeSinceStartup;
                 ScheduleNextWorldStep(); 
             }
             else if (isProcessingWorld) { 
                 Debug.Log($"[McWorld] World Processing seems complete (iterator exhausted). Processed {chunksProcessedAndInstantiatedCount}/{totalWorldChunks}. Steps: {debug_worldStepCallCount}");
+                if (enableTimingLogs) LogFinalTimingStats();
                 isProcessingWorld = false;
             }
             return;
@@ -230,15 +310,59 @@ public class McWorld : UdonSharpBehaviour
             bool dataForThisChunkCompleted = PopulateDataSliceForCurrentTargetChunk();
             if (dataForThisChunkCompleted)
             {
+                // Record data generation time
+                float dataGenTime = 0f;
+                if (enableTimingLogs)
+                {
+                    dataGenTime = Time.realtimeSinceStartup - currentChunkStartTime;
+                    totalChunkDataGenTime += dataGenTime;
+                    if (chunkTimingIndex < chunkDataGenTimes.Length)
+                        chunkDataGenTimes[chunkTimingIndex] = dataGenTime;
+                }
+                
+                // Time feature placement
+                float featurePlacementStartTime = 0f;
+                if (enableTimingLogs) featurePlacementStartTime = Time.realtimeSinceStartup;
+                
                 terrainGenerator.PlaceFeaturesInChunk(currentArrayCX, currentArrayCY, currentArrayCZ); 
+                
+                if (enableTimingLogs)
+                {
+                    float featurePlacementTime = Time.realtimeSinceStartup - featurePlacementStartTime;
+                    totalFeaturePlacementTime += featurePlacementTime;
+                }
+                
                 chunkDataFinalized[currentArrayCX][currentArrayCY][currentArrayCZ] = true; 
 
                 if (chunks[currentArrayCX][currentArrayCY][currentArrayCZ] == null) 
                 {
+                    float instantiationStartTime = 0f;
+                    if (enableTimingLogs) instantiationStartTime = Time.realtimeSinceStartup;
+                    
                     InstantiateAndConfigureChunk(currentArrayCX, currentArrayCY, currentArrayCZ, proc_dx, proc_dy, proc_dz);
+                    
+                    if (enableTimingLogs)
+                    {
+                        float instantiationTime = Time.realtimeSinceStartup - instantiationStartTime;
+                        totalChunkInstantiationTime += instantiationTime;
+                        if (chunkTimingIndex < chunkInstantiationTimes.Length)
+                            chunkInstantiationTimes[chunkTimingIndex] = instantiationTime;
+                    }
                 }
                 chunksProcessedAndInstantiatedCount++;
                 currentChunkDataBeingPopulated = false; 
+                
+                if (enableTimingLogs)
+                {
+                    chunkTimingIndex++;
+                    chunksTimingLogged++;
+                    
+                    // Log timing stats periodically
+                    if (chunksTimingLogged % timingLogInterval == 0)
+                    {
+                        LogPeriodicTimingStats();
+                    }
+                }
 
                 if (totalWorldChunks > 0) {
                     int currentPercent = (chunksProcessedAndInstantiatedCount * 100) / totalWorldChunks;
@@ -251,9 +375,11 @@ public class McWorld : UdonSharpBehaviour
                 bool foundNext = AdvanceRadialIterator(); // Find next chunk for proc_dx,dy,dz
                 if (foundNext) {
                     currentChunkDataBeingPopulated = true; 
+                    if (enableTimingLogs) currentChunkStartTime = Time.realtimeSinceStartup;
                 } else { 
                     isProcessingWorld = false; 
                     Debug.Log($"[McWorld] All chunks processed and instantiated. Total: {chunksProcessedAndInstantiatedCount}. World steps: {debug_worldStepCallCount}.");
+                    if (enableTimingLogs) LogFinalTimingStats();
                 }
             }
         }
@@ -262,8 +388,19 @@ public class McWorld : UdonSharpBehaviour
             // This case means data was done, and we should have advanced. If we are here, advance.
             Debug.LogWarning($"[McWorld] ProcessNextWorldStep: currentChunkDataBeingPopulated is false for C_rel({proc_dx},{proc_dy},{proc_dz}). Advancing iterator.");
             bool foundNext = AdvanceRadialIterator();
-            if (foundNext) currentChunkDataBeingPopulated = true;
+            if (foundNext) {
+                currentChunkDataBeingPopulated = true;
+                if (enableTimingLogs) currentChunkStartTime = Time.realtimeSinceStartup;
+            }
             else isProcessingWorld = false;
+        }
+        
+        // Record step timing
+        if (enableTimingLogs)
+        {
+            float stepTime = Time.realtimeSinceStartup - lastStepStartTime;
+            totalStepTime += stepTime;
+            stepTimingCount++;
         }
         
         if (isProcessingWorld) ScheduleNextWorldStep();
@@ -408,6 +545,14 @@ public class McWorld : UdonSharpBehaviour
             chunks[array_cx][array_cy][array_cz] = newChunkScript; 
             newChunkScript.chunkSizeXZ = this.chunkSizeXZ; newChunkScript.chunkSizeY = this.chunkSizeY;
             newChunkScript.voxelsPerSlice = this.voxelsPerSliceInChunks;
+            
+            // Determine fast build mode based on settings and world generation state
+            if (useDynamicFastBuildMode) {
+                newChunkScript.useFastBuildMode = isProcessingWorld; // Fast during world gen, normal during runtime
+            } else {
+                newChunkScript.useFastBuildMode = useChunkFastBuildMode; // Use manual setting
+            }
+            
             newChunkScript.chunkX = centered_dx * this.chunkSizeXZ; 
             newChunkScript.chunkY = centered_dy * this.chunkSizeY; 
             newChunkScript.chunkZ = centered_dz * this.chunkSizeXZ;
@@ -444,6 +589,11 @@ public class McWorld : UdonSharpBehaviour
 
     public void ProcessChunkRebuildQueue() 
     {
+        if (enableTimingLogs)
+        {
+            lastRebuildQueueStartTime = Time.realtimeSinceStartup;
+        }
+        
         int processedThisCall = 0;
         for(int k=0; k < chunkRebuildQueueCount && processedThisCall < maxChunksToRebuildPerInterval; )
         {
@@ -476,6 +626,13 @@ public class McWorld : UdonSharpBehaviour
                 chunkRebuildQueueCount--;
 
                 if (chunkToBuild != null && !chunkToBuild.isBuildingMesh) {
+                    // Set build mode for runtime rebuilds
+                    if (useDynamicFastBuildMode) {
+                        chunkToBuild.useFastBuildMode = false; // Always use normal mode for runtime rebuilds
+                    } else {
+                        chunkToBuild.useFastBuildMode = useChunkFastBuildMode;
+                    }
+                    
                     chunkToBuild.StartBuildMesh();
                     processedThisCall++;
 
@@ -490,6 +647,14 @@ public class McWorld : UdonSharpBehaviour
                 k++; 
             }
         }
+        
+        if (enableTimingLogs)
+        {
+            float rebuildTime = Time.realtimeSinceStartup - lastRebuildQueueStartTime;
+            totalRebuildQueueTime += rebuildTime;
+            rebuildQueueProcessCount++;
+        }
+        
         SendCustomEventDelayedSeconds(nameof(ProcessChunkRebuildQueue), chunkRebuildInterval);
     }
 
@@ -586,9 +751,22 @@ public class McWorld : UdonSharpBehaviour
 
     public void SetBlock(int globalX, int globalY, int globalZ, byte blockType)
     {
+        float setBlockStartTime = 0f;
+        if (enableTimingLogs)
+        {
+            setBlockStartTime = Time.realtimeSinceStartup;
+            setBlockCallCount++;
+        }
+        
         int dataIndex = GlobalPosToIndex(globalX, globalY, globalZ);
-        if (dataIndex == -1) { return; }
-        if (data[dataIndex] == blockType) { return; } 
+        if (dataIndex == -1) { 
+            if (enableTimingLogs) RecordSetBlockTime(setBlockStartTime);
+            return; 
+        }
+        if (data[dataIndex] == blockType) { 
+            if (enableTimingLogs) RecordSetBlockTime(setBlockStartTime);
+            return; 
+        } 
         
         data[dataIndex] = blockType;
 
@@ -615,6 +793,22 @@ public class McWorld : UdonSharpBehaviour
         if (Networking.LocalPlayer != null) 
         {
             ProcessPlayerActionRebuildsImmediately();
+        }
+        
+        if (enableTimingLogs) RecordSetBlockTime(setBlockStartTime);
+    }
+    
+    private void RecordSetBlockTime(float startTime)
+    {
+        float setBlockTime = Time.realtimeSinceStartup - startTime;
+        totalSetBlockTime += setBlockTime;
+        lastSetBlockTime = setBlockTime;
+        
+        // Log every 100 block modifications
+        if (setBlockCallCount % 100 == 0)
+        {
+            float avgSetBlockTime = totalSetBlockTime / setBlockCallCount;
+            Debug.Log($"[McWorld Timing] Block Modifications - Count: {setBlockCallCount}, Avg Time: {avgSetBlockTime * 1000f:F2}ms, Last: {lastSetBlockTime * 1000f:F2}ms");
         }
     }
 
@@ -653,6 +847,13 @@ public class McWorld : UdonSharpBehaviour
                 initialQueueCount--; 
 
                 if (chunkToBuild != null && !chunkToBuild.isBuildingMesh) {
+                    // For player actions, we might want faster response
+                    if (useDynamicFastBuildMode) {
+                        chunkToBuild.useFastBuildMode = false; // Use normal sliced mode for smooth gameplay
+                    } else {
+                        chunkToBuild.useFastBuildMode = useChunkFastBuildMode;
+                    }
+                    
                     chunkToBuild.StartBuildMesh();
                     processedThisCall++;
 
@@ -686,5 +887,209 @@ public class McWorld : UdonSharpBehaviour
         //List<int> array_coords = new List<int> { array_cx, array_cy, array_cz };
         if (array_cx < 0 || array_cx >= worldDimensionX || array_cy < 0 || array_cy >= worldDimensionY || array_cz < 0 || array_cz >= worldDimensionZ) return null;
         return chunks[array_cx][array_cy][array_cz];
+    }
+
+    private void LogPeriodicTimingStats()
+    {
+        if (!enableTimingLogs) return;
+        
+        float avgChunkDataGen = chunksProcessedAndInstantiatedCount > 0 ? totalChunkDataGenTime / chunksProcessedAndInstantiatedCount : 0f;
+        float avgChunkInstantiation = chunksProcessedAndInstantiatedCount > 0 ? totalChunkInstantiationTime / chunksProcessedAndInstantiatedCount : 0f;
+        float avgStepTime = stepTimingCount > 0 ? totalStepTime / stepTimingCount : 0f;
+        
+        Debug.Log($"[McWorld Timing] Periodic Stats - Chunks Processed: {chunksProcessedAndInstantiatedCount}" +
+                  $"\n  Avg Chunk Data Gen: {avgChunkDataGen * 1000f:F2}ms" +
+                  $"\n  Avg Chunk Instantiation: {avgChunkInstantiation * 1000f:F2}ms" +
+                  $"\n  Avg Step Time: {avgStepTime * 1000f:F2}ms" +
+                  $"\n  Total Feature Placement: {totalFeaturePlacementTime:F2}s");
+    }
+    
+    private void LogFinalTimingStats()
+    {
+        if (!enableTimingLogs) return;
+        
+        worldProcessingEndTime = Time.realtimeSinceStartup;
+        float totalTime = worldProcessingEndTime - worldProcessingStartTime;
+        
+        float avgChunkDataGen = chunksProcessedAndInstantiatedCount > 0 ? totalChunkDataGenTime / chunksProcessedAndInstantiatedCount : 0f;
+        float avgChunkInstantiation = chunksProcessedAndInstantiatedCount > 0 ? totalChunkInstantiationTime / chunksProcessedAndInstantiatedCount : 0f;
+        float avgStepTime = stepTimingCount > 0 ? totalStepTime / stepTimingCount : 0f;
+        float avgRebuildQueueTime = rebuildQueueProcessCount > 0 ? totalRebuildQueueTime / rebuildQueueProcessCount : 0f;
+        
+        // Calculate min/max for chunk data generation
+        float minDataGen = float.MaxValue;
+        float maxDataGen = 0f;
+        for (int i = 0; i < chunkTimingIndex && i < chunkDataGenTimes.Length; i++)
+        {
+            if (chunkDataGenTimes[i] < minDataGen) minDataGen = chunkDataGenTimes[i];
+            if (chunkDataGenTimes[i] > maxDataGen) maxDataGen = chunkDataGenTimes[i];
+        }
+        if (minDataGen == float.MaxValue) minDataGen = 0f;
+        
+        // Calculate min/max for chunk instantiation
+        float minInstantiation = float.MaxValue;
+        float maxInstantiation = 0f;
+        for (int i = 0; i < chunkTimingIndex && i < chunkInstantiationTimes.Length; i++)
+        {
+            if (chunkInstantiationTimes[i] < minInstantiation) minInstantiation = chunkInstantiationTimes[i];
+            if (chunkInstantiationTimes[i] > maxInstantiation) maxInstantiation = chunkInstantiationTimes[i];
+        }
+        if (minInstantiation == float.MaxValue) minInstantiation = 0f;
+        
+        Debug.Log($"[McWorld Timing] FINAL WORLD GENERATION STATISTICS" +
+                  $"\n========================================" +
+                  $"\nTotal Processing Time: {totalTime:F2} seconds" +
+                  $"\nTotal Chunks Processed: {chunksProcessedAndInstantiatedCount}" +
+                  $"\nTotal World Steps: {debug_worldStepCallCount}" +
+                  $"\n" +
+                  $"\nCHUNK DATA GENERATION:" +
+                  $"\n  Total Time: {totalChunkDataGenTime:F2}s" +
+                  $"\n  Average: {avgChunkDataGen * 1000f:F2}ms" +
+                  $"\n  Min: {minDataGen * 1000f:F2}ms" +
+                  $"\n  Max: {maxDataGen * 1000f:F2}ms" +
+                  $"\n" +
+                  $"\nCHUNK INSTANTIATION:" +
+                  $"\n  Total Time: {totalChunkInstantiationTime:F2}s" +
+                  $"\n  Average: {avgChunkInstantiation * 1000f:F2}ms" +
+                  $"\n  Min: {minInstantiation * 1000f:F2}ms" +
+                  $"\n  Max: {maxInstantiation * 1000f:F2}ms" +
+                  $"\n" +
+                  $"\nFEATURE PLACEMENT:" +
+                  $"\n  Total Time: {totalFeaturePlacementTime:F2}s" +
+                  $"\n  Average per chunk: {(totalFeaturePlacementTime / chunksProcessedAndInstantiatedCount) * 1000f:F2}ms" +
+                  $"\n" +
+                  $"\nPROCESSING STEPS:" +
+                  $"\n  Total Steps: {stepTimingCount}" +
+                  $"\n  Total Time: {totalStepTime:F2}s" +
+                  $"\n  Average Step: {avgStepTime * 1000f:F2}ms" +
+                  $"\n" +
+                  $"\nREBUILD QUEUE:" +
+                  $"\n  Total Calls: {rebuildQueueProcessCount}" +
+                  $"\n  Total Time: {totalRebuildQueueTime:F2}s" +
+                  $"\n  Average per call: {avgRebuildQueueTime * 1000f:F2}ms" +
+                  $"\n" +
+                  $"\nBLOCK MODIFICATIONS:" +
+                  $"\n  Total SetBlock Calls: {setBlockCallCount}" +
+                  $"\n  Total Time: {totalSetBlockTime:F2}s" +
+                  $"\n  Average: {(setBlockCallCount > 0 ? totalSetBlockTime / setBlockCallCount * 1000f : 0f):F2}ms" +
+                  $"\n" +
+                  $"\nPERFORMANCE METRICS:" +
+                  $"\n  Chunks per second: {chunksProcessedAndInstantiatedCount / totalTime:F2}" +
+                  $"\n  Voxels per chunk data slice: {voxelsPerChunkDataProcessingSlice}" +
+                  $"\n  World processing step delay: {worldProcessingStepDelay}s" +
+                  $"\n========================================");
+    }
+
+    public void LogCurrentTimingStats()
+    {
+        if (!enableTimingLogs) {
+            Debug.Log("[McWorld] Timing logs are disabled. Set enableTimingLogs to true to see timing statistics.");
+            return;
+        }
+        
+        float currentTime = Time.realtimeSinceStartup;
+        float elapsedTime = currentTime - worldProcessingStartTime;
+        
+        float avgChunkDataGen = chunksProcessedAndInstantiatedCount > 0 ? totalChunkDataGenTime / chunksProcessedAndInstantiatedCount : 0f;
+        float avgChunkInstantiation = chunksProcessedAndInstantiatedCount > 0 ? totalChunkInstantiationTime / chunksProcessedAndInstantiatedCount : 0f;
+        float avgStepTime = stepTimingCount > 0 ? totalStepTime / stepTimingCount : 0f;
+        float avgRebuildQueueTime = rebuildQueueProcessCount > 0 ? totalRebuildQueueTime / rebuildQueueProcessCount : 0f;
+        float chunksPerSecond = elapsedTime > 0 ? chunksProcessedAndInstantiatedCount / elapsedTime : 0f;
+        float avgSetBlockTime = setBlockCallCount > 0 ? totalSetBlockTime / setBlockCallCount : 0f;
+        
+        string processingStatus = isProcessingWorld ? "ACTIVE" : "COMPLETE";
+        
+        Debug.Log($"[McWorld Timing] CURRENT STATISTICS - Status: {processingStatus}" +
+                  $"\n========================================" +
+                  $"\nElapsed Time: {elapsedTime:F2} seconds" +
+                  $"\nChunks Processed: {chunksProcessedAndInstantiatedCount}/{totalWorldChunks}" +
+                  $"\nWorld Steps: {debug_worldStepCallCount}" +
+                  $"\n" +
+                  $"\nCHUNK PROCESSING:" +
+                  $"\n  Avg Data Gen: {avgChunkDataGen * 1000f:F2}ms" +
+                  $"\n  Avg Instantiation: {avgChunkInstantiation * 1000f:F2}ms" +
+                  $"\n  Avg Feature Placement: {(chunksProcessedAndInstantiatedCount > 0 ? (totalFeaturePlacementTime / chunksProcessedAndInstantiatedCount) * 1000f : 0f):F2}ms" +
+                  $"\n  Chunks per second: {chunksPerSecond:F2}" +
+                  $"\n" +
+                  $"\nSTEP PERFORMANCE:" +
+                  $"\n  Total Steps: {stepTimingCount}" +
+                  $"\n  Avg Step Time: {avgStepTime * 1000f:F2}ms" +
+                  $"\n" +
+                  $"\nREBUILD QUEUE:" +
+                  $"\n  Current Queue Size: {chunkRebuildQueueCount}" +
+                  $"\n  Total Process Calls: {rebuildQueueProcessCount}" +
+                  $"\n  Avg Process Time: {avgRebuildQueueTime * 1000f:F2}ms" +
+                  $"\n" +
+                  $"\nBLOCK MODIFICATIONS:" +
+                  $"\n  Total SetBlock Calls: {setBlockCallCount}" +
+                  $"\n  Avg SetBlock Time: {avgSetBlockTime * 1000f:F2}ms" +
+                  $"\n  Last SetBlock Time: {lastSetBlockTime * 1000f:F2}ms" +
+                  $"\n========================================");
+    }
+    
+    // Test method to rebuild a specific chunk with fast mode
+    public void TestFastChunkBuild(int worldX, int worldY, int worldZ)
+    {
+        int centeredChunkX = Mathf.FloorToInt((float)worldX / chunkSizeXZ);
+        int centeredChunkY = Mathf.FloorToInt((float)worldY / chunkSizeY);
+        int centeredChunkZ = Mathf.FloorToInt((float)worldZ / chunkSizeXZ);
+        
+        int array_cx = centeredChunkX + chunkOffsetX;
+        int array_cy = centeredChunkY + chunkOffsetY;
+        int array_cz = centeredChunkZ + chunkOffsetZ;
+        
+        McChunk chunk = GetChunkScript(array_cx, array_cy, array_cz);
+        if (chunk != null)
+        {
+            bool previousFastMode = chunk.useFastBuildMode;
+            chunk.useFastBuildMode = true;
+            Debug.Log($"[McWorld] Testing fast build for chunk at ({chunk.chunkX},{chunk.chunkY},{chunk.chunkZ})...");
+            chunk.StartBuildMesh();
+            chunk.useFastBuildMode = previousFastMode;
+        }
+        else
+        {
+            Debug.LogWarning($"[McWorld] No chunk found at world position ({worldX},{worldY},{worldZ})");
+        }
+    }
+    
+    public void LogRecommendedSettings()
+    {
+        Debug.Log("[McWorld] RECOMMENDED SETTINGS FOR BETTER PERFORMANCE:" +
+                  "\n========================================" +
+                  "\nOPTION 1: DYNAMIC MODE (RECOMMENDED)" +
+                  "\n  - useDynamicFastBuildMode = true" +
+                  "\n  - voxelsPerSliceInChunks = 2048" +
+                  "\n  This automatically uses fast build during world gen," +
+                  "\n  and switches to sliced mode for runtime updates." +
+                  "\n" +
+                  "\nOPTION 2: MANUAL SETTINGS" +
+                  "\nFOR INITIAL WORLD GENERATION:" +
+                  "\n  - useDynamicFastBuildMode = false" +
+                  "\n  - useChunkFastBuildMode = true" +
+                  "\n  - voxelsPerSliceInChunks = 4096 or higher" +
+                  "\n  - worldProcessingStepDelay = 0" +
+                  "\n  - chunkRebuildInterval = 0.1" +
+                  "\n" +
+                  "\nFOR RUNTIME (PLAYER INTERACTIONS):" +
+                  "\n  - useDynamicFastBuildMode = false" +
+                  "\n  - useChunkFastBuildMode = false" +
+                  "\n  - voxelsPerSliceInChunks = 1024-2048" +
+                  "\n  - chunkRebuildInterval = 0.03" +
+                  "\n  - maxChunksToRebuildPerInterval = 2-3" +
+                  "\n" +
+                  "\nCURRENT SETTINGS:" +
+                  $"\n  - useDynamicFastBuildMode = {useDynamicFastBuildMode}" +
+                  $"\n  - useChunkFastBuildMode = {useChunkFastBuildMode}" +
+                  $"\n  - voxelsPerSliceInChunks = {voxelsPerSliceInChunks}" +
+                  $"\n  - worldProcessingStepDelay = {worldProcessingStepDelay}" +
+                  $"\n  - chunkRebuildInterval = {chunkRebuildInterval}" +
+                  "\n" +
+                  "\nYOUR CURRENT ISSUE:" +
+                  "\n  With 256 voxels/slice, you get 128 slices per chunk." +
+                  "\n  Each slice = 1 frame delay = 3.3 seconds total!" +
+                  "\n  Try: voxelsPerSliceInChunks = 2048 (16x fewer slices)" +
+                  "\n  Or enable fast build mode for instant generation." +
+                  "\n========================================");
     }
 }

@@ -1186,12 +1186,12 @@ MonoBehaviour:
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 185524275}
   world: {fileID: 1596987940}
-  particleManager: {fileID: 1615954562}
+  particleManager: {fileID: 0}
   blockTypeManager: {fileID: 1410233257}
   blockInteractionRange: 5
   terrainLayerMask:
     serializedVersion: 2
-    m_Bits: 0
+    m_Bits: 1
   blockTypeToPlace: 1
   blockOutline: {fileID: 1278873914}
 --- !u!4 &185524277
@@ -3365,7 +3365,6 @@ Transform:
   - {fileID: 1401464475}
   - {fileID: 1577476460}
   - {fileID: 1410233255}
-  - {fileID: 1721311352}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &492312362
@@ -4468,6 +4467,8 @@ MonoBehaviour:
   - {fileID: 1950640946}
   world: {fileID: 1596987940}
   blockTypeManager: {fileID: 1410233257}
+  perlinSeedOffsetX_terrain: 0
+  perlinSeedOffsetZ_terrain: 0
 --- !u!1 &711094559
 GameObject:
   m_ObjectHideFlags: 0
@@ -13557,9 +13558,9 @@ MonoBehaviour:
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 1596987939}
   worldSeedString: DefaultSeed
-  worldDimensionX: 4
+  worldDimensionX: 64
   worldDimensionY: 1
-  worldDimensionZ: 4
+  worldDimensionZ: 64
   chunkSizeXZ: 16
   chunkSizeY: 128
   chunkPrefab: {fileID: 2075272781}
@@ -13571,12 +13572,16 @@ MonoBehaviour:
   globalVoxelOffsetY: 0
   globalVoxelOffsetZ: 0
   terrainGenerator: {fileID: 660800870}
-  voxelsPerChunkDataProcessingSlice: 256
+  voxelsPerChunkDataProcessingSlice: 512
   worldProcessingStepDelay: 0
-  chunkRebuildInterval: 0.05
-  maxChunksToRebuildPerInterval: 4
+  chunkRebuildInterval: 0
+  maxChunksToRebuildPerInterval: 1
   neighboringChunksProcessingMode: 1
-  voxelsPerSliceInChunks: 256
+  voxelsPerSliceInChunks: 1024
+  useChunkFastBuildMode: 0
+  useDynamicFastBuildMode: 1
+  enableTimingLogs: 1
+  timingLogInterval: 10
 --- !u!4 &1596987941
 Transform:
   m_ObjectHideFlags: 0
@@ -14070,37 +14075,6 @@ MonoBehaviour:
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 1702850230}
   blockID: 5
---- !u!1 &1721311351
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 1721311352}
-  m_Layer: 0
-  m_Name: UdonCoroutines
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!4 &1721311352
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1721311351}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 488268621}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1730620459
 GameObject:
   m_ObjectHideFlags: 0
@@ -20882,6 +20856,12 @@ PrefabInstance:
       propertyPath: m_LocalEulerAnglesHint.z
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 7351894590968346449, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
+      propertyPath: serializedProgramAsset
+      value: 
+      objectReference: {fileID: 11400000, guid: 7e2329493b4892845a60db96648f5e7a,
+        type: 2}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: world
@@ -20989,9 +20969,35 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
+      propertyPath: blockTypeManagerRef
+      value: 
+      objectReference: {fileID: 1410233257}
+    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
       propertyPath: transparentMaterial
       value: 
       objectReference: {fileID: 2100000, guid: beafd7eb95a8aad498df2db5b5604e46, type: 2}
+    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
+      propertyPath: _udonChunkSizeVoxelsID
+      value: 1029
+      objectReference: {fileID: 0}
+    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
+      propertyPath: _udonChunkOriginVoxelsID
+      value: 1028
+      objectReference: {fileID: 0}
+    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
+      propertyPath: dummyMeshForGpuRendering
+      value: 
+      objectReference: {fileID: -5495902117074765545, guid: b2a1ef1facc06c24eba749ebecc66f45,
+        type: 3}
+    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
+      propertyPath: gpuMeshGeneratorMaterial
+      value: 
+      objectReference: {fileID: 2100000, guid: 331c8f148d05fbd4ea2ebddf13c3ef48, type: 2}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: serializationData.Prefab
@@ -21868,7 +21874,7 @@ Transform:
   m_GameObject: {fileID: 3480278762663670689}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0.7071068, z: 0, w: 0.7071068}
-  m_LocalPosition: {x: -6, y: 16, z: 0}
+  m_LocalPosition: {x: -6, y: 39, z: 0}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -22686,7 +22692,7 @@ Transform:
   m_GameObject: {fileID: 7606902903243430483}
   serializedVersion: 2
   m_LocalRotation: {x: 0.7071068, y: 0, z: 0, w: 0.7071068}
-  m_LocalPosition: {x: -9, y: 16, z: 0}
+  m_LocalPosition: {x: -9, y: 39, z: 0}
   m_LocalScale: {x: 16, y: 16, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []

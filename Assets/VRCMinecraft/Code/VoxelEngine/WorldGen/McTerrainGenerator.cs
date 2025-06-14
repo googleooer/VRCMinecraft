@@ -1,21 +1,20 @@
-﻿﻿using UdonSharp;
+﻿﻿﻿using UdonSharp;
 using UnityEngine;
-using VRC.SDKBase; 
-using VRRefAssist; 
+using VRC.SDKBase;
+using VRRefAssist;
 
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
-// Uses McTerrainGeneratorEditor.cs for the inspector
 public class McTerrainGenerator : UdonSharpBehaviour
 {
     [Header("Global Terrain Noise Settings")]
     public float baseNoiseScale = 70.0f;
-    public int baseTerrainHeight = 0; 
+    public int baseTerrainHeight = 0;
     public float baseHeightVariationAmplitude = 15f;
-    public float perlinHeightOffset = 0f;
+    public float perlinHeightOffset = 0f; // Offset added to Perlin result before scaling by amplitude
 
     [Header("Terrain Composition")]
-    public int seaLevel = -5;
+    public int seaLevel = -5; // Global Y coordinate for sea level
     public byte grassBlockID = 2;
     public byte stoneBlockID = 1;
     public byte dirtBlockID = 3;
@@ -23,83 +22,77 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     [Header("Structure & Feature Templates")]
     [Tooltip("List of all structure and feature template prefabs (GameObjects with McStructureTemplate script and baked data).")]
-    public McStructureTemplate[] structureTemplates; 
+    public McStructureTemplate[] structureTemplates;
 
-    [SerializeField, FindObjectOfType(true)] 
-    private McWorld world; 
-    
-    [SerializeField, FindObjectOfType(true)] 
-    private McBlockTypeManager blockTypeManager; // Not directly used in V3.1 stamping, but good to have
+    [SerializeField, FindObjectOfType(true)]
+    private McWorld world;
 
-    private float perlinSeedOffsetX_terrain;
-    private float perlinSeedOffsetZ_terrain;
+    [SerializeField, FindObjectOfType(true)]
+    private McBlockTypeManager blockTypeManager; // Good to have, though not directly used by this script's core logic now
+
+    // These are now primarily used by McWorld to set parameters for VoxelDataInitializer.shader
+    [HideInInspector] public float perlinSeedOffsetX_terrain;
+    [HideInInspector] public float perlinSeedOffsetZ_terrain;
+
     private bool isInitialized = false;
-    private int _worldActualSeed; // To store world seed for deterministic Random.InitState
+    private int _worldActualSeed;
 
     // Custom PRNG state for structure placement
     private uint _placementRandState;
 
-    // Custom PRNG: Initialize state
     private void InitPlacementRand(int seed)
     {
-        // Ensure the seed is positive before casting to uint to avoid System.Convert overflow
-        // Using Abs ensures a non-negative value. The bit pattern is what matters for the PRNG start.
         _placementRandState = (uint)Mathf.Abs(seed);
-        // It's also good to ensure _placementRandState is not zero if the LCG behaves poorly with a zero state.
-        // A common LCG issue: if state becomes 0, it might stay 0 if c (the additive constant) is 0.
-        // Our LCG has a non-zero c (1013904223u), so 0 state is fine but can be avoided for robustness.
-        if (_placementRandState == 0) _placementRandState = 1; // Avoid zero state if Abs(seed) was 0
-
-        for (int i = 0; i < 5; i++) GetPlacementRand(); 
+        if (_placementRandState == 0) _placementRandState = 1;
+        for (int i = 0; i < 5; i++) GetPlacementRand(); // Stir the pot
     }
 
-    // Custom PRNG: Get next float [0,1)
     private float GetPlacementRand()
     {
-        _placementRandState = _placementRandState * 1664525u + 1013904223u; // LCG parameters (Numerical Recipes)
-        return (float)(_placementRandState >> 8) / (float)0x00FFFFFF; // Use upper 24 bits for float, avoid issues with direct uint to float conversion maxing out.
+        _placementRandState = _placementRandState * 1664525u + 1013904223u;
+        return (float)(_placementRandState >> 8) / (float)0x00FFFFFF;
     }
-    
-    // Custom PRNG: Get int [0, maxExclusive - 1]
+
     private int GetPlacementRandRange(int maxExclusive)
     {
         if (maxExclusive <= 0) return 0;
-        return (int)(GetPlacementRand() * maxExclusive); // Basic range mapping
+        return (int)(GetPlacementRand() * maxExclusive);
     }
 
     public void InitializeGenerator(int seed)
     {
         if(isInitialized) return;
-        
-        // VRRefAssist should populate world and blockTypeManager.
-        // Adding checks here for robustness.
+
         if (world == null) {
             Debug.LogError("[McTerrainGenerator] McWorld instance NOT FOUND! Cannot initialize."); return;
         }
-        if (blockTypeManager == null) {
-            Debug.LogError("[McTerrainGenerator] McBlockTypeManager instance NOT FOUND! Cannot initialize."); return;
-        }
+        // blockTypeManager check can be here if needed for future features
 
-        _worldActualSeed = seed; // Store the main world seed
+        _worldActualSeed = seed;
+        // Calculate Perlin offsets for McWorld to use with the shader
         perlinSeedOffsetX_terrain = (seed % 1000) * 1.23f + 10000.0f;
         perlinSeedOffsetZ_terrain = ((seed / 1000) % 1000) * 1.45f + 20000.0f;
         isInitialized = true;
+        Debug.Log($"[McTerrainGenerator] Initialized with seed {seed}. Perlin offsets: X={perlinSeedOffsetX_terrain}, Z={perlinSeedOffsetZ_terrain}");
     }
 
-    public int GetBaseTerrainHeight(int worldX_voxel, int worldZ_voxel) 
+    // This CPU version is no longer the primary source for terrain height.
+    // The VoxelDataInitializer.shader handles initial terrain generation.
+    // This can be kept for CPU-side logic or reference if needed.
+    public int GetBaseTerrainHeight(int worldX_voxel, int worldZ_voxel)
     {
-        if (world == null) return baseTerrainHeight; // Fallback if world not initialized
-        if (Mathf.Approximately(baseNoiseScale, 0f)) return baseTerrainHeight; 
+        if (world == null || !isInitialized) return baseTerrainHeight;
+        if (Mathf.Approximately(baseNoiseScale, 0f)) return baseTerrainHeight;
 
         float inputX = ((float)worldX_voxel + perlinSeedOffsetX_terrain) / baseNoiseScale;
         float inputZ = ((float)worldZ_voxel + perlinSeedOffsetZ_terrain) / baseNoiseScale;
-        float perlinValue = Mathf.PerlinNoise(inputX, inputZ); 
+        float perlinValue = Mathf.PerlinNoise(inputX, inputZ); // Unity's Perlin, 0 to 1
         perlinValue = Mathf.Clamp01(perlinValue);
-        
+
         int calculatedHeight = baseTerrainHeight + Mathf.FloorToInt(perlinValue * baseHeightVariationAmplitude + perlinHeightOffset);
-        
+
         int minYVoxel = -world.globalVoxelOffsetY;
-        int maxYVoxel = world.globalVoxelOffsetY - 1;
+        int maxYVoxel = world.globalVoxelOffsetY - 1; // Assuming globalVoxelOffsetY is half of total Y voxels
         return Mathf.Clamp(calculatedHeight, minYVoxel, maxYVoxel);
     }
 
@@ -107,65 +100,56 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         if (!isInitialized || world == null || structureTemplates == null || structureTemplates.Length == 0) return;
 
-        int centeredChunkX = chunkArrayX - world.chunkOffsetX; 
+        int centeredChunkX = chunkArrayX - world.chunkOffsetX;
         int centeredChunkY = chunkArrayY - world.chunkOffsetY;
         int centeredChunkZ = chunkArrayZ - world.chunkOffsetZ;
 
         int chunkOriginGlobalX = centeredChunkX * world.chunkSizeXZ;
-        int chunkOriginGlobalY = centeredChunkY * world.chunkSizeY;
+        int chunkOriginGlobalY = centeredChunkY * world.chunkSizeY; // Base Y of the current chunk layer
         int chunkOriginGlobalZ = centeredChunkZ * world.chunkSizeXZ;
-        
+
         foreach (McStructureTemplate structureTemplate in structureTemplates)
         {
             if (structureTemplate == null) continue;
 
+            // Use a seed unique to this chunk and structure template for consistent placement attempts
             int combinedSeed = _worldActualSeed + chunkArrayX * 7883 + chunkArrayY * 1471 + chunkArrayZ * 3463 + structureTemplate.placementSalt;
-            InitPlacementRand(combinedSeed); // Initialize our custom PRNG
+            InitPlacementRand(combinedSeed);
 
-            if (GetPlacementRand() <= structureTemplate.spawnChance) // Use custom PRNG
+            if (GetPlacementRand() <= structureTemplate.spawnChance)
             {
-                int placementAttempts = 3; 
+                int placementAttempts = 1;
                 for (int attempt = 0; attempt < placementAttempts; attempt++) {
-                    int localX = GetPlacementRandRange(world.chunkSizeXZ); // Use custom PRNG
-                    int localZ = GetPlacementRandRange(world.chunkSizeXZ); // Use custom PRNG
-                    int spawnOriginGlobalX = chunkOriginGlobalX + localX;
-                    int spawnOriginGlobalZ = chunkOriginGlobalZ + localZ;
+                    int localX = GetPlacementRandRange(world.chunkSizeXZ);
+                    int localZ = GetPlacementRandRange(world.chunkSizeXZ);
+                    int spawnCandidateGlobalX = chunkOriginGlobalX + localX;
+                    int spawnCandidateGlobalZ = chunkOriginGlobalZ + localZ;
 
-                    int surfaceY = -world.globalVoxelOffsetY -1; 
-                    // Scan from top of current chunk down to find surface (simplified from original, ensure it works)
-                    for(int yInChunkScan = world.chunkSizeY -1; yInChunkScan >=0; --yInChunkScan) {
-                        int currentScanGlobalY = chunkOriginGlobalY + yInChunkScan;
-                         if(world.GetBlock(spawnOriginGlobalX, currentScanGlobalY, spawnOriginGlobalZ) != 0) { // Found non-air block
-                            surfaceY = currentScanGlobalY;
-                            break;
-                        }
-                    }
+                    // Determine surface Y. This now relies on McWorld.GetBlock which is a placeholder.
+                    // For accurate structure placement, GetBlock would need to work (e.g., AsyncGPUReadback)
+                    // or placement logic needs to be aware of the GPU data.
+                    // A simplified approach: use the CPU GetBaseTerrainHeight as an estimate.
+                    int estimatedSurfaceY = GetBaseTerrainHeight(spawnCandidateGlobalX, spawnCandidateGlobalZ);
 
-                    if (surfaceY < -world.globalVoxelOffsetY) continue; // No ground found in this column for this attempt
+                    // If structure needs to be placed relative to a specific Y layer (e.g. caves)
+                    // this logic would need to change. For surface structures:
+                    int spawnOriginGlobalY = estimatedSurfaceY + 1;
 
-                    // Check requiredSpawnBlockID
-                    if (structureTemplate.requiredSpawnBlockID != -1) {
-                        byte blockAtSurface = world.GetBlock(spawnOriginGlobalX, surfaceY, spawnOriginGlobalZ);
-                        if (blockAtSurface != (byte)structureTemplate.requiredSpawnBlockID) {
-                            continue; // Did not match required block, try next attempt or template
-                        }
-                    }
-
-                    int spawnOriginGlobalY = surfaceY + 1; 
 
                     if (spawnOriginGlobalY < structureTemplate.minYSpawnLevel || spawnOriginGlobalY > structureTemplate.maxYSpawnLevel) continue;
-                    if (structureTemplate.requiresSolidGround) {
-                        bool groundSolidEnough = true;
-                        for (int d = 0; d < structureTemplate.solidGroundDepth; d++) {
-                            if (world.GetBlock(spawnOriginGlobalX, surfaceY - d, spawnOriginGlobalZ) == 0) {
-                                groundSolidEnough = false; break;
-                            }
-                        }
-                        if (!groundSolidEnough) continue;
-                    }
-                    
-                    StampStructure(structureTemplate, spawnOriginGlobalX, spawnOriginGlobalY, spawnOriginGlobalZ);
-                    break; // Structure placed, move to next template
+
+                    // RequiredSpawnBlockID check is difficult without reliable GetBlock.
+                    // For now, we might have to skip this check or use the estimated surface type.
+                    // byte blockAtSurface = world.GetBlock(spawnCandidateGlobalX, estimatedSurfaceY, spawnCandidateGlobalZ);
+                    // if (structureTemplate.requiredSpawnBlockID != -1 && blockAtSurface != (byte)structureTemplate.requiredSpawnBlockID) continue;
+
+
+                    // Solid ground check is also difficult.
+                    // if (structureTemplate.requiresSolidGround) { ... }
+
+                    // If all checks pass (many are currently difficult with GPU data without readback):
+                    StampStructure(structureTemplate, spawnCandidateGlobalX, spawnOriginGlobalY, spawnCandidateGlobalZ);
+                    break; // Structure placed, move to next template if only one per chunk
                 }
             }
         }
@@ -174,28 +158,30 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void StampStructure(McStructureTemplate structureTemplate, int originGlobalX, int originGlobalY, int originGlobalZ)
     {
         if (structureTemplate == null || world == null) return;
-        
+
         Vector3Int[] positions = structureTemplate.bakedVoxelPositions;
         byte[] blockIDs = structureTemplate.bakedVoxelBlockIDs;
 
         if (positions == null || blockIDs == null || positions.Length == 0 || positions.Length != blockIDs.Length) {
-            // It's normal for some structures to have no baked data if not processed yet, or if empty by design.
-            // Only log warning if it was expected to have data.
-            // Debug.LogWarning($"[McTerrainGenerator] Attempted to stamp structure '{structureTemplate.structureName}' but its baked data is missing, empty, or mismatched. Ensure it's baked correctly via its Inspector.", structureTemplate.gameObject);
+            // Debug.LogWarning($"[McTerrainGenerator] Structure '{structureTemplate.structureName}' has no baked data.");
             return;
         }
-
-        // Debug.Log($"[McTerrainGenerator] Stamping '{structureTemplate.structureName}' with {positions.Length} voxels at G({originGlobalX},{originGlobalY},{originGlobalZ})");
+        
+        // Debug.Log($"[McTerrainGenerator] Stamping '{structureTemplate.structureName}' at G({originGlobalX},{originGlobalY},{originGlobalZ})");
 
         for (int i = 0; i < positions.Length; i++)
         {
             Vector3Int relativePos = positions[i];
             byte blockID = blockIDs[i];
 
+            // Apply rotation if any (not implemented here, baked data is pre-rotated or axis-aligned)
+            // Vector3Int rotatedRelativePos = ApplyRotation(relativePos, structureTemplate.rotation);
+
             int placeGlobalX = originGlobalX + relativePos.x;
             int placeGlobalY = originGlobalY + relativePos.y;
             int placeGlobalZ = originGlobalZ + relativePos.z;
-            
+
+            // world.SetBlock will call world.SetBlockGPU
             world.SetBlock(placeGlobalX, placeGlobalY, placeGlobalZ, blockID);
         }
     }
