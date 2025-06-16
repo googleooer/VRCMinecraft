@@ -1119,6 +1119,12 @@ MonoBehaviour:
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 154425360}
   blockID: 5
+--- !u!1 &184660996 stripped
+GameObject:
+  m_CorrespondingSourceObject: {fileID: 3973730579472240992, guid: 928c64da033388b41a7cfada72e97259,
+    type: 3}
+  m_PrefabInstance: {fileID: 2075272780}
+  m_PrefabAsset: {fileID: 0}
 --- !u!1 &185524274
 GameObject:
   m_ObjectHideFlags: 0
@@ -4558,9 +4564,7 @@ MonoBehaviour:
   stoneBlockID: 1
   dirtBlockID: 3
   waterBlockID: 4
-  structureTemplates:
-  - {fileID: 1950640946}
-  - {fileID: 443865784}
+  structureTemplates: []
   world: {fileID: 1596987940}
   blockTypeManager: {fileID: 1410233257}
   enableVerboseLogging: 1
@@ -13430,7 +13434,7 @@ MonoBehaviour:
   - Log
   - Leaves
   - Tall_Grass
-  isSolidData: 0101010101010100
+  isSolidData: 0101010100010100
   blockVisibilityTypeData: 0000000000000000000000000000000002000000000000000400000001000000
   blockShapeTypeData: 0000000000000000000000000000000000000000000000000000000001000000
   uv_allFacesData: 79000000010000000000000002000000cd000000340000003400000027000000
@@ -13989,6 +13993,7 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 1577476460}
+  - component: {fileID: 1577476461}
   m_Layer: 0
   m_Name: Prefabs
   m_TagString: Untagged
@@ -14013,6 +14018,21 @@ Transform:
   - {fileID: 1278873914}
   m_Father: {fileID: 488268621}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1577476461
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1577476459}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 454367647, guid: 661092b4961be7145bfbe56e1e62337b, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  Pool: []
+  StartPositions: []
+  StartRotations: []
 --- !u!1 &1596987938
 GameObject:
   m_ObjectHideFlags: 0
@@ -14081,10 +14101,10 @@ MonoBehaviour:
   _udonSharpBackingUdonBehaviour: {fileID: 1596987939}
   worldSeedString: DefaultSeed
   worldDimensionX: 16
-  worldDimensionY: 2
+  worldDimensionY: 1
   worldDimensionZ: 16
   chunkSizeXZ: 16
-  chunkSizeY: 64
+  chunkSizeY: 128
   chunkPrefab: {fileID: 2075272781}
   data: 
   chunkOffsetX: 0
@@ -14094,12 +14114,13 @@ MonoBehaviour:
   globalVoxelOffsetY: 0
   globalVoxelOffsetZ: 0
   terrainGenerator: {fileID: 660800870}
+  blockTypeManager: {fileID: 1410233257}
   voxelsPerChunkDataProcessingSlice: 1024
-  worldProcessingStepDelay: 0.015
-  chunkRebuildInterval: 0.05
-  maxChunksToRebuildPerInterval: 2
+  worldProcessingStepDelay: 0.05
+  chunkRebuildInterval: 0.075
+  maxChunksToRebuildPerInterval: 1
   neighboringChunksProcessingMode: 1
-  voxelsPerSliceInChunks: 1024
+  voxelsPerSliceInChunks: 2048
   enableVerboseLogging: 1
 --- !u!4 &1596987941
 Transform:
@@ -21300,6 +21321,12 @@ PrefabInstance:
       propertyPath: m_LocalEulerAnglesHint.z
       value: 0
       objectReference: {fileID: 0}
+    - target: {fileID: 7711944557073637222, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
+      propertyPath: serializationData.Prefab
+      value: 
+      objectReference: {fileID: 7711944557073637222, guid: 928c64da033388b41a7cfada72e97259,
+        type: 3}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: world
@@ -21318,13 +21345,8 @@ PrefabInstance:
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: chunkSizeY
-      value: 64
+      value: 128
       objectReference: {fileID: 0}
-    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
-        type: 3}
-      propertyPath: meshFilter
-      value: 
-      objectReference: {fileID: 2075272792}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: chunkSizeXZ
@@ -21335,16 +21357,6 @@ PrefabInstance:
       propertyPath: dirtMaterial
       value: 
       objectReference: {fileID: 2100000, guid: 4fc19b744cfd9d046ab6f9687e634b34, type: 2}
-    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
-        type: 3}
-      propertyPath: meshCollider
-      value: 
-      objectReference: {fileID: 2075272791}
-    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
-        type: 3}
-      propertyPath: meshRenderer
-      value: 
-      objectReference: {fileID: 2075272793}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: subChunkSize
@@ -21399,12 +21411,12 @@ PrefabInstance:
         type: 3}
       propertyPath: meshFilterOpaque
       value: 
-      objectReference: {fileID: 2075272792}
+      objectReference: {fileID: 0}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: sharedMeshFilter
       value: 
-      objectReference: {fileID: 2075272792}
+      objectReference: {fileID: 0}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: grassSideMaterial
@@ -21417,19 +21429,14 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
-      propertyPath: meshBuildCoroutine
+      propertyPath: meshRendererOpaque
       value: 
       objectReference: {fileID: 0}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
-      propertyPath: meshRendererOpaque
-      value: 
-      objectReference: {fileID: 2075272793}
-    - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
-        type: 3}
       propertyPath: sharedMeshRenderer
       value: 
-      objectReference: {fileID: 2075272793}
+      objectReference: {fileID: 0}
     - target: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
       propertyPath: transparentMaterial
@@ -21446,7 +21453,8 @@ PrefabInstance:
       value: 
       objectReference: {fileID: 8556602118690499040, guid: 928c64da033388b41a7cfada72e97259,
         type: 3}
-    m_RemovedComponents: []
+    m_RemovedComponents:
+    - {fileID: 472526439175799951, guid: 928c64da033388b41a7cfada72e97259, type: 3}
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
     m_AddedComponents: []
@@ -21460,24 +21468,6 @@ GameObject:
 --- !u!4 &2075272788 stripped
 Transform:
   m_CorrespondingSourceObject: {fileID: 2532590517209761895, guid: 928c64da033388b41a7cfada72e97259,
-    type: 3}
-  m_PrefabInstance: {fileID: 2075272780}
-  m_PrefabAsset: {fileID: 0}
---- !u!64 &2075272791 stripped
-MeshCollider:
-  m_CorrespondingSourceObject: {fileID: 4764116004796110643, guid: 928c64da033388b41a7cfada72e97259,
-    type: 3}
-  m_PrefabInstance: {fileID: 2075272780}
-  m_PrefabAsset: {fileID: 0}
---- !u!33 &2075272792 stripped
-MeshFilter:
-  m_CorrespondingSourceObject: {fileID: 8442739359175774405, guid: 928c64da033388b41a7cfada72e97259,
-    type: 3}
-  m_PrefabInstance: {fileID: 2075272780}
-  m_PrefabAsset: {fileID: 0}
---- !u!23 &2075272793 stripped
-MeshRenderer:
-  m_CorrespondingSourceObject: {fileID: 472526439175799951, guid: 928c64da033388b41a7cfada72e97259,
     type: 3}
   m_PrefabInstance: {fileID: 2075272780}
   m_PrefabAsset: {fileID: 0}
@@ -22908,6 +22898,14 @@ MonoBehaviour:
     - VRC.Udon.UdonBehaviour
   - gameObject: {fileID: 1500735654}
     ID: 84
+    SerializedTypeNames:
+    - VRC.Udon.UdonBehaviour
+  - gameObject: {fileID: 1577476459}
+    ID: 85
+    SerializedTypeNames:
+    - VRC.SDK3.Components.VRCObjectPool
+  - gameObject: {fileID: 184660996}
+    ID: 86
     SerializedTypeNames:
     - VRC.Udon.UdonBehaviour
   portraitCameraPositionOffset: {x: 0, y: 0, z: 0}

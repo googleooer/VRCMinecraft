@@ -21,9 +21,11 @@ public class ModifyTerrain : UdonSharpBehaviour
 
     [Header("Visuals")]
     [SerializeField] private Transform blockOutline;
-    
+
     [Header("Logging")]
+    #if UNITY_EDITOR
     public bool enableVerboseLogging = true; // Toggle for logging
+    #endif
 
     private VRCPlayerApi localPlayer;
     private bool isInitialized = false;
@@ -201,7 +203,7 @@ public class ModifyTerrain : UdonSharpBehaviour
                     int breakGlobalZ = Mathf.FloorToInt(pointToConvert.z);
 
                     effectPosition = new Vector3(breakGlobalX + 0.5f, breakGlobalY + 0.5f, breakGlobalZ + 0.5f);
-                    idOfAffectedBlock = world.GetBlock(breakGlobalX, breakGlobalY, breakGlobalZ);
+                    idOfAffectedBlock = (byte)(world.GetBlock(breakGlobalX, breakGlobalY, breakGlobalZ) & 0xFF);
 
                     if (idOfAffectedBlock != 0)
                     {
@@ -210,6 +212,7 @@ public class ModifyTerrain : UdonSharpBehaviour
                         {
                             particleManager.PlayBreakEffect(effectPosition, blockTypeManager != null ? idOfAffectedBlock : (byte)0);
                         }
+#if UNITY_EDITOR
                         if (enableVerboseLogging)
                         {
                             logBuilder.Clear();
@@ -217,7 +220,10 @@ public class ModifyTerrain : UdonSharpBehaviour
                                 idOfAffectedBlock, breakGlobalX, breakGlobalY, breakGlobalZ);
                             Debug.Log(logBuilder.ToString());
                         }
-                    } else {
+#endif
+                    }
+                    else
+                    {
                         actionType = "Break (Air)"; // No action if breaking air
                     }
                 }
