@@ -132,7 +132,7 @@ public class McParticleManager : UdonSharpBehaviour
                     int globalX = Mathf.FloorToInt(blockPosUnderPlayer.x);
                     int globalY = Mathf.FloorToInt(blockPosUnderPlayer.y);
                     int globalZ = Mathf.FloorToInt(blockPosUnderPlayer.z);
-                    byte blockID = world.GetBlock(globalX, globalY, globalZ); 
+                    byte blockID = (byte)(world.GetBlock(globalX, globalY, globalZ) & 0xFF); 
                     AudioClip footstepSound = blockTypeManager.GetFootstepSound(blockID);
                     if (footstepSound != null) _audioSource.PlayOneShot(footstepSound);
                 }

@@ -76,9 +76,11 @@ public class McBlockTypeManager : UdonSharpBehaviour
     [Header("Particles")]
     public ParticleSystem[] breakParticlesPrefabData;
     public ParticleSystem[] placeParticlesPrefabData;
-    
+
     [Header("Logging")]
-    public bool enableVerboseLogging = true; 
+    #if UNITY_EDITOR
+    public bool enableVerboseLogging = true;
+    #endif
     private StringBuilder logBuilder;
 
     // Pre-filtered audio clips (jagged array)

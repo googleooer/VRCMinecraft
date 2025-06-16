@@ -52,9 +52,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private bool _worldParametersCached = false;
 
 
-    
+
     // Logging
+    #if UNITY_EDITOR
     [HideInInspector] public bool enableVerboseLogging = true; // Can be set by McWorld or manually
+    #endif
     private StringBuilder logBuilder;
 
 
@@ -203,7 +205,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
                     if (structureTemplate.requiredSpawnBlockID != -1)
                     {
-                        byte blockAtSurface = world.GetBlock(spawnOriginGlobalX, surfaceY, spawnOriginGlobalZ);
+                        byte blockAtSurface = (byte)(world.GetBlock(spawnOriginGlobalX, surfaceY, spawnOriginGlobalZ) & 0xFF);
                         if (blockAtSurface != (byte)structureTemplate.requiredSpawnBlockID) continue;
                     }
 
