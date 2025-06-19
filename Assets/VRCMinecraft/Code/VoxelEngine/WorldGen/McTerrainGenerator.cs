@@ -276,7 +276,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
             int placeGlobalX = originGlobalX + relativePos.x;
             int placeGlobalY = originGlobalY + relativePos.y;
             int placeGlobalZ = originGlobalZ + relativePos.z;
-            world.SetBlock(placeGlobalX, placeGlobalY, placeGlobalZ, blockID, false); // SetBlock in McWorld now has its own logging
+            world.SetBlock(placeGlobalX, placeGlobalY, placeGlobalZ, blockID); // SetBlock in McWorld now has its own logging
         }
         // world.FinalizeBatchedBlockUpdates(); // This method was removed from McWorld
     }
