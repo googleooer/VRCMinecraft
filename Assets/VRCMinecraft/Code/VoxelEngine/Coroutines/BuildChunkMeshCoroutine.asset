@@ -10,18 +10,18 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: c333ccfdd0cbdbc4ca30cef2dd6e6b9b, type: 3}
-  m_Name: BuildMeshForChunkCoroutine
+  m_Name: BuildChunkMeshCoroutine
   m_EditorClassIdentifier: 
-  serializedUdonProgramAsset: {fileID: 11400000, guid: 4e4ebfa87787d0a468775a0aef7f094a,
+  serializedUdonProgramAsset: {fileID: 11400000, guid: 49b961d54c600994192518fae5c5daaa,
     type: 2}
   udonAssembly: 
   assemblyError: 
-  sourceCsScript: {fileID: 11500000, guid: 1b4461885661b4440ae243b646326765, type: 3}
+  sourceCsScript: {fileID: 11500000, guid: 981e4c6cbd0a0bf4e8a21df67587698e, type: 3}
   scriptVersion: 2
   compiledVersion: 2
   behaviourSyncMode: 1
   hasInteractEvent: 0
-  scriptID: 2650572937771412973
+  scriptID: 6822880870558865972
   serializationData:
     SerializedFormat: 2
     SerializedBytes: 

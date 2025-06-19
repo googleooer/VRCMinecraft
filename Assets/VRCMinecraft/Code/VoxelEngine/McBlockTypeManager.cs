@@ -20,14 +20,26 @@ public enum McBlockTextureMappingType
 /// </summary>
 public enum BlockVisibilityType
 {
-    Opaque,                             
-    Transparent_NoCull,                 
-    Transparent_CullSelf,               
-    Transparent_CullSelfAndOpaque,      
-    Cutout_CullOpaqueOnly,              
-    Cutout_CullSelf,                    
-    Cutout_CullSelfAndOtherCutout,      
-    Invisible                           
+    Opaque,
+    Transparent,
+    Transparent_NoCull, // DEPRECATED, replace with BlockCullingType
+    Transparent_CullSelf, // DEPRECATED, replace with BlockCullingType
+    Transparent_CullSelfAndOpaque, // DEPRECATED, replace with BlockCullingType
+    Cutout,
+    Cutout_CullOpaqueOnly, // DEPRECATED, replace with BlockCullingType
+    Cutout_CullSelf, // DEPRECATED, replace with BlockCullingType
+    Cutout_CullSelfAndOtherCutout, // DEPRECATED, replace with BlockCullingType
+    Invisible
+}
+
+public enum BlockCullingType
+{
+    NoCull,
+    CullSelf,
+    CullSelfAndOpaque,
+    CullSelfAndCutout,
+    CullSelfAndTransparent,
+    CullAll
 }
 
 /// <summary>
@@ -35,8 +47,8 @@ public enum BlockVisibilityType
 /// </summary>
 public enum McBlockShapeType
 {
-    Cube,   
-    Cross   
+    Cube,
+    Cross
 }
 
 // REMOVED: AudioClipArrayWrapper class

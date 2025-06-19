@@ -2,7 +2,7 @@
 using UnityEngine;
 using VRC.SDKBase;
 using VRRefAssist;
-using System.Text; // For StringBuilder
+using System.Text;
 
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
@@ -22,14 +22,19 @@ public class McWorld : UdonSharpBehaviour
     private McChunk[] chunks_1D;
     private bool[] chunkDataFinalized_1D;
 
-    [Header("Voxel Data")]
-    // OPTIMIZATION: World data is now ushort[] to store pre-packed block properties.
-    public ushort[] data;
+    [Header("Voxel Data Storage (RLE)")]
+    // World voxel data is now stored per-chunk in a generic object array.
+    // Each object can be either:
+    // 1. A ushort[] for uncompressed, detailed chunks.
+    // 2. A ushort[chunkSizeY] for chunks compressed into horizontal layers (RLE).
+    private object[] chunkDataArray;
+    // A parallel array of flags for fast checking of a chunk's compression state,
+    // avoiding slower type checks with 'is' or 'GetType()'.
+    private bool[] isChunkCompressedAsLayers;
 
     private int worldSizeX_voxels;
     private int worldSizeY_voxels;
     private int worldSizeZ_voxels;
-    private int layerSize_voxels_for_1D_data;
     private int totalWorldVoxels;
     private int totalWorldChunks;
 
@@ -41,42 +46,29 @@ public class McWorld : UdonSharpBehaviour
     [HideInInspector] public int globalVoxelOffsetY;
     [HideInInspector] public int globalVoxelOffsetZ;
 
-    private int currentColumnTerrainSurfaceY; // Used in PopulateDataSliceForCurrentTargetChunk
-
     [Header("Generators")]
     [Tooltip("Reference to the McTerrainGenerator for base terrain and structure placement.")]
     [SerializeField, FindObjectOfType(true)]
     private McTerrainGenerator terrainGenerator;
     [Tooltip("Reference to the McBlockTypeManager for getting block properties.")]
     [SerializeField, FindObjectOfType(true)]
-    private McBlockTypeManager blockTypeManager;
-
-
+    public McBlockTypeManager blockTypeManager;
+    
     [Header("Performance Parameters (McWorld)")]
-    [Tooltip("Number of voxels to process for the *current chunk's data* per step. Min 1.")]
-    public int voxelsPerChunkDataProcessingSlice = 128;
-    [Tooltip("Delay (seconds) between processing steps for world generation (data slices or moving to next chunk). 0 for frame-by-frame.")]
+    [Tooltip("Delay (seconds) between processing steps for world generation. 0 for frame-by-frame.")]
     public float worldProcessingStepDelay = 0f;
     [Tooltip("How often (seconds) McWorld checks its queue to start rebuilding chunk meshes.")]
-    public float chunkRebuildInterval = 0.03f; // Approx 33 FPS check
-    [Tooltip("Max number of chunks McWorld will start rebuilding in a single interval (if neighbors' data is ready).")]
+    public float chunkRebuildInterval = 0.03f;
+    [Tooltip("Max number of chunks McWorld will start rebuilding in a single interval.")]
     public int maxChunksToRebuildPerInterval = 1;
     [Tooltip("Neighboring chunks processing mode for async rebuilds. 0 = Off, 1 = Normal (wait for neighbors), 2 = Regenerate (build this, queue neighbors).")]
     public int neighboringChunksProcessingMode = 1;
-
-
-    [Header("Performance Parameters (Passed to Chunks)")]
-    [Tooltip("Number of voxels each McChunk processes per slice during its *asynchronous full* mesh build.")]
-    public int voxelsPerSliceInChunks = 256;
-
+    
     [Header("Debug")]
     #if UNITY_EDITOR
     public bool enableVerboseLogging = true;
     #endif
     private StringBuilder logBuilder_McWorld;
-    private float currentChunkDataGen_StartTime_Total;
-    private float currentChunkDataGen_StartTime_Slice;
-    private int currentChunkDataGen_SliceCount;
 
     // Chunk Rebuild Queue (Circular Buffer)
     private McChunk[] chunkRebuildQueue;
@@ -85,27 +77,12 @@ public class McWorld : UdonSharpBehaviour
     private int chunkRebuildQueue_count = 0;
     private const int MAX_REBUILD_QUEUE_SIZE = 256;
 
-    // World Processing State (Radial Iteration for Chunks)
-    private int proc_radius = 0;
-    private int proc_dx = 0, proc_dy = 0, proc_dz = 0;
-    private bool inst_shellIterationInitialized = false;
-
-    // Per-Chunk Data Generation State
-    private int dataGen_vox_x_in_chunk = 0;
-    private int dataGen_vox_y_in_chunk = 0;
-    private int dataGen_vox_z_in_chunk = 0;
-    private bool currentChunkDataBeingPopulated = false;
-
+    // World Processing State
     private bool isProcessingWorld = false;
     private int proc_lastLoggedPercent = -1;
-    private int debug_worldStepCallCount = 0;
-    private int chunksProcessedAndInstantiatedCount = 0;
-
-    // Radial Iterator state for chunk instantiation
-    private int inst_radius_iterator = 0;
-    private int inst_dx_iterator = 0;
-    private int inst_dy_iterator = 0;
-    private int inst_dz_iterator = 0;
+    private int chunksProcessedCount = 0;
+    private int radialIterator_chunkIndex = 0;
+    private int[] radialChunkOrder;
 
     // Cached values from TerrainGenerator & BlockTypeManager
     private ushort cachedPackedGrassData;
@@ -114,57 +91,35 @@ public class McWorld : UdonSharpBehaviour
     private ushort cachedPackedWaterData;
     private int cachedSeaLevel;
     
-    // Caching for PackBlockData to avoid repeated lookups
-    private byte _lastPackedBlockId = 255; // Use an invalid ID to ensure the first call is always a full pack
+    private byte _lastPackedBlockId = 255; 
     private ushort _lastPackedUshort;
 
-
-    // Neighbor offsets for performance.
-    private readonly int[] neighbor_dx_offsets = new int[] { 1, -1, 0,  0, 0,  0 };
-    private readonly int[] neighbor_dy_offsets = new int[] { 0,  0, 1, -1, 0,  0 };
-    private readonly int[] neighbor_dz_offsets = new int[] { 0,  0, 0,  0, 1, -1 };
+    private readonly int[] neighbor_dx_offsets = { 1, -1, 0,  0, 0,  0 };
+    private readonly int[] neighbor_dy_offsets = { 0,  0, 1, -1, 0,  0 };
+    private readonly int[] neighbor_dz_offsets = { 0,  0, 0,  0, 1, -1 };
 
 
     void Start()
     {
-        // Critical dependency checks
-        if (chunkPrefab == null) { Debug.LogError("[McWorld] Chunk Prefab is not assigned! Aborting."); this.enabled = false; return; }
-        if (chunkPrefab.GetComponent<McChunk>() == null) { Debug.LogError($"[McWorld] Chunk Prefab '{chunkPrefab.name}' missing McChunk script! Aborting."); this.enabled = false; return; }
-        if (terrainGenerator == null) { Debug.LogError("[McWorld] McTerrainGenerator is not assigned! Aborting."); this.enabled = false; return; }
-        if (blockTypeManager == null) { Debug.LogError("[McWorld] McBlockTypeManager is not assigned! Aborting."); this.enabled = false; return; }
-
-
-        // Parameter validation
-        if (voxelsPerChunkDataProcessingSlice < 1) voxelsPerChunkDataProcessingSlice = 1;
-        if (worldProcessingStepDelay < 0f) worldProcessingStepDelay = 0f;
+        if (chunkPrefab == null || terrainGenerator == null || blockTypeManager == null) {
+            Debug.LogError("[McWorld] A critical component (Chunk Prefab, Terrain Generator, or Block Type Manager) is not assigned! Aborting.");
+            this.enabled = false;
+            return;
+        }
 
         logBuilder_McWorld = new StringBuilder(512);
 
         InitializeWorldParameters();
-        InitializeChunkStorageAndFlags();
-        InitializeAndAllocateVoxelData();
+        InitializeChunkStorage();
+        InitializeVoxelDataStorage();
+        
+        terrainGenerator.InitializeGenerator(worldSeedString.GetHashCode());
 
-        int actualWorldSeed = worldSeedString.GetHashCode();
-        terrainGenerator.InitializeGenerator(actualWorldSeed);
-
-        // Pre-pack and cache common block types from the terrain generator
-        cachedPackedGrassData = PackBlockData(terrainGenerator.grassBlockID);
-        cachedPackedStoneData = PackBlockData(terrainGenerator.stoneBlockID);
-        cachedPackedDirtData = PackBlockData(terrainGenerator.dirtBlockID);
-        cachedPackedWaterData = PackBlockData(terrainGenerator.waterBlockID);
-        cachedSeaLevel = terrainGenerator.seaLevel;
-
-        // Initialize rebuild queue
+        CacheCommonBlockData();
+        
         chunkRebuildQueue = new McChunk[MAX_REBUILD_QUEUE_SIZE];
-        chunkRebuildQueue_head = 0;
-        chunkRebuildQueue_tail = 0;
-        chunkRebuildQueue_count = 0;
-
-#if UNITY_EDITOR
-        if (enableVerboseLogging) Debug.Log("[McWorld.Start] Initializing Interleaved Radial World Processing.");
-#endif
+        
         StartWorldProcessing();
-
         SendCustomEventDelayedSeconds(nameof(ProcessChunkRebuildQueue), chunkRebuildInterval);
     }
 
@@ -188,108 +143,53 @@ public class McWorld : UdonSharpBehaviour
         globalVoxelOffsetY = worldSizeY_voxels / 2;
         globalVoxelOffsetZ = worldSizeZ_voxels / 2;
 
-        layerSize_voxels_for_1D_data = worldSizeX_voxels * worldSizeZ_voxels;
-        totalWorldVoxels = layerSize_voxels_for_1D_data * worldSizeY_voxels;
+        totalWorldVoxels = worldSizeX_voxels * worldSizeY_voxels * worldSizeZ_voxels;
         totalWorldChunks = worldDimensionX * worldDimensionY * worldDimensionZ;
     }
 
-    void InitializeChunkStorageAndFlags()
+    void InitializeChunkStorage()
     {
         if (totalWorldChunks <= 0) {
-            Debug.LogError("[McWorld] totalWorldChunks is zero or negative. Cannot initialize chunk storage.");
+            Debug.LogError("[McWorld] totalWorldChunks is zero. Cannot initialize chunk storage.");
             this.enabled = false;
             return;
         }
         chunks_1D = new McChunk[totalWorldChunks];
         chunkDataFinalized_1D = new bool[totalWorldChunks];
     }
+
+    void InitializeVoxelDataStorage()
+    {
+        if (totalWorldChunks <= 0) {
+            this.enabled = false;
+            return;
+        }
+        // Initialize the new data storage arrays.
+        chunkDataArray = new object[totalWorldChunks];
+        isChunkCompressedAsLayers = new bool[totalWorldChunks];
+    }
+
+    void CacheCommonBlockData()
+    {
+        cachedPackedGrassData = PackBlockData(terrainGenerator.grassBlockID);
+        cachedPackedStoneData = PackBlockData(terrainGenerator.stoneBlockID);
+        cachedPackedDirtData = PackBlockData(terrainGenerator.dirtBlockID);
+        cachedPackedWaterData = PackBlockData(terrainGenerator.waterBlockID);
+        cachedSeaLevel = terrainGenerator.seaLevel;
+    }
     
-    // OPTIMIZATION: Packs block properties into a single ushort for efficient storage and access.
-    private ushort PackBlockData(byte blockID)
-    {
-        // Caching optimization: if the requested ID is the same as the last one, return the cached packed value.
-        // This is highly effective during terrain generation where long runs of the same block type are common.
-        if (blockID == _lastPackedBlockId)
-        {
-            return _lastPackedUshort;
-        }
-
-        if (blockID == 0) // Air block
-        {
-            _lastPackedBlockId = 0;
-            _lastPackedUshort = 0;
-            return 0;
-        }
-
-        ushort packedData = blockID; // Lower 8 bits are the block ID
-
-        // Pack IsSolid (bit 8)
-        if (blockTypeManager.GetBlockIsSolid(blockID))
-        {
-            packedData |= (1 << 8);
-        }
-
-        // Pack VisibilityType (bits 9-11)
-        BlockVisibilityType visibility = blockTypeManager.GetBlockVisibilityType(blockID);
-        packedData |= (ushort)((int)visibility << 9);
-
-        // Pack ShapeType (bit 12)
-        McBlockShapeType shape = blockTypeManager.GetBlockShapeType(blockID);
-        packedData |= (ushort)((int)shape << 12);
-        
-        // Cache the newly packed data
-        _lastPackedBlockId = blockID;
-        _lastPackedUshort = packedData;
-        
-        return packedData;
-    }
-
-
-    private int ChunkArrayCoordsTo1D(int arrayX, int arrayY, int arrayZ)
-    {
-        if (arrayX < 0 || arrayX >= worldDimensionX ||
-            arrayY < 0 || arrayY >= worldDimensionY ||
-            arrayZ < 0 || arrayZ >= worldDimensionZ)
-        {
-            return -1;
-        }
-        return (arrayZ * worldDimensionX * worldDimensionY) + (arrayY * worldDimensionX) + arrayX;
-    }
-
-    void InitializeAndAllocateVoxelData()
-    {
-        if (totalWorldVoxels <= 0) {
-            Debug.LogError("[McWorld] Total world voxels is zero or negative. Cannot allocate data array.");
-            this.enabled = false; return;
-        }
-        // OPTIMIZATION: Allocate ushort array.
-        data = new ushort[totalWorldVoxels];
-    }
-
     public void StartWorldProcessing()
     {
-        if (isProcessingWorld) { Debug.LogWarning("[McWorld] StartWorldProcessing called while already processing."); return; }
-        if (totalWorldChunks == 0) { Debug.LogWarning("[McWorld] World has zero total chunks. Skipping world processing."); isProcessingWorld = false; return; }
-
-#if UNITY_EDITOR
-        if (enableVerboseLogging) Debug.Log($"[McWorld] Initializing Interleaved Radial World Processing. Target chunk (Rel 0,0,0). Voxels per data slice: {voxelsPerChunkDataProcessingSlice}. Step delay: {worldProcessingStepDelay}s.");
-#endif
+        if (isProcessingWorld) return;
+        if (totalWorldChunks == 0) return;
 
         isProcessingWorld = true;
-        proc_radius = 0; proc_dx = 0; proc_dy = 0; proc_dz = 0;
-
-        inst_radius_iterator = 0; inst_dx_iterator = 0; inst_dy_iterator = 0; inst_dz_iterator = 0;
-        inst_shellIterationInitialized = true;
-
-        dataGen_vox_x_in_chunk = 0; dataGen_vox_y_in_chunk = 0; dataGen_vox_z_in_chunk = 0;
-        currentChunkDataBeingPopulated = true;
-        currentChunkDataGen_StartTime_Total = Time.realtimeSinceStartup;
-        currentChunkDataGen_StartTime_Slice = Time.realtimeSinceStartup;
-        currentChunkDataGen_SliceCount = 0;
-
         proc_lastLoggedPercent = -1;
-        debug_worldStepCallCount = 0;
-        chunksProcessedAndInstantiatedCount = 0;
+        chunksProcessedCount = 0;
+        
+        // Pre-calculate the processing order to be a radial expansion from the center.
+        GenerateRadialChunkOrder();
+        radialIterator_chunkIndex = 0;
 
         ProcessNextWorldStep();
     }
@@ -297,329 +197,202 @@ public class McWorld : UdonSharpBehaviour
     public void ProcessNextWorldStep()
     {
         if (!isProcessingWorld) return;
-        debug_worldStepCallCount++;
 
-        int currentArrayCX = proc_dx + chunkOffsetX;
-        int currentArrayCY = proc_dy + chunkOffsetY;
-        int currentArrayCZ = proc_dz + chunkOffsetZ;
+        // Get the next chunk to process from the pre-calculated radial order.
+        int chunk1DIndex = radialChunkOrder[radialIterator_chunkIndex];
+        
+        int array_cx, array_cy, array_cz;
+        Chunk1DToArrrayCoords(chunk1DIndex, out array_cx, out array_cy, out array_cz);
 
-        if (currentArrayCX < 0 || currentArrayCX >= worldDimensionX ||
-            currentArrayCY < 0 || currentArrayCY >= worldDimensionY ||
-            currentArrayCZ < 0 || currentArrayCZ >= worldDimensionZ)
-        {
-#if UNITY_EDITOR
-            if (enableVerboseLogging) Debug.LogWarning($"[McWorld] ProcessNextWorldStep: Current target chunk Arr({currentArrayCX},{currentArrayCY},{currentArrayCZ}) is out of bounds. Rel({proc_dx},{proc_dy},{proc_dz}). Advancing iterator.");
-#endif
+        // --- 1. Generate Voxel Data for this Chunk ---
+        GenerateDataForChunk(array_cx, array_cy, array_cz);
 
-            bool foundNext = AdvanceRadialIterator();
-            if (foundNext && isProcessingWorld) {
-                currentChunkDataBeingPopulated = true;
-                currentChunkDataGen_StartTime_Total = Time.realtimeSinceStartup;
-                currentChunkDataGen_StartTime_Slice = Time.realtimeSinceStartup;
-                currentChunkDataGen_SliceCount = 0;
-                dataGen_vox_x_in_chunk = 0; dataGen_vox_y_in_chunk = 0; dataGen_vox_z_in_chunk = 0;
-                ScheduleNextWorldStep();
+        // --- 2. Place Features (trees, etc.) ---
+        terrainGenerator.PlaceFeaturesInChunk(array_cx, array_cy, array_cz);
+
+        // --- 3. Finalize and Instantiate ---
+        chunkDataFinalized_1D[chunk1DIndex] = true;
+        InstantiateAndConfigureChunk(array_cx, array_cy, array_cz);
+        chunksProcessedCount++;
+        
+        // --- Progress Reporting ---
+        if (totalWorldChunks > 0) {
+            int currentPercent = (chunksProcessedCount * 100) / totalWorldChunks;
+            if (currentPercent / 10 > proc_lastLoggedPercent / 10) {
+                #if UNITY_EDITOR
+                if (enableVerboseLogging) Debug.Log($"[McWorld] World Processing: ~{currentPercent}% complete ({chunksProcessedCount}/{totalWorldChunks} chunks processed).");
+                #endif
+                proc_lastLoggedPercent = currentPercent;
             }
-            else if (isProcessingWorld) {
-#if UNITY_EDITOR
-                if (enableVerboseLogging) Debug.Log($"[McWorld] World Processing seems complete (radial iterator exhausted). Processed {chunksProcessedAndInstantiatedCount}/{totalWorldChunks} chunks. Total steps: {debug_worldStepCallCount}.");
-#endif
-                isProcessingWorld = false;
-            }
-            return;
         }
-
-        if (currentChunkDataBeingPopulated)
+        
+        // --- Advance Iterator and Schedule Next Step ---
+        radialIterator_chunkIndex++;
+        if (radialIterator_chunkIndex >= totalWorldChunks)
         {
-            bool dataForThisChunkCompleted = PopulateDataSliceForCurrentTargetChunk();
-            if (dataForThisChunkCompleted)
-            {
-#if UNITY_EDITOR
-                if (enableVerboseLogging)
-                {
-                    float totalDataGenTime = (Time.realtimeSinceStartup - currentChunkDataGen_StartTime_Total) * 1000f;
-                    logBuilder_McWorld.Clear();
-                    logBuilder_McWorld.AppendFormat("[McWorld.DataGen] Finished data for chunk Arr({0},{1},{2}), Rel({3},{4},{5}). Slices: {6}. Total Time: {7:F2} ms.",
-                                                   currentArrayCX, currentArrayCY, currentArrayCZ, proc_dx, proc_dy, proc_dz, currentChunkDataGen_SliceCount + 1, totalDataGenTime);
-                    Debug.Log(logBuilder_McWorld.ToString());
-                }
-#endif
-                
-                // Note: Structure placement could also be optimized to work with packed data.
-                terrainGenerator.PlaceFeaturesInChunk(currentArrayCX, currentArrayCY, currentArrayCZ);
-
-                int chunk1DIndex_current = ChunkArrayCoordsTo1D(currentArrayCX, currentArrayCY, currentArrayCZ);
-                if (chunk1DIndex_current != -1) {
-                    chunkDataFinalized_1D[chunk1DIndex_current] = true;
-
-                    if (chunks_1D[chunk1DIndex_current] == null)
-                    {
-                        InstantiateAndConfigureChunk(currentArrayCX, currentArrayCY, currentArrayCZ, proc_dx, proc_dy, proc_dz);
-                    } else {
-                        RequestChunkMeshUpdate(chunks_1D[chunk1DIndex_current]);
-                    }
-                } else {
-                    Debug.LogError($"[McWorld] ProcessNextWorldStep: Invalid chunk 1D index for Arr({currentArrayCX},{currentArrayCY},{currentArrayCZ}) after data gen.");
-                }
-
-                chunksProcessedAndInstantiatedCount++;
-                currentChunkDataBeingPopulated = false;
-
-                if (totalWorldChunks > 0) {
-                    int currentPercent = (chunksProcessedAndInstantiatedCount * 100) / totalWorldChunks;
-                    if (currentPercent / 10 > proc_lastLoggedPercent / 10 && currentPercent <= 100) {
-#if UNITY_EDITOR
-                        if (enableVerboseLogging) Debug.Log($"[McWorld] World Processing: ~{currentPercent}% complete ({chunksProcessedAndInstantiatedCount}/{totalWorldChunks} chunks data finalized & instantiated).");
-#endif
-                        proc_lastLoggedPercent = currentPercent;
-                    }
-                }
-
-                bool foundNext = AdvanceRadialIterator();
-                if (foundNext) {
-                    currentChunkDataBeingPopulated = true;
-                    currentChunkDataGen_StartTime_Total = Time.realtimeSinceStartup;
-                    currentChunkDataGen_StartTime_Slice = Time.realtimeSinceStartup;
-                    currentChunkDataGen_SliceCount = 0;
-                    dataGen_vox_x_in_chunk = 0; dataGen_vox_y_in_chunk = 0; dataGen_vox_z_in_chunk = 0;
-                } else {
-                    isProcessingWorld = false;
-#if UNITY_EDITOR
-                    if (enableVerboseLogging) Debug.Log($"[McWorld] All chunks processed and instantiated. Total: {chunksProcessedAndInstantiatedCount}. World steps: {debug_worldStepCallCount}.");
-#endif
-                }
-            }
+            isProcessingWorld = false;
+            #if UNITY_EDITOR
+            if (enableVerboseLogging) Debug.Log($"[McWorld] All {totalWorldChunks} chunks processed. World generation complete.");
+            #endif
         }
         else
         {
-#if UNITY_EDITOR
-            if (enableVerboseLogging) Debug.LogWarning($"[McWorld] ProcessNextWorldStep: currentChunkDataBeingPopulated is false for C_rel({proc_dx},{proc_dy},{proc_dz}). Attempting to advance iterator.");
-#endif
-            bool foundNext = AdvanceRadialIterator();
-            if (foundNext) {
-                currentChunkDataBeingPopulated = true;
-                currentChunkDataGen_StartTime_Total = Time.realtimeSinceStartup;
-                currentChunkDataGen_StartTime_Slice = Time.realtimeSinceStartup;
-                currentChunkDataGen_SliceCount = 0;
-                dataGen_vox_x_in_chunk = 0; dataGen_vox_y_in_chunk = 0; dataGen_vox_z_in_chunk = 0;
-            }
-            else isProcessingWorld = false;
+            ScheduleNextWorldStep();
         }
+    }
+    
+    private void GenerateDataForChunk(int array_cx, int array_cy, int array_cz)
+    {
+        int chunk1DIndex = ChunkArrayCoordsTo1D(array_cx, array_cy, array_cz);
+        if (chunk1DIndex == -1) return;
 
-        if (isProcessingWorld) ScheduleNextWorldStep();
+        int chunkVoxels = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
+        ushort[] tempChunkData = new ushort[chunkVoxels];
+
+        int chunkWorldStartX = (array_cx - chunkOffsetX) * chunkSizeXZ;
+        int chunkWorldStartY = (array_cy - chunkOffsetY) * chunkSizeY;
+        int chunkWorldStartZ = (array_cz - chunkOffsetZ) * chunkSizeXZ;
+
+        // Generate the full, uncompressed data first
+        for (int y = 0; y < chunkSizeY; y++)
+        {
+            int globalY = chunkWorldStartY + y;
+            for (int z = 0; z < chunkSizeXZ; z++)
+            {
+                int globalZ = chunkWorldStartZ + z;
+                for (int x = 0; x < chunkSizeXZ; x++)
+                {
+                    int globalX = chunkWorldStartX + x;
+
+                    int surfaceHeight = terrainGenerator.GetBaseTerrainHeight(globalX, globalZ);
+                    ushort blockData = 0; // Air
+
+                    if (globalY < surfaceHeight)
+                    {
+                        if (globalY >= surfaceHeight - 3) blockData = cachedPackedDirtData;
+                        else blockData = cachedPackedStoneData;
+                    }
+                    else if (globalY == surfaceHeight)
+                    {
+                        blockData = cachedPackedGrassData;
+                    }
+                    else if (globalY <= cachedSeaLevel)
+                    {
+                        blockData = cachedPackedWaterData;
+                    }
+                    
+                    int localIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
+                    tempChunkData[localIndex] = blockData;
+                }
+            }
+        }
+        
+        // Attempt to compress the data
+        ushort[] compressedLayerData = TryCompressAsLayers(tempChunkData, chunkSizeXZ, chunkSizeY);
+
+        if (compressedLayerData != null)
+        {
+            chunkDataArray[chunk1DIndex] = compressedLayerData;
+            isChunkCompressedAsLayers[chunk1DIndex] = true;
+        }
+        else
+        {
+            chunkDataArray[chunk1DIndex] = tempChunkData;
+            isChunkCompressedAsLayers[chunk1DIndex] = false;
+        }
     }
 
-    private void ScheduleNextWorldStep() {
+    private ushort[] TryCompressAsLayers(ushort[] fullChunkData, int sizeXZ, int sizeY)
+    {
+        ushort[] layerData = new ushort[sizeY];
+        int layerVoxelCount = sizeXZ * sizeXZ;
+
+        for (int y = 0; y < sizeY; y++)
+        {
+            int layerStartIndex = y * layerVoxelCount;
+            ushort firstBlockOfLayer = fullChunkData[layerStartIndex];
+
+            for (int i = 1; i < layerVoxelCount; i++)
+            {
+                if (fullChunkData[layerStartIndex + i] != firstBlockOfLayer)
+                {
+                    return null; // Layer is not uniform, compression fails for this chunk.
+                }
+            }
+            layerData[y] = firstBlockOfLayer;
+        }
+        return layerData; // All layers in the chunk were uniform.
+    }
+    
+    // Decompresses layer data into a full voxel array.
+    private ushort[] DecompressLayerData(ushort[] layerData)
+    {
+        int chunkVoxelCount = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
+        int layerVoxelCount = chunkSizeXZ * chunkSizeXZ;
+        ushort[] fullData = new ushort[chunkVoxelCount];
+
+        for (int y = 0; y < chunkSizeY; y++)
+        {
+            int layerStartIndex = y * layerVoxelCount;
+            ushort blockForLayer = layerData[y];
+            for (int i = 0; i < layerVoxelCount; i++)
+            {
+                fullData[layerStartIndex + i] = blockForLayer;
+            }
+        }
+        return fullData;
+    }
+
+    private void ScheduleNextWorldStep()
+    {
         if (worldProcessingStepDelay > 0.0001f) SendCustomEventDelayedSeconds(nameof(ProcessNextWorldStep), worldProcessingStepDelay);
         else SendCustomEventDelayedFrames(nameof(ProcessNextWorldStep), 1);
     }
 
-    private bool PopulateDataSliceForCurrentTargetChunk()
-    {
-        int voxelsInDataSliceProcessed = 0;
-        
-        // Use pre-packed ushort data for efficiency
-        ushort grassData = cachedPackedGrassData;
-        ushort stoneData = cachedPackedStoneData;
-        ushort dirtData = cachedPackedDirtData;
-        ushort waterData = cachedPackedWaterData;
-        int currentSeaLevel = cachedSeaLevel;
-
-        while (voxelsInDataSliceProcessed < voxelsPerChunkDataProcessingSlice)
-        {
-            if (dataGen_vox_x_in_chunk >= chunkSizeXZ)
-            {
-#if UNITY_EDITOR
-                if (enableVerboseLogging && voxelsInDataSliceProcessed > 0)
-                {
-                    float sliceDuration = (Time.realtimeSinceStartup - currentChunkDataGen_StartTime_Slice) * 1000f;
-                    logBuilder_McWorld.Clear();
-                    logBuilder_McWorld.AppendFormat("[McWorld.DataGen] Slice {0} (final segment for chunk C_Rel({1},{2},{3})) completed. Voxels: {4}. Time: {5:F2} ms.",
-                                                    currentChunkDataGen_SliceCount, proc_dx, proc_dy, proc_dz, voxelsInDataSliceProcessed, sliceDuration);
-                    Debug.Log(logBuilder_McWorld.ToString());
-                }
-#endif
-                return true;
-            }
-
-            if (dataGen_vox_y_in_chunk == 0)
-            {
-                int currentGlobalX_forHeight = (proc_dx * chunkSizeXZ) + dataGen_vox_x_in_chunk;
-                int currentGlobalZ_forHeight = (proc_dz * chunkSizeXZ) + dataGen_vox_z_in_chunk;
-                currentColumnTerrainSurfaceY = terrainGenerator.GetBaseTerrainHeight(currentGlobalX_forHeight, currentGlobalZ_forHeight);
-            }
-
-            int currentGlobalY = (proc_dy * chunkSizeY) + dataGen_vox_y_in_chunk;
-            ushort blockData = 0; // Default to air
-
-            if (currentGlobalY == currentColumnTerrainSurfaceY) blockData = grassData;
-            else if (currentGlobalY < currentColumnTerrainSurfaceY) {
-                if (currentGlobalY >= currentColumnTerrainSurfaceY - 3) blockData = dirtData;
-                else blockData = stoneData;
-            }
-            else {
-                if (currentGlobalY <= currentSeaLevel) blockData = waterData;
-            }
-
-            int currentGlobalX_forIndex = (proc_dx * chunkSizeXZ) + dataGen_vox_x_in_chunk;
-            int currentGlobalZ_forIndex = (proc_dz * chunkSizeXZ) + dataGen_vox_z_in_chunk;
-            int dataIndex = GlobalPosToIndex(currentGlobalX_forIndex, currentGlobalY, currentGlobalZ_forIndex);
-            if (dataIndex != -1) data[dataIndex] = blockData;
-
-            voxelsInDataSliceProcessed++;
-
-            dataGen_vox_y_in_chunk++;
-            if (dataGen_vox_y_in_chunk >= chunkSizeY) {
-                dataGen_vox_y_in_chunk = 0;
-                dataGen_vox_z_in_chunk++;
-                if (dataGen_vox_z_in_chunk >= chunkSizeXZ) {
-                    dataGen_vox_z_in_chunk = 0;
-                    dataGen_vox_x_in_chunk++;
-                }
-            }
-        }
-#if UNITY_EDITOR
-        if (enableVerboseLogging)
-        {
-            float sliceDuration = (Time.realtimeSinceStartup - currentChunkDataGen_StartTime_Slice) * 1000f;
-            logBuilder_McWorld.Clear();
-            logBuilder_McWorld.AppendFormat("[McWorld.DataGen] Slice {0} completed for C_Rel({1},{2},{3}). Voxels: {4}. Time: {5:F2} ms.",
-                                            currentChunkDataGen_SliceCount, proc_dx, proc_dy, proc_dz, voxelsInDataSliceProcessed, sliceDuration);
-            Debug.Log(logBuilder_McWorld.ToString());
-        }
-#endif
-        currentChunkDataGen_SliceCount++;
-        currentChunkDataGen_StartTime_Slice = Time.realtimeSinceStartup;
-        return false;
-    }
-
-    private bool AdvanceRadialIterator()
-    {
-        dataGen_vox_x_in_chunk = 0; dataGen_vox_y_in_chunk = 0; dataGen_vox_z_in_chunk = 0;
-
-        while (true)
-        {
-            if (!inst_shellIterationInitialized)
-            {
-                inst_dx_iterator = -inst_radius_iterator;
-                inst_dy_iterator = -inst_radius_iterator;
-                inst_dz_iterator = -inst_radius_iterator;
-                inst_shellIterationInitialized = true;
-            }
-            else
-            {
-                inst_dz_iterator++;
-                if (inst_dz_iterator > inst_radius_iterator) {
-                    inst_dz_iterator = -inst_radius_iterator; inst_dy_iterator++;
-                    if (inst_dy_iterator > inst_radius_iterator) {
-                        inst_dy_iterator = -inst_radius_iterator; inst_dx_iterator++;
-                        if (inst_dx_iterator > inst_radius_iterator) {
-                            inst_radius_iterator++;
-                            inst_shellIterationInitialized = false;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            int max_abs_coord_x = (worldDimensionX - 1) / 2 + ((worldDimensionX - 1) % 2);
-            int max_abs_coord_y = (worldDimensionY - 1) / 2 + ((worldDimensionY - 1) % 2);
-            int max_abs_coord_z = (worldDimensionZ - 1) / 2 + ((worldDimensionZ - 1) % 2);
-
-            if (inst_radius_iterator > Mathf.Max(max_abs_coord_x, Mathf.Max(max_abs_coord_y, max_abs_coord_z)) + 1)
-            {
-                return false;
-            }
-
-            if (inst_radius_iterator == 0 || Mathf.Abs(inst_dx_iterator) == inst_radius_iterator || Mathf.Abs(inst_dy_iterator) == inst_radius_iterator || Mathf.Abs(inst_dz_iterator) == inst_radius_iterator)
-            {
-                proc_dx = inst_dx_iterator;
-                proc_dy = inst_dy_iterator;
-                proc_dz = inst_dz_iterator;
-
-                int array_cx = proc_dx + chunkOffsetX;
-                int array_cy = proc_dy + chunkOffsetY;
-                int array_cz = proc_dz + chunkOffsetZ;
-
-                if (array_cx >= 0 && array_cx < worldDimensionX &&
-                    array_cy >= 0 && array_cy < worldDimensionY &&
-                    array_cz >= 0 && array_cz < worldDimensionZ)
-                {
-                    int chunk1DIndex_radial = ChunkArrayCoordsTo1D(array_cx, array_cy, array_cz);
-                    if (chunk1DIndex_radial != -1 && !chunkDataFinalized_1D[chunk1DIndex_radial])
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    void InstantiateAndConfigureChunk(int array_cx, int array_cy, int array_cz, int centered_dx, int centered_dy, int centered_dz)
+    void InstantiateAndConfigureChunk(int array_cx, int array_cy, int array_cz)
     {
         int chunk1DIndex = ChunkArrayCoordsTo1D(array_cx, array_cy, array_cz);
-        if (chunk1DIndex == -1) {
-            Debug.LogError($"[McWorld] InstantiateAndConfigureChunk: Invalid chunk 1D index for Arr({array_cx},{array_cy},{array_cz})");
-            return;
-        }
+        if (chunk1DIndex == -1) return;
 
-        if (chunks_1D[chunk1DIndex] != null) {
-#if UNITY_EDITOR
-            if (enableVerboseLogging) Debug.LogWarning($"[McWorld] InstantiateAndConfigureChunk: Chunk Arr({array_cx},{array_cy},{array_cz}) already exists. Requesting mesh update.");
-#endif
-            RequestChunkMeshUpdate(chunks_1D[chunk1DIndex]);
-            return;
-        }
+        if (chunks_1D[chunk1DIndex] != null) return;
 
-        GameObject newChunkGO = (GameObject)Instantiate(chunkPrefab);
-        if (newChunkGO == null) { Debug.LogError($"[McWorld] Instantiate FAILED for chunkPrefab at C_array({array_cx},{array_cy},{array_cz})."); return; }
+        int centered_dx = array_cx - chunkOffsetX;
+        int centered_dy = array_cy - chunkOffsetY;
+        int centered_dz = array_cz - chunkOffsetZ;
 
-        newChunkGO.name = $"Chunk_arr({array_cx},{array_cy},{array_cz})_cen({centered_dx},{centered_dy},{centered_dz})";
+        GameObject newChunkGO = Instantiate(chunkPrefab);
+        newChunkGO.name = $"Chunk_arr({array_cx},{array_cy},{array_cz})";
         newChunkGO.transform.SetParent(this.transform, false);
         newChunkGO.transform.localPosition = new Vector3(centered_dx * chunkSizeXZ, centered_dy * chunkSizeY, centered_dz * chunkSizeXZ);
-        newChunkGO.transform.localRotation = Quaternion.identity;
 
         McChunk newChunkScript = newChunkGO.GetComponent<McChunk>();
-        if (newChunkScript != null) {
-            chunks_1D[chunk1DIndex] = newChunkScript;
-            newChunkScript.chunkSizeXZ = this.chunkSizeXZ;
-            newChunkScript.chunkSizeY = this.chunkSizeY;
-            newChunkScript.voxelsPerSlice = this.voxelsPerSliceInChunks;
-            newChunkScript.chunkX = centered_dx * this.chunkSizeXZ;
-            newChunkScript.chunkY = centered_dy * this.chunkSizeY;
-            newChunkScript.chunkZ = centered_dz * this.chunkSizeXZ;
-            newChunkScript.template = false;
-            newChunkScript.SetWorld(this);
-            newChunkGO.SetActive(true);
-        } else {
-            Debug.LogError($"[McWorld] Failed to get McChunk script from instantiated prefab for C_array({array_cx},{array_cy},{array_cz}). GO: {newChunkGO.name}. Destroying GO.");
-            if (newChunkGO != null) Destroy(newChunkGO);
-        }
+        chunks_1D[chunk1DIndex] = newChunkScript;
+
+        newChunkScript.world = this;
+        newChunkScript.chunkSizeXZ = this.chunkSizeXZ;
+        newChunkScript.chunkSizeY = this.chunkSizeY;
+        newChunkScript.chunkX_world = centered_dx;
+        newChunkScript.chunkY_world = centered_dy;
+        newChunkScript.chunkZ_world = centered_dz;
+
+        newChunkGO.SetActive(true);
+        RequestChunkMeshUpdate(newChunkScript);
     }
     
     public void RequestChunkMeshUpdate(McChunk chunkToUpdate)
     {
-        if (chunkToUpdate == null) return;
+        if (chunkToUpdate == null || chunkRebuildQueue_count >= MAX_REBUILD_QUEUE_SIZE) return;
         
+        // Prevent duplicates
         for (int i = 0; i < chunkRebuildQueue_count; i++)
         {
             int index = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
-            if (chunkRebuildQueue[index] == chunkToUpdate) {
-                return;
-            }
+            if (chunkRebuildQueue[index] == chunkToUpdate) return;
         }
 
-        if (chunkRebuildQueue_count < MAX_REBUILD_QUEUE_SIZE)
-        {
-            chunkRebuildQueue[chunkRebuildQueue_tail] = chunkToUpdate;
-            chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
-            chunkRebuildQueue_count++;
-        }
-        else {
-#if UNITY_EDITOR
-            if (enableVerboseLogging) Debug.LogWarning($"[McWorld] Chunk rebuild queue is full ({MAX_REBUILD_QUEUE_SIZE}). Dropping request for {chunkToUpdate.gameObject.name}.");
-#endif
-        }
+        chunkRebuildQueue[chunkRebuildQueue_tail] = chunkToUpdate;
+        chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+        chunkRebuildQueue_count++;
     }
 
     public void ProcessChunkRebuildQueue()
@@ -632,11 +405,14 @@ public class McWorld : UdonSharpBehaviour
             McChunk chunkToBuild = chunkRebuildQueue[chunkRebuildQueue_head];
 
             if (chunkToBuild == null) {
+                // Dequeue null chunk
                 chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
                 chunkRebuildQueue_count--;
                 continue;
             }
+            
             if (chunkToBuild.isBuildingMesh) {
+                // Still building, move to back of queue to try later
                 if (chunkRebuildQueue_count > 1) {
                     chunkRebuildQueue[chunkRebuildQueue_tail] = chunkToBuild;
                     chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
@@ -645,25 +421,15 @@ public class McWorld : UdonSharpBehaviour
                 continue;
             }
 
-            bool canBuild = false;
-            switch (neighboringChunksProcessingMode)
-            {
-                case 0: canBuild = true; break;
-                case 1: canBuild = AreAllNeighborsDataFinalized(chunkToBuild); break;
-                case 2: canBuild = true; break;
-                default:
-                    canBuild = AreAllNeighborsDataFinalized(chunkToBuild);
-                    Debug.LogWarning($"[McWorld] Unknown neighboringChunksProcessingMode: {neighboringChunksProcessingMode}. Defaulting to mode 1.");
-                    break;
-            }
+            bool canBuild = (neighboringChunksProcessingMode == 0) || AreAllNeighborsDataFinalized(chunkToBuild);
 
             if (canBuild)
             {
-                chunkRebuildQueue[chunkRebuildQueue_head] = null;
+                // Dequeue and build
                 chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
                 chunkRebuildQueue_count--;
                 
-                chunkToBuild.StartBuildMesh(false);
+                chunkToBuild.BuildMesh();
                 processedThisCall++;
 
                 if (neighboringChunksProcessingMode == 2)
@@ -673,6 +439,7 @@ public class McWorld : UdonSharpBehaviour
             }
             else
             {
+                // Cannot build yet (waiting for neighbors), move to back of queue
                 if (chunkRebuildQueue_count > 1)
                 {
                     chunkRebuildQueue[chunkRebuildQueue_tail] = chunkToBuild;
@@ -684,181 +451,206 @@ public class McWorld : UdonSharpBehaviour
         SendCustomEventDelayedSeconds(nameof(ProcessChunkRebuildQueue), chunkRebuildInterval);
     }
 
-    private bool AreAllNeighborsDataFinalized(McChunk chunk)
+    // Gets the packed ushort data at global voxel coordinates.
+    public ushort GetBlock(int globalX, int globalY, int globalZ)
     {
-        if (chunk == null) return false;
+        int centeredChunkX = Mathf.FloorToInt((float)globalX / chunkSizeXZ);
+        int centeredChunkY = Mathf.FloorToInt((float)globalY / chunkSizeY);
+        int centeredChunkZ = Mathf.FloorToInt((float)globalZ / chunkSizeXZ);
+        
+        int chunkIndex = ChunkCenteredCoordsTo1D(centeredChunkX, centeredChunkY, centeredChunkZ);
+        if (chunkIndex == -1) return 0; // Air for out-of-bounds
 
-        int centeredCX = chunk.chunkX / chunkSizeXZ;
-        int centeredCY = chunk.chunkY / chunkSizeY;
-        int centeredCZ = chunk.chunkZ / chunkSizeXZ;
+        object data = chunkDataArray[chunkIndex];
+        if (data == null) return 0; // Not generated yet
 
-        for (int i = 0; i < 6; i++)
+        if (isChunkCompressedAsLayers[chunkIndex])
         {
-            int neighborCenteredX = centeredCX + neighbor_dx_offsets[i];
-            int neighborCenteredY = centeredCY + neighbor_dy_offsets[i];
-            int neighborCenteredZ = centeredCZ + neighbor_dz_offsets[i];
-
-            int neighborArrayX = neighborCenteredX + chunkOffsetX;
-            int neighborArrayY = neighborCenteredY + chunkOffsetY;
-            int neighborArrayZ = neighborCenteredZ + chunkOffsetZ;
-
-            int neighbor1DIndex = ChunkArrayCoordsTo1D(neighborArrayX, neighborArrayY, neighborArrayZ);
-            if (neighbor1DIndex != -1)
-            {
-                if (!chunkDataFinalized_1D[neighbor1DIndex])
-                {
-                    return false;
-                }
-            }
+            ushort[] layerData = (ushort[])data;
+            int localY = globalY - centeredChunkY * chunkSizeY;
+            return layerData[localY];
         }
-        return true;
+        else
+        {
+            ushort[] chunkVoxelData = (ushort[])data;
+            int localX = globalX - centeredChunkX * chunkSizeXZ;
+            int localY = globalY - centeredChunkY * chunkSizeY;
+            int localZ = globalZ - centeredChunkZ * chunkSizeXZ;
+            int localIndex = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
+            return chunkVoxelData[localIndex];
+        }
+    }
+    
+    // Sets the block type at global voxel coordinates and triggers mesh updates.
+    public void SetBlock(int globalX, int globalY, int globalZ, byte blockType)
+    {
+        int centeredChunkX = Mathf.FloorToInt((float)globalX / chunkSizeXZ);
+        int centeredChunkY = Mathf.FloorToInt((float)globalY / chunkSizeY);
+        int centeredChunkZ = Mathf.FloorToInt((float)globalZ / chunkSizeXZ);
+        
+        int chunkIndex = ChunkCenteredCoordsTo1D(centeredChunkX, centeredChunkY, centeredChunkZ);
+        if (chunkIndex == -1) return;
+
+        object data = chunkDataArray[chunkIndex];
+        if (data == null) return;
+        
+        ushort[] chunkVoxelData;
+
+        // If the chunk is compressed, we must decompress it before modifying it.
+        if (isChunkCompressedAsLayers[chunkIndex])
+        {
+            chunkVoxelData = DecompressLayerData((ushort[])data);
+            chunkDataArray[chunkIndex] = chunkVoxelData;
+            isChunkCompressedAsLayers[chunkIndex] = false;
+        }
+        else
+        {
+            chunkVoxelData = (ushort[])data;
+        }
+
+        int localX = globalX - centeredChunkX * chunkSizeXZ;
+        int localY = globalY - centeredChunkY * chunkSizeY;
+        int localZ = globalZ - centeredChunkZ * chunkSizeXZ;
+        int localIndex = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
+        
+        ushort newPackedData = PackBlockData(blockType);
+        if (chunkVoxelData[localIndex] == newPackedData) return; // No change needed
+
+        chunkVoxelData[localIndex] = newPackedData;
+
+        // --- Trigger mesh updates for this chunk and any affected neighbors ---
+        McChunk targetChunk = GetChunkScriptFromCentered(centeredChunkX, centeredChunkY, centeredChunkZ);
+        if (targetChunk != null) RequestChunkMeshUpdate(targetChunk);
+
+        if (localX == 0) TriggerNeighborUpdate(centeredChunkX - 1, centeredChunkY, centeredChunkZ);
+        if (localX == chunkSizeXZ - 1) TriggerNeighborUpdate(centeredChunkX + 1, centeredChunkY, centeredChunkZ);
+        if (localY == 0) TriggerNeighborUpdate(centeredChunkX, centeredChunkY - 1, centeredChunkZ);
+        if (localY == chunkSizeY - 1) TriggerNeighborUpdate(centeredChunkX, centeredChunkY + 1, centeredChunkZ);
+        if (localZ == 0) TriggerNeighborUpdate(centeredChunkX, centeredChunkY, centeredChunkZ - 1);
+        if (localZ == chunkSizeXZ - 1) TriggerNeighborUpdate(centeredChunkX, centeredChunkY, centeredChunkZ + 1);
+    }
+    
+    private void TriggerNeighborUpdate(int centeredCX, int centeredCY, int centeredCZ)
+    {
+        McChunk neighborChunk = GetChunkScriptFromCentered(centeredCX, centeredCY, centeredCZ);
+        if (neighborChunk != null) RequestChunkMeshUpdate(neighborChunk);
+    }
+
+    #region Helper and Utility Methods
+
+    private ushort PackBlockData(byte blockID)
+    {
+        if (blockID == _lastPackedBlockId) return _lastPackedUshort;
+        if (blockID == 0) { _lastPackedBlockId = 0; _lastPackedUshort = 0; return 0; }
+        ushort packedData = blockID;
+        if (blockTypeManager.GetBlockIsSolid(blockID)) packedData |= (1 << 8);
+        packedData |= (ushort)((int)blockTypeManager.GetBlockVisibilityType(blockID) << 9);
+        packedData |= (ushort)((int)blockTypeManager.GetBlockShapeType(blockID) << 12);
+        _lastPackedBlockId = blockID;
+        _lastPackedUshort = packedData;
+        return packedData;
     }
 
     private void TriggerNeighborMeshRebuilds(McChunk chunk)
     {
-        if (chunk == null) return;
-
-        int centeredCX = chunk.chunkX / chunkSizeXZ;
-        int centeredCY = chunk.chunkY / chunkSizeY;
-        int centeredCZ = chunk.chunkZ / chunkSizeXZ;
-
         for (int i = 0; i < 6; i++)
         {
-            int neighborCenteredX = centeredCX + neighbor_dx_offsets[i];
-            int neighborCenteredY = centeredCY + neighbor_dy_offsets[i];
-            int neighborCenteredZ = centeredCZ + neighbor_dz_offsets[i];
+            TriggerNeighborUpdate(
+                chunk.chunkX_world + neighbor_dx_offsets[i],
+                chunk.chunkY_world + neighbor_dy_offsets[i],
+                chunk.chunkZ_world + neighbor_dz_offsets[i]
+            );
+        }
+    }
+    
+    private bool AreAllNeighborsDataFinalized(McChunk chunk)
+    {
+        if (chunk == null) return false;
+        for (int i = 0; i < 6; i++)
+        {
+            int n_arrayX = (chunk.chunkX_world + neighbor_dx_offsets[i]) + chunkOffsetX;
+            int n_arrayY = (chunk.chunkY_world + neighbor_dy_offsets[i]) + chunkOffsetY;
+            int n_arrayZ = (chunk.chunkZ_world + neighbor_dz_offsets[i]) + chunkOffsetZ;
+            int n_1DIndex = ChunkArrayCoordsTo1D(n_arrayX, n_arrayY, n_arrayZ);
+            if (n_1DIndex != -1 && !chunkDataFinalized_1D[n_1DIndex]) return false;
+        }
+        return true;
+    }
+    
+    public object GetChunkDataObject(int centered_cx, int centered_cy, int centered_cz)
+    {
+        int index = ChunkCenteredCoordsTo1D(centered_cx, centered_cy, centered_cz);
+        if (index == -1) return null;
+        return chunkDataArray[index];
+    }
 
-            int neighborArrayX = neighborCenteredX + chunkOffsetX;
-            int neighborArrayY = neighborCenteredY + chunkOffsetY;
-            int neighborArrayZ = neighborCenteredZ + chunkOffsetZ;
+    public bool IsChunkDataLayerCompressed(int centered_cx, int centered_cy, int centered_cz)
+    {
+        int index = ChunkCenteredCoordsTo1D(centered_cx, centered_cy, centered_cz);
+        if (index == -1) return false;
+        return isChunkCompressedAsLayers[index];
+    }
+    
+    private int ChunkArrayCoordsTo1D(int arrayX, int arrayY, int arrayZ)
+    {
+        if (arrayX < 0 || arrayX >= worldDimensionX || arrayY < 0 || arrayY >= worldDimensionY || arrayZ < 0 || arrayZ >= worldDimensionZ) return -1;
+        return (arrayZ * worldDimensionX * worldDimensionY) + (arrayY * worldDimensionX) + arrayX;
+    }
+    
+    private void Chunk1DToArrrayCoords(int index, out int x, out int y, out int z)
+    {
+        z = index / (worldDimensionX * worldDimensionY);
+        y = (index / worldDimensionX) % worldDimensionY;
+        x = index % worldDimensionX;
+    }
+    
+    private int ChunkCenteredCoordsTo1D(int centeredX, int centeredY, int centeredZ)
+    {
+        return ChunkArrayCoordsTo1D(centeredX + chunkOffsetX, centeredY + chunkOffsetY, centeredZ + chunkOffsetZ);
+    }
+    
+    public McChunk GetChunkScriptFromCentered(int centered_cx, int centered_cy, int centered_cz)
+    {
+        int index = ChunkCenteredCoordsTo1D(centered_cx, centered_cy, centered_cz);
+        if (index == -1 || chunks_1D == null || index >= chunks_1D.Length) return null;
+        return chunks_1D[index];
+    }
 
-            int neighbor1DIndex = ChunkArrayCoordsTo1D(neighborArrayX, neighborArrayY, neighborArrayZ);
-            if (neighbor1DIndex != -1)
+    private void GenerateRadialChunkOrder()
+    {
+        radialChunkOrder = new int[totalWorldChunks];
+        int count = 0;
+        int maxRadius = Mathf.Max(worldDimensionX, Mathf.Max(worldDimensionY, worldDimensionZ));
+        
+        for (int r = 0; r < maxRadius; r++)
+        {
+            for (int y = -r; y <= r; y++)
             {
-                if (chunkDataFinalized_1D[neighbor1DIndex])
+                for (int z = -r; z <= r; z++)
                 {
-                    McChunk neighborChunk = chunks_1D[neighbor1DIndex];
-                    if (neighborChunk != null && !neighborChunk.isBuildingMesh)
+                    for (int x = -r; x <= r; x++)
                     {
-                        RequestChunkMeshUpdate(neighborChunk);
+                        if (Mathf.Abs(x) == r || Mathf.Abs(y) == r || Mathf.Abs(z) == r)
+                        {
+                            int chunkIndex = ChunkCenteredCoordsTo1D(x, y, z);
+                            if (chunkIndex != -1)
+                            {
+                                bool alreadyAdded = false;
+                                for (int i = 0; i < count; i++) {
+                                    if (radialChunkOrder[i] == chunkIndex) {
+                                        alreadyAdded = true;
+                                        break;
+                                    }
+                                }
+                                if (!alreadyAdded) {
+                                    radialChunkOrder[count++] = chunkIndex;
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
-
-    private int GlobalPosToIndex(int globalX, int globalY, int globalZ)
-    {
-        int arrayCoordX = globalX + globalVoxelOffsetX;
-        int arrayCoordY = globalY + globalVoxelOffsetY;
-        int arrayCoordZ = globalZ + globalVoxelOffsetZ;
-
-        if (arrayCoordX < 0 || arrayCoordX >= worldSizeX_voxels ||
-            arrayCoordY < 0 || arrayCoordY >= worldSizeY_voxels ||
-            arrayCoordZ < 0 || arrayCoordZ >= worldSizeZ_voxels) return -1;
-
-        return arrayCoordY * layerSize_voxels_for_1D_data + arrayCoordZ * worldSizeX_voxels + arrayCoordX;
-    }
-    
-    // Gets the full packed ushort data at global voxel coordinates.
-    public ushort GetBlock(int globalX, int globalY, int globalZ)
-    {
-        int index = GlobalPosToIndex(globalX, globalY, globalZ);
-        if (index == -1) return 0; // Air for out-of-bounds
-        if (data == null || index < 0 || index >= data.Length) {
-            return 0;
-        }
-        return data[index];
-    }
-    
-    private void _UpdateAffectedNeighbor(int neighborCenteredCX, int neighborCenteredCY, int neighborCenteredCZ,
-                                     int neighborLocalPoiX, int neighborLocalPoiY, int neighborLocalPoiZ,
-                                     bool rebuildImmediately) {
-        int neighborArrX = neighborCenteredCX + chunkOffsetX;
-        int neighborArrY = neighborCenteredCY + chunkOffsetY;
-        int neighborArrZ = neighborCenteredCZ + chunkOffsetZ;
-
-        int neighbor1DIdx = ChunkArrayCoordsTo1D(neighborArrX, neighborArrY, neighborArrZ);
-        if (neighbor1DIdx != -1 && chunkDataFinalized_1D[neighbor1DIdx])
-        {
-            McChunk neighborChunk = GetChunkScript(neighborArrX, neighborArrY, neighborArrZ);
-            if (neighborChunk != null) {
-                if (rebuildImmediately) {
-                    neighborChunk.StartBuildMesh(true);
-                    RequestChunkMeshUpdate(neighborChunk);
-                } else {
-                    RequestChunkMeshUpdate(neighborChunk);
-                }
-            }
-        }
-    }
-
-    // Sets the block type at global voxel coordinates and triggers mesh updates.
-    public void SetBlock(int globalX, int globalY, int globalZ, byte blockType, bool rebuildImmediately)
-    {
-        int dataIndex = GlobalPosToIndex(globalX, globalY, globalZ);
-        if (dataIndex == -1) {
-#if UNITY_EDITOR
-            if (enableVerboseLogging) Debug.LogWarning($"[McWorld.SetBlock] Attempted to set block outside world bounds at G({globalX},{globalY},{globalZ}).");
-#endif
-            return;
-        }
-        if (data == null || dataIndex < 0 || dataIndex >= data.Length) {
-            Debug.LogError($"[McWorld.SetBlock] Index {dataIndex} out of bounds for data array at G({globalX},{globalY},{globalZ}). Aborting SetBlock.");
-            return;
-        }
-        
-        // Pack the new block data and check if it's actually different.
-        ushort newPackedData = PackBlockData(blockType);
-        if (data[dataIndex] == newPackedData) {
-            return; // No change needed
-        }
-
-        data[dataIndex] = newPackedData; // Update voxel data
-
-        int centeredChunkX = Mathf.FloorToInt((float)globalX / chunkSizeXZ);
-        int centeredChunkY = Mathf.FloorToInt((float)globalY / chunkSizeY);
-        int centeredChunkZ = Mathf.FloorToInt((float)globalZ / chunkSizeXZ);
-
-        int array_cx = centeredChunkX + chunkOffsetX;
-        int array_cy = centeredChunkY + chunkOffsetY;
-        int array_cz = centeredChunkZ + chunkOffsetZ;
-
-        McChunk targetChunk = GetChunkScript(array_cx, array_cy, array_cz);
-        int localPoiX = globalX - (centeredChunkX * chunkSizeXZ);
-        int localPoiY = globalY - (centeredChunkY * chunkSizeY);
-        int localPoiZ = globalZ - (centeredChunkZ * chunkSizeXZ);
-
-
-        if (targetChunk != null) {
-            if (rebuildImmediately) {
-                targetChunk.StartBuildMesh(true);
-                RequestChunkMeshUpdate(targetChunk);
-            } else {
-                RequestChunkMeshUpdate(targetChunk);
-            }
-        } else {
-#if UNITY_EDITOR
-            if (enableVerboseLogging) Debug.LogWarning($"[McWorld.SetBlock] Target chunk at Arr({array_cx},{array_cy},{array_cz}) for G({globalX},{globalY},{globalZ}) is null. Cannot update mesh.");
-#endif
-        }
-
-        // Update affected neighbors
-        if (localPoiX == 0) _UpdateAffectedNeighbor(centeredChunkX - 1, centeredChunkY, centeredChunkZ, chunkSizeXZ - 1, localPoiY, localPoiZ, rebuildImmediately);
-        if (localPoiX == chunkSizeXZ - 1) _UpdateAffectedNeighbor(centeredChunkX + 1, centeredChunkY, centeredChunkZ, 0, localPoiY, localPoiZ, rebuildImmediately);
-        if (localPoiY == 0) _UpdateAffectedNeighbor(centeredChunkX, centeredChunkY - 1, centeredChunkZ, localPoiX, chunkSizeY - 1, localPoiZ, rebuildImmediately);
-        if (localPoiY == chunkSizeY - 1) _UpdateAffectedNeighbor(centeredChunkX, centeredChunkY + 1, centeredChunkZ, localPoiX, 0, localPoiZ, rebuildImmediately);
-        if (localPoiZ == 0) _UpdateAffectedNeighbor(centeredChunkX, centeredChunkY, centeredChunkZ - 1, localPoiX, localPoiY, chunkSizeXZ - 1, rebuildImmediately);
-        if (localPoiZ == chunkSizeXZ - 1) _UpdateAffectedNeighbor(centeredChunkX, centeredChunkY, centeredChunkZ + 1, localPoiX, localPoiY, 0, rebuildImmediately);
-    }
-
-    public McChunk GetChunkScript(int array_cx, int array_cy, int array_cz)
-    {
-        int index = ChunkArrayCoordsTo1D(array_cx, array_cy, array_cz);
-        if (index == -1) return null;
-        if (chunks_1D == null || index < 0 || index >= chunks_1D.Length) {
-            return null;
-        }
-        return chunks_1D[index];
-    }
+    #endregion
 }
