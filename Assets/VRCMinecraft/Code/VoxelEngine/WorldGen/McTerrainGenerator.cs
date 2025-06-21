@@ -2,7 +2,7 @@
 using UnityEngine;
 using VRC.SDKBase;
 using VRRefAssist;
-using System.Text; // Added for StringBuilder
+using System.Text;
 
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
@@ -37,25 +37,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private uint _placementRandState;
 
-
-
-
-
-
-
-
-
     private float _inverseBaseNoiseScale;
     private bool _isBaseNoiseScaleEffectivelyZero;
     private int _cachedMinYVoxel;
     private int _cachedMaxYVoxel;
     private bool _worldParametersCached = false;
 
-
-
-    // Logging
     #if UNITY_EDITOR
-    [HideInInspector] public bool enableVerboseLogging = true; // Can be set by McWorld or manually
+    [HideInInspector] public bool enableVerboseLogging = true;
     #endif
     private StringBuilder logBuilder;
 
@@ -84,14 +73,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
         float startTime = Time.realtimeSinceStartup;
         if (isInitialized) return;
 
-        logBuilder = new StringBuilder(256); // Initialize StringBuilder
+        logBuilder = new StringBuilder(256);
 
         UpdateTerrainGenParameters();
         
-        // Inherit logging state from world if possible
-        // if (world != null) enableVerboseLogging = world.enableVerboseLogging;
-
-
         _worldActualSeed = seed;
         perlinSeedOffsetX_terrain = (seed % 1000) * 1.23f + 10000.0f;
         perlinSeedOffsetZ_terrain = ((seed / 1000) % 1000) * 1.45f + 20000.0f;
@@ -107,14 +92,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
     }
 
-    // Call this method in Start() or OnEnable(), and if baseNoiseScale or world.globalVoxelOffsetY can change at runtime,
-    // call it again after they change.
     public void UpdateTerrainGenParameters()
     {
-        if (Mathf.Approximately(baseNoiseScale, 0f) || baseNoiseScale == 0f) // More robust check for zero
+        if (Mathf.Approximately(baseNoiseScale, 0f))
         {
             _isBaseNoiseScaleEffectivelyZero = true;
-            _inverseBaseNoiseScale = 0f; // Or some other safe default if you prefer not to branch
+            _inverseBaseNoiseScale = 0f;
         }
         else
         {
@@ -128,34 +111,18 @@ public class McTerrainGenerator : UdonSharpBehaviour
             _cachedMaxYVoxel = world.globalVoxelOffsetY - 1;
             _worldParametersCached = true;
         } else {
-            _worldParametersCached = false; // Mark as not cached if world is null
+            _worldParametersCached = false;
         }
     }
 
     public int GetBaseTerrainHeight(int worldX_voxel, int worldZ_voxel)
     {
-        // Ensure parameters are cached. This check might be skippable if UpdateTerrainGenParameters()
-        // is guaranteed to be called before any GetBaseTerrainHeight() calls.
-        // if (!_worldParametersCached && world != null) UpdateTerrainGenParameters();
-
-
-        //if (world == null || !_worldParametersCached) return baseTerrainHeight; // Return base if world is null or params not cached
         if (_isBaseNoiseScaleEffectivelyZero) return baseTerrainHeight;
 
-        // Use multiplication instead of division
         float inputX = ((float)worldX_voxel + perlinSeedOffsetX_terrain) * _inverseBaseNoiseScale;
         float inputZ = ((float)worldZ_voxel + perlinSeedOffsetZ_terrain) * _inverseBaseNoiseScale;
-
         float perlinValue = Mathf.PerlinNoise(inputX, inputZ);
-
-        // Mathf.PerlinNoise in Unity (and likely UdonSharp) typically returns values in the [0,1] range.
-        // If this is guaranteed, Mathf.Clamp01(perlinValue) is redundant and can be removed.
-        // Verify this behavior in your VRChat/UdonSharp environment.
-        // perlinValue = Mathf.Clamp01(perlinValue); // Potentially remove this line
-
-        // Calculation remains similar, but uses pre-calculated min/max Y
         int calculatedHeight = baseTerrainHeight + Mathf.FloorToInt(perlinValue * baseHeightVariationAmplitude + perlinHeightOffset);
-
         return Mathf.Clamp(calculatedHeight, _cachedMinYVoxel, _cachedMaxYVoxel);
     }
 
@@ -225,7 +192,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
 
                     float stampStartTime = Time.realtimeSinceStartup;
+                    // --- MODIFIED ---
+                    // Call the new, optimized batch stamping method instead of the old one.
                     StampStructure(structureTemplate, spawnOriginGlobalX, spawnOriginGlobalY, spawnOriginGlobalZ);
+                    // --- END MODIFIED ---
                     float stampDuration = (Time.realtimeSinceStartup - stampStartTime) * 1000f;
                     structuresPlacedThisChunk++;
 #if UNITY_EDITOR
@@ -252,32 +222,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
 #endif
     }
-
+    
+    // --- MODIFIED ---
+    // This method now calls the new batch-optimized function in McWorld.
     private void StampStructure(McStructureTemplate structureTemplate, int originGlobalX, int originGlobalY, int originGlobalZ)
     {
-        // Profiling done by caller (PlaceFeaturesInChunk)
         if (structureTemplate == null || world == null) return;
-
-        Vector3Int[] positions = structureTemplate.bakedVoxelPositions;
-        byte[] blockIDs = structureTemplate.bakedVoxelBlockIDs;
-
-        if (positions == null || blockIDs == null || positions.Length == 0 || positions.Length != blockIDs.Length)
-        {
-#if UNITY_EDITOR
-            // if (enableVerboseLogging) Debug.LogWarning($"[McTerrainGenerator.StampStructure] Attempted to stamp structure '{structureTemplate.structureName}' but its baked data is missing, empty, or mismatched.");
-#endif
-            return;
-        }
-
-        for (int i = 0; i < positions.Length; i++)
-        {
-            Vector3Int relativePos = positions[i];
-            byte blockID = blockIDs[i];
-            int placeGlobalX = originGlobalX + relativePos.x;
-            int placeGlobalY = originGlobalY + relativePos.y;
-            int placeGlobalZ = originGlobalZ + relativePos.z;
-            world.SetBlock(placeGlobalX, placeGlobalY, placeGlobalZ, blockID); // SetBlock in McWorld now has its own logging
-        }
-        // world.FinalizeBatchedBlockUpdates(); // This method was removed from McWorld
+        
+        // This single call replaces the entire loop that was here before.
+        //world.StampStructureInWorld(structureTemplate, originGlobalX, originGlobalY, originGlobalZ);
     }
+    // --- END MODIFIED ---
 }
