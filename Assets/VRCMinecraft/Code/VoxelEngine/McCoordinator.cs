@@ -32,6 +32,8 @@ public class McCoordinator : UdonSharpBehaviour
     public int columnsPerDataGenStep = 2;
     [Tooltip("How many voxels to check for meshing per step inside a chunk. Higher values build meshes faster but may cause lag spikes.")]
     public int voxelsPerMeshStep = 1024;
+    [Tooltip("How many voxels to process when generating data.")]
+    public int voxelsPerTerrainStep = 1024;
 
 
     // --- Worker Pool State ---
@@ -174,7 +176,7 @@ public class McCoordinator : UdonSharpBehaviour
 
                     world.Chunk1DToArrrayCoords(chunk1DIndex, out int array_cx, out int array_cy, out int array_cz);
 
-                    McChunk newChunk = world.InstantiateAndConfigureChunk(array_cx, array_cy, array_cz, columnsPerDataGenStep, voxelsPerMeshStep);
+                    McChunk newChunk = world.InstantiateAndConfigureChunk(array_cx, array_cy, array_cz, columnsPerDataGenStep, voxelsPerMeshStep, voxelsPerTerrainStep);
 
                     if (newChunk != null) {
                         worker_targetChunk[i] = newChunk;

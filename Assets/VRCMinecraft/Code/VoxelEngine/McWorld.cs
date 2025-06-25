@@ -70,11 +70,15 @@ public class McWorld : UdonSharpBehaviour
         chunkSizeXZ = Mathf.Max(1, chunkSizeXZ);
         chunkSizeY = Mathf.Max(1, chunkSizeY);
         totalWorldChunks = worldDimensionX * worldDimensionY * worldDimensionZ;
+        
+        // --- FIX: Remove vertical (Y-axis) centering ---
+        // The world should be centered on XZ, but start at Y=0 and build upwards.
         chunkOffsetX = worldDimensionX / 2;
-        chunkOffsetY = worldDimensionY / 2;
+        chunkOffsetY = 0; 
         chunkOffsetZ = worldDimensionZ / 2;
+        
         globalVoxelOffsetX = (worldDimensionX * chunkSizeXZ) / 2;
-        globalVoxelOffsetY = (worldDimensionY * chunkSizeY) / 2;
+        globalVoxelOffsetY = 0;
         globalVoxelOffsetZ = (worldDimensionZ * chunkSizeXZ) / 2;
     }
 
@@ -83,13 +87,11 @@ public class McWorld : UdonSharpBehaviour
         chunks_1D = new McChunk[totalWorldChunks];
     }
     
-    /// <summary>
-    /// MODIFIED: Accepts workload parameters and passes them to the new chunk instance.
-    /// </summary>
-    public McChunk InstantiateAndConfigureChunk(int array_cx, int array_cy, int array_cz, int columnsPerDataGenStep, int voxelsPerMeshStep)
+    public McChunk InstantiateAndConfigureChunk(int array_cx, int array_cy, int array_cz, int columnsPerDataGenStep, int voxelsPerMeshStep, int voxelsPerTerrainStep)
     {
+        // With chunkOffsetY = 0, centered_dy is now the same as the array_cy.
         int centered_dx = array_cx - chunkOffsetX;
-        int centered_dy = array_cy - chunkOffsetY;
+        int centered_dy = array_cy - chunkOffsetY; 
         int centered_dz = array_cz - chunkOffsetZ;
 
         int chunk1DIndex = ChunkCenteredCoordsTo1D(centered_dx, centered_dy, centered_dz);
@@ -104,8 +106,7 @@ public class McWorld : UdonSharpBehaviour
         
         chunks_1D[chunk1DIndex] = newChunkScript;
 
-        // Pass the workload configuration to the chunk during initialization
-        newChunkScript.Initialize(this, terrainGenerator, centered_dx, centered_dy, centered_dz, columnsPerDataGenStep, voxelsPerMeshStep);
+        newChunkScript.Initialize(this, terrainGenerator, centered_dx, centered_dy, centered_dz, columnsPerDataGenStep, voxelsPerMeshStep, voxelsPerTerrainStep);
         
         newChunkGO.SetActive(true);
 
@@ -120,10 +121,10 @@ public class McWorld : UdonSharpBehaviour
     public ushort GetBlock(int globalX, int globalY, int globalZ)
     {
         int centeredChunkX = Mathf.FloorToInt((float)globalX / chunkSizeXZ);
-        int centeredChunkY = Mathf.FloorToInt((float)globalY / chunkSizeY);
+        int chunkY = Mathf.FloorToInt((float)globalY / chunkSizeY); // Y is no longer centered
         int centeredChunkZ = Mathf.FloorToInt((float)globalZ / chunkSizeXZ);
         
-        McChunk chunk = GetChunkAt(centeredChunkX, centeredChunkY, centeredChunkZ);
+        McChunk chunk = GetChunkAt(centeredChunkX, chunkY, centeredChunkZ);
         if (chunk == null) return 0;
 
         int localX = globalX - chunk.chunkX_world * chunkSizeXZ;
@@ -136,10 +137,10 @@ public class McWorld : UdonSharpBehaviour
     public void SetBlock(int globalX, int globalY, int globalZ, byte blockType)
     {
         int centeredChunkX = Mathf.FloorToInt((float)globalX / chunkSizeXZ);
-        int centeredChunkY = Mathf.FloorToInt((float)globalY / chunkSizeY);
+        int chunkY = Mathf.FloorToInt((float)globalY / chunkSizeY); // Y is no longer centered
         int centeredChunkZ = Mathf.FloorToInt((float)globalZ / chunkSizeXZ);
         
-        McChunk chunk = GetChunkAt(centeredChunkX, centeredChunkY, centeredChunkZ);
+        McChunk chunk = GetChunkAt(centeredChunkX, chunkY, centeredChunkZ);
         if (chunk == null) return;
 
         int localX = globalX - chunk.chunkX_world * chunkSizeXZ;
@@ -149,9 +150,9 @@ public class McWorld : UdonSharpBehaviour
         chunk.SetBlockLocal(localX, localY, localZ, blockType);
     }
     
-    private void TriggerNeighborUpdate(int centeredCX, int centeredCY, int centeredCZ)
+    private void TriggerNeighborUpdate(int centeredCX, int cY, int centeredCZ)
     {
-        McChunk neighborChunk = GetChunkAt(centeredCX, centeredCY, centeredCZ);
+        McChunk neighborChunk = GetChunkAt(centeredCX, cY, centeredCZ);
         if (neighborChunk != null) RequestChunkMeshUpdate(neighborChunk);
     }
     
@@ -176,9 +177,9 @@ public class McWorld : UdonSharpBehaviour
         }
     }
     
-    public McChunk GetChunkAt(int centered_cx, int centered_cy, int centered_cz)
+    public McChunk GetChunkAt(int centered_cx, int cy, int centered_cz)
     {
-        int index = ChunkCenteredCoordsTo1D(centered_cx, centered_cy, centered_cz);
+        int index = ChunkCenteredCoordsTo1D(centered_cx, cy, centered_cz);
         if (index == -1 || chunks_1D == null || index >= chunks_1D.Length) return null;
         return chunks_1D[index];
     }
@@ -191,6 +192,7 @@ public class McWorld : UdonSharpBehaviour
 
     public int ChunkCenteredCoordsTo1D(int centeredX, int centeredY, int centeredZ)
     {
+        // Y is no longer "centered", it's an absolute index.
         return ChunkArrayCoordsTo1D(centeredX + chunkOffsetX, centeredY + chunkOffsetY, centeredZ + chunkOffsetZ);
     }
     
@@ -206,15 +208,17 @@ public class McWorld : UdonSharpBehaviour
         int[] radialOrder = new int[totalWorldChunks];
         bool[] chunkAdded = new bool[totalWorldChunks];
         int count = 0;
-        int maxRadius = Mathf.Max(worldDimensionX / 2, Mathf.Max(worldDimensionY / 2, worldDimensionZ / 2)) + 1;
+        int maxRadius = Mathf.Max(worldDimensionX / 2, Mathf.Max(worldDimensionY, worldDimensionZ / 2)) + 1;
 
         for (int r = 0; r < maxRadius && count < totalWorldChunks; r++) {
-            for (int y = -r; y <= r; y++) {
+            // Y loop now starts from 0 since it's not centered
+            for (int y = 0; y < worldDimensionY; y++) {
                 for (int z = -r; z <= r; z++) {
                     for (int x = -r; x <= r; x++) {
-                        if (Mathf.Abs(x) == r || Mathf.Abs(y) == r || Mathf.Abs(z) == r) {
+                        // Only check XZ for radius, process all Y levels at that radius
+                        if (Mathf.Abs(x) == r || Mathf.Abs(z) == r) {
                             int arrayX = x + chunkOffsetX;
-                            int arrayY = y + chunkOffsetY;
+                            int arrayY = y; // No offset
                             int arrayZ = z + chunkOffsetZ;
                             int chunkIndex = ChunkArrayCoordsTo1D(arrayX, arrayY, arrayZ);
                             if (chunkIndex != -1 && !chunkAdded[chunkIndex]) {
@@ -249,9 +253,9 @@ public class McWorld : UdonSharpBehaviour
         return true;
     }
 
-    public bool IsChunkSingleOpaqueSolid(int centered_cx, int centered_cy, int centered_cz)
+    public bool IsChunkSingleOpaqueSolid(int centered_cx, int cy, int centered_cz)
     {
-        McChunk chunk = GetChunkAt(centered_cx, centered_cy, centered_cz);
+        McChunk chunk = GetChunkAt(centered_cx, cy, centered_cz);
         if (chunk == null) return false; 
         return chunk.isSingleOpaqueSolid;
     }

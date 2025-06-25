@@ -1,7 +1,8 @@
 #if UNITY_EDITOR
 using UnityEngine;
 using UnityEditor;
-using System.Collections.Generic; // For List<AudioClip>
+using UnityEditorInternal; // Required for ReorderableList
+using System.Collections.Generic;
 
 [CustomEditor(typeof(McBlockTypeManager))]
 public class McBlockTypeManagerEditor : Editor
@@ -9,35 +10,34 @@ public class McBlockTypeManagerEditor : Editor
     private McBlockTypeManager manager;
     private SerializedObject soTarget;
 
+    // --- Serialized Properties ---
     private SerializedProperty previewTextureArrayProp;
-
+    private SerializedProperty finalDataArrayProp;
     private SerializedProperty numberOfBlockTypesProp;
     private SerializedProperty blockNamesProp;
     private SerializedProperty isSolidDataProp;
     private SerializedProperty blockVisibilityTypeDataProp; 
     private SerializedProperty blockShapeTypeDataProp; 
-    
     private SerializedProperty uv_allFacesDataProp;
     private SerializedProperty uv_topFaceDataProp;
     private SerializedProperty uv_bottomFaceDataProp;
     private SerializedProperty uv_sideFacesDataProp;
-    private SerializedProperty textureMappingTypeDataProp; 
-
+    private SerializedProperty textureMappingTypeDataProp;
     private SerializedProperty breakParticlesPrefabDataProp;
     private SerializedProperty placeParticlesPrefabDataProp;
-
     private SerializedProperty fallbackBreakSoundsProp;
     private SerializedProperty fallbackPlaceSoundsProp;
     private SerializedProperty fallbackFootstepSoundsProp;
 
+    // --- Editor State ---
+    private ReorderableList blockTypesList;
     private bool[] foldoutStates; 
     private Texture2D singleSlicePreviewTexture; 
     private const int ATLAS_GRID_WIDTH = 16; 
     private const float PICKER_SLICE_SIZE = 40f; 
     private const float PICKER_SLICE_PADDING = 2f;
 
-
-    // --- Inner class for the Texture Slice Picker Popup ---
+    // --- Inner class for the Texture Slice Picker Popup (Unchanged) ---
     private class TextureSlicePickerPopup : PopupWindowContent
     {
         private McBlockTypeManager managerInstance;
@@ -53,22 +53,20 @@ public class McBlockTypeManagerEditor : Editor
             this.targetSliceIndexProperty = sliceIndexProp;
             this.textureArray = manager.previewTextureArray; 
             this.initialSliceIndex = sliceIndexProp.intValue;
-            this.tempSliceTexture = null; // Initialize as null
+            this.tempSliceTexture = null;
 
             if (textureArray != null && textureArray.width > 0 && textureArray.height > 0)
             {
-                // Always use RGBA32 for the temporary destination texture for Graphics.CopyTexture.
-                // This is a known good, uncompressed format, generally safe as a destination.
                 try {
-                    tempSliceTexture = new Texture2D(textureArray.width, textureArray.height, TextureFormat.RGBA32, false); // false for mipChain
+                    tempSliceTexture = new Texture2D(textureArray.width, textureArray.height, TextureFormat.RGBA32, false);
                     tempSliceTexture.filterMode = FilterMode.Point;
                 } catch (System.Exception ex) { 
-                    Debug.LogError($"[TextureSlicePickerPopup] Error creating temp Texture2D with RGBA32: {ex.Message}");
-                    tempSliceTexture = null; // Ensure it's null if creation fails
+                    Debug.LogError($"[TextureSlicePickerPopup] Error creating temp Texture2D: {ex.Message}");
+                    tempSliceTexture = null;
                 }
             } else {
-                 if(managerInstance != null && managerInstance.enableVerboseLogging) Debug.LogWarning("[TextureSlicePickerPopup] TextureArray is null or has zero dimensions. Cannot create tempSliceTexture.");
-                 tempSliceTexture = null; // Ensure it's null
+                 if(managerInstance != null && managerInstance.enableVerboseLogging) Debug.LogWarning("[TextureSlicePickerPopup] TextureArray is null or has zero dimensions.");
+                 tempSliceTexture = null;
             }
         }
 
@@ -85,10 +83,8 @@ public class McBlockTypeManagerEditor : Editor
                 EditorGUILayout.LabelField("Texture Array not assigned in Manager.");
                 return;
             }
-            // More robust check for tempSliceTexture validity
-            if (tempSliceTexture == null || tempSliceTexture.GetNativeTexturePtr() == System.IntPtr.Zero || tempSliceTexture.width == 0 || tempSliceTexture.height == 0) 
-            {
-                EditorGUILayout.LabelField("Error: Could not initialize temporary texture for picker (null, native error, or zero dimensions).");
+            if (tempSliceTexture == null) {
+                EditorGUILayout.LabelField("Error: Could not initialize temp texture for picker.");
                 return;
             }
 
@@ -106,22 +102,14 @@ public class McBlockTypeManagerEditor : Editor
                     int sliceIndex = y * ATLAS_GRID_WIDTH + x;
                     if (sliceIndex < textureArray.depth)
                     {
-                        // Ensure tempSliceTexture is still valid before copying
-                        if (tempSliceTexture == null || tempSliceTexture.GetNativeTexturePtr() == System.IntPtr.Zero) {
-                            Debug.LogError("[TextureSlicePicker] tempSliceTexture became invalid before Graphics.CopyTexture.");
-                            EditorGUILayout.LabelField("Error drawing slice.", GUILayout.Width(PICKER_SLICE_SIZE), GUILayout.Height(PICKER_SLICE_SIZE));
-                            GUILayout.Space(PICKER_SLICE_PADDING);
-                            continue;
-                        }
-
                         try {
                              Graphics.CopyTexture(textureArray, sliceIndex, 0, tempSliceTexture, 0, 0);
-                        } catch (System.Exception e) { // Catch System.Exception for broader error capture
+                        } catch (System.Exception e) {
                             Color[] colors = new Color[tempSliceTexture.width * tempSliceTexture.height];
                             for(int c=0; c < colors.Length; c++) colors[c] = Color.gray;
                             tempSliceTexture.SetPixels(colors);
                             tempSliceTexture.Apply();
-                            if(managerInstance != null && managerInstance.enableVerboseLogging) Debug.LogWarning($"[TextureSlicePicker] Error copying texture slice {sliceIndex} for preview: {e.Message}. Ensure Texture Array has Read/Write enabled if necessary, or formats are compatible for Graphics.CopyTexture.");
+                            if(managerInstance != null && managerInstance.enableVerboseLogging) Debug.LogWarning($"[TextureSlicePicker] Error copying texture slice {sliceIndex}: {e.Message}.");
                         }
 
                         GUIStyle buttonStyle = new GUIStyle(GUI.skin.button);
@@ -168,44 +156,53 @@ public class McBlockTypeManagerEditor : Editor
     void OnEnable()
     {
         manager = (McBlockTypeManager)target;
-        soTarget = serializedObject; 
+        soTarget = new SerializedObject(manager); 
 
+        // --- Find All Properties ---
         previewTextureArrayProp = soTarget.FindProperty("previewTextureArray");
+        finalDataArrayProp = soTarget.FindProperty("finalDataArray");
         numberOfBlockTypesProp = soTarget.FindProperty("numberOfBlockTypes");
         blockNamesProp = soTarget.FindProperty("blockNames");
         isSolidDataProp = soTarget.FindProperty("isSolidData");
         blockVisibilityTypeDataProp = soTarget.FindProperty("blockVisibilityTypeData");
         blockShapeTypeDataProp = soTarget.FindProperty("blockShapeTypeData"); 
-        
         uv_allFacesDataProp = soTarget.FindProperty("uv_allFacesData"); 
         uv_topFaceDataProp = soTarget.FindProperty("uv_topFaceData"); 
         uv_bottomFaceDataProp = soTarget.FindProperty("uv_bottomFaceData"); 
         uv_sideFacesDataProp = soTarget.FindProperty("uv_sideFacesData"); 
         textureMappingTypeDataProp = soTarget.FindProperty("textureMappingTypeData");
-
         breakParticlesPrefabDataProp = soTarget.FindProperty("breakParticlesPrefabData");
         placeParticlesPrefabDataProp = soTarget.FindProperty("placeParticlesPrefabData");
-
         fallbackBreakSoundsProp = soTarget.FindProperty("fallbackBreakSounds");
         fallbackPlaceSoundsProp = soTarget.FindProperty("fallbackPlaceSounds");
         fallbackFootstepSoundsProp = soTarget.FindProperty("fallbackFootstepSounds");
 
-        ValidateSerializedProperties(); 
-
-        int currentNumberOfBlockTypes = 0;
-        if (numberOfBlockTypesProp != null) 
-        {
-            currentNumberOfBlockTypes = numberOfBlockTypesProp.intValue;
-        }
-        if (currentNumberOfBlockTypes < 0) currentNumberOfBlockTypes = 0;
-
-
-        if (foldoutStates == null || foldoutStates.Length != currentNumberOfBlockTypes)
-        {
-            foldoutStates = new bool[currentNumberOfBlockTypes];
-        }
+        // --- Initialize ReorderableList ---
+        blockTypesList = new ReorderableList(soTarget, blockNamesProp, true, true, true, true);
         
+        blockTypesList.drawHeaderCallback = rect => EditorGUI.LabelField(rect, "Block Properties (per ID)");
+        blockTypesList.drawElementCallback = DrawListElement;
+        blockTypesList.onAddCallback = AddNewBlockType;
+        blockTypesList.onRemoveCallback = RemoveBlockType;
+        blockTypesList.onReorderCallbackWithDetails = ReorderBlockTypes;
+        blockTypesList.elementHeightCallback = GetElementHeight;
+        
+        // --- Sync Foldout States ---
+        SyncFoldoutStates();
         InitializeSingleSlicePreviewTexture();
+    }
+    
+    private void SyncFoldoutStates() {
+        int currentNum = blockNamesProp.arraySize;
+        if (foldoutStates == null || foldoutStates.Length != currentNum)
+        {
+            bool[] newStates = new bool[currentNum];
+            if (foldoutStates != null)
+            {
+                System.Array.Copy(foldoutStates, newStates, Mathf.Min(foldoutStates.Length, newStates.Length));
+            }
+            foldoutStates = newStates;
+        }
     }
 
     private void InitializeSingleSlicePreviewTexture() {
@@ -214,34 +211,18 @@ public class McBlockTypeManagerEditor : Editor
 
         if (manager != null && manager.previewTextureArray != null) {
             if (manager.previewTextureArray.width > 0 && manager.previewTextureArray.height > 0) {
-                // Use RGBA32 for singleSlicePreviewTexture as well for consistency and safety as a CopyTexture destination
                 try {
                     singleSlicePreviewTexture = new Texture2D(manager.previewTextureArray.width, manager.previewTextureArray.height, TextureFormat.RGBA32, false);
                     singleSlicePreviewTexture.filterMode = FilterMode.Point;
                 } catch (System.Exception ex) { 
-                    Debug.LogWarning($"[McBlockTypeManagerEditor] Error creating singleSlicePreviewTexture with RGBA32: {ex.Message}. Using fallback.");
-                    try {
-                        singleSlicePreviewTexture = new Texture2D(16, 16, TextureFormat.RGBA32, false);
-                        singleSlicePreviewTexture.filterMode = FilterMode.Point;
-                    } catch (System.Exception innerEx) { 
-                         Debug.LogError($"[McBlockTypeManagerEditor] Fallback singleSlicePreviewTexture creation also failed: {innerEx.Message}");
-                         singleSlicePreviewTexture = null; 
-                    }
+                    Debug.LogWarning($"[McBlockTypeManagerEditor] Error creating singleSlicePreviewTexture: {ex.Message}");
+                    singleSlicePreviewTexture = null;
                 }
             } else {
-                if(manager != null && manager.enableVerboseLogging) Debug.LogWarning("[McBlockTypeManagerEditor] Preview Texture Array has zero width or height. Cannot create single slice preview texture.");
+                if(manager != null && manager.enableVerboseLogging) Debug.LogWarning("[McBlockTypeManagerEditor] Preview Texture Array has zero width or height.");
             }
         }
     }
-
-
-    private void ValidateSerializedProperties()
-    {
-        if (previewTextureArrayProp == null) Debug.LogError("[McBlockTypeManagerEditor] Failed to find SP: previewTextureArray");
-        if (numberOfBlockTypesProp == null) Debug.LogError("[McBlockTypeManagerEditor] Failed to find SP: numberOfBlockTypes");
-        // ... (other property validations)
-    }
-
 
     void OnDisable() 
     {
@@ -256,234 +237,351 @@ public class McBlockTypeManagerEditor : Editor
     {
         soTarget.Update();
 
-        if (numberOfBlockTypesProp == null || blockNamesProp == null /* ... other critical SPs ... */)
-        {
-            EditorGUILayout.HelpBox("Core SerializedProperties missing. Check console.", MessageType.Error);
-            if (GUILayout.Button("Re-initialize Editor")) OnEnable();
-            return;
-        }
-
         EditorGUILayout.Space();
         EditorGUILayout.LabelField("Block Type Definitions Manager", EditorStyles.boldLabel);
-        EditorGUILayout.HelpBox("Configure per-block properties.", MessageType.Info);
+        EditorGUILayout.HelpBox("Configure per-block properties using the list below. Drag to reorder, then press 'Bake' to generate optimized runtime data.", MessageType.Info);
         EditorGUILayout.Space();
 
-        if (previewTextureArrayProp != null)
+        // --- Management Buttons ---
+        EditorGUILayout.BeginHorizontal();
+        GUI.backgroundColor = new Color(0.7f, 1f, 0.8f); // Light green
+        if (GUILayout.Button(new GUIContent("Bake Properties", "Processes the Editor-Only Source arrays into the optimized 'finalDataArray' for use in builds."), GUILayout.Height(30)))
         {
-            EditorGUI.BeginChangeCheck();
-            EditorGUILayout.PropertyField(previewTextureArrayProp, new GUIContent("Preview Texture Array"));
-            if (EditorGUI.EndChangeCheck()) {
-                soTarget.ApplyModifiedProperties(); 
-                InitializeSingleSlicePreviewTexture(); 
+            if (EditorUtility.DisplayDialog("Confirm Bake", "This will overwrite the existing 'finalDataArray' with newly packed data from the source arrays. Are you sure?", "Yes, Bake Data", "Cancel"))
+            {
+                manager.EncodeDataForBuild();
+                EditorUtility.SetDirty(manager);
+                soTarget.Update();
             }
-            EditorGUILayout.Space();
         }
+        
+        GUI.backgroundColor = new Color(1f, 0.8f, 0.8f); // Light red
+        if (GUILayout.Button(new GUIContent("Force Sync Arrays", "Synchronizes the sizes of all data arrays. Use this to fix 'Array size mismatch' errors."), GUILayout.Height(30)))
+        {
+            if (EditorUtility.DisplayDialog("Confirm Sync", "This will force all data arrays to match the size of the 'Block Names' list. This can fix errors but may result in data loss if an array has shrunk. Are you sure?", "Yes, Sync Arrays", "Cancel"))
+            {
+                ForceSyncAllArrays();
+            }
+        }
+        EditorGUILayout.EndHorizontal();
+        GUI.backgroundColor = Color.white;
+        EditorGUILayout.Space(10);
 
-        EditorGUILayout.LabelField("Block Type Configuration", EditorStyles.boldLabel);
+        // --- Runtime Data Display ---
+        EditorGUILayout.LabelField("Runtime Data", EditorStyles.boldLabel);
+        EditorGUI.BeginDisabledGroup(true);
+        EditorGUILayout.PropertyField(finalDataArrayProp, true);
+        EditorGUI.EndDisabledGroup();
+        EditorGUILayout.Space(10);
+
+        // --- Editor-Only Source Data ---
+        EditorGUILayout.LabelField("Editor-Only Source Data", EditorStyles.boldLabel);
         EditorGUI.BeginChangeCheck();
-        EditorGUILayout.PropertyField(numberOfBlockTypesProp);
-        if(EditorGUI.EndChangeCheck()){
-            if(numberOfBlockTypesProp.intValue < 0) numberOfBlockTypesProp.intValue = 0;
-            int currentNum = numberOfBlockTypesProp.intValue;
-            if(foldoutStates == null || foldoutStates.Length != currentNum) {
-                foldoutStates = new bool[currentNum];
-            }
+        EditorGUILayout.PropertyField(previewTextureArrayProp, new GUIContent("Preview Texture Array"));
+        if (EditorGUI.EndChangeCheck()) {
+            soTarget.ApplyModifiedProperties(); 
+            InitializeSingleSlicePreviewTexture(); 
         }
-        
-        if (GUILayout.Button("Apply Number of Types & Resize Arrays"))
-        {
-            ResizeAllArrays(numberOfBlockTypesProp.intValue);
-            foldoutStates = new bool[numberOfBlockTypesProp.intValue < 0 ? 0 : numberOfBlockTypesProp.intValue];
-        }
-        
-        EditorGUILayout.Space(); 
-        GUI.backgroundColor = new Color(1f, 0.6f, 0.6f); 
-        if (GUILayout.Button("Reset All Block Types to Zero (Irreversible!)"))
-        {
-            if (EditorUtility.DisplayDialog("Confirm Reset", "Reset all block types to zero?", "Yes, Reset All", "Cancel"))
-            {
-                numberOfBlockTypesProp.intValue = 0;
-                soTarget.ApplyModifiedProperties(); 
-                ResizeAllArrays(0);
-                foldoutStates = new bool[0];
-            }
-        }
-        GUI.backgroundColor = Color.white; 
-        EditorGUILayout.Space(); 
-
-        EditorGUILayout.LabelField("Fallback Audio", EditorStyles.boldLabel);
-        if(fallbackBreakSoundsProp != null) EditorGUILayout.PropertyField(fallbackBreakSoundsProp, true);
-        if(fallbackPlaceSoundsProp != null) EditorGUILayout.PropertyField(fallbackPlaceSoundsProp, true);
-        if(fallbackFootstepSoundsProp != null) EditorGUILayout.PropertyField(fallbackFootstepSoundsProp, true);
         EditorGUILayout.Space();
-
-        EditorGUILayout.LabelField("Block Properties (per ID):", EditorStyles.boldLabel);
-        int currentNumberOfBlockTypes = numberOfBlockTypesProp.intValue;
-        if (currentNumberOfBlockTypes < 0) currentNumberOfBlockTypes = 0;
-
-        if (foldoutStates == null || foldoutStates.Length != currentNumberOfBlockTypes) {
-             foldoutStates = new bool[currentNumberOfBlockTypes]; 
-        }
         
-        bool overallMismatch = CheckOverallMismatch(currentNumberOfBlockTypes);
-        if (overallMismatch) {
-            EditorGUILayout.HelpBox("Array sizes mismatch 'Number Of Block Types'. Click 'Apply Number of Types & Resize Arrays'.", MessageType.Warning);
-        }
+        EditorGUILayout.LabelField("Fallback Audio", EditorStyles.boldLabel);
+        EditorGUILayout.PropertyField(fallbackBreakSoundsProp, true);
+        EditorGUILayout.PropertyField(fallbackPlaceSoundsProp, true);
+        EditorGUILayout.PropertyField(fallbackFootstepSoundsProp, true);
+        EditorGUILayout.Space();
         
-        for (int i = 0; i < currentNumberOfBlockTypes; i++)
-        {
-            if (i >= foldoutStates.Length) break; 
-
-            bool canDisplayBlockProperties = CheckCanDisplayProperties(i); 
-
-            string foldoutLabel;
-            if (canDisplayBlockProperties && blockNamesProp != null && i < blockNamesProp.arraySize)
-            {
-                SerializedProperty nameProp = blockNamesProp.GetArrayElementAtIndex(i);
-                foldoutLabel = nameProp.stringValue;
-                if (string.IsNullOrEmpty(foldoutLabel)) foldoutLabel = $"Block ID: {i} (Unnamed)";
-                else foldoutLabel = $"{foldoutLabel} (ID: {i})";
-            }
-            else
-            {
-                foldoutLabel = $"Block ID: {i} (Data Array Mismatch!)";
-            }
-
-            foldoutStates[i] = EditorGUILayout.Foldout(foldoutStates[i], foldoutLabel, true, EditorStyles.foldoutHeader);
-
-            if (foldoutStates[i])
-            {
-                if (canDisplayBlockProperties)
-                {
-                    EditorGUI.indentLevel++;
-                    EditorGUILayout.LabelField("General", EditorStyles.boldLabel);
-                    if (blockNamesProp != null && i < blockNamesProp.arraySize) EditorGUILayout.PropertyField(blockNamesProp.GetArrayElementAtIndex(i), new GUIContent("Name"));
-                    if (isSolidDataProp != null && i < isSolidDataProp.arraySize) EditorGUILayout.PropertyField(isSolidDataProp.GetArrayElementAtIndex(i), new GUIContent("Is Solid"));
-                    
-                    if (blockVisibilityTypeDataProp != null && i < blockVisibilityTypeDataProp.arraySize) {
-                        SerializedProperty visibilityTypeProp = blockVisibilityTypeDataProp.GetArrayElementAtIndex(i);
-                        visibilityTypeProp.intValue = (int)(BlockVisibilityType)EditorGUILayout.EnumPopup(new GUIContent("Visibility Type"), (BlockVisibilityType)visibilityTypeProp.intValue);
-                    }
-                    if (blockShapeTypeDataProp != null && i < blockShapeTypeDataProp.arraySize) {
-                        SerializedProperty shapeTypeProp = blockShapeTypeDataProp.GetArrayElementAtIndex(i);
-                        shapeTypeProp.intValue = (int)(McBlockShapeType)EditorGUILayout.EnumPopup(new GUIContent("Shape Type"), (McBlockShapeType)shapeTypeProp.intValue);
-                    }
-                    
-                    EditorGUILayout.Space();
-                    EditorGUILayout.LabelField("Texturing (Atlas XY Coords)", EditorStyles.boldLabel);
-                    if (textureMappingTypeDataProp!= null && i < textureMappingTypeDataProp.arraySize)
-                    {
-                        SerializedProperty mappingTypeProp = textureMappingTypeDataProp.GetArrayElementAtIndex(i);
-                        mappingTypeProp.intValue = (int)(McBlockTextureMappingType)EditorGUILayout.EnumPopup(new GUIContent("Texture Mapping"), (McBlockTextureMappingType)mappingTypeProp.intValue);
-                        
-                        McBlockTextureMappingType currentMappingType = (McBlockTextureMappingType)mappingTypeProp.intValue;
-                        if (currentMappingType == McBlockTextureMappingType.AllFacesSame)
-                        {
-                            if (uv_allFacesDataProp != null && i < uv_allFacesDataProp.arraySize) DrawAtlasSlicePicker(uv_allFacesDataProp.GetArrayElementAtIndex(i), "All Faces");
-                        }
-                        else if (currentMappingType == McBlockTextureMappingType.TopBottomSides)
-                        {
-                            if (uv_topFaceDataProp != null && i < uv_topFaceDataProp.arraySize) DrawAtlasSlicePicker(uv_topFaceDataProp.GetArrayElementAtIndex(i), "Top Face");
-                            if (uv_bottomFaceDataProp != null && i < uv_bottomFaceDataProp.arraySize) DrawAtlasSlicePicker(uv_bottomFaceDataProp.GetArrayElementAtIndex(i), "Bottom Face");
-                            if (uv_sideFacesDataProp != null && i < uv_sideFacesDataProp.arraySize) DrawAtlasSlicePicker(uv_sideFacesDataProp.GetArrayElementAtIndex(i), "Side Faces");
-                        }
-                    }
-                    
-                    EditorGUILayout.Space();
-                    EditorGUILayout.LabelField("Audio (Manually Handled)", EditorStyles.boldLabel);
-                    if (manager != null && manager.breakSounds != null && i < manager.breakSounds.Length) manager.breakSounds[i] = DrawAudioClipArray(manager.breakSounds[i], "Break Sounds");
-                    if (manager != null && manager.placeSounds != null && i < manager.placeSounds.Length) manager.placeSounds[i] = DrawAudioClipArray(manager.placeSounds[i], "Place Sounds");
-                    if (manager != null && manager.footstepSounds != null && i < manager.footstepSounds.Length) manager.footstepSounds[i] = DrawAudioClipArray(manager.footstepSounds[i], "Footstep Sounds");
-                    
-                    EditorGUILayout.Space();
-                    EditorGUILayout.LabelField("Particles", EditorStyles.boldLabel);
-                    if (breakParticlesPrefabDataProp != null && i < breakParticlesPrefabDataProp.arraySize) EditorGUILayout.PropertyField(breakParticlesPrefabDataProp.GetArrayElementAtIndex(i), new GUIContent("Break Particles"));
-                    if (placeParticlesPrefabDataProp != null && i < placeParticlesPrefabDataProp.arraySize) EditorGUILayout.PropertyField(placeParticlesPrefabDataProp.GetArrayElementAtIndex(i), new GUIContent("Place Particles"));
-
-                    EditorGUI.indentLevel--;
-                }
-                else 
-                {
-                    EditorGUI.indentLevel++;
-                    EditorGUILayout.HelpBox("Properties for this block ID cannot be displayed. Resize arrays.", MessageType.Error);
-                    EditorGUI.indentLevel--;
-                }
-            }
-            EditorGUILayout.Separator();
+        // --- Reorderable List ---
+        if (CheckOverallMismatch(blockNamesProp.arraySize)) {
+            EditorGUILayout.HelpBox("Source array sizes mismatch! Use the 'Force Sync Arrays' button to fix this.", MessageType.Error);
         }
+        blockTypesList.DoLayoutList();
         
         if (GUI.changed) EditorUtility.SetDirty(manager);
         soTarget.ApplyModifiedProperties(); 
     }
 
-    private bool CheckOverallMismatch(int currentNumberOfBlockTypes) {
-        if (currentNumberOfBlockTypes <= 0) return false;
-        if (blockNamesProp == null || blockNamesProp.arraySize != currentNumberOfBlockTypes) return true;
-        // ... (other SP checks)
-        if (manager == null) return true; 
-        if (manager.breakSounds == null || manager.breakSounds.Length != currentNumberOfBlockTypes) return true;
-        // ... (other jagged array checks)
-        return false;
-    }
-
-     private bool CheckCanDisplayProperties(int index) {
-        if (numberOfBlockTypesProp == null) return false; 
-        int currentNumberOfBlockTypes = numberOfBlockTypesProp.intValue;
-        if (index >= currentNumberOfBlockTypes) return false;
-
-        // Check SerializedProperty arrays (ensure property itself is not null AND index is within bounds)
-        if (blockNamesProp == null || index >= blockNamesProp.arraySize) return false;
-        // ... (other SP checks) ...
-
-        // Check manager's jagged arrays for outer dimension validity
-        if (manager == null) return false; 
-        if (manager.breakSounds == null || index >= manager.breakSounds.Length) return false;
-        // ... (other jagged array checks) ...
-        
-        return true;
-    }
-
-    private void ResizeAllArrays(int newSize)
+    #region ReorderableList Callbacks
+    private float GetElementHeight(int index)
     {
-        if (newSize < 0) newSize = 0; 
-        Undo.RecordObject(manager, "Resize Block Type Arrays");
-
-        if(blockNamesProp != null) ResizeSerializedArray<string>(blockNamesProp, newSize, "");
-        // ... (resize other SP arrays with null checks) ...
-        if(isSolidDataProp != null) ResizeSerializedArrayValueType<bool>(isSolidDataProp, newSize, true);
-        if(blockVisibilityTypeDataProp != null) ResizeSerializedArrayValueType<int>(blockVisibilityTypeDataProp, newSize, (int)BlockVisibilityType.Opaque); 
-        if(blockShapeTypeDataProp != null) ResizeSerializedArrayValueType<int>(blockShapeTypeDataProp, newSize, (int)McBlockShapeType.Cube); 
-        if(uv_allFacesDataProp != null) ResizeSerializedArrayValueType<int>(uv_allFacesDataProp, newSize, 0); 
-        if(uv_topFaceDataProp != null) ResizeSerializedArrayValueType<int>(uv_topFaceDataProp, newSize, 0); 
-        if(uv_bottomFaceDataProp != null) ResizeSerializedArrayValueType<int>(uv_bottomFaceDataProp, newSize, 0); 
-        if(uv_sideFacesDataProp != null) ResizeSerializedArrayValueType<int>(uv_sideFacesDataProp, newSize, 0); 
-        if(textureMappingTypeDataProp != null) ResizeSerializedArrayValueType<int>(textureMappingTypeDataProp, newSize, (int)McBlockTextureMappingType.AllFacesSame);
-        if(breakParticlesPrefabDataProp != null) ResizeSerializedArray<ParticleSystem>(breakParticlesPrefabDataProp, newSize, null);
-        if(placeParticlesPrefabDataProp != null) ResizeSerializedArray<ParticleSystem>(placeParticlesPrefabDataProp, newSize, null);
-
-
-        if (manager != null) 
+        if (foldoutStates == null || index >= foldoutStates.Length || !foldoutStates[index])
         {
-            manager.breakSounds = ResizeJaggedArrayManual(manager.breakSounds, newSize);
-            manager.placeSounds = ResizeJaggedArrayManual(manager.placeSounds, newSize);
-            manager.footstepSounds = ResizeJaggedArrayManual(manager.footstepSounds, newSize);
+            return EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
         }
+        else
+        {
+            float height = EditorGUIUtility.singleLineHeight; // Foldout header
+            // Add heights for all properties shown when unfolded
+            height += (EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing) * 11; // General + Particles + Section Labels
+            
+            // Texture Mapping
+            var mappingTypeProp = textureMappingTypeDataProp.GetArrayElementAtIndex(index);
+            McBlockTextureMappingType currentMappingType = (McBlockTextureMappingType)mappingTypeProp.intValue;
+            if (currentMappingType == McBlockTextureMappingType.AllFacesSame) height += 42f;
+            else if (currentMappingType == McBlockTextureMappingType.TopBottomSides) height += 42f * 3;
 
-
-        if (blockNamesProp != null && blockNamesProp.arraySize == newSize) {
-            for (int i = 0; i < newSize; i++) {
-                SerializedProperty nameElement = blockNamesProp.GetArrayElementAtIndex(i);
-                if (nameElement != null && nameElement.propertyType == SerializedPropertyType.String && string.IsNullOrEmpty(nameElement.stringValue)) {
-                    nameElement.stringValue = $"Block_{i}";
+            // Audio
+            height += EditorGUIUtility.singleLineHeight; // "Audio" label
+            for(int i = 0; i < 3; i++) {
+                AudioClip[][] audioArray = (i == 0) ? manager.breakSounds : (i == 1) ? manager.placeSounds : manager.footstepSounds;
+                height += EditorGUIUtility.singleLineHeight * 2; // "Size" field + label
+                if (audioArray != null && index < audioArray.Length && audioArray[index] != null) {
+                    height += (EditorGUIUtility.singleLineHeight) * audioArray[index].Length;
                 }
             }
+            height += EditorGUIUtility.standardVerticalSpacing * 15;
+            return height;
         }
-
-        if (manager != null) EditorUtility.SetDirty(manager); 
-        soTarget.ApplyModifiedProperties(); 
     }
 
-     private AudioClip[][] ResizeJaggedArrayManual(AudioClip[][] currentArray, int newOuterSize)
+    private void DrawListElement(Rect rect, int index, bool isActive, bool isFocused)
+    {
+        if (index >= blockNamesProp.arraySize) return;
+        SyncFoldoutStates();
+
+        string foldoutLabel;
+        if (blockNamesProp != null && index < blockNamesProp.arraySize)
+        {
+            foldoutLabel = $"{blockNamesProp.GetArrayElementAtIndex(index).stringValue} (ID: {index})";
+        }
+        else
+        {
+            foldoutLabel = $"Block ID: {index} (Data Array Mismatch!)";
+        }
+        
+        Rect foldoutRect = new Rect(rect.x, rect.y, rect.width, EditorGUIUtility.singleLineHeight);
+        foldoutStates[index] = EditorGUI.Foldout(foldoutRect, foldoutStates[index], foldoutLabel, true, EditorStyles.foldoutHeader);
+
+        if (foldoutStates[index])
+        {
+            Rect propertyRect = new Rect(rect.x, rect.y + EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing, rect.width, EditorGUIUtility.singleLineHeight);
+            
+            if (CheckCanDisplayProperties(index))
+            {
+                EditorGUI.indentLevel++;
+                
+                DrawLabel(ref propertyRect, "General");
+                DrawProperty(ref propertyRect, blockNamesProp.GetArrayElementAtIndex(index), "Name");
+                DrawProperty(ref propertyRect, isSolidDataProp.GetArrayElementAtIndex(index), "Is Solid");
+                DrawEnumPopup<BlockVisibilityType>(ref propertyRect, blockVisibilityTypeDataProp.GetArrayElementAtIndex(index), "Visibility Type");
+                DrawEnumPopup<McBlockShapeType>(ref propertyRect, blockShapeTypeDataProp.GetArrayElementAtIndex(index), "Shape Type");
+                
+                DrawLabel(ref propertyRect, "Texturing");
+                DrawEnumPopup<McBlockTextureMappingType>(ref propertyRect, textureMappingTypeDataProp.GetArrayElementAtIndex(index), "Texture Mapping");
+
+                var mappingTypeProp = textureMappingTypeDataProp.GetArrayElementAtIndex(index);
+                McBlockTextureMappingType currentMappingType = (McBlockTextureMappingType)mappingTypeProp.intValue;
+                if (currentMappingType == McBlockTextureMappingType.AllFacesSame)
+                {
+                    DrawAtlasSlicePicker(ref propertyRect, uv_allFacesDataProp.GetArrayElementAtIndex(index), "All Faces");
+                }
+                else if (currentMappingType == McBlockTextureMappingType.TopBottomSides)
+                {
+                    DrawAtlasSlicePicker(ref propertyRect, uv_topFaceDataProp.GetArrayElementAtIndex(index), "Top Face");
+                    DrawAtlasSlicePicker(ref propertyRect, uv_bottomFaceDataProp.GetArrayElementAtIndex(index), "Bottom Face");
+                    DrawAtlasSlicePicker(ref propertyRect, uv_sideFacesDataProp.GetArrayElementAtIndex(index), "Side Faces");
+                }
+                
+                DrawLabel(ref propertyRect, "Audio");
+                manager.breakSounds[index] = DrawAudioClipArray(ref propertyRect, manager.breakSounds[index], "Break Sounds");
+                manager.placeSounds[index] = DrawAudioClipArray(ref propertyRect, manager.placeSounds[index], "Place Sounds");
+                manager.footstepSounds[index] = DrawAudioClipArray(ref propertyRect, manager.footstepSounds[index], "Footstep Sounds");
+
+                DrawLabel(ref propertyRect, "Particles");
+                DrawProperty(ref propertyRect, breakParticlesPrefabDataProp.GetArrayElementAtIndex(index), "Break Particles");
+                DrawProperty(ref propertyRect, placeParticlesPrefabDataProp.GetArrayElementAtIndex(index), "Place Particles");
+
+                EditorGUI.indentLevel--;
+            }
+            else
+            {
+                EditorGUI.HelpBox(new Rect(rect.x, propertyRect.y, rect.width, 40), "Properties for this block ID cannot be displayed. Array mismatch.", MessageType.Error);
+            }
+        }
+    }
+
+    private void AddNewBlockType(ReorderableList list)
+    {
+        int index = list.serializedProperty.arraySize;
+        list.serializedProperty.InsertArrayElementAtIndex(index);
+
+        blockNamesProp.GetArrayElementAtIndex(index).stringValue = $"Block_{index}";
+
+        isSolidDataProp.arraySize = blockNamesProp.arraySize;
+        isSolidDataProp.GetArrayElementAtIndex(index).boolValue = true;
+
+        blockVisibilityTypeDataProp.arraySize = blockNamesProp.arraySize;
+        blockVisibilityTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)BlockVisibilityType.Opaque;
+
+        blockShapeTypeDataProp.arraySize = blockNamesProp.arraySize;
+        blockShapeTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)McBlockShapeType.Cube;
+
+        textureMappingTypeDataProp.arraySize = blockNamesProp.arraySize;
+        textureMappingTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)McBlockTextureMappingType.AllFacesSame;
+
+        uv_allFacesDataProp.arraySize = blockNamesProp.arraySize;
+        uv_allFacesDataProp.GetArrayElementAtIndex(index).intValue = 0;
+        uv_topFaceDataProp.arraySize = blockNamesProp.arraySize;
+        uv_topFaceDataProp.GetArrayElementAtIndex(index).intValue = 0;
+        uv_bottomFaceDataProp.arraySize = blockNamesProp.arraySize;
+        uv_bottomFaceDataProp.GetArrayElementAtIndex(index).intValue = 0;
+        uv_sideFacesDataProp.arraySize = blockNamesProp.arraySize;
+        uv_sideFacesDataProp.GetArrayElementAtIndex(index).intValue = 0;
+
+        breakParticlesPrefabDataProp.arraySize = blockNamesProp.arraySize;
+        breakParticlesPrefabDataProp.GetArrayElementAtIndex(index).objectReferenceValue = null;
+        placeParticlesPrefabDataProp.arraySize = blockNamesProp.arraySize;
+        placeParticlesPrefabDataProp.GetArrayElementAtIndex(index).objectReferenceValue = null;
+
+        manager.breakSounds = ResizeJaggedArrayManual(manager.breakSounds, blockNamesProp.arraySize);
+        manager.placeSounds = ResizeJaggedArrayManual(manager.placeSounds, blockNamesProp.arraySize);
+        manager.footstepSounds = ResizeJaggedArrayManual(manager.footstepSounds, blockNamesProp.arraySize);
+
+        numberOfBlockTypesProp.intValue = blockNamesProp.arraySize;
+        SyncFoldoutStates();
+        if (foldoutStates.Length > index)
+        {
+            foldoutStates[index] = true;
+        }
+
+        soTarget.ApplyModifiedProperties();
+
+        ForceSyncAllArrays();
+    }
+
+    private void RemoveBlockType(ReorderableList list)
+    {
+        if (EditorUtility.DisplayDialog("Confirm Deletion", $"Are you sure you want to delete block ID {list.index} ({blockNamesProp.GetArrayElementAtIndex(list.index).stringValue})?", "Delete", "Cancel"))
+        {
+            RemoveElementFromAllArrays(list.index);
+            SyncFoldoutStates();
+        }
+    }
+
+    private void ReorderBlockTypes(ReorderableList list, int oldIndex, int newIndex)
+    {
+        // Reordering is handled automatically for the master property (blockNames)
+        // We just need to move the elements in our other parallel arrays.
+        isSolidDataProp.MoveArrayElement(oldIndex, newIndex);
+        blockVisibilityTypeDataProp.MoveArrayElement(oldIndex, newIndex);
+        blockShapeTypeDataProp.MoveArrayElement(oldIndex, newIndex);
+        textureMappingTypeDataProp.MoveArrayElement(oldIndex, newIndex);
+        uv_allFacesDataProp.MoveArrayElement(oldIndex, newIndex);
+        uv_topFaceDataProp.MoveArrayElement(oldIndex, newIndex);
+        uv_bottomFaceDataProp.MoveArrayElement(oldIndex, newIndex);
+        uv_sideFacesDataProp.MoveArrayElement(oldIndex, newIndex);
+        breakParticlesPrefabDataProp.MoveArrayElement(oldIndex, newIndex);
+        placeParticlesPrefabDataProp.MoveArrayElement(oldIndex, newIndex);
+
+        manager.breakSounds = ReorderJaggedArray(manager.breakSounds, oldIndex, newIndex);
+        manager.placeSounds = ReorderJaggedArray(manager.placeSounds, oldIndex, newIndex);
+        manager.footstepSounds = ReorderJaggedArray(manager.footstepSounds, oldIndex, newIndex);
+        
+        if (foldoutStates != null)
+        {
+            List<bool> foldoutList = new List<bool>(foldoutStates);
+            bool item = foldoutList[oldIndex];
+            foldoutList.RemoveAt(oldIndex);
+            foldoutList.Insert(newIndex, item);
+            foldoutStates = foldoutList.ToArray();
+        }
+        
+        EditorUtility.SetDirty(manager);
+    }
+    #endregion
+    
+    #region Array Management
+    private void ForceSyncAllArrays()
+    {
+        Undo.RecordObject(manager, "Force Sync Block Type Arrays");
+        int masterSize = blockNamesProp.arraySize;
+        
+        ResizeSerializedArray(isSolidDataProp, masterSize, () => true);
+        ResizeSerializedArray(blockVisibilityTypeDataProp, masterSize, () => (int)BlockVisibilityType.Opaque);
+        ResizeSerializedArray(blockShapeTypeDataProp, masterSize, () => (int)McBlockShapeType.Cube);
+        ResizeSerializedArray(textureMappingTypeDataProp, masterSize, () => (int)McBlockTextureMappingType.AllFacesSame);
+        ResizeSerializedArray(uv_allFacesDataProp, masterSize, () => 0);
+        ResizeSerializedArray(uv_topFaceDataProp, masterSize, () => 0);
+        ResizeSerializedArray(uv_bottomFaceDataProp, masterSize, () => 0);
+        ResizeSerializedArray(uv_sideFacesDataProp, masterSize, () => 0);
+        ResizeSerializedArray<ParticleSystem>(breakParticlesPrefabDataProp, masterSize, () => null);
+        ResizeSerializedArray<ParticleSystem>(placeParticlesPrefabDataProp, masterSize, () => null);
+        
+        manager.breakSounds = ResizeJaggedArrayManual(manager.breakSounds, masterSize);
+        manager.placeSounds = ResizeJaggedArrayManual(manager.placeSounds, masterSize);
+        manager.footstepSounds = ResizeJaggedArrayManual(manager.footstepSounds, masterSize);
+
+        numberOfBlockTypesProp.intValue = masterSize;
+        SyncFoldoutStates();
+        soTarget.ApplyModifiedProperties();
+        EditorUtility.SetDirty(manager);
+        Debug.Log($"[McBlockTypeManagerEditor] All data arrays force-synchronized to size {masterSize}.");
+    }
+
+    private void ResizeSerializedArray<T>(SerializedProperty arrayProperty, int newSize, System.Func<T> defaultValueFactory)
+    {
+        int oldSize = arrayProperty.arraySize;
+        if (oldSize == newSize) return;
+
+        arrayProperty.arraySize = newSize;
+        if (newSize > oldSize)
+        {
+            for (int i = oldSize; i < newSize; i++)
+            {
+                var element = arrayProperty.GetArrayElementAtIndex(i);
+                object value = defaultValueFactory();
+                if (element.propertyType == SerializedPropertyType.String) element.stringValue = (string)value;
+                else if (element.propertyType == SerializedPropertyType.Boolean) element.boolValue = (bool)value;
+                else if (element.propertyType == SerializedPropertyType.Integer) element.intValue = (int)value;
+                else if (element.propertyType == SerializedPropertyType.ObjectReference) element.objectReferenceValue = (Object)value;
+            }
+        }
+    }
+    
+    private bool CheckOverallMismatch(int count) {
+        if (count < 0) count = 0;
+        return blockNamesProp.arraySize != count || isSolidDataProp.arraySize != count ||
+            blockVisibilityTypeDataProp.arraySize != count || blockShapeTypeDataProp.arraySize != count ||
+            uv_allFacesDataProp.arraySize != count || uv_topFaceDataProp.arraySize != count ||
+            uv_bottomFaceDataProp.arraySize != count || uv_sideFacesDataProp.arraySize != count ||
+            textureMappingTypeDataProp.arraySize != count || (manager.breakSounds != null && manager.breakSounds.Length != count) ||
+            (manager.placeSounds != null && manager.placeSounds.Length != count) || (manager.footstepSounds != null && manager.footstepSounds.Length != count) ||
+            breakParticlesPrefabDataProp.arraySize != count || placeParticlesPrefabDataProp.arraySize != count;
+    }
+
+    private bool CheckCanDisplayProperties(int index) {
+        int count = blockNamesProp.arraySize;
+        if (index >= count) return false;
+        return !(index >= blockNamesProp.arraySize || index >= isSolidDataProp.arraySize ||
+            index >= blockVisibilityTypeDataProp.arraySize || index >= blockShapeTypeDataProp.arraySize ||
+            index >= uv_allFacesDataProp.arraySize || index >= uv_topFaceDataProp.arraySize ||
+            index >= uv_bottomFaceDataProp.arraySize || index >= uv_sideFacesDataProp.arraySize ||
+            index >= textureMappingTypeDataProp.arraySize || (manager.breakSounds != null && index >= manager.breakSounds.Length) ||
+            (manager.placeSounds != null && index >= manager.placeSounds.Length) || (manager.footstepSounds != null && index >= manager.footstepSounds.Length) ||
+            index >= breakParticlesPrefabDataProp.arraySize || index >= placeParticlesPrefabDataProp.arraySize);
+    }
+
+    private void RemoveElementFromAllArrays(int index) {
+        blockNamesProp.DeleteArrayElementAtIndex(index);
+        isSolidDataProp.DeleteArrayElementAtIndex(index);
+        blockVisibilityTypeDataProp.DeleteArrayElementAtIndex(index);
+        blockShapeTypeDataProp.DeleteArrayElementAtIndex(index);
+        textureMappingTypeDataProp.DeleteArrayElementAtIndex(index);
+        uv_allFacesDataProp.DeleteArrayElementAtIndex(index);
+        uv_topFaceDataProp.DeleteArrayElementAtIndex(index);
+        uv_bottomFaceDataProp.DeleteArrayElementAtIndex(index);
+        uv_sideFacesDataProp.DeleteArrayElementAtIndex(index);
+        breakParticlesPrefabDataProp.DeleteArrayElementAtIndex(index);
+        placeParticlesPrefabDataProp.DeleteArrayElementAtIndex(index);
+        
+        manager.breakSounds = RemoveFromJaggedArray(manager.breakSounds, index);
+        manager.placeSounds = RemoveFromJaggedArray(manager.placeSounds, index);
+        manager.footstepSounds = RemoveFromJaggedArray(manager.footstepSounds, index);
+        
+        numberOfBlockTypesProp.intValue = blockNamesProp.arraySize;
+        soTarget.ApplyModifiedProperties();
+    }
+    
+    private AudioClip[][] ResizeJaggedArrayManual(AudioClip[][] currentArray, int newOuterSize)
     {
         AudioClip[][] newArray = new AudioClip[newOuterSize][];
         int oldOuterSize = (currentArray != null) ? currentArray.Length : 0;
@@ -495,125 +593,117 @@ public class McBlockTypeManagerEditor : Editor
         return newArray;
     }
 
-    private void ResizeSerializedArray<T>(SerializedProperty arrayProperty, int newSize, T defaultValue) where T : class
+    private AudioClip[][] ReorderJaggedArray(AudioClip[][] source, int oldIndex, int newIndex)
     {
-        if (arrayProperty == null) return; 
-        int oldSize = arrayProperty.arraySize;
-        arrayProperty.arraySize = newSize; 
-        if (newSize > oldSize) {
-            for (int i = oldSize; i < newSize; i++) {
-                SerializedProperty element = arrayProperty.GetArrayElementAtIndex(i);
-                if (element == null) continue;
-                if (typeof(T) == typeof(string)) element.stringValue = defaultValue as string; 
-                else element.objectReferenceValue = defaultValue as UnityEngine.Object;
-            }
-        }
+        if (source == null || oldIndex == newIndex || oldIndex < 0 || newIndex < 0 || oldIndex >= source.Length || newIndex >= source.Length) return source;
+        AudioClip[] item = source[oldIndex];
+        List<AudioClip[]> list = new List<AudioClip[]>(source);
+        list.RemoveAt(oldIndex);
+        list.Insert(newIndex, item);
+        return list.ToArray();
     }
 
-    private void ResizeSerializedArrayValueType<T>(SerializedProperty arrayProperty, int newSize, T defaultValue) where T : struct
+    private AudioClip[][] RemoveFromJaggedArray(AudioClip[][] source, int index)
     {
-        if (arrayProperty == null) return; 
-        int oldSize = arrayProperty.arraySize;
-        arrayProperty.arraySize = newSize;
-        if (newSize > oldSize) {
-            for (int i = oldSize; i < newSize; i++) {
-                SerializedProperty element = arrayProperty.GetArrayElementAtIndex(i);
-                if (element == null) continue;
-                if (typeof(T) == typeof(bool)) element.boolValue = (bool)(object)defaultValue;
-                else if (typeof(T) == typeof(int)) element.intValue = (int)(object)defaultValue;
-            }
-        }
+        if (source == null || index < 0 || index >= source.Length) return source;
+        List<AudioClip[]> list = new List<AudioClip[]>(source);
+        list.RemoveAt(index);
+        return list.ToArray();
     }
-     private AudioClip[] DrawAudioClipArray(AudioClip[] clips, string label)
+
+    #endregion
+
+    #region Drawing Helpers
+
+    private void DrawLabel(ref Rect rect, string label) {
+        EditorGUI.LabelField(rect, label, EditorStyles.boldLabel);
+        rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
+    }
+    
+    private void DrawProperty(ref Rect rect, SerializedProperty prop, string label) {
+        EditorGUI.PropertyField(rect, prop, new GUIContent(label));
+        rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
+    }
+
+    private void DrawEnumPopup<T>(ref Rect rect, SerializedProperty prop, string label) where T : System.Enum {
+        prop.intValue = System.Convert.ToInt32(EditorGUI.EnumPopup(rect, new GUIContent(label), (T)System.Enum.ToObject(typeof(T), prop.intValue)));
+        rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
+    }
+
+    private AudioClip[] DrawAudioClipArray(ref Rect rect, AudioClip[] clips, string label)
     {
-        if (manager == null) return clips; 
+        EditorGUI.LabelField(rect, label);
+        rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
 
-        EditorGUI.BeginChangeCheck();
-
-        EditorGUILayout.LabelField(label, EditorStyles.boldLabel);
         EditorGUI.indentLevel++;
-
-        if (clips == null) clips = new AudioClip[0]; 
-
-        int newSize = EditorGUILayout.IntField("Size", clips.Length);
+        Rect sizeRect = new Rect(rect.x, rect.y, rect.width, EditorGUIUtility.singleLineHeight);
+        
+        if (clips == null) clips = new AudioClip[0];
+        int newSize = EditorGUI.IntField(sizeRect, "Size", clips.Length);
         if (newSize < 0) newSize = 0;
+        rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
 
         if (newSize != clips.Length)
         {
             AudioClip[] resizedClips = new AudioClip[newSize];
-            for (int j = 0; j < Mathf.Min(newSize, clips.Length); j++)
-            {
-                resizedClips[j] = clips[j];
-            }
+            System.Array.Copy(clips, resizedClips, Mathf.Min(newSize, clips.Length));
             clips = resizedClips; 
         }
 
         for (int j = 0; j < clips.Length; j++)
         {
-            clips[j] = (AudioClip)EditorGUILayout.ObjectField($"Element {j}", clips[j], typeof(AudioClip), false);
+            Rect clipRect = new Rect(rect.x, rect.y, rect.width, EditorGUIUtility.singleLineHeight);
+            clips[j] = (AudioClip)EditorGUI.ObjectField(clipRect, $"Element {j}", clips[j], typeof(AudioClip), false);
+            rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
         }
         EditorGUI.indentLevel--;
-
-        if(EditorGUI.EndChangeCheck()) {
-            EditorUtility.SetDirty(manager); 
-        }
         return clips; 
     }
 
-
-    private void DrawAtlasSlicePicker(SerializedProperty sliceIndexProp, string baseLabel = "Atlas Coords")
+    private void DrawAtlasSlicePicker(ref Rect rect, SerializedProperty sliceIndexProp, string baseLabel = "Atlas Coords")
     {
-        if (sliceIndexProp == null) return; 
-
-        EditorGUILayout.BeginHorizontal();
-
+        Rect lineRect = new Rect(rect.x, rect.y, rect.width, 36);
         int currentSliceIndex = sliceIndexProp.intValue;
-        int displayX = currentSliceIndex % ATLAS_GRID_WIDTH;
-        int displayY = currentSliceIndex / ATLAS_GRID_WIDTH;
         
-        EditorGUILayout.LabelField(new GUIContent(baseLabel, $"Current Raw Slice Index: {currentSliceIndex}"), new GUIContent($"XY: ({displayX}, {displayY})"), GUILayout.MinWidth(150));
+        Rect labelRect = new Rect(lineRect.x, lineRect.y + 8, EditorGUIUtility.labelWidth - 50, lineRect.height);
+        EditorGUI.LabelField(labelRect, new GUIContent(baseLabel, $"Raw Index: {currentSliceIndex}"), new GUIContent($"XY: ({currentSliceIndex % ATLAS_GRID_WIDTH}, {currentSliceIndex / ATLAS_GRID_WIDTH})"));
 
-        if (GUILayout.Button("Pick", GUILayout.Width(60)))
+        Rect buttonRect = new Rect(labelRect.xMax, lineRect.y + 4, 60, 28);
+        if (GUI.Button(buttonRect, "Pick"))
         {
-            if (manager != null && manager.previewTextureArray != null)
+            if (manager.previewTextureArray != null)
             {
-                Rect buttonRect = GUILayoutUtility.GetLastRect();
-                buttonRect = GUIUtility.GUIToScreenRect(buttonRect); 
-
                 PopupWindow.Show(buttonRect, new TextureSlicePickerPopup(manager, sliceIndexProp));
             }
             else
             {
-                Debug.LogWarning("[McBlockTypeManagerEditor] Cannot open slice picker: Preview Texture Array is not assigned in the manager.");
+                Debug.LogWarning("[McBlockTypeManagerEditor] Cannot open picker: Preview Texture Array is not assigned.");
             }
         }
         
-        if (manager != null && manager.previewTextureArray != null && singleSlicePreviewTexture != null && 
-            currentSliceIndex >= 0 && currentSliceIndex < manager.previewTextureArray.depth)
+        Rect previewRect = new Rect(buttonRect.xMax + 10, lineRect.y, 36, 36);
+        if (manager.previewTextureArray != null && singleSlicePreviewTexture != null && currentSliceIndex >= 0 && currentSliceIndex < manager.previewTextureArray.depth)
         {
             try {
                 if (singleSlicePreviewTexture.width != manager.previewTextureArray.width || singleSlicePreviewTexture.height != manager.previewTextureArray.height) {
-                    Object.DestroyImmediate(singleSlicePreviewTexture);
-                    InitializeSingleSlicePreviewTexture(); 
+                    InitializeSingleSlicePreviewTexture();
                 }
 
                 if (singleSlicePreviewTexture != null) { 
                      Graphics.CopyTexture(manager.previewTextureArray, currentSliceIndex, 0, singleSlicePreviewTexture, 0, 0);
-                     EditorGUI.DrawPreviewTexture(GUILayoutUtility.GetRect(32, 32, GUILayout.ExpandWidth(false), GUILayout.ExpandHeight(false)), singleSlicePreviewTexture, null, ScaleMode.StretchToFill); 
-                } else {
-                     EditorGUI.DrawPreviewTexture(GUILayoutUtility.GetRect(32, 32, GUILayout.ExpandWidth(false), GUILayout.ExpandHeight(false)), Texture2D.grayTexture, null, ScaleMode.StretchToFill);
+                     EditorGUI.DrawPreviewTexture(previewRect, singleSlicePreviewTexture, null, ScaleMode.StretchToFill); 
                 }
-            } catch (System.Exception e) { // Catch System.Exception for broader error capture
-                EditorGUI.DrawPreviewTexture(GUILayoutUtility.GetRect(32, 32, GUILayout.ExpandWidth(false), GUILayout.ExpandHeight(false)), Texture2D.grayTexture, null, ScaleMode.StretchToFill);
-                if(manager != null && manager.enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManagerEditor] Could not copy texture for preview (Slice: {currentSliceIndex}). Error: {e.Message}.");
+            } catch {
+                EditorGUI.DrawPreviewTexture(previewRect, Texture2D.grayTexture, null, ScaleMode.StretchToFill);
             }
         }
         else
         {
-            EditorGUI.DrawPreviewTexture(GUILayoutUtility.GetRect(32, 32, GUILayout.ExpandWidth(false), GUILayout.ExpandHeight(false)), Texture2D.grayTexture, null, ScaleMode.StretchToFill);
+            EditorGUI.DrawPreviewTexture(previewRect, Texture2D.grayTexture, null, ScaleMode.StretchToFill);
         }
-        EditorGUILayout.EndHorizontal();
+        
+        rect.y += 42;
     }
+    #endregion
 }
 #endif
-

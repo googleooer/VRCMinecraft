@@ -5,13 +5,11 @@ using System.Text;
 
 /// <summary>
 /// This version of McChunk features a fully time-sliced generation and meshing pipeline.
-/// The amount of work done per frame is configurable via the McCoordinator.
-/// 1.  CONFIGURABLE WORKLOAD: Accepts workload parameters from the coordinator to
-///     determine how many columns to generate or voxels to mesh per step.
-/// 2.  TIME-SLICED MESHING: BuildMesh() is now a state machine that processes a
-///     configurable number of voxels per frame, preventing lag spikes from complex chunks.
-/// 3.  MULTI-LAYER RLE: A more advanced Run-Length Encoding that can compress entire
-///     1D lines, 2D planes, or 3D volumes for maximum efficiency.
+///
+/// 1.  TIME-SLICED MESHING: BuildMesh() is a state machine that processes a
+///     configurable number of voxels per frame.
+/// 2.  MULTI-LAYER RLE: Advanced Run-Length Encoding compresses chunk data for
+///     maximum memory efficiency.
 /// </summary>
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McChunk : UdonSharpBehaviour
@@ -32,7 +30,7 @@ public class McChunk : UdonSharpBehaviour
     // --- Private State ---
     private object _chunkData;
     private bool _isCompressed;
-    private ushort[] _localBlockData;
+    private ushort[] _localBlockData; // Temporary, for meshing
     private int _chunkDataSize;
     [HideInInspector] public bool isBuildingMesh = false;
     
@@ -54,14 +52,11 @@ public class McChunk : UdonSharpBehaviour
     private ushort[] neighborCache_PZ; private ushort[] neighborCache_NZ;
     
     // --- Time-slicing State & Config ---
-    private bool _isGeneratingData = false;
-    private int _dataGen_z_progress = 0;
     private int _meshing_progress_index = 0;
-    private int _columnsPerDataGenStep = 1;
     private int _voxelsPerMeshStep = 512;
+    // --- REMOVED old generation state variables ---
     
     private McTerrainGenerator _terrainGenRef;
-    private float _h00, _h10, _h01, _h11;
     
     // --- Constants ---
     private const int FACE_INDEX_SIDE = 0; private const int FACE_INDEX_TOP = 2; private const int FACE_INDEX_BOTTOM = 3;
@@ -95,7 +90,7 @@ public class McChunk : UdonSharpBehaviour
         #endif
     }
     
-    public void Initialize(McWorld worldRef, McTerrainGenerator terrainGen, int cX, int cY, int cZ, int columnsPerDataGenStep, int voxelsPerMeshStep)
+    public void Initialize(McWorld worldRef, McTerrainGenerator terrainGen, int cX, int cY, int cZ, int noisePointsPerStep, int voxelsPerMeshStep, int voxelsPerTerrainStep)
     {
         this.world = worldRef;
         this.chunkSizeXZ = world.chunkSizeXZ;
@@ -105,9 +100,8 @@ public class McChunk : UdonSharpBehaviour
         this.chunkZ_world = cZ;
         this._terrainGenRef = terrainGen;
         
-        this._columnsPerDataGenStep = Mathf.Max(1, columnsPerDataGenStep);
         this._voxelsPerMeshStep = Mathf.Max(1, voxelsPerMeshStep);
-
+        
         _chunkDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
         _localBlockData = new ushort[_chunkDataSize];
         _opaqueVertices = new Vector3[MAX_VERTS]; _opaqueTriangles = new int[MAX_TRIS]; _opaqueUVs = new Vector3[MAX_VERTS]; _opaqueNormals = new Vector3[MAX_VERTS];
@@ -118,103 +112,49 @@ public class McChunk : UdonSharpBehaviour
         StartDataGeneration();
     }
     
+    // --- REWRITTEN --- The new, simplified data generation process.
     private void StartDataGeneration()
     {
-        if (_isGeneratingData) return;
-        _isGeneratingData = true;
-        _dataGen_z_progress = 0;
+        // All generation logic is now handled within McTerrainGenerator.
+        // TODO: Turn this into a multi-step thing like with the mesh generation, so we could get the terrain data for a specific voxel and time-slice it all.
+        ushort[] generatedData = _terrainGenRef.GenerateChunkData(chunkX_world, chunkY_world, chunkZ_world);
         
-        int chunkWorldStartX = chunkX_world * chunkSizeXZ;
-        int chunkWorldStartZ = chunkZ_world * chunkSizeXZ;
-        _h00 = (float)_terrainGenRef.GetBaseTerrainHeight(chunkWorldStartX, chunkWorldStartZ);
-        _h10 = (float)_terrainGenRef.GetBaseTerrainHeight(chunkWorldStartX + chunkSizeXZ - 1, chunkWorldStartZ);
-        _h01 = (float)_terrainGenRef.GetBaseTerrainHeight(chunkWorldStartX, chunkWorldStartZ + chunkSizeXZ - 1);
-        _h11 = (float)_terrainGenRef.GetBaseTerrainHeight(chunkWorldStartX + chunkSizeXZ - 1, chunkWorldStartZ + chunkSizeXZ - 1);
-        
-        SendCustomEventDelayedFrames(nameof(GenerateDataStep), 1);
-    }
-
-    public void GenerateDataStep()
-    {
-        if (!_isGeneratingData) return;
-        
-        int chunkWorldStartY = chunkY_world * chunkSizeY;
-        int planeSize = chunkSizeXZ * chunkSizeXZ;
-        
-        int columnsProcessed = 0;
-        while(columnsProcessed < _columnsPerDataGenStep && _dataGen_z_progress < chunkSizeXZ)
-        {
-            int z = _dataGen_z_progress;
-            float tz = (float)z / (chunkSizeXZ > 1 ? chunkSizeXZ - 1 : 1);
-            float height_edge_x0 = Mathf.Lerp(_h00, _h01, tz);
-            float height_edge_x1 = Mathf.Lerp(_h10, _h11, tz);
+        // After getting the data, compress it as before.
+        ushort[] compressedRLEData = CompressChunkMultiLayerRLE(generatedData);
+        float compressionRatio = (float)compressedRLEData.Length / generatedData.Length;
             
-            for (int x = 0; x < chunkSizeXZ; x++) {
-                float tx = (float)x / (chunkSizeXZ > 1 ? chunkSizeXZ - 1 : 1);
-                int surfaceHeight = Mathf.FloorToInt(Mathf.Lerp(height_edge_x0, height_edge_x1, tx));
-                for (int y = 0; y < chunkSizeY; y++) {
-                    int globalY = chunkWorldStartY + y;
-                    ushort blockData = 0;
-                    if (globalY < surfaceHeight) {
-                        blockData = world.PackBlockData(_terrainGenRef.stoneBlockID);
-                        if (globalY >= surfaceHeight - 3) blockData = world.PackBlockData(_terrainGenRef.dirtBlockID);
-                    } else if (globalY == surfaceHeight) {
-                        blockData = world.PackBlockData(_terrainGenRef.grassBlockID);
-                    } else if (globalY <= _terrainGenRef.seaLevel) {
-                        blockData = world.PackBlockData(_terrainGenRef.waterBlockID);
-                    }
-                    _localBlockData[y * planeSize + z * chunkSizeXZ + x] = blockData;
+        #if UNITY_EDITOR
+        if (enableVerboseLogging) {
+            Debug.Log($"[McChunk ({chunkX_world},{chunkY_world},{chunkZ_world})] RLE Compression complete. Ratio: {compressionRatio:P2} (Original: {generatedData.Length*2} bytes, Compressed: {compressedRLEData.Length*2} bytes)");
+        }
+        #endif
+
+        if (compressionRatio < 1.0f) {
+            _chunkData = compressedRLEData;
+            _isCompressed = true;
+        } else {
+            _chunkData = generatedData;
+            _isCompressed = false;
+        }
+        
+        if (_isCompressed) {
+            ushort[] data = (ushort[])_chunkData;
+            if(data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK)
+            {
+                ushort blockValue = data[1];
+                bool isSolid = (blockValue & 0x0100) != 0;
+                var visibility = (BlockVisibilityType)((blockValue >> 9) & 0x7);
+                if(isSolid && visibility == BlockVisibilityType.Opaque) {
+                    isSingleOpaqueSolid = true;
                 }
             }
-            _dataGen_z_progress++;
-            columnsProcessed++;
         }
-
-        if (_dataGen_z_progress >= chunkSizeXZ)
-        {
-            _isGeneratingData = false;
             
-            ushort[] compressedRLEData = CompressChunkMultiLayerRLE(_localBlockData);
-            float compressionRatio = (float)compressedRLEData.Length / _localBlockData.Length;
-            
-            #if UNITY_EDITOR
-            if (enableVerboseLogging) {
-                Debug.Log($"[McChunk ({chunkX_world},{chunkY_world},{chunkZ_world})] RLE Compression complete. Ratio: {compressionRatio:P2} (Original: {_localBlockData.Length*2} bytes, Compressed: {compressedRLEData.Length*2} bytes)");
-            }
-            #endif
-
-            if (compressionRatio < 1.0f) {
-                _chunkData = compressedRLEData;
-                _isCompressed = true;
-            } else {
-                ushort[] permanentData = new ushort[_chunkDataSize];
-                System.Array.Copy(_localBlockData, permanentData, _chunkDataSize);
-                _chunkData = permanentData;
-                _isCompressed = false;
-            }
-            
-            if (_isCompressed) {
-                ushort[] data = (ushort[])_chunkData;
-                if(data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK)
-                {
-                    ushort blockValue = data[1];
-                    bool isSolid = (blockValue & 0x0100) != 0;
-                    var visibility = (BlockVisibilityType)((blockValue >> 9) & 0x7);
-                    if(isSolid && visibility == BlockVisibilityType.Opaque) {
-                        isSingleOpaqueSolid = true;
-                    }
-                }
-            }
-            
-            isDataReady = true;
-            world.TriggerNeighborMeshRebuilds(this);
-        }
-        else
-        {
-            SendCustomEventDelayedFrames(nameof(GenerateDataStep), 1);
-        }
+        isDataReady = true;
+        world.TriggerNeighborMeshRebuilds(this);
     }
 
+    
     public void BuildMesh()
     {
         if (isBuildingMesh) return;
@@ -251,8 +191,10 @@ public class McChunk : UdonSharpBehaviour
 
         CacheAllNeighbors();
         if (_isCompressed) {
+            // Use the temporary _localBlockData for meshing to avoid repeated decompression.
             _localBlockData = DecompressChunkMultiLayerRLE((ushort[])_chunkData);
         } else {
+            // If not compressed, we still need to copy it to the local buffer for meshing.
             System.Array.Copy((ushort[])_chunkData, _localBlockData, _chunkDataSize);
         }
 
@@ -288,7 +230,7 @@ public class McChunk : UdonSharpBehaviour
             int index = _meshing_progress_index;
             ushort blockData = _localBlockData[index];
 
-            if ((blockData & 0x0100) != 0)
+            if ((blockData & 0xFF) != 0) 
             {
                 int y = index / y_stride;
                 int rem = index % y_stride;
@@ -337,6 +279,7 @@ public class McChunk : UdonSharpBehaviour
         if (_meshing_progress_index >= _chunkDataSize)
         {
             ApplyAllMeshData();
+            _localBlockData = null; // Clear temporary mesh data
             isBuildingMesh = false;
             
             #if UNITY_EDITOR
@@ -440,6 +383,7 @@ public class McChunk : UdonSharpBehaviour
     public ushort[] GetDecompressedData()
     {
         if (_isCompressed) { return DecompressChunkMultiLayerRLE((ushort[])_chunkData); }
+        // If not compressed, _chunkData is already the full array.
         return (ushort[])_chunkData;
     }
     
@@ -453,11 +397,23 @@ public class McChunk : UdonSharpBehaviour
     
     private bool ShouldDrawFace(BlockVisibilityType selfVisibility, ushort neighborData)
     {
-        bool neighborIsSolid = (neighborData & 0x0100) != 0;
-        if (!neighborIsSolid) return true;
+        byte neighborID = (byte)(neighborData & 0xFF);
+        if (neighborID == 0) return true; // Neighbor is air
+
         BlockVisibilityType neighborVisibility = (BlockVisibilityType)((neighborData >> 9) & 0x7);
-        if (neighborVisibility == BlockVisibilityType.Opaque && selfVisibility == BlockVisibilityType.Opaque) return false;
-        if (selfVisibility == neighborVisibility && selfVisibility != BlockVisibilityType.Opaque) return false;
+
+        if (selfVisibility == BlockVisibilityType.Opaque) {
+            return neighborVisibility != BlockVisibilityType.Opaque;
+        }
+        
+        if (selfVisibility == BlockVisibilityType.Transparent) {
+             return neighborVisibility != BlockVisibilityType.Transparent && neighborVisibility != BlockVisibilityType.Opaque;
+        }
+        
+        if (selfVisibility == BlockVisibilityType.Cutout) {
+            return neighborVisibility == BlockVisibilityType.Transparent || neighborID == 0;
+        }
+
         return true;
     }
     
@@ -529,6 +485,8 @@ public class McChunk : UdonSharpBehaviour
     {
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ) return 0;
         
+        if (_chunkData == null) return 0;
+
         if (_isCompressed) {
             return DecompressBlockFromMultiLayerRLE((ushort[])_chunkData, x, y, z);
         }
@@ -542,6 +500,7 @@ public class McChunk : UdonSharpBehaviour
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ) return;
         
         ushort[] fullData = GetDecompressedData();
+        if (fullData == null) return; 
 
         int localIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         ushort newPackedData = world.PackBlockData(blockType);
@@ -608,7 +567,6 @@ public class McChunk : UdonSharpBehaviour
                 }
                 
                 if (isPlaneRun) {
-                    // Write 2D run
                     tempCompressed[compressedIndex++] = RLE_TYPE_2D_XZ_PLANE;
                     tempCompressed[compressedIndex++] = firstBlockInPlane;
                 } else {
@@ -638,7 +596,6 @@ public class McChunk : UdonSharpBehaviour
         ushort[] fullData = new ushort[_chunkDataSize];
         if (rleData == null || rleData.Length == 0) return fullData;
 
-        int decompressedIndex = 0;
         int rleIndex = 0;
 
         if (rleData[rleIndex] == RLE_TYPE_3D_FULL_CHUNK) {
@@ -655,6 +612,7 @@ public class McChunk : UdonSharpBehaviour
             int planeDecompressed = 0;
             
             while (planeDecompressed < planeSize) {
+                if (rleIndex >= rleData.Length) return fullData; // Bounds check
                 ushort runType = rleData[rleIndex++];
                 if (runType == RLE_TYPE_2D_XZ_PLANE) {
                     ushort blockValue = rleData[rleIndex++];
@@ -696,6 +654,7 @@ public class McChunk : UdonSharpBehaviour
 
             while(planeDecompressed < planeSize)
             {
+                if (rleIndex >= rleData.Length) return 0; // Bounds check
                 ushort runType = rleData[rleIndex++];
 
                 if(runType == RLE_TYPE_2D_XZ_PLANE)
@@ -716,6 +675,6 @@ public class McChunk : UdonSharpBehaviour
                 }
             }
         }
-        return 0; // Should not be reached
+        return 0; 
     }
 }
