@@ -164,7 +164,7 @@ public class McChunk : UdonSharpBehaviour
         #if UNITY_EDITOR
         time_TotalBuild = 0; time_MainLoop = 0;
         float timer_start_total = 0f; float timer_start_stage = 0f;
-        if (enableVerboseLogging) {
+        if (enableVerboseLogging && logBuilder != null) {
             logBuilder.Clear(); logBuilder.AppendLine($"--- BuildMesh for Chunk ({chunkX_world},{chunkY_world},{chunkZ_world}) ---");
             timer_start_total = Time.realtimeSinceStartup; timer_start_stage = Time.realtimeSinceStartup;
         }
