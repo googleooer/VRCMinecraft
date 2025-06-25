@@ -89,6 +89,14 @@ public class McTerrainGeneratorEditor : Editor
             return;
         }
 
+        EditorGUI.BeginChangeCheck();
+        
+        // If any values changed, regenerate the preview
+        if (EditorGUI.EndChangeCheck())
+        {
+            GeneratePreviews();
+        }
+
         GUILayout.Label("GPU Accelerated Previews (Drag to Pan, Scroll to Zoom, Ctrl+Scroll for Y-Zoom)", EditorStyles.largeLabel);
 
         EditorGUILayout.BeginHorizontal();
@@ -211,21 +219,35 @@ public class McTerrainGeneratorEditor : Editor
         int topViewKernel = previewShader.FindKernel("CSMain_TopDownView");
         
         ReleaseBuffers();
-        // Pack and send parameters to the shader
-        //TODO
         
-        // Pass pan and zoom to shader
+        // Pack parameters for shader - include all the important values
+        Vector4 parameters = new Vector4(
+            generator.seaLevel,
+            generator.surfaceDepth,
+            generator.terrainHeightMultiplier,
+            worldInstance != null ? worldInstance.worldSeedString.GetHashCode() : 0
+        );
+        
+        // Noise scales used in Beta 1.7.3
+        Vector4 noiseScales = new Vector4(
+            684.412f,  // coordinateScale
+            200.0f,    // depthScale  
+            80.0f,     // mainScale
+            512.0f     // selectorScale
+        );
+        
+        previewShader.SetVector("_Params", parameters);
+        previewShader.SetVector("_NoiseScales", noiseScales);
         previewShader.SetVector("_PreviewTransform", new Vector4(previewOrigin.x, previewOrigin.y, previewZoom, sideViewYZoom));
         
-        // Dispatch Side View Kernel
+        // Dispatch kernels
         previewShader.SetTexture(sideViewKernel, "_Result", sideViewTexture);
         previewShader.Dispatch(sideViewKernel, sideViewTexture.width / 8, sideViewTexture.height / 8, 1);
         
-        // Dispatch Top Down View Kernel
         previewShader.SetTexture(topViewKernel, "_Result", topViewTexture);
         previewShader.Dispatch(topViewKernel, topViewTexture.width / 8, topViewTexture.height / 8, 1);
         
-        Repaint(); // Force the inspector to redraw
+        Repaint();
     }
 
     private void DrawCoordinateLabels(Rect area, string horizontalAxis, string verticalAxis, float horizontalMax, float verticalMax)
