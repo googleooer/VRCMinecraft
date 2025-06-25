@@ -22,13 +22,13 @@ public enum BlockVisibilityType
 {
     Opaque,
     Transparent,
-    Transparent_NoCull, // DEPRECATED, replace with BlockCullingType
-    Transparent_CullSelf, // DEPRECATED, replace with BlockCullingType
-    Transparent_CullSelfAndOpaque, // DEPRECATED, replace with BlockCullingType
+    Transparent_NoCull, // DEPRECATED
+    Transparent_CullSelf, // DEPRECATED
+    Transparent_CullSelfAndOpaque, // DEPRECATED
     Cutout,
-    Cutout_CullOpaqueOnly, // DEPRECATED, replace with BlockCullingType
-    Cutout_CullSelf, // DEPRECATED, replace with BlockCullingType
-    Cutout_CullSelfAndOtherCutout, // DEPRECATED, replace with BlockCullingType
+    Cutout_CullOpaqueOnly, // DEPRECATED
+    Cutout_CullSelf, // DEPRECATED
+    Cutout_CullSelfAndOtherCutout, // DEPRECATED
     Invisible
 }
 
@@ -51,8 +51,6 @@ public enum McBlockShapeType
     Cross
 }
 
-// REMOVED: AudioClipArrayWrapper class
-
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McBlockTypeManager : UdonSharpBehaviour
@@ -61,31 +59,36 @@ public class McBlockTypeManager : UdonSharpBehaviour
     [Tooltip("Assign the Texture 2D Array used for block textures here to enable slice previews in the editor.")]
     public Texture2DArray previewTextureArray;
 
-    [Header("Block Definitions (Parallel Arrays)")]
+    [Header("--- Runtime Data ---")]
+    [Tooltip("Baked, bit-packed data for runtime use. Generated from the editor.")]
+    public ushort[] finalDataArray;
+    
+    // The following arrays are for editor configuration and are stripped in builds.
+    [Header("Block Definitions (Editor-Only Source)")]
     public int numberOfBlockTypes = 1;
     public string[] blockNames;
     public bool[] isSolidData;
     public int[] blockVisibilityTypeData;
     public int[] blockShapeTypeData; 
+    public int[] textureMappingTypeData;
 
+    [Header("UV Data (Runtime)")]
     public int[] uv_allFacesData;
     public int[] uv_topFaceData;
     public int[] uv_bottomFaceData;
     public int[] uv_sideFacesData;
-    public int[] textureMappingTypeData;
-
-    [Header("Audio")]
-    // MODIFIED: Reverted to AudioClip[][]
+    
+    [Header("Audio (Runtime)")]
     public AudioClip[][] breakSounds; 
     public AudioClip[][] placeSounds; 
     public AudioClip[][] footstepSounds; 
 
-    [Header("Fallback Audio (if block-specific is not set)")]
+    [Header("Fallback Audio (Runtime)")]
     public AudioClip[] fallbackBreakSounds; 
     public AudioClip[] fallbackPlaceSounds; 
     public AudioClip[] fallbackFootstepSounds; 
 
-    [Header("Particles")]
+    [Header("Particles (Runtime)")]
     public ParticleSystem[] breakParticlesPrefabData;
     public ParticleSystem[] placeParticlesPrefabData;
 
@@ -109,20 +112,21 @@ public class McBlockTypeManager : UdonSharpBehaviour
         float startTime = Time.realtimeSinceStartup;
         logBuilder = new StringBuilder(256); 
 
+        #if UNITY_EDITOR
+        // In the editor, validate the source arrays to help with configuration.
         bool arraysValid = true;
         if (numberOfBlockTypes < 0) numberOfBlockTypes = 0;
 
-        // Validate array sizes against numberOfBlockTypes
         string errorFormat = "[McBlockTypeManager.Start] '{0}' array size mismatch. Expected {1}, got {2}.";
         if (blockNames == null || blockNames.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockNames", numberOfBlockTypes, (blockNames != null ? blockNames.Length : -1))); arraysValid = false; }
         if (isSolidData == null || isSolidData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "isSolidData", numberOfBlockTypes, (isSolidData != null ? isSolidData.Length : -1))); arraysValid = false; }
         if (blockVisibilityTypeData == null || blockVisibilityTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockVisibilityTypeData", numberOfBlockTypes, (blockVisibilityTypeData != null ? blockVisibilityTypeData.Length : -1))); arraysValid = false; }
         if (blockShapeTypeData == null || blockShapeTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockShapeTypeData", numberOfBlockTypes, (blockShapeTypeData != null ? blockShapeTypeData.Length : -1))); arraysValid = false; }
+        if (textureMappingTypeData == null || textureMappingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "textureMappingTypeData", numberOfBlockTypes, (textureMappingTypeData != null ? textureMappingTypeData.Length : -1))); arraysValid = false; }
         if (uv_allFacesData == null || uv_allFacesData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_allFacesData", numberOfBlockTypes, (uv_allFacesData != null ? uv_allFacesData.Length : -1))); arraysValid = false; }
         if (uv_topFaceData == null || uv_topFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_topFaceData", numberOfBlockTypes, (uv_topFaceData != null ? uv_topFaceData.Length : -1))); arraysValid = false; }
         if (uv_bottomFaceData == null || uv_bottomFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_bottomFaceData", numberOfBlockTypes, (uv_bottomFaceData != null ? uv_bottomFaceData.Length : -1))); arraysValid = false; }
         if (uv_sideFacesData == null || uv_sideFacesData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_sideFacesData", numberOfBlockTypes, (uv_sideFacesData != null ? uv_sideFacesData.Length : -1))); arraysValid = false; }
-        if (textureMappingTypeData == null || textureMappingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "textureMappingTypeData", numberOfBlockTypes, (textureMappingTypeData != null ? textureMappingTypeData.Length : -1))); arraysValid = false; }
         
         if (breakSounds == null || breakSounds.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "breakSounds (AudioClip[][])", numberOfBlockTypes, (breakSounds != null ? breakSounds.Length : -1))); arraysValid = false; }
         if (placeSounds == null || placeSounds.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "placeSounds (AudioClip[][])", numberOfBlockTypes, (placeSounds != null ? placeSounds.Length : -1))); arraysValid = false; }
@@ -130,58 +134,81 @@ public class McBlockTypeManager : UdonSharpBehaviour
         
         if (breakParticlesPrefabData == null || breakParticlesPrefabData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "breakParticlesPrefabData", numberOfBlockTypes, (breakParticlesPrefabData != null ? breakParticlesPrefabData.Length : -1))); arraysValid = false; }
         if (placeParticlesPrefabData == null || placeParticlesPrefabData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "placeParticlesPrefabData", numberOfBlockTypes, (placeParticlesPrefabData != null ? placeParticlesPrefabData.Length : -1))); arraysValid = false; }
+        #endif
 
+        // Pre-filtering sounds is always needed for runtime.
         PreFilterAllSounds();
 
-#if UNITY_EDITOR
+        #if UNITY_EDITOR
         if (enableVerboseLogging)
         {
             logBuilder.Clear();
-            logBuilder.AppendFormat("[McBlockTypeManager.Start] Initialized. Expecting {0} block types. Arrays valid: {1}. Audio pre-filtered. Time: {2:F2} ms.",
-                numberOfBlockTypes, arraysValid, (Time.realtimeSinceStartup - startTime) * 1000f);
+            logBuilder.AppendFormat("[McBlockTypeManager.Start] Initialized. Total Blocks: {0}. Time: {1:F2} ms.",
+                (finalDataArray != null ? finalDataArray.Length : 0), (Time.realtimeSinceStartup - startTime) * 1000f);
             Debug.Log(logBuilder.ToString());
         }
-#endif
+        #endif
+        
+        #if !UNITY_EDITOR
+        // In a build, clear the source data arrays to save memory.
+        // The baked finalDataArray is used instead.
+        isSolidData = null;
+        blockVisibilityTypeData = null;
+        blockShapeTypeData = null;
+        textureMappingTypeData = null;
+        blockNames = null;
+        #endif
+    }
+    
+    /// <summary>
+    /// Called from the editor script to bake source arrays into the final packed data array.
+    /// </summary>
+    public void EncodeDataForBuild()
+    {
+        if (numberOfBlockTypes < 0) numberOfBlockTypes = 0;
+        finalDataArray = new ushort[numberOfBlockTypes];
+        for (int i = 0; i < numberOfBlockTypes; i++)
+        {
+            ushort data = 0;
+            // Bit 0:         IsSolid (1 bit)
+            // Bits 1-4:      VisibilityType (4 bits)
+            // Bits 5-6:      ShapeType (2 bits)
+            // Bits 7-8:      TextureMappingType (2 bits)
+            // Bits 9-15:     Unused (7 bits)
+
+            if (isSolidData[i]) data |= (1 << 0);
+            data |= (ushort)(blockVisibilityTypeData[i] << 1);
+            data |= (ushort)(blockShapeTypeData[i] << 5);
+            data |= (ushort)(textureMappingTypeData[i] << 7);
+            
+            finalDataArray[i] = data;
+        }
     }
 
     private void PreFilterAllSounds()
     {
-        _prefilteredBreakSounds = new AudioClip[numberOfBlockTypes][];
-        _prefilteredPlaceSounds = new AudioClip[numberOfBlockTypes][];
-        _prefilteredFootstepSounds = new AudioClip[numberOfBlockTypes][];
+        int totalTypes = (finalDataArray != null) ? finalDataArray.Length : 0;
+        
+        _prefilteredBreakSounds = new AudioClip[totalTypes][];
+        _prefilteredPlaceSounds = new AudioClip[totalTypes][];
+        _prefilteredFootstepSounds = new AudioClip[totalTypes][];
 
-        for (int i = 0; i < numberOfBlockTypes; i++)
+        for (int i = 0; i < totalTypes; i++)
         {
-            // Pre-filter breakSounds
-            // Ensure breakSounds itself is not null and index i is valid for breakSounds outer array
             if (breakSounds != null && i < breakSounds.Length && breakSounds[i] != null)
-            {
                 _prefilteredBreakSounds[i] = _prefilterClipArray(breakSounds[i]);
-            }
             else
-            {
-                _prefilteredBreakSounds[i] = new AudioClip[0]; // Default to empty if source is problematic
-            }
+                _prefilteredBreakSounds[i] = new AudioClip[0];
 
-            // Pre-filter placeSounds
             if (placeSounds != null && i < placeSounds.Length && placeSounds[i] != null)
-            {
                 _prefilteredPlaceSounds[i] = _prefilterClipArray(placeSounds[i]);
-            }
             else
-            {
                 _prefilteredPlaceSounds[i] = new AudioClip[0];
-            }
 
-            // Pre-filter footstepSounds
             if (footstepSounds != null && i < footstepSounds.Length && footstepSounds[i] != null)
-            {
                 _prefilteredFootstepSounds[i] = _prefilterClipArray(footstepSounds[i]);
-            }
             else
-            {
                 _prefilteredFootstepSounds[i] = new AudioClip[0];
-            }
         }
         
         _prefilteredFallbackBreakSounds = _prefilterClipArray(fallbackBreakSounds);
@@ -219,41 +246,44 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public string GetBlockName(byte blockID)
     {
+        // Block names are editor-only, so this will only work in the editor.
+        #if UNITY_EDITOR
         if (blockNames != null && blockID >= 0 && blockID < blockNames.Length) return blockNames[blockID];
-#if UNITY_EDITOR
         if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockName] Invalid ID {blockID}.");
-#endif
         return "Unknown Block";
+        #else
+        return "N/A in build";
+        #endif
     }
 
     public bool GetBlockIsSolid(byte blockID)
     {
-        if (isSolidData != null && blockID >= 0 && blockID < isSolidData.Length) return isSolidData[blockID];
-#if UNITY_EDITOR
-        if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockIsSolid] Invalid ID {blockID}. Defaulting to false.");
-#endif
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+            return (finalDataArray[blockID] & 1) != 0; // Bit 0
         return false;
     }
 
     public BlockVisibilityType GetBlockVisibilityType(byte blockID)
     {
-        if (blockVisibilityTypeData != null && blockID >= 0 && blockID < blockVisibilityTypeData.Length) return (BlockVisibilityType)blockVisibilityTypeData[blockID];
-#if UNITY_EDITOR
-        if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockVisibilityType] Invalid ID {blockID}. Defaulting to Opaque.");
-#endif
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+            return (BlockVisibilityType)((finalDataArray[blockID] >> 1) & 0xF); // Bits 1-4
         return BlockVisibilityType.Opaque;
     }
 
     public McBlockShapeType GetBlockShapeType(byte blockID)
     {
-        if (blockShapeTypeData != null && blockID >= 0 && blockID < blockShapeTypeData.Length) return (McBlockShapeType)blockShapeTypeData[blockID];
-#if UNITY_EDITOR
-        if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockShapeType] Invalid ID {blockID}. Defaulting to Cube.");
-#endif
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+            return (McBlockShapeType)((finalDataArray[blockID] >> 5) & 0x3); // Bits 5-6
         return McBlockShapeType.Cube;
     }
-
-
+    
+    public int GetBlockTextureMappingTypeAsInt(byte blockID)
+    {
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+            return (finalDataArray[blockID] >> 7) & 0x3; // Bits 7-8
+        return (int)McBlockTextureMappingType.AllFacesSame;
+    }
+    
     public int GetBlockTextureSlice_AllFaces(byte blockID)
     {
         if (uv_allFacesData != null && blockID >= 0 && blockID < uv_allFacesData.Length) return uv_allFacesData[blockID];
@@ -274,16 +304,10 @@ public class McBlockTypeManager : UdonSharpBehaviour
         if (uv_sideFacesData != null && blockID >= 0 && blockID < uv_sideFacesData.Length) return uv_sideFacesData[blockID];
         return 0;
     }
-
-    public int GetBlockTextureMappingTypeAsInt(byte blockID)
-    {
-        if (textureMappingTypeData != null && blockID >= 0 && blockID < textureMappingTypeData.Length) return textureMappingTypeData[blockID];
-        return (int)McBlockTextureMappingType.AllFacesSame;
-    }
-
+    
     public int GetFinalBlockTextureSlice(byte blockID, int faceIndex)
     {
-        if (blockID >= 0 && blockID < numberOfBlockTypes) 
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length) 
         {
             McBlockTextureMappingType mappingType = (McBlockTextureMappingType)GetBlockTextureMappingTypeAsInt(blockID);
             switch (mappingType)
@@ -294,15 +318,9 @@ public class McBlockTypeManager : UdonSharpBehaviour
                     if (faceIndex == 3) return GetBlockTextureSlice_BottomFace(blockID); 
                     return GetBlockTextureSlice_SideFaces(blockID); 
                 default:
-#if UNITY_EDITOR
-                    if(enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetFinalBlockTextureSlice] Unknown mapping type for block ID {blockID}. Defaulting to AllFaces.");
-#endif
                     return GetBlockTextureSlice_AllFaces(blockID);
             }
         }
-#if UNITY_EDITOR
-        if(enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetFinalBlockTextureSlice] Invalid block ID {blockID} or configuration error. Defaulting to slice 0.");
-#endif
         return 0;
     }
     
@@ -317,8 +335,8 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public AudioClip GetBreakSound(byte blockID)
     {
-        // Use prefiltered arrays. _prefilteredBreakSounds is guaranteed to have numberOfBlockTypes elements.
-        if (blockID >= 0 && blockID < numberOfBlockTypes && _prefilteredBreakSounds[blockID] != null)
+        int totalTypes = (finalDataArray != null) ? finalDataArray.Length : 0;
+        if (blockID >= 0 && blockID < totalTypes && _prefilteredBreakSounds[blockID] != null)
         {
              AudioClip clip = GetRandomClip(_prefilteredBreakSounds[blockID]);
              if (clip != null) return clip;
@@ -328,7 +346,8 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public AudioClip GetPlaceSound(byte blockID)
     {
-        if (blockID >= 0 && blockID < numberOfBlockTypes && _prefilteredPlaceSounds[blockID] != null)
+        int totalTypes = (finalDataArray != null) ? finalDataArray.Length : 0;
+        if (blockID >= 0 && blockID < totalTypes && _prefilteredPlaceSounds[blockID] != null)
         {
             AudioClip clip = GetRandomClip(_prefilteredPlaceSounds[blockID]);
             if (clip != null) return clip;
@@ -338,7 +357,8 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public AudioClip GetFootstepSound(byte blockID)
     {
-        if (blockID >= 0 && blockID < numberOfBlockTypes && _prefilteredFootstepSounds[blockID] != null)
+        int totalTypes = (finalDataArray != null) ? finalDataArray.Length : 0;
+        if (blockID >= 0 && blockID < totalTypes && _prefilteredFootstepSounds[blockID] != null)
         {
             AudioClip clip = GetRandomClip(_prefilteredFootstepSounds[blockID]);
             if (clip != null) return clip;
@@ -348,12 +368,14 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public ParticleSystem GetBreakParticlesPrefab(byte blockID)
     {
-        if (breakParticlesPrefabData != null && blockID >= 0 && blockID < breakParticlesPrefabData.Length) return breakParticlesPrefabData[blockID];
+        int totalTypes = (finalDataArray != null) ? finalDataArray.Length : 0;
+        if (breakParticlesPrefabData != null && blockID >= 0 && blockID < totalTypes) return breakParticlesPrefabData[blockID];
         return null;
     }
     public ParticleSystem GetPlaceParticlesPrefab(byte blockID)
     {
-        if (placeParticlesPrefabData != null && blockID >= 0 && blockID < placeParticlesPrefabData.Length) return placeParticlesPrefabData[blockID];
+        int totalTypes = (finalDataArray != null) ? finalDataArray.Length : 0;
+        if (placeParticlesPrefabData != null && blockID >= 0 && blockID < totalTypes) return placeParticlesPrefabData[blockID];
         return null;
     }
 

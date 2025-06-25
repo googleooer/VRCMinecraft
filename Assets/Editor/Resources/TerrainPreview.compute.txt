@@ -1,0 +1,46 @@
+#pragma kernel CSMain_SideView
+#pragma kernel CSMain_TopDownView
+
+// The output textures. Must be RW (Read/Write)
+RWTexture2D<float4> _Result;
+
+// Parameters packed into vectors for efficiency
+float4 _Params; // x: seaLevel
+float4 _PreviewTransform; // x: originX, y: originZ, z: zoomH, w: zoomV
+
+#define seaLevel _Params.x
+#define previewOrigin _PreviewTransform.xy
+#define previewZoomH _PreviewTransform.z
+#define previewZoomV _PreviewTransform.w
+
+
+// --- Main Kernel for the Side-On (XY) Preview ---
+[numthreads(8,8,1)]
+void CSMain_SideView(uint3 id : SV_DispatchThreadID)
+{
+    // Convert pixel coordinate to world coordinate using pan and zoom
+    float normalizedX = (float)id.x / 255.0 - 0.5;
+    float normalizedY = (float)id.y / 255.0 - 0.5;
+    float worldX = previewOrigin.x + normalizedX * previewZoomH;
+    float worldY = (maxWorldHeight / 2.0) + normalizedY * previewZoomV;
+
+    //TODO show terrain shape with block colors
+
+    _Result[id.xy] = color;
+}
+
+
+// --- Main Kernel for the Top-Down (XZ) Preview ---
+[numthreads(8,8,1)]
+void CSMain_TopDownView(uint3 id : SV_DispatchThreadID)
+{
+    // Convert pixel coordinates to world coordinates
+    float normalizedX = (float)id.x / 255.0 - 0.5;
+    float normalizedZ = (float)id.y / 255.0 - 0.5;
+    float worldX = previewOrigin.x + normalizedX * previewZoomH;
+    float worldZ = previewOrigin.y + normalizedZ * previewZoomH;
+
+    //TODO show terrain shape with basic block colors (light blue air, gray stone, green grass, ) and depth
+    
+    _Result[id.xy] = color;
+}
