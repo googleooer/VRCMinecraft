@@ -118,8 +118,27 @@ public class McCoordinator : UdonSharpBehaviour
             switch (worker_state[i])
             {
                 case STATE_DATA_GEN:
-                    if (chunk.isDataReady)
+                    // Check if chunk is generating data using the new time-sliced system
+                    if (chunk.IsGeneratingData())
                     {
+                        // Step the data generation
+                        bool dataComplete = chunk.StepDataGeneration();
+                        
+                        if (dataComplete)
+                        {
+                            // Data generation is complete, move to waiting for mesh
+                            worker_state[i] = STATE_WAITING_FOR_MESH;
+                            
+                            #if UNITY_EDITOR
+                            if (enableVerboseLogging) {
+                                Debug.Log($"[McCoordinator] Chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) completed data generation");
+                            }
+                            #endif
+                        }
+                    }
+                    else if (chunk.isDataReady)
+                    {
+                        // Fallback for chunks that complete instantly
                         worker_state[i] = STATE_WAITING_FOR_MESH;
                     }
                     break; 
@@ -133,8 +152,11 @@ public class McCoordinator : UdonSharpBehaviour
                     break;
 
                 case STATE_MESHING:
+                    // The chunk handles its own time-sliced mesh building via BuildMeshStep()
+                    // We just need to check if it's done
                     if (!chunk.isBuildingMesh)
                     {
+                        // Mesh building is complete
                         worker_targetChunk[i] = null;
                         worker_state[i] = STATE_IDLE;
                         
@@ -143,7 +165,14 @@ public class McCoordinator : UdonSharpBehaviour
                         {
                            chunksCompletedCount++;
                         }
+                        
+                        #if UNITY_EDITOR
+                        if (enableVerboseLogging) {
+                            Debug.Log($"[McCoordinator] Chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) completed mesh building");
+                        }
+                        #endif
                     }
+                    // If still building, just let it continue on its own
                     break;
             }
         }
@@ -181,6 +210,12 @@ public class McCoordinator : UdonSharpBehaviour
                     if (newChunk != null) {
                         worker_targetChunk[i] = newChunk;
                         worker_state[i] = STATE_DATA_GEN;
+                        
+                        #if UNITY_EDITOR
+                        if (enableVerboseLogging) {
+                            Debug.Log($"[McCoordinator] Started data generation for chunk ({newChunk.chunkX_world},{newChunk.chunkY_world},{newChunk.chunkZ_world})");
+                        }
+                        #endif
                     } else {
                         // If chunk already existed, we still need to count it as "completed" to not stall the progress counter.
                         chunksCompletedCount++;

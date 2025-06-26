@@ -4,8 +4,6 @@ using VRC.SDKBase;
 using VRRefAssist;
 using System.Text; 
 
-// Enums McBlockTextureMappingType and BlockVisibilityType should be defined globally or accessible.
-
 /// <summary>
 /// Defines how block textures are mapped to faces.
 /// </summary>
@@ -16,30 +14,27 @@ public enum McBlockTextureMappingType
 }
 
 /// <summary>
-/// Defines how a block is rendered and how it affects face culling of itself and neighbors.
+/// Defines how a block is rendered (which material/queue it uses).
 /// </summary>
 public enum BlockVisibilityType
 {
     Opaque,
     Transparent,
-    Transparent_NoCull, // DEPRECATED
-    Transparent_CullSelf, // DEPRECATED
-    Transparent_CullSelfAndOpaque, // DEPRECATED
     Cutout,
-    Cutout_CullOpaqueOnly, // DEPRECATED
-    Cutout_CullSelf, // DEPRECATED
-    Cutout_CullSelfAndOtherCutout, // DEPRECATED
     Invisible
 }
 
+/// <summary>
+/// Defines how this block culls its faces when next to other blocks.
+/// </summary>
 public enum BlockCullingType
 {
-    NoCull,
-    CullSelf,
-    CullSelfAndOpaque,
-    CullSelfAndCutout,
-    CullSelfAndTransparent,
-    CullAll
+    NoCull, //Never culls side
+    CullSelf, //Culls side if it's the same block type
+    CullSelfAndOpaque, //Culls side if it's the same block type or an opaque block type
+    CullSelfAndCutout, //Culls side if it's the same block type or a cutout block type
+    CullSelfAndTransparent, //Culls side if it's the same block type or a transparent block type
+    CullAll //Always culls side, unless it's air
 }
 
 /// <summary>
@@ -69,6 +64,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
     public string[] blockNames;
     public bool[] isSolidData;
     public int[] blockVisibilityTypeData;
+    public int[] blockCullingTypeData;  // NEW
     public int[] blockShapeTypeData; 
     public int[] textureMappingTypeData;
 
@@ -121,6 +117,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
         if (blockNames == null || blockNames.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockNames", numberOfBlockTypes, (blockNames != null ? blockNames.Length : -1))); arraysValid = false; }
         if (isSolidData == null || isSolidData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "isSolidData", numberOfBlockTypes, (isSolidData != null ? isSolidData.Length : -1))); arraysValid = false; }
         if (blockVisibilityTypeData == null || blockVisibilityTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockVisibilityTypeData", numberOfBlockTypes, (blockVisibilityTypeData != null ? blockVisibilityTypeData.Length : -1))); arraysValid = false; }
+        if (blockCullingTypeData == null || blockCullingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockCullingTypeData", numberOfBlockTypes, (blockCullingTypeData != null ? blockCullingTypeData.Length : -1))); arraysValid = false; }
         if (blockShapeTypeData == null || blockShapeTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockShapeTypeData", numberOfBlockTypes, (blockShapeTypeData != null ? blockShapeTypeData.Length : -1))); arraysValid = false; }
         if (textureMappingTypeData == null || textureMappingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "textureMappingTypeData", numberOfBlockTypes, (textureMappingTypeData != null ? textureMappingTypeData.Length : -1))); arraysValid = false; }
         if (uv_allFacesData == null || uv_allFacesData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_allFacesData", numberOfBlockTypes, (uv_allFacesData != null ? uv_allFacesData.Length : -1))); arraysValid = false; }
@@ -154,6 +151,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
         // The baked finalDataArray is used instead.
         isSolidData = null;
         blockVisibilityTypeData = null;
+        blockCullingTypeData = null;
         blockShapeTypeData = null;
         textureMappingTypeData = null;
         blockNames = null;
@@ -171,15 +169,17 @@ public class McBlockTypeManager : UdonSharpBehaviour
         {
             ushort data = 0;
             // Bit 0:         IsSolid (1 bit)
-            // Bits 1-4:      VisibilityType (4 bits)
-            // Bits 5-6:      ShapeType (2 bits)
-            // Bits 7-8:      TextureMappingType (2 bits)
-            // Bits 9-15:     Unused (7 bits)
+            // Bits 1-2:      VisibilityType (2 bits) - now only needs 2 bits for 4 values
+            // Bits 3-5:      CullingType (3 bits)
+            // Bits 6-7:      ShapeType (2 bits)
+            // Bits 8-9:      TextureMappingType (2 bits)
+            // Bits 10-15:    Unused (6 bits)
 
             if (isSolidData[i]) data |= (1 << 0);
             data |= (ushort)(blockVisibilityTypeData[i] << 1);
-            data |= (ushort)(blockShapeTypeData[i] << 5);
-            data |= (ushort)(textureMappingTypeData[i] << 7);
+            data |= (ushort)(blockCullingTypeData[i] << 3);
+            data |= (ushort)(blockShapeTypeData[i] << 6);
+            data |= (ushort)(textureMappingTypeData[i] << 8);
             
             finalDataArray[i] = data;
         }
@@ -266,21 +266,28 @@ public class McBlockTypeManager : UdonSharpBehaviour
     public BlockVisibilityType GetBlockVisibilityType(byte blockID)
     {
         if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
-            return (BlockVisibilityType)((finalDataArray[blockID] >> 1) & 0xF); // Bits 1-4
+            return (BlockVisibilityType)((finalDataArray[blockID] >> 1) & 0x3); // Bits 1-2
         return BlockVisibilityType.Opaque;
+    }
+
+    public BlockCullingType GetBlockCullingType(byte blockID)
+    {
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+            return (BlockCullingType)((finalDataArray[blockID] >> 3) & 0x7); // Bits 3-5
+        return BlockCullingType.CullAll;
     }
 
     public McBlockShapeType GetBlockShapeType(byte blockID)
     {
         if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
-            return (McBlockShapeType)((finalDataArray[blockID] >> 5) & 0x3); // Bits 5-6
+            return (McBlockShapeType)((finalDataArray[blockID] >> 6) & 0x3); // Bits 6-7
         return McBlockShapeType.Cube;
     }
     
     public int GetBlockTextureMappingTypeAsInt(byte blockID)
     {
         if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
-            return (finalDataArray[blockID] >> 7) & 0x3; // Bits 7-8
+            return (finalDataArray[blockID] >> 8) & 0x3; // Bits 8-9
         return (int)McBlockTextureMappingType.AllFacesSame;
     }
     
@@ -377,18 +384,5 @@ public class McBlockTypeManager : UdonSharpBehaviour
         int totalTypes = (finalDataArray != null) ? finalDataArray.Length : 0;
         if (placeParticlesPrefabData != null && blockID >= 0 && blockID < totalTypes) return placeParticlesPrefabData[blockID];
         return null;
-    }
-
-    public bool IsAnyCutoutType(BlockVisibilityType visibilityType)
-    {
-        return visibilityType == BlockVisibilityType.Cutout_CullOpaqueOnly ||
-               visibilityType == BlockVisibilityType.Cutout_CullSelf ||
-               visibilityType == BlockVisibilityType.Cutout_CullSelfAndOtherCutout;
-    }
-
-    public bool IsSelfCullingCutout(BlockVisibilityType visibilityType)
-    {
-        return visibilityType == BlockVisibilityType.Cutout_CullSelf ||
-               visibilityType == BlockVisibilityType.Cutout_CullSelfAndOtherCutout;
     }
 }

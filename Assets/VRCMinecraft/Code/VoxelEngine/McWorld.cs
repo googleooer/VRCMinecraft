@@ -156,13 +156,22 @@ public class McWorld : UdonSharpBehaviour
         if (neighborChunk != null) RequestChunkMeshUpdate(neighborChunk);
     }
     
-    public ushort PackBlockData(byte blockID)
+    public ushort PackBlockData(byte blockType)
     {
-        if (blockID == 0) return 0;
-        ushort packedData = blockID;
-        if (blockTypeManager.GetBlockIsSolid(blockID)) packedData |= (1 << 8);
-        packedData |= (ushort)((int)blockTypeManager.GetBlockVisibilityType(blockID) << 9);
-        packedData |= (ushort)((int)blockTypeManager.GetBlockShapeType(blockID) << 12);
+        if (blockTypeManager == null) return blockType;
+        
+        ushort packedData = blockType;
+        bool isSolid = blockTypeManager.GetBlockIsSolid(blockType);
+        BlockVisibilityType visibility = blockTypeManager.GetBlockVisibilityType(blockType);
+        
+        // Bits 0-7: Block ID (8 bits)
+        // Bit 8: IsSolid (1 bit)
+        // Bits 9-10: VisibilityType (2 bits)
+        // Bits 11-15: Reserved
+        
+        if (isSolid) packedData |= (1 << 8);
+        packedData |= (ushort)((int)visibility << 9);
+        
         return packedData;
     }
 
