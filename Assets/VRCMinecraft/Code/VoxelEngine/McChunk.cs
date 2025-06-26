@@ -33,6 +33,8 @@ public class McChunk : UdonSharpBehaviour
     private ushort[] _localBlockData; // Temporary, for meshing
     private int _chunkDataSize;
     [HideInInspector] public bool isBuildingMesh = false;
+    private bool isGeneratingData = false;
+    private int generationStep = 0;
     
     // --- Meshing Buffers ---
     private const int MAX_VERTS = 12288;
@@ -115,43 +117,67 @@ public class McChunk : UdonSharpBehaviour
     // --- REWRITTEN --- The new, simplified data generation process.
     private void StartDataGeneration()
     {
-        // All generation logic is now handled within McTerrainGenerator.
-        // TODO: Turn this into a multi-step thing like with the mesh generation, so we could get the terrain data for a specific voxel and time-slice it all.
-        ushort[] generatedData = _terrainGenRef.GenerateChunkData(chunkX_world, chunkY_world, chunkZ_world);
+        isGeneratingData = true;
+        generationStep = 0;
         
-        // After getting the data, compress it as before.
-        ushort[] compressedRLEData = CompressChunkMultiLayerRLE(generatedData);
-        float compressionRatio = (float)compressedRLEData.Length / generatedData.Length;
-            
-        #if UNITY_EDITOR
-        if (enableVerboseLogging) {
-            Debug.Log($"[McChunk ({chunkX_world},{chunkY_world},{chunkZ_world})] RLE Compression complete. Ratio: {compressionRatio:P2} (Original: {generatedData.Length*2} bytes, Compressed: {compressedRLEData.Length*2} bytes)");
-        }
-        #endif
+        // Initialize terrain generator for this chunk
+        _terrainGenRef.StartChunkGeneration(chunkX_world, chunkY_world, chunkZ_world);
+    }
+    
+    public bool StepDataGeneration()
+    {
+        if (!isGeneratingData) return true;
+        
+        ushort[] generatedData;
+        bool isComplete = _terrainGenRef.StepChunkGeneration(out generatedData);
+        
+        if (isComplete)
+        {
+            // Generation complete, compress the data
+            ushort[] compressedRLEData = CompressChunkMultiLayerRLE(generatedData);
+            float compressionRatio = (float)compressedRLEData.Length / generatedData.Length;
+                
+            #if UNITY_EDITOR
+            if (enableVerboseLogging) {
+                Debug.Log($"[McChunk ({chunkX_world},{chunkY_world},{chunkZ_world})] RLE Compression complete. Ratio: {compressionRatio:P2} (Original: {generatedData.Length*2} bytes, Compressed: {compressedRLEData.Length*2} bytes)");
+            }
+            #endif
 
-        if (compressionRatio < 1.0f) {
-            _chunkData = compressedRLEData;
-            _isCompressed = true;
-        } else {
-            _chunkData = generatedData;
-            _isCompressed = false;
-        }
-        
-        if (_isCompressed) {
-            ushort[] data = (ushort[])_chunkData;
-            if(data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK)
-            {
-                ushort blockValue = data[1];
-                bool isSolid = (blockValue & 0x0100) != 0;
-                var visibility = (BlockVisibilityType)((blockValue >> 9) & 0x7);
-                if(isSolid && visibility == BlockVisibilityType.Opaque) {
-                    isSingleOpaqueSolid = true;
+            if (compressionRatio < 1.0f) {
+                _chunkData = compressedRLEData;
+                _isCompressed = true;
+            } else {
+                _chunkData = generatedData;
+                _isCompressed = false;
+            }
+            
+            if (_isCompressed) {
+                ushort[] data = (ushort[])_chunkData;
+                if(data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK)
+                {
+                    ushort blockValue = data[1];
+                    bool isSolid = (blockValue & 0x0100) != 0;
+                    var visibility = (BlockVisibilityType)((blockValue >> 9) & 0x7);
+                    if(isSolid && visibility == BlockVisibilityType.Opaque) {
+                        isSingleOpaqueSolid = true;
+                    }
                 }
             }
-        }
+                
+            isDataReady = true;
+            isGeneratingData = false;
+            world.TriggerNeighborMeshRebuilds(this);
             
-        isDataReady = true;
-        world.TriggerNeighborMeshRebuilds(this);
+            return true;
+        }
+        
+        return false;
+    }
+
+    // Add a method to check if chunk is generating data:
+    public bool IsGeneratingData()
+    {
+        return isGeneratingData;
     }
 
     
@@ -161,52 +187,62 @@ public class McChunk : UdonSharpBehaviour
         if (world == null || _chunkData == null) return;
         isBuildingMesh = true;
 
-        #if UNITY_EDITOR
+#if UNITY_EDITOR
         time_TotalBuild = 0; time_MainLoop = 0;
         float timer_start_total = 0f; float timer_start_stage = 0f;
-        if (enableVerboseLogging && logBuilder != null) {
+        if (enableVerboseLogging && logBuilder != null)
+        {
             logBuilder.Clear(); logBuilder.AppendLine($"--- BuildMesh for Chunk ({chunkX_world},{chunkY_world},{chunkZ_world}) ---");
             timer_start_total = Time.realtimeSinceStartup; timer_start_stage = Time.realtimeSinceStartup;
         }
-        #endif
+#endif
 
         ClearAllBuffers();
-        
-        if (isSingleOpaqueSolid) {
+
+        if (isSingleOpaqueSolid)
+        {
             bool isFullyOccluded = true;
-            for (int i = 0; i < 6; i++) {
-                if (!world.IsChunkSingleOpaqueSolid(chunkX_world + neighbor_dx_offsets[i], chunkY_world + neighbor_dy_offsets[i], chunkZ_world + neighbor_dz_offsets[i])) {
+            for (int i = 0; i < 6; i++)
+            {
+                if (!world.IsChunkSingleOpaqueSolid(chunkX_world + neighbor_dx_offsets[i], chunkY_world + neighbor_dy_offsets[i], chunkZ_world + neighbor_dz_offsets[i]))
+                {
                     isFullyOccluded = false; break;
                 }
             }
             if (isFullyOccluded) { ApplyEmptyMesh(); isBuildingMesh = false; return; }
         }
 
-        if (_isCompressed) {
-             ushort[] data = (ushort[])_chunkData;
-             if (data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK && data[1] == 0) {
-                 ApplyEmptyMesh(); isBuildingMesh = false; return;
-             }
+        if (_isCompressed)
+        {
+            ushort[] data = (ushort[])_chunkData;
+            if (data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK && data[1] == 0)
+            {
+                ApplyEmptyMesh(); isBuildingMesh = false; return;
+            }
         }
 
         CacheAllNeighbors();
-        if (_isCompressed) {
+        if (_isCompressed)
+        {
             // Use the temporary _localBlockData for meshing to avoid repeated decompression.
             _localBlockData = DecompressChunkMultiLayerRLE((ushort[])_chunkData);
-        } else {
+        }
+        else
+        {
             // If not compressed, we still need to copy it to the local buffer for meshing.
             System.Array.Copy((ushort[])_chunkData, _localBlockData, _chunkDataSize);
         }
 
         _meshing_progress_index = 0;
-        
-        #if UNITY_EDITOR
-        if (enableVerboseLogging) {
+
+#if UNITY_EDITOR
+        if (enableVerboseLogging)
+        {
             time_NeighborCache = (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
             timer_start_stage = Time.realtimeSinceStartup;
             time_DataPrep = (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
         }
-        #endif
+#endif
 
         SendCustomEventDelayedFrames(nameof(BuildMeshStep), 1);
     }
@@ -238,34 +274,34 @@ public class McChunk : UdonSharpBehaviour
                 int x = rem % z_stride;
                 
                 byte blockID = (byte)(blockData & 0xFF);
-                BlockVisibilityType visibility = (BlockVisibilityType)((blockData >> 9) & 0x7);
+                BlockVisibilityType visibility = (BlockVisibilityType)((blockData >> 9) & 0x3); // Only 2 bits needed now
                 Vector3 blockPos = new Vector3(x, y, z);
                 
                 ushort neighborData;
 
                 if (y + 1 >= chunkSizeY) { neighborData = (neighborCache_PY == null) ? (ushort)0 : neighborCache_PY[z * z_stride + x]; } 
                 else { neighborData = _localBlockData[index + y_stride]; }
-                if (ShouldDrawFace(visibility, neighborData)) AddFace(FaceVertices_Up, Normal_Up, blockPos, blockID, visibility, FACE_INDEX_TOP);
+                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_Up, Normal_Up, blockPos, blockID, visibility, FACE_INDEX_TOP);
 
                 if (y - 1 < 0) { neighborData = (neighborCache_NY == null) ? (ushort)0 : neighborCache_NY[((chunkSizeY - 1) * y_stride) + (z * z_stride) + x]; } 
                 else { neighborData = _localBlockData[index - y_stride]; }
-                if (ShouldDrawFace(visibility, neighborData)) AddFace(FaceVertices_Down, Normal_Down, blockPos, blockID, visibility, FACE_INDEX_BOTTOM);
+                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_Down, Normal_Down, blockPos, blockID, visibility, FACE_INDEX_BOTTOM);
 
                 if (z + 1 >= chunkSizeXZ) { neighborData = (neighborCache_PZ == null) ? (ushort)0 : neighborCache_PZ[y * y_stride + x]; } 
                 else { neighborData = _localBlockData[index + z_stride]; }
-                if (ShouldDrawFace(visibility, neighborData)) AddFace(FaceVertices_North, Normal_North, blockPos, blockID, visibility, FACE_INDEX_SIDE);
+                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_North, Normal_North, blockPos, blockID, visibility, FACE_INDEX_SIDE);
 
                 if (z - 1 < 0) { neighborData = (neighborCache_NZ == null) ? (ushort)0 : neighborCache_NZ[y * y_stride + (chunkSizeXZ - 1) * z_stride + x]; } 
                 else { neighborData = _localBlockData[index - z_stride]; }
-                if (ShouldDrawFace(visibility, neighborData)) AddFace(FaceVertices_South, Normal_South, blockPos, blockID, visibility, FACE_INDEX_SIDE);
+                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_South, Normal_South, blockPos, blockID, visibility, FACE_INDEX_SIDE);
 
                 if (x + 1 >= chunkSizeXZ) { neighborData = (neighborCache_PX == null) ? (ushort)0 : neighborCache_PX[y * y_stride + z * z_stride]; } 
                 else { neighborData = _localBlockData[index + 1]; }
-                if (ShouldDrawFace(visibility, neighborData)) AddFace(FaceVertices_East, Normal_East, blockPos, blockID, visibility, FACE_INDEX_SIDE);
+                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_East, Normal_East, blockPos, blockID, visibility, FACE_INDEX_SIDE);
 
                 if (x - 1 < 0) { neighborData = (neighborCache_NX == null) ? (ushort)0 : neighborCache_NX[y * y_stride + z * z_stride + (chunkSizeXZ - 1)]; } 
                 else { neighborData = _localBlockData[index - 1]; }
-                if (ShouldDrawFace(visibility, neighborData)) AddFace(FaceVertices_West, Normal_West, blockPos, blockID, visibility, FACE_INDEX_SIDE);
+                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_West, Normal_West, blockPos, blockID, visibility, FACE_INDEX_SIDE);
             }
             
             _meshing_progress_index++;
@@ -395,26 +431,54 @@ public class McChunk : UdonSharpBehaviour
         _collisionVertexCount = 0; _collisionTriangleCount = 0;
     }
     
-    private bool ShouldDrawFace(BlockVisibilityType selfVisibility, ushort neighborData)
+    // Updated ShouldDrawFace method signature and implementation
+    private bool ShouldDrawFace(byte selfID, BlockVisibilityType selfVisibility, ushort neighborData)
     {
         byte neighborID = (byte)(neighborData & 0xFF);
-        if (neighborID == 0) return true; // Neighbor is air
-
-        BlockVisibilityType neighborVisibility = (BlockVisibilityType)((neighborData >> 9) & 0x7);
-
-        if (selfVisibility == BlockVisibilityType.Opaque) {
-            return neighborVisibility != BlockVisibilityType.Opaque;
-        }
         
-        if (selfVisibility == BlockVisibilityType.Transparent) {
-             return neighborVisibility != BlockVisibilityType.Transparent && neighborVisibility != BlockVisibilityType.Opaque;
-        }
-        
-        if (selfVisibility == BlockVisibilityType.Cutout) {
-            return neighborVisibility == BlockVisibilityType.Transparent || neighborID == 0;
-        }
+        // Always draw if neighbor is air
+        if (neighborID == 0) return true;
 
-        return true;
+        // Get neighbor visibility
+        BlockVisibilityType neighborVisibility = (BlockVisibilityType)((neighborData >> 9) & 0x3); // Updated bit position
+        
+        // Invisible blocks never draw faces
+        if (selfVisibility == BlockVisibilityType.Invisible) return false;
+        
+        // Get culling type for this block
+        BlockCullingType selfCulling = world.blockTypeManager.GetBlockCullingType(selfID);
+        
+        // Apply culling rules
+        switch (selfCulling)
+        {
+            case BlockCullingType.NoCull:
+                // Never cull - always draw the face
+                return true;
+                
+            case BlockCullingType.CullSelf:
+                // Only cull if neighbor is the same block type
+                return neighborID != selfID;
+                
+            case BlockCullingType.CullSelfAndOpaque:
+                // Cull if neighbor is same block or opaque
+                return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Opaque);
+                
+            case BlockCullingType.CullSelfAndCutout:
+                // Cull if neighbor is same block or cutout
+                return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Cutout);
+                
+            case BlockCullingType.CullSelfAndTransparent:
+                // Cull if neighbor is same block or transparent
+                return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Transparent);
+                
+            case BlockCullingType.CullAll:
+                // Always cull (unless neighbor is air, which we already checked)
+                return false;
+                
+            default:
+                // Default to most conservative culling
+                return !(neighborVisibility == BlockVisibilityType.Opaque);
+        }
     }
     
     private void ApplyAllMeshData()

@@ -4,6 +4,16 @@ using VRC.SDKBase;
 using VRRefAssist;
 using System.Text;
 
+public enum GenerationState
+{
+    GeneratingDensity,
+    FillingBlocks,
+    GeneratingBedrock,
+    ApplyingSurface,
+    GeneratingCaves,
+    Complete
+}
+
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McTerrainGenerator : UdonSharpBehaviour
@@ -54,6 +64,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private float[] biomeTemperature;
     private float[] biomeHumidity;
 
+    // Time-slicing state constants
+    private const int STATE_IDLE = 0;
+    private const int STATE_GENERATING_DENSITY = 1;
+    private const int STATE_FILLING_BLOCKS = 2;
+    private const int STATE_APPLYING_SURFACE = 3;
+    private const int STATE_GENERATING_CAVES = 4;
+    private const int STATE_GENERATING_BEDROCK = 5;
+    private const int STATE_COMPLETE = 6;
+
+    private GenerationState currentState = STATE_IDLE;
+    private int currentStep = 0;
+    private int currentChunkX, currentChunkY, currentChunkZ;
+    private ushort[] workingChunkData;
+    private float[] workingDensityField;
+    private float[] workingHeightMap;
+    private float[] workingSamples;
+    private int workingSampleXZ, workingSampleY;
+
 #if UNITY_EDITOR
     [HideInInspector] public bool enableVerboseLogging = true;
 #endif
@@ -74,9 +102,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
         if (depthNoise != null) depthNoise.Initialize(seed, 300);
         if (selectorNoise != null) selectorNoise.Initialize(seed, 400);
 
-        // Initialize biome arrays (16x16 for each chunk)
-        biomeTemperature = new float[256];
-        biomeHumidity = new float[256];
+        // Initialize biome arrays (flexible size based on chunk dimensions)
+        int biomeArraySize = world.chunkSizeXZ * world.chunkSizeXZ;
+        biomeTemperature = new float[biomeArraySize];
+        biomeHumidity = new float[biomeArraySize];
 
         isInitialized = true;
 
@@ -89,189 +118,211 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
     }
 
+    // Main entry point - now returns null to indicate processing needed
     public ushort[] GenerateChunkData(int chunkX, int chunkY, int chunkZ)
     {
-        // Ensure we're initialized
+        // Start the time-sliced generation process
+        StartChunkGeneration(chunkX, chunkY, chunkZ);
+        return null; // Indicates time-sliced processing needed
+    }
+
+    // Initialize time-sliced generation
+    public void StartChunkGeneration(int chunkX, int chunkY, int chunkZ)
+    {
         if (!isInitialized)
         {
             Debug.LogError("[McTerrainGenerator] Not initialized! Call InitializeGenerator first.");
-            return new ushort[world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ];
+            return;
         }
 
-        int chunkSizeXZ = world.chunkSizeXZ; // 16
-        int chunkSizeY = world.chunkSizeY;   // 64
-        
-        ushort[] chunkData = new ushort[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
-        
-        // Generate height map and density field
-        float[] heightMap = new float[chunkSizeXZ * chunkSizeXZ];
-        float[] densityField = GenerateDensityField(chunkX, chunkY, chunkZ);
-        
-        // First pass: Generate base terrain
-        for (int x = 0; x < chunkSizeXZ; x++)
-        {
-            for (int z = 0; z < chunkSizeXZ; z++)
-            {
-                int worldX = chunkX * chunkSizeXZ + x;
-                int worldZ = chunkZ * chunkSizeXZ + z;
-                
-                // Calculate surface height from density field - look for the highest solid block
-                int surfaceWorldY = -1;
+        currentChunkX = chunkX;
+        currentChunkY = chunkY;
+        currentChunkZ = chunkZ;
+        currentState = GenerationState.GeneratingDensity;
+        currentStep = 0;
 
-                // We need to check the density field to find the actual surface
-                // The surface is where we transition from solid (positive density) to air (negative density)
-                for (int y = chunkSizeY - 1; y >= 0; y--)
-                {
-                    int index3D = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                    int worldY = chunkY * chunkSizeY + y;
-                    
-                    if (densityField[index3D] > 0)
-                    {
-                        // Check if the block above is air (or we're at the top of the chunk)
-                        if (y == chunkSizeY - 1)
-                        {
-                            // We're at the top of the chunk, this might be the surface
-                            // but the actual surface could be in the chunk above
-                            surfaceWorldY = worldY;
-                        }
-                        else
-                        {
-                            int indexAbove = x + (y + 1) * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                            if (densityField[indexAbove] <= 0)
-                            {
-                                // Found the surface - solid below, air above
-                                surfaceWorldY = worldY;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Store the world Y coordinate of the surface
-                heightMap[x + z * chunkSizeXZ] = surfaceWorldY;
-                
-                // Fill blocks based on density
-                for (int y = 0; y < chunkSizeY; y++)
-                {
-                    int worldY = chunkY * chunkSizeY + y;
-                    int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                    
-                    if (densityField[index] > 0)
-                    {
-                        chunkData[index] = stoneBlockID;
-                    }
-                    else if (worldY <= seaLevel)
-                    {
-                        chunkData[index] = waterBlockID;
-                    }
-                    else
-                    {
-                        chunkData[index] = airBlockID;
-                    }
-                }
-            }
-        }
-        
-        // Second pass: Surface decoration
-        ApplySurfaceDecoration(chunkData, chunkX, chunkY, chunkZ, heightMap);
-        
-        // Third pass: Cave generation
-        if (generateCaves)
-        {
-            GenerateCaves(chunkData, chunkX, chunkY, chunkZ);
-        }
-        
-        // Fourth pass: Bedrock layer
-        if (generateBedrock && chunkY == 0)
-        {
-            GenerateBedrock(chunkData);
-        }
-        
-        return chunkData;
+        int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
+        workingChunkData = new ushort[chunkSize];
+        workingHeightMap = new float[world.chunkSizeXZ * world.chunkSizeXZ];
     }
 
-    private float[] GenerateDensityField(int chunkX, int chunkY, int chunkZ)
+    // Process one step of generation - returns true when complete
+    public bool StepChunkGeneration(out ushort[] completedData)
+    {
+        completedData = null;
+
+        switch (currentState)
+        {
+            case GenerationState.GeneratingDensity:
+                if (StepDensityGeneration())
+                {
+                    currentState = GenerationState.FillingBlocks;
+                    currentStep = 0;
+                }
+                return false;
+
+            case GenerationState.FillingBlocks:
+                if (StepBlockFilling())
+                {
+                    currentState = GenerationState.ApplyingSurface;
+                    currentStep = 0;
+                }
+                return false;
+
+            case GenerationState.ApplyingSurface:
+                ApplySurfaceDecoration(workingChunkData, currentChunkX, currentChunkY, currentChunkZ, workingHeightMap);
+                currentState = generateCaves ? GenerationState.GeneratingCaves : GenerationState.GeneratingBedrock;
+                currentStep = 0;
+                return false;
+
+            case GenerationState.GeneratingCaves:
+                if (StepCaveGeneration())
+                {
+                    currentState = GenerationState.GeneratingBedrock;
+                    currentStep = 0;
+                }
+                return false;
+
+            case GenerationState.GeneratingBedrock:
+                if (generateBedrock && currentChunkY == 0)
+                {
+                    GenerateBedrock(workingChunkData);
+                }
+                currentState = GenerationState.Complete;
+                completedData = workingChunkData;
+                return true;
+
+            case GenerationState.Complete:
+                completedData = workingChunkData;
+                return true;
+
+            default:
+                return true;
+        }
+    }
+
+    private bool StepDensityGeneration()
     {
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
-        
-        // Use sparse sampling and interpolation (5x33x5 -> 16x64x16)
-        int sampleXZ = 5;
-        int sampleY = 33;
-        float[] samples = new float[sampleXZ * sampleY * sampleXZ];
-        
-        // Check if noise generators are available
+
+        if (currentStep == 0)
+        {
+            // Initialize density field generation
+            // Calculate sample dimensions based on chunk size
+            // Use fixed sample spacing to ensure consistent alignment across chunks
+            workingSampleXZ = 5; // Fixed for consistent chunk boundaries
+            workingSampleY = Mathf.Max(5, (chunkSizeY / 8) + 1); // Scale with chunk height
+            
+            workingSamples = new float[workingSampleXZ * workingSampleY * workingSampleXZ];
+            workingDensityField = new float[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
+            currentStep++;
+            return false;
+        }
+
+        // Generate samples in steps
+        int samplesPerStep = 64; // Process 64 sample points per step
+        int totalSamples = workingSampleXZ * workingSampleY * workingSampleXZ;
+        int startIndex = (currentStep - 1) * samplesPerStep;
+        int endIndex = Mathf.Min(startIndex + samplesPerStep, totalSamples);
+
+        for (int i = startIndex; i < endIndex; i++)
+        {
+            // Convert linear index to 3D coordinates
+            int sx = i % workingSampleXZ;
+            int sy = (i / workingSampleXZ) % workingSampleY;
+            int sz = i / (workingSampleXZ * workingSampleY);
+
+            // FIXED: Use consistent 4-unit spacing for all chunks
+            // This ensures samples at chunk boundaries align perfectly
+            float worldX = (currentChunkX * chunkSizeXZ) + (sx * 4.0f);
+            float worldY = (currentChunkY * chunkSizeY) + (sy * (chunkSizeY / 4.0f));
+            float worldZ = (currentChunkZ * chunkSizeXZ) + (sz * 4.0f);
+
+            // Generate noise value
+            float density = GenerateDensityAtPoint(worldX, worldY, worldZ);
+            workingSamples[sx + sy * workingSampleXZ * workingSampleXZ + sz * workingSampleXZ] = density;
+        }
+
+        currentStep++;
+
+        // Check if we're done with samples
+        if (endIndex >= totalSamples)
+        {
+            // Interpolate samples to full resolution
+            InterpolateDensityField();
+            return true;
+        }
+
+        return false;
+    }
+
+    private float GenerateDensityAtPoint(float worldX, float worldY, float worldZ)
+    {
         if (mainNoise == null || minLimitNoise == null || maxLimitNoise == null || 
             selectorNoise == null || depthNoise == null)
         {
-            Debug.LogError("[McTerrainGenerator] Noise generators not assigned!");
-            return new float[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
+            return 0;
         }
+
+        // Beta 1.7.3 noise combination
+        float mainVal = mainNoise.GenerateNoise(
+            worldX / 684.412f, 
+            worldY / 684.412f, 
+            worldZ / 684.412f, 
+            16, 0.5f
+        );
         
-        // Generate sparse samples
-        for (int sx = 0; sx < sampleXZ; sx++)
-        {
-            for (int sz = 0; sz < sampleXZ; sz++)
-            {
-                for (int sy = 0; sy < sampleY; sy++)
-                {
-                    float worldX = (chunkX * chunkSizeXZ) + (sx * 4);
-                    float worldY = (chunkY * chunkSizeY) + (sy * 2);
-                    float worldZ = (chunkZ * chunkSizeXZ) + (sz * 4);
-                    
-                    // Beta 1.7.3 noise combination
-                    float mainVal = mainNoise.GenerateNoise(
-                        worldX / 684.412f, 
-                        worldY / 684.412f, 
-                        worldZ / 684.412f, 
-                        16, 0.5f
-                    );
-                    
-                    float minVal = minLimitNoise.GenerateNoise(
-                        worldX / 512f, 
-                        worldY / 512f, 
-                        worldZ / 512f, 
-                        16, 0.5f
-                    );
-                    
-                    float maxVal = maxLimitNoise.GenerateNoise(
-                        worldX / 512f, 
-                        worldY / 512f, 
-                        worldZ / 512f, 
-                        16, 0.5f
-                    );
-                    
-                    float selectorVal = selectorNoise.GenerateNoise(
-                        worldX / 512f, 
-                        worldY / 512f, 
-                        worldZ / 512f, 
-                        8, 0.5f
-                    );
-                    
-                    // Depth-based density reduction
-                    float depth = depthNoise.GenerateNoise(
-                        worldX / 200f, 
-                        0, 
-                        worldZ / 200f, 
-                        16, 0.5f
-                    );
-                    
-                    // Height gradient
-                    float heightGradient = (worldY - seaLevel) / 64.0f;
-                    
-                    // Combine noises Beta 1.7.3 style
-                    float density = Mathf.Lerp(minVal, maxVal, selectorVal) + mainVal;
-                    density -= heightGradient * (1.0f + depth * 0.5f);
-                    density *= terrainHeightMultiplier;
-                    
-                    samples[sx + sy * sampleXZ * sampleXZ + sz * sampleXZ] = density;
-                }
-            }
-        }
+        float minVal = minLimitNoise.GenerateNoise(
+            worldX / 512f, 
+            worldY / 512f, 
+            worldZ / 512f, 
+            16, 0.5f
+        );
         
-        // Interpolate to full resolution
-        float[] densityField = new float[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
+        float maxVal = maxLimitNoise.GenerateNoise(
+            worldX / 512f, 
+            worldY / 512f, 
+            worldZ / 512f, 
+            16, 0.5f
+        );
         
+        float selectorVal = selectorNoise.GenerateNoise(
+            worldX / 512f, 
+            worldY / 512f, 
+            worldZ / 512f, 
+            8, 0.5f
+        );
+        
+        // Depth-based density reduction
+        float depth = depthNoise.GenerateNoise(
+            worldX / 200f, 
+            0, 
+            worldZ / 200f, 
+            16, 0.5f
+        );
+        
+        // Height gradient
+        float heightGradient = (worldY - seaLevel) / 64.0f;
+        
+        // Combine noises Beta 1.7.3 style
+        float density = Mathf.Lerp(minVal, maxVal, selectorVal) + mainVal;
+        density -= heightGradient * (1.0f + depth * 0.5f);
+        density *= terrainHeightMultiplier;
+        
+        return density;
+    }
+
+    private void InterpolateDensityField()
+    {
+        int chunkSizeXZ = world.chunkSizeXZ;
+        int chunkSizeY = world.chunkSizeY;
+
+        // FIXED: Use exact spacing that matches our sample generation
+        float sampleSpacingX = 4.0f;
+        float sampleSpacingY = chunkSizeY / 4.0f;
+        float sampleSpacingZ = 4.0f;
+
         for (int x = 0; x < chunkSizeXZ; x++)
         {
             for (int z = 0; z < chunkSizeXZ; z++)
@@ -279,31 +330,47 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 for (int y = 0; y < chunkSizeY; y++)
                 {
                     // Find sample positions
-                    float sx = x / 4.0f;
-                    float sy = y / 2.0f;
-                    float sz = z / 4.0f;
+                    float sx = x / sampleSpacingX;
+                    float sy = y / sampleSpacingY;
+                    float sz = z / sampleSpacingZ;
                     
                     int sx0 = Mathf.FloorToInt(sx);
                     int sy0 = Mathf.FloorToInt(sy);
                     int sz0 = Mathf.FloorToInt(sz);
                     
-                    int sx1 = Mathf.Min(sx0 + 1, sampleXZ - 1);
-                    int sy1 = Mathf.Min(sy0 + 1, sampleY - 1);
-                    int sz1 = Mathf.Min(sz0 + 1, sampleXZ - 1);
+                    // FIXED: Clamp to valid sample indices
+                    sx0 = Mathf.Clamp(sx0, 0, workingSampleXZ - 2);
+                    sy0 = Mathf.Clamp(sy0, 0, workingSampleY - 2);
+                    sz0 = Mathf.Clamp(sz0, 0, workingSampleXZ - 2);
                     
-                    float fx = sx - sx0;
-                    float fy = sy - sy0;
-                    float fz = sz - sz0;
+                    int sx1 = sx0 + 1;
+                    int sy1 = sy0 + 1;
+                    int sz1 = sz0 + 1;
+                    
+                    // Calculate interpolation factors
+                    float fx = Mathf.Clamp01(sx - sx0);
+                    float fy = Mathf.Clamp01(sy - sy0);
+                    float fz = Mathf.Clamp01(sz - sz0);
+                    
+                    // Get sample indices
+                    int idx000 = sx0 + sy0 * workingSampleXZ * workingSampleXZ + sz0 * workingSampleXZ;
+                    int idx100 = sx1 + sy0 * workingSampleXZ * workingSampleXZ + sz0 * workingSampleXZ;
+                    int idx010 = sx0 + sy1 * workingSampleXZ * workingSampleXZ + sz0 * workingSampleXZ;
+                    int idx110 = sx1 + sy1 * workingSampleXZ * workingSampleXZ + sz0 * workingSampleXZ;
+                    int idx001 = sx0 + sy0 * workingSampleXZ * workingSampleXZ + sz1 * workingSampleXZ;
+                    int idx101 = sx1 + sy0 * workingSampleXZ * workingSampleXZ + sz1 * workingSampleXZ;
+                    int idx011 = sx0 + sy1 * workingSampleXZ * workingSampleXZ + sz1 * workingSampleXZ;
+                    int idx111 = sx1 + sy1 * workingSampleXZ * workingSampleXZ + sz1 * workingSampleXZ;
                     
                     // Trilinear interpolation
-                    float v000 = samples[sx0 + sy0 * sampleXZ * sampleXZ + sz0 * sampleXZ];
-                    float v100 = samples[sx1 + sy0 * sampleXZ * sampleXZ + sz0 * sampleXZ];
-                    float v010 = samples[sx0 + sy1 * sampleXZ * sampleXZ + sz0 * sampleXZ];
-                    float v110 = samples[sx1 + sy1 * sampleXZ * sampleXZ + sz0 * sampleXZ];
-                    float v001 = samples[sx0 + sy0 * sampleXZ * sampleXZ + sz1 * sampleXZ];
-                    float v101 = samples[sx1 + sy0 * sampleXZ * sampleXZ + sz1 * sampleXZ];
-                    float v011 = samples[sx0 + sy1 * sampleXZ * sampleXZ + sz1 * sampleXZ];
-                    float v111 = samples[sx1 + sy1 * sampleXZ * sampleXZ + sz1 * sampleXZ];
+                    float v000 = workingSamples[idx000];
+                    float v100 = workingSamples[idx100];
+                    float v010 = workingSamples[idx010];
+                    float v110 = workingSamples[idx110];
+                    float v001 = workingSamples[idx001];
+                    float v101 = workingSamples[idx101];
+                    float v011 = workingSamples[idx011];
+                    float v111 = workingSamples[idx111];
                     
                     float v00 = Mathf.Lerp(v000, v100, fx);
                     float v10 = Mathf.Lerp(v010, v110, fx);
@@ -313,14 +380,80 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     float v0 = Mathf.Lerp(v00, v10, fy);
                     float v1 = Mathf.Lerp(v01, v11, fy);
                     
-                    densityField[x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ] = Mathf.Lerp(v0, v1, fz);
+                    workingDensityField[x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ] = Mathf.Lerp(v0, v1, fz);
                 }
             }
         }
-        
-        return densityField;
     }
 
+    private bool StepBlockFilling()
+    {
+        int chunkSizeXZ = world.chunkSizeXZ;
+        int chunkSizeY = world.chunkSizeY;
+        int columnsPerStep = 4; // Process 4 columns per step
+
+        int totalColumns = chunkSizeXZ * chunkSizeXZ;
+        int startColumn = currentStep * columnsPerStep;
+        int endColumn = Mathf.Min(startColumn + columnsPerStep, totalColumns);
+
+        for (int col = startColumn; col < endColumn; col++)
+        {
+            int x = col % chunkSizeXZ;
+            int z = col / chunkSizeXZ;
+
+            // Calculate surface height from density field
+            int surfaceWorldY = -1;
+            for (int y = chunkSizeY - 1; y >= 0; y--)
+            {
+                int index3D = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
+                int worldY = currentChunkY * chunkSizeY + y;
+                
+                if (workingDensityField[index3D] > 0)
+                {
+                    if (y == chunkSizeY - 1 || workingDensityField[x + (y + 1) * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ] <= 0)
+                    {
+                        surfaceWorldY = worldY;
+                        break;
+                    }
+                }
+            }
+            
+            workingHeightMap[x + z * chunkSizeXZ] = surfaceWorldY;
+            
+            // Fill blocks based on density
+            for (int y = 0; y < chunkSizeY; y++)
+            {
+                int worldY = currentChunkY * chunkSizeY + y;
+                int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
+                
+                if (workingDensityField[index] > 0)
+                {
+                    workingChunkData[index] = stoneBlockID;
+                }
+                else if (worldY <= seaLevel)
+                {
+                    workingChunkData[index] = waterBlockID;
+                }
+                else
+                {
+                    workingChunkData[index] = airBlockID;
+                }
+            }
+        }
+
+        currentStep++;
+        return endColumn >= totalColumns;
+    }
+
+    private bool StepCaveGeneration()
+    {
+        // For simplicity, do all cave generation in one step
+        // Could be further subdivided if needed
+        GenerateCaves(workingChunkData, currentChunkX, currentChunkY, currentChunkZ);
+        return true;
+    }
+
+    // Keep existing methods below unchanged...
     private void ApplySurfaceDecoration(ushort[] chunkData, int chunkX, int chunkY, int chunkZ, float[] heightMap)
     {
         int chunkSizeXZ = world.chunkSizeXZ;
@@ -345,11 +478,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 int worldX = chunkX * chunkSizeXZ + x;
                 int worldZ = chunkZ * chunkSizeXZ + z;
                 
-                // Find the highest solid block in this column across ALL chunks vertically
+                // Find the highest solid block in this column
                 int surfaceWorldY = -1;
                 bool foundSurface = false;
                 
-                // First, check current chunk for surface
                 for (int y = chunkSizeY - 1; y >= 0; y--)
                 {
                     int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
@@ -361,25 +493,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                 }
                 
-                // If no surface found in this chunk, it might be above or below
-                // For chunks above the surface, we don't need to do anything
-                // For chunks below the surface, all stone remains stone
-                if (!foundSurface)
-                {
-                    // Check if this chunk is entirely below the terrain
-                    // by checking if the top block is stone
-                    int topIndex = x + (chunkSizeY - 1) * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                    if (chunkData[topIndex] == stoneBlockID)
-                    {
-                        // This chunk is entirely underground, no surface decoration needed
-                        continue;
-                    }
-                    else
-                    {
-                        // This chunk is entirely above ground, no surface decoration needed
-                        continue;
-                    }
-                }
+                if (!foundSurface) continue;
                 
                 // Apply surface decoration based on WORLD surface height
                 for (int y = chunkSizeY - 1; y >= 0; y--)
@@ -418,7 +532,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             {
                                 chunkData[index] = sandBlockID;
                             }
-                            else if (surfaceWorldY < seaLevel - 1) // Near water
+                            else if (surfaceWorldY < seaLevel - 1)
                             {
                                 if (depthFromWorldSurface < 3)
                                 {
@@ -434,7 +548,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                 chunkData[index] = dirtBlockID;
                             }
                         }
-                        // Else it remains stone (deeper than surface depth)
                     }
                 }
             }
@@ -443,44 +556,60 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private void GenerateBiomeData(int chunkX, int chunkZ)
     {
+        int chunkSizeXZ = world.chunkSizeXZ;
+        
+        // Save current random state
+        Random.State savedState = Random.state;
+        
+        // Use deterministic seed for biome generation
+        Random.InitState(HashChunkCoord(chunkX, chunkZ, _worldActualSeed + 1000));
+        
         // Generate temperature and humidity maps
-        for (int x = 0; x < 16; x++)
+        for (int x = 0; x < chunkSizeXZ; x++)
         {
-            for (int z = 0; z < 16; z++)
+            for (int z = 0; z < chunkSizeXZ; z++)
             {
-                float worldX = chunkX * 16 + x;
-                float worldZ = chunkZ * 16 + z;
+                float worldX = chunkX * chunkSizeXZ + x;
+                float worldZ = chunkZ * chunkSizeXZ + z;
                 
                 // Temperature noise
-                float temp = Mathf.PerlinNoise(worldX * 0.025f, worldZ * 0.025f);
+                float temp = Mathf.PerlinNoise(worldX * 0.025f + 0.5f, worldZ * 0.025f + 0.5f);
                 temp = Mathf.Clamp01(temp);
                 
-                // Humidity noise
-                float humidity = Mathf.PerlinNoise(worldX * 0.05f + 1000, worldZ * 0.05f + 1000);
-                humidity = Mathf.Clamp01(humidity * temp); // Humidity affected by temperature
+                // Humidity noise  
+                float humidity = Mathf.PerlinNoise(worldX * 0.05f + 1000.5f, worldZ * 0.05f + 1000.5f);
+                humidity = Mathf.Clamp01(humidity * temp);
                 
-                biomeTemperature[x + z * 16] = temp;
-                biomeHumidity[x + z * 16] = humidity;
+                biomeTemperature[x + z * chunkSizeXZ] = temp;
+                biomeHumidity[x + z * chunkSizeXZ] = humidity;
             }
         }
+        
+        // Restore random state
+        Random.state = savedState;
     }
 
     private void GenerateCaves(ushort[] chunkData, int chunkX, int chunkY, int chunkZ)
     {
-        Random.InitState(_worldActualSeed + chunkX * 341873128 + chunkZ * 132897987);
-        
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
         
-        // Check 8x8 chunk area for cave systems that might intersect this chunk
-        for (int cx = -8; cx <= 8; cx++)
+        // Scale cave generation radius based on chunk size
+        int caveRadius = Mathf.Max(8, chunkSizeXZ / 2);
+        
+        // Check surrounding chunks for cave systems
+        for (int cx = -caveRadius; cx <= caveRadius; cx++)
         {
-            for (int cz = -8; cz <= 8; cz++)
+            for (int cz = -caveRadius; cz <= caveRadius; cz++)
             {
                 int otherChunkX = chunkX + cx;
                 int otherChunkZ = chunkZ + cz;
                 
-                Random.InitState(_worldActualSeed + otherChunkX * 341873128 + otherChunkZ * 132897987);
+                // Use a better hash function for cave seeds
+                // This uses the FNV-1a hash algorithm which distributes better
+                int caveSeed = HashChunkCoord(otherChunkX, otherChunkZ, _worldActualSeed);
+                
+                Random.InitState(caveSeed);
                 
                 if (Random.value > caveFrequency) continue;
                 
@@ -489,26 +618,52 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 
                 for (int i = 0; i < caveCount; i++)
                 {
-                    float startX = otherChunkX * 16 + Random.Range(0, 16);
+                    float startX = otherChunkX * chunkSizeXZ + Random.Range(0, chunkSizeXZ);
                     float startY = Random.Range(32, 96);
-                    float startZ = otherChunkZ * 16 + Random.Range(0, 16);
+                    float startZ = otherChunkZ * chunkSizeXZ + Random.Range(0, chunkSizeXZ);
                     
                     float yaw = Random.Range(0f, Mathf.PI * 2);
                     float pitch = Random.Range(-0.5f, 0.5f);
                     
                     CarveCaveSystem(chunkData, chunkX, chunkY, chunkZ, 
-                                   startX, startY, startZ, yaw, pitch, 
-                                   Random.Range(85, 112), 0);
+                                startX, startY, startZ, yaw, pitch, 
+                                Random.Range(85, 112), 0);
                 }
             }
         }
+    }
+
+    // Add this helper method for better hash distribution
+    private int HashChunkCoord(int x, int z, int seed)
+    {
+        // FNV-1a hash algorithm adapted for chunk coordinates
+        int hash = 2166136261; // FNV offset basis
+            
+        // Mix in the seed
+        hash = (hash ^ seed) * 16777619;
+        
+        // Mix in x coordinate
+        hash = (hash ^ x) * 16777619;
+        hash = (hash ^ (x >> 16)) * 16777619;
+        
+        // Mix in z coordinate  
+        hash = (hash ^ z) * 16777619;
+        hash = (hash ^ (z >> 16)) * 16777619;
+        
+        // Additional mixing
+        hash ^= hash >> 13;
+        hash *= 16777619;
+        hash ^= hash >> 15;
+        
+        return hash;
+        
     }
 
     private void CarveCaveSystem(ushort[] chunkData, int chunkX, int chunkY, int chunkZ,
                                  float x, float y, float z, float yaw, float pitch, 
                                  int length, int branch)
     {
-        if (branch > 3) return; // Max branch depth
+        if (branch > 3) return;
         
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
@@ -517,27 +672,26 @@ public class McTerrainGenerator : UdonSharpBehaviour
         
         for (int i = 0; i < length; i++)
         {
-            // Cave expansion/contraction
             float scale = Mathf.Sin(i * Mathf.PI / length);
             float currentRadius = radius * scale;
             
             // Calculate chunk-relative coordinates
-            float relativeX = x - (chunkX * 16);
-            float relativeY = y - (chunkY * 64);
-            float relativeZ = z - (chunkZ * 16);
+            float relativeX = x - (chunkX * chunkSizeXZ);
+            float relativeY = y - (chunkY * chunkSizeY);
+            float relativeZ = z - (chunkZ * chunkSizeXZ);
             
             // Only carve if the cave center is within reasonable distance of this chunk
-            if (relativeX >= -currentRadius && relativeX <= 15 + currentRadius &&
-                relativeY >= -currentRadius && relativeY <= 63 + currentRadius &&
-                relativeZ >= -currentRadius && relativeZ <= 15 + currentRadius)
+            if (relativeX >= -currentRadius && relativeX <= chunkSizeXZ - 1 + currentRadius &&
+                relativeY >= -currentRadius && relativeY <= chunkSizeY - 1 + currentRadius &&
+                relativeZ >= -currentRadius && relativeZ <= chunkSizeXZ - 1 + currentRadius)
             {
                 // Carve sphere at current position
                 int minX = Mathf.Max(0, Mathf.FloorToInt(relativeX - currentRadius));
-                int maxX = Mathf.Min(15, Mathf.CeilToInt(relativeX + currentRadius));
+                int maxX = Mathf.Min(chunkSizeXZ - 1, Mathf.CeilToInt(relativeX + currentRadius));
                 int minY = Mathf.Max(0, Mathf.FloorToInt(relativeY - currentRadius));
-                int maxY = Mathf.Min(63, Mathf.CeilToInt(relativeY + currentRadius));
+                int maxY = Mathf.Min(chunkSizeY - 1, Mathf.CeilToInt(relativeY + currentRadius));
                 int minZ = Mathf.Max(0, Mathf.FloorToInt(relativeZ - currentRadius));
-                int maxZ = Mathf.Min(15, Mathf.CeilToInt(relativeZ + currentRadius));
+                int maxZ = Mathf.Min(chunkSizeXZ - 1, Mathf.CeilToInt(relativeZ + currentRadius));
                 
                 for (int cx = minX; cx <= maxX; cx++)
                 {
@@ -553,10 +707,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             {
                                 int index = cx + cy * chunkSizeXZ * chunkSizeXZ + cz * chunkSizeXZ;
                                 
-                                // Bounds check to prevent array out of bounds
+                                // Bounds check
                                 if (index >= 0 && index < chunkData.Length)
                                 {
-                                    // Don't carve through water
                                     if (chunkData[index] != waterBlockID)
                                     {
                                         chunkData[index] = airBlockID;
@@ -576,8 +729,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
             // Random direction changes
             yaw += Random.Range(-0.2f, 0.2f);
             pitch = pitch * 0.9f + Random.Range(-0.1f, 0.1f);
-            
-            // Clamp pitch to prevent vertical caves
             pitch = Mathf.Clamp(pitch, -0.7f, 0.7f);
             
             // Branching
@@ -595,8 +746,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void GenerateBedrock(ushort[] chunkData)
     {
         int chunkSizeXZ = world.chunkSizeXZ;
+        int chunkSizeY = world.chunkSizeY;
         
-        Random.InitState(_worldActualSeed);
+        // Save current random state
+        Random.State savedState = Random.state;
+        
+        // Use chunk-specific seed for bedrock
+        Random.InitState(HashChunkCoord(currentChunkX, currentChunkZ, _worldActualSeed + 2000));
         
         for (int x = 0; x < chunkSizeXZ; x++)
         {
@@ -605,8 +761,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 // Layer 0: Always bedrock
                 chunkData[x + 0 * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ] = bedrockBlockID;
                 
-                // Layers 1-4: Random bedrock
-                for (int y = 1; y <= 4; y++)
+                // Layers 1-4: Random bedrock (only if chunk is tall enough)
+                for (int y = 1; y <= 4 && y < chunkSizeY; y++)
                 {
                     if (Random.value < (5 - y) / 5.0f)
                     {
@@ -615,5 +771,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 }
             }
         }
+        
+        // Restore random state
+        Random.state = savedState;
     }
 }

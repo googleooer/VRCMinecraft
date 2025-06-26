@@ -1,7 +1,7 @@
 #if UNITY_EDITOR
 using UnityEngine;
 using UnityEditor;
-using UnityEditorInternal; // Required for ReorderableList
+using UnityEditorInternal;
 using System.Collections.Generic;
 
 [CustomEditor(typeof(McBlockTypeManager))]
@@ -16,7 +16,8 @@ public class McBlockTypeManagerEditor : Editor
     private SerializedProperty numberOfBlockTypesProp;
     private SerializedProperty blockNamesProp;
     private SerializedProperty isSolidDataProp;
-    private SerializedProperty blockVisibilityTypeDataProp; 
+    private SerializedProperty blockVisibilityTypeDataProp;
+    private SerializedProperty blockCullingTypeDataProp; // NEW
     private SerializedProperty blockShapeTypeDataProp; 
     private SerializedProperty uv_allFacesDataProp;
     private SerializedProperty uv_topFaceDataProp;
@@ -150,8 +151,6 @@ public class McBlockTypeManagerEditor : Editor
             }
         }
     }
-    // --- End of Popup Inner Class ---
-
 
     void OnEnable()
     {
@@ -165,6 +164,7 @@ public class McBlockTypeManagerEditor : Editor
         blockNamesProp = soTarget.FindProperty("blockNames");
         isSolidDataProp = soTarget.FindProperty("isSolidData");
         blockVisibilityTypeDataProp = soTarget.FindProperty("blockVisibilityTypeData");
+        blockCullingTypeDataProp = soTarget.FindProperty("blockCullingTypeData"); // NEW
         blockShapeTypeDataProp = soTarget.FindProperty("blockShapeTypeData"); 
         uv_allFacesDataProp = soTarget.FindProperty("uv_allFacesData"); 
         uv_topFaceDataProp = soTarget.FindProperty("uv_topFaceData"); 
@@ -176,6 +176,12 @@ public class McBlockTypeManagerEditor : Editor
         fallbackBreakSoundsProp = soTarget.FindProperty("fallbackBreakSounds");
         fallbackPlaceSoundsProp = soTarget.FindProperty("fallbackPlaceSounds");
         fallbackFootstepSoundsProp = soTarget.FindProperty("fallbackFootstepSounds");
+
+        // Initialize culling data if it doesn't exist
+        if (blockCullingTypeDataProp != null && blockCullingTypeDataProp.arraySize == 0 && blockNamesProp.arraySize > 0)
+        {
+            MigrateFromOldVisibilityTypes();
+        }
 
         // --- Initialize ReorderableList ---
         blockTypesList = new ReorderableList(soTarget, blockNamesProp, true, true, true, true);
@@ -190,6 +196,73 @@ public class McBlockTypeManagerEditor : Editor
         // --- Sync Foldout States ---
         SyncFoldoutStates();
         InitializeSingleSlicePreviewTexture();
+    }
+
+    private void MigrateFromOldVisibilityTypes()
+    {
+        blockCullingTypeDataProp.arraySize = blockVisibilityTypeDataProp.arraySize;
+        
+        for (int i = 0; i < blockVisibilityTypeDataProp.arraySize; i++)
+        {
+            int oldVisType = blockVisibilityTypeDataProp.GetArrayElementAtIndex(i).intValue;
+            int newVisType = 0;
+            int cullingType = 0;
+            
+            // Map old visibility types to new visibility + culling type
+            switch (oldVisType)
+            {
+                case 0: // Opaque
+                    newVisType = (int)BlockVisibilityType.Opaque;
+                    cullingType = (int)BlockCullingType.CullAll;
+                    break;
+                case 1: // Transparent
+                    newVisType = (int)BlockVisibilityType.Transparent;
+                    cullingType = (int)BlockCullingType.CullSelfAndOpaque;
+                    break;
+                case 2: // Transparent_NoCull (deprecated)
+                    newVisType = (int)BlockVisibilityType.Transparent;
+                    cullingType = (int)BlockCullingType.NoCull;
+                    break;
+                case 3: // Transparent_CullSelf (deprecated)
+                    newVisType = (int)BlockVisibilityType.Transparent;
+                    cullingType = (int)BlockCullingType.CullSelf;
+                    break;
+                case 4: // Transparent_CullSelfAndOpaque (deprecated)
+                    newVisType = (int)BlockVisibilityType.Transparent;
+                    cullingType = (int)BlockCullingType.CullSelfAndOpaque;
+                    break;
+                case 5: // Cutout
+                    newVisType = (int)BlockVisibilityType.Cutout;
+                    cullingType = (int)BlockCullingType.CullAll;
+                    break;
+                case 6: // Cutout_CullOpaqueOnly (deprecated)
+                    newVisType = (int)BlockVisibilityType.Cutout;
+                    cullingType = (int)BlockCullingType.CullSelfAndOpaque;
+                    break;
+                case 7: // Cutout_CullSelf (deprecated)
+                    newVisType = (int)BlockVisibilityType.Cutout;
+                    cullingType = (int)BlockCullingType.CullSelf;
+                    break;
+                case 8: // Cutout_CullSelfAndOtherCutout (deprecated)
+                    newVisType = (int)BlockVisibilityType.Cutout;
+                    cullingType = (int)BlockCullingType.CullSelfAndCutout;
+                    break;
+                case 9: // Invisible
+                    newVisType = (int)BlockVisibilityType.Invisible;
+                    cullingType = (int)BlockCullingType.CullAll;
+                    break;
+                default:
+                    newVisType = (int)BlockVisibilityType.Opaque;
+                    cullingType = (int)BlockCullingType.CullAll;
+                    break;
+            }
+            
+            blockVisibilityTypeDataProp.GetArrayElementAtIndex(i).intValue = newVisType;
+            blockCullingTypeDataProp.GetArrayElementAtIndex(i).intValue = cullingType;
+        }
+        
+        soTarget.ApplyModifiedProperties();
+        Debug.Log("[McBlockTypeManagerEditor] Migrated from old visibility types to new visibility + culling system.");
     }
     
     private void SyncFoldoutStates() {
@@ -218,8 +291,6 @@ public class McBlockTypeManagerEditor : Editor
                     Debug.LogWarning($"[McBlockTypeManagerEditor] Error creating singleSlicePreviewTexture: {ex.Message}");
                     singleSlicePreviewTexture = null;
                 }
-            } else {
-                if(manager != null && manager.enableVerboseLogging) Debug.LogWarning("[McBlockTypeManagerEditor] Preview Texture Array has zero width or height.");
             }
         }
     }
@@ -311,7 +382,7 @@ public class McBlockTypeManagerEditor : Editor
         {
             float height = EditorGUIUtility.singleLineHeight; // Foldout header
             // Add heights for all properties shown when unfolded
-            height += (EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing) * 11; // General + Particles + Section Labels
+            height += (EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing) * 12; // Added 1 for culling type
             
             // Texture Mapping
             var mappingTypeProp = textureMappingTypeDataProp.GetArrayElementAtIndex(index);
@@ -363,6 +434,7 @@ public class McBlockTypeManagerEditor : Editor
                 DrawProperty(ref propertyRect, blockNamesProp.GetArrayElementAtIndex(index), "Name");
                 DrawProperty(ref propertyRect, isSolidDataProp.GetArrayElementAtIndex(index), "Is Solid");
                 DrawEnumPopup<BlockVisibilityType>(ref propertyRect, blockVisibilityTypeDataProp.GetArrayElementAtIndex(index), "Visibility Type");
+                DrawEnumPopup<BlockCullingType>(ref propertyRect, blockCullingTypeDataProp.GetArrayElementAtIndex(index), "Culling Type"); // NEW
                 DrawEnumPopup<McBlockShapeType>(ref propertyRect, blockShapeTypeDataProp.GetArrayElementAtIndex(index), "Shape Type");
                 
                 DrawLabel(ref propertyRect, "Texturing");
@@ -411,6 +483,9 @@ public class McBlockTypeManagerEditor : Editor
 
         blockVisibilityTypeDataProp.arraySize = blockNamesProp.arraySize;
         blockVisibilityTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)BlockVisibilityType.Opaque;
+
+        blockCullingTypeDataProp.arraySize = blockNamesProp.arraySize;
+        blockCullingTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)BlockCullingType.CullAll;
 
         blockShapeTypeDataProp.arraySize = blockNamesProp.arraySize;
         blockShapeTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)McBlockShapeType.Cube;
@@ -463,6 +538,7 @@ public class McBlockTypeManagerEditor : Editor
         // We just need to move the elements in our other parallel arrays.
         isSolidDataProp.MoveArrayElement(oldIndex, newIndex);
         blockVisibilityTypeDataProp.MoveArrayElement(oldIndex, newIndex);
+        blockCullingTypeDataProp.MoveArrayElement(oldIndex, newIndex); // NEW
         blockShapeTypeDataProp.MoveArrayElement(oldIndex, newIndex);
         textureMappingTypeDataProp.MoveArrayElement(oldIndex, newIndex);
         uv_allFacesDataProp.MoveArrayElement(oldIndex, newIndex);
@@ -497,6 +573,7 @@ public class McBlockTypeManagerEditor : Editor
         
         ResizeSerializedArray(isSolidDataProp, masterSize, () => true);
         ResizeSerializedArray(blockVisibilityTypeDataProp, masterSize, () => (int)BlockVisibilityType.Opaque);
+        ResizeSerializedArray(blockCullingTypeDataProp, masterSize, () => (int)BlockCullingType.CullAll); // NEW
         ResizeSerializedArray(blockShapeTypeDataProp, masterSize, () => (int)McBlockShapeType.Cube);
         ResizeSerializedArray(textureMappingTypeDataProp, masterSize, () => (int)McBlockTextureMappingType.AllFacesSame);
         ResizeSerializedArray(uv_allFacesDataProp, masterSize, () => 0);
@@ -540,7 +617,8 @@ public class McBlockTypeManagerEditor : Editor
     private bool CheckOverallMismatch(int count) {
         if (count < 0) count = 0;
         return blockNamesProp.arraySize != count || isSolidDataProp.arraySize != count ||
-            blockVisibilityTypeDataProp.arraySize != count || blockShapeTypeDataProp.arraySize != count ||
+            blockVisibilityTypeDataProp.arraySize != count || blockCullingTypeDataProp.arraySize != count ||
+            blockShapeTypeDataProp.arraySize != count ||
             uv_allFacesDataProp.arraySize != count || uv_topFaceDataProp.arraySize != count ||
             uv_bottomFaceDataProp.arraySize != count || uv_sideFacesDataProp.arraySize != count ||
             textureMappingTypeDataProp.arraySize != count || (manager.breakSounds != null && manager.breakSounds.Length != count) ||
@@ -552,7 +630,8 @@ public class McBlockTypeManagerEditor : Editor
         int count = blockNamesProp.arraySize;
         if (index >= count) return false;
         return !(index >= blockNamesProp.arraySize || index >= isSolidDataProp.arraySize ||
-            index >= blockVisibilityTypeDataProp.arraySize || index >= blockShapeTypeDataProp.arraySize ||
+            index >= blockVisibilityTypeDataProp.arraySize || index >= blockCullingTypeDataProp.arraySize ||
+            index >= blockShapeTypeDataProp.arraySize ||
             index >= uv_allFacesDataProp.arraySize || index >= uv_topFaceDataProp.arraySize ||
             index >= uv_bottomFaceDataProp.arraySize || index >= uv_sideFacesDataProp.arraySize ||
             index >= textureMappingTypeDataProp.arraySize || (manager.breakSounds != null && index >= manager.breakSounds.Length) ||
@@ -564,6 +643,7 @@ public class McBlockTypeManagerEditor : Editor
         blockNamesProp.DeleteArrayElementAtIndex(index);
         isSolidDataProp.DeleteArrayElementAtIndex(index);
         blockVisibilityTypeDataProp.DeleteArrayElementAtIndex(index);
+        blockCullingTypeDataProp.DeleteArrayElementAtIndex(index); // NEW
         blockShapeTypeDataProp.DeleteArrayElementAtIndex(index);
         textureMappingTypeDataProp.DeleteArrayElementAtIndex(index);
         uv_allFacesDataProp.DeleteArrayElementAtIndex(index);
