@@ -59,6 +59,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private bool isInitialized = false;
     private int _worldActualSeed;
     private uint _placementRandState;
+    private uint _biomeRandState;
+    private uint _caveRandState;
+    private uint _bedrockRandState;
 
     // Biome temperature/humidity for simple biome selection
     private float[] biomeTemperature;
@@ -94,6 +97,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
         logBuilder = new StringBuilder(256);
         _worldActualSeed = seed;
+
+        _placementRandState = (uint)seed;
+        if (_placementRandState == 0) _placementRandState = 1; // Ensure non-zero
 
         // Initialize all noise generators with different offsets
         if (mainNoise != null) mainNoise.Initialize(seed, 0);
@@ -558,11 +564,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         int chunkSizeXZ = world.chunkSizeXZ;
         
-        // Save current random state
-        Random.State savedState = Random.state;
-        
-        // Use deterministic seed for biome generation
-        Random.InitState(HashChunkCoord(chunkX, chunkZ, _worldActualSeed + 1000));
+        // Initialize biome random state
+        _biomeRandState = (uint)HashChunkCoord(chunkX, chunkZ, _worldActualSeed + 1000);
+        if (_biomeRandState == 0) _biomeRandState = 1;
         
         // Generate temperature and humidity maps
         for (int x = 0; x < chunkSizeXZ; x++)
@@ -584,9 +588,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 biomeHumidity[x + z * chunkSizeXZ] = humidity;
             }
         }
-        
-        // Restore random state
-        Random.state = savedState;
     }
 
     private void GenerateCaves(ushort[] chunkData, int chunkX, int chunkY, int chunkZ)
@@ -637,7 +638,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int HashChunkCoord(int x, int z, int seed)
     {
         // FNV-1a hash algorithm adapted for chunk coordinates
-        int hash = 2166136261; // FNV offset basis
+        int hash = -2128831035; // Same bit pattern as 2166136261u when cast to int
             
         // Mix in the seed
         hash = (hash ^ seed) * 16777619;
@@ -659,27 +660,113 @@ public class McTerrainGenerator : UdonSharpBehaviour
         
     }
 
+    private int SimpleHash(int x, int y, int seed)
+    {
+        int h = seed + x * 374761393 + y * 668265261;
+        h = (h ^ (h >> 13)) * 1274126177;
+        return h ^ (h >> 16);
+    }
+
+    private int SimpleHash3D(int x, int y, int z, int seed)
+    {
+        int h = seed + x * 374761393 + y * 668265261 + z * 805306457;
+        h = (h ^ (h >> 13)) * 1274126177;
+        return h ^ (h >> 16);
+    }
+    
+    private uint XorShift32(uint state)
+    {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
+    }
+
+    private float GetRandomFloat(ref uint state)
+    {
+        state = XorShift32(state);
+        return (state & 0x7FFFFFFF) / (float)0x7FFFFFFF;
+    }
+
+    private int GetRandomInt(ref uint state, int min, int max)
+    {
+        state = XorShift32(state);
+        uint range = (uint)(max - min);
+        uint randomValue = state & 0x7FFFFFFF;
+        uint result = randomValue - ((randomValue / range) * range); // This is equivalent to % 
+        return min + (int)result;
+    }
+
+    // Simple value noise (not true Perlin, but works for terrain)
+private float ValueNoise2D(float x, float y, int seed)
+{
+    int xi = Mathf.FloorToInt(x);
+    int yi = Mathf.FloorToInt(y);
+    
+    float fx = x - xi;
+    float fy = y - yi;
+    
+    // Smooth the fractional parts
+    fx = fx * fx * (3.0f - 2.0f * fx);
+    fy = fy * fy * (3.0f - 2.0f * fy);
+    
+    // Get corner values
+    float v00 = HashToFloat(SimpleHash(xi, yi, seed));
+    float v10 = HashToFloat(SimpleHash(xi + 1, yi, seed));
+    float v01 = HashToFloat(SimpleHash(xi, yi + 1, seed));
+    float v11 = HashToFloat(SimpleHash(xi + 1, yi + 1, seed));
+    
+    // Bilinear interpolation
+    float v0 = Mathf.Lerp(v00, v10, fx);
+    float v1 = Mathf.Lerp(v01, v11, fx);
+    return Mathf.Lerp(v0, v1, fy);
+}
+
+    private float HashToFloat(int hash)
+    {
+        return (hash & 0x7FFFFFFF) / (float)0x7FFFFFFF;
+    }
+
+    // Octaved noise for terrain
+    private float OctavedNoise2D(float x, float y, int seed, int octaves, float persistence, float scale)
+    {
+        float total = 0;
+        float frequency = scale;
+        float amplitude = 1;
+        float maxValue = 0;
+        
+        for (int i = 0; i < octaves; i++)
+        {
+            total += ValueNoise2D(x * frequency, y * frequency, seed + i) * amplitude;
+            maxValue += amplitude;
+            amplitude *= persistence;
+            frequency *= 2;
+        }
+        
+        return total / maxValue;
+    }
+
     private void CarveCaveSystem(ushort[] chunkData, int chunkX, int chunkY, int chunkZ,
-                                 float x, float y, float z, float yaw, float pitch, 
+                                 float x, float y, float z, float yaw, float pitch,
                                  int length, int branch)
     {
         if (branch > 3) return;
-        
+
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
-        
+
         float radius = Random.Range(1.0f, 6.0f);
-        
+
         for (int i = 0; i < length; i++)
         {
             float scale = Mathf.Sin(i * Mathf.PI / length);
             float currentRadius = radius * scale;
-            
+
             // Calculate chunk-relative coordinates
             float relativeX = x - (chunkX * chunkSizeXZ);
             float relativeY = y - (chunkY * chunkSizeY);
             float relativeZ = z - (chunkZ * chunkSizeXZ);
-            
+
             // Only carve if the cave center is within reasonable distance of this chunk
             if (relativeX >= -currentRadius && relativeX <= chunkSizeXZ - 1 + currentRadius &&
                 relativeY >= -currentRadius && relativeY <= chunkSizeY - 1 + currentRadius &&
@@ -692,7 +779,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 int maxY = Mathf.Min(chunkSizeY - 1, Mathf.CeilToInt(relativeY + currentRadius));
                 int minZ = Mathf.Max(0, Mathf.FloorToInt(relativeZ - currentRadius));
                 int maxZ = Mathf.Min(chunkSizeXZ - 1, Mathf.CeilToInt(relativeZ + currentRadius));
-                
+
                 for (int cx = minX; cx <= maxX; cx++)
                 {
                     for (int cy = minY; cy <= maxY; cy++)
@@ -702,11 +789,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             float dx = cx - relativeX;
                             float dy = cy - relativeY;
                             float dz = cz - relativeZ;
-                            
+
                             if (dx * dx + dy * dy + dz * dz < currentRadius * currentRadius)
                             {
                                 int index = cx + cy * chunkSizeXZ * chunkSizeXZ + cz * chunkSizeXZ;
-                                
+
                                 // Bounds check
                                 if (index >= 0 && index < chunkData.Length)
                                 {
@@ -720,17 +807,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                 }
             }
-            
+
             // Move position
             x += Mathf.Cos(yaw) * Mathf.Cos(pitch);
             y += Mathf.Sin(pitch);
             z += Mathf.Sin(yaw) * Mathf.Cos(pitch);
-            
+
             // Random direction changes
             yaw += Random.Range(-0.2f, 0.2f);
             pitch = pitch * 0.9f + Random.Range(-0.1f, 0.1f);
             pitch = Mathf.Clamp(pitch, -0.7f, 0.7f);
-            
+
             // Branching
             if (Random.value < 0.25f && branch < 3)
             {
@@ -747,9 +834,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
-        
-        // Save current random state
-        Random.State savedState = Random.state;
         
         // Use chunk-specific seed for bedrock
         Random.InitState(HashChunkCoord(currentChunkX, currentChunkZ, _worldActualSeed + 2000));
@@ -771,8 +855,5 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 }
             }
         }
-        
-        // Restore random state
-        Random.state = savedState;
     }
 }
