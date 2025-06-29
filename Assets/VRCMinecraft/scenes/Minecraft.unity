@@ -4018,6 +4018,13 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 615657631}
+  COORDINATE_SCALE: 684.412
+  HEIGHT_SCALE: 684.412
+  MAIN_NOISE_SCALE_X: 80
+  MAIN_NOISE_SCALE_Y: 160
+  MAIN_NOISE_SCALE_Z: 80
+  DEPTH_NOISE_SCALE_X: 200
+  DEPTH_NOISE_SCALE_Z: 200
 --- !u!1 &628294503
 GameObject:
   m_ObjectHideFlags: 0
@@ -4635,6 +4642,13 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 649514700}
+  COORDINATE_SCALE: 684.412
+  HEIGHT_SCALE: 684.412
+  MAIN_NOISE_SCALE_X: 80
+  MAIN_NOISE_SCALE_Y: 160
+  MAIN_NOISE_SCALE_Z: 80
+  DEPTH_NOISE_SCALE_X: 200
+  DEPTH_NOISE_SCALE_Z: 200
 --- !u!1 &660800867
 GameObject:
   m_ObjectHideFlags: 0
@@ -4716,7 +4730,7 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 660800869}
-  seaLevel: 64
+  seaLevel: 62
   surfaceDepth: 4
   airBlockID: 0
   grassBlockID: 2
@@ -4731,14 +4745,14 @@ MonoBehaviour:
   maxLimitNoise: {fileID: 1681099801}
   depthNoise: {fileID: 649514701}
   selectorNoise: {fileID: 1914483143}
-  terrainHeightMultiplier: 1.379
-  caveFrequency: 0.691
+  terrainHeightMultiplier: 1
+  caveFrequency: 0.14
   generateCaves: 1
   generateBedrock: 1
   structureTemplates: []
+  enableVerboseLogging: 1
   world: {fileID: 1596987940}
   blockTypeManager: {fileID: 1410233257}
-  enableVerboseLogging: 1
 --- !u!1 &711094559
 GameObject:
   m_ObjectHideFlags: 0
@@ -5856,6 +5870,13 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 867640768}
+  COORDINATE_SCALE: 684.412
+  HEIGHT_SCALE: 684.412
+  MAIN_NOISE_SCALE_X: 80
+  MAIN_NOISE_SCALE_Y: 160
+  MAIN_NOISE_SCALE_Z: 80
+  DEPTH_NOISE_SCALE_X: 200
+  DEPTH_NOISE_SCALE_Z: 200
 --- !u!1 &869143803
 GameObject:
   m_ObjectHideFlags: 0
@@ -12000,7 +12021,7 @@ MonoBehaviour:
   workerProcessingInterval: 0
   columnsPerDataGenStep: 8
   voxelsPerMeshStep: 512
-  voxelsPerTerrainStep: 1024
+  voxelsPerTerrainStep: 512
   enableVerboseLogging: 1
 --- !u!114 &1156113853
 MonoBehaviour:
@@ -14593,12 +14614,12 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 1596987939}
-  worldSeedString: 404
+  worldSeedString: 2147483647
   worldDimensionX: 16
-  worldDimensionY: 1
+  worldDimensionY: 8
   worldDimensionZ: 16
   chunkSizeXZ: 16
-  chunkSizeY: 128
+  chunkSizeY: 16
   chunkPrefab: {fileID: 2075272781}
   enableGenerationTimings: 1
   chunkOffsetX: 0
@@ -14916,6 +14937,13 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 1681099800}
+  COORDINATE_SCALE: 684.412
+  HEIGHT_SCALE: 684.412
+  MAIN_NOISE_SCALE_X: 80
+  MAIN_NOISE_SCALE_Y: 160
+  MAIN_NOISE_SCALE_Z: 80
+  DEPTH_NOISE_SCALE_X: 200
+  DEPTH_NOISE_SCALE_Z: 200
 --- !u!1 &1698151829
 GameObject:
   m_ObjectHideFlags: 0
@@ -21264,6 +21292,13 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 1914483142}
+  COORDINATE_SCALE: 684.412
+  HEIGHT_SCALE: 684.412
+  MAIN_NOISE_SCALE_X: 80
+  MAIN_NOISE_SCALE_Y: 160
+  MAIN_NOISE_SCALE_Z: 80
+  DEPTH_NOISE_SCALE_X: 200
+  DEPTH_NOISE_SCALE_Z: 200
 --- !u!1 &1931831713
 GameObject:
   m_ObjectHideFlags: 0

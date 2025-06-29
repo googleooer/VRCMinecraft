@@ -50,6 +50,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
     [Header("Structure & Feature Templates")]
     public McStructureTemplate[] structureTemplates;
 
+#if UNITY_EDITOR
+    [Header("Debugging")]
+    public bool enableVerboseLogging = true;
+    private float time_Total, time_DensitySamples, time_DensityInterp, time_BlockFill, time_Surface, time_Caves, time_Bedrock;
+#endif
+
     [SerializeField, FindObjectOfType(true)]
     private McWorld world;
 
@@ -62,6 +68,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private uint _biomeRandState;
     private uint _caveRandState;
     private uint _bedrockRandState;
+
+    // Global heightmap cache to avoid re-calculating surface Y
+    private int[] globalHeightMap;
+    private bool[] globalHeightMapInitialized;
 
     // Biome temperature/humidity for simple biome selection
     private float[] biomeTemperature;
@@ -85,9 +95,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private float[] workingSamples;
     private int workingSampleXZ, workingSampleY;
 
-#if UNITY_EDITOR
-    [HideInInspector] public bool enableVerboseLogging = true;
-#endif
+    // FIXED: Use consistent sampling interval regardless of chunk size
+    private const int DENSITY_SAMPLE_INTERVAL = 4;
+
     private StringBuilder logBuilder;
 
     public void InitializeGenerator(int seed)
@@ -112,6 +122,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int biomeArraySize = world.chunkSizeXZ * world.chunkSizeXZ;
         biomeTemperature = new float[biomeArraySize];
         biomeHumidity = new float[biomeArraySize];
+
+        // Initialize the global heightmap cache
+        if (globalHeightMap == null)
+        {
+            int worldSizeX = world.worldDimensionX * world.chunkSizeXZ;
+            int worldSizeZ = world.worldDimensionZ * world.chunkSizeXZ;
+            globalHeightMap = new int[worldSizeX * worldSizeZ];
+            globalHeightMapInitialized = new bool[worldSizeX * worldSizeZ];
+        }
 
         isInitialized = true;
 
@@ -150,6 +169,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
         workingChunkData = new ushort[chunkSize];
         workingHeightMap = new float[world.chunkSizeXZ * world.chunkSizeXZ];
+
+#if UNITY_EDITOR
+        if (enableVerboseLogging)
+        {
+            time_Total = Time.realtimeSinceStartup;
+            time_DensitySamples = 0f;
+            time_DensityInterp = 0f;
+            time_BlockFill = 0f;
+            time_Surface = 0f;
+            time_Caves = 0f;
+            time_Bedrock = 0f;
+        }
+#endif
     }
 
     // Process one step of generation - returns true when complete
@@ -157,10 +189,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         completedData = null;
 
+#if UNITY_EDITOR
+        float stepTimer = 0f;
+        if (enableVerboseLogging) stepTimer = Time.realtimeSinceStartup;
+#endif
+
         switch (currentState)
         {
             case GenerationState.GeneratingDensity:
-                if (StepDensityGeneration())
+                bool densityDone = StepDensityGeneration();
+#if UNITY_EDITOR
+                if(enableVerboseLogging) time_DensitySamples += (Time.realtimeSinceStartup - stepTimer);
+#endif
+                if (densityDone)
                 {
                     currentState = GenerationState.FillingBlocks;
                     currentStep = 0;
@@ -168,22 +209,37 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 return false;
 
             case GenerationState.FillingBlocks:
-                if (StepBlockFilling())
+                bool fillDone = StepBlockFilling();
+#if UNITY_EDITOR
+                if(enableVerboseLogging) time_BlockFill += (Time.realtimeSinceStartup - stepTimer);
+#endif
+                if (fillDone)
                 {
+                    // Setup for surface decoration
+                    GenerateBiomeData(currentChunkX, currentChunkZ);
                     currentState = GenerationState.ApplyingSurface;
                     currentStep = 0;
                 }
                 return false;
 
             case GenerationState.ApplyingSurface:
-                ApplySurfaceDecoration(workingChunkData, currentChunkX, currentChunkY, currentChunkZ, workingHeightMap);
-                currentState = generateCaves ? GenerationState.GeneratingCaves : GenerationState.GeneratingBedrock;
-                currentStep = 0;
+                bool surfaceDone = StepSurfaceDecoration();
+#if UNITY_EDITOR
+                if (enableVerboseLogging) time_Surface += (Time.realtimeSinceStartup - stepTimer);
+#endif
+                if(surfaceDone)
+                {
+                    currentState = generateCaves ? GenerationState.GeneratingCaves : GenerationState.GeneratingBedrock;
+                    currentStep = 0;
+                }
                 return false;
 
             case GenerationState.GeneratingCaves:
                 if (StepCaveGeneration())
                 {
+#if UNITY_EDITOR
+                    if (enableVerboseLogging) time_Caves = (Time.realtimeSinceStartup - stepTimer) * 1000f;
+#endif
                     currentState = GenerationState.GeneratingBedrock;
                     currentStep = 0;
                 }
@@ -194,8 +250,29 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 {
                     GenerateBedrock(workingChunkData);
                 }
+#if UNITY_EDITOR
+                if (enableVerboseLogging) time_Bedrock = (Time.realtimeSinceStartup - stepTimer) * 1000f;
+#endif
                 currentState = GenerationState.Complete;
                 completedData = workingChunkData;
+
+#if UNITY_EDITOR
+                if (enableVerboseLogging)
+                {
+                    float totalTime = (Time.realtimeSinceStartup - time_Total) * 1000f;
+                    logBuilder.Clear();
+                    logBuilder.AppendFormat("--- Terrain Gen Timings for Chunk ({0},{1},{2}) ---", currentChunkX, currentChunkY, currentChunkZ).AppendLine();
+                    logBuilder.AppendFormat("1. Density Samples (total): {0:F3} ms", time_DensitySamples * 1000f).AppendLine();
+                    logBuilder.AppendFormat("2. Density Interp:          {0:F3} ms", time_DensityInterp).AppendLine();
+                    logBuilder.AppendFormat("3. Block Fill (total):      {0:F3} ms", time_BlockFill * 1000f).AppendLine();
+                    logBuilder.AppendFormat("4. Surface Decor (total):   {0:F3} ms", time_Surface * 1000f).AppendLine();
+                    logBuilder.AppendFormat("5. Cave Gen:                {0:F3} ms", time_Caves).AppendLine();
+                    logBuilder.AppendFormat("6. Bedrock Gen:             {0:F3} ms", time_Bedrock).AppendLine();
+                    logBuilder.AppendFormat("-> Total Measured:          {0:F3} ms", (time_DensitySamples*1000f + time_DensityInterp + time_BlockFill*1000f + time_Surface*1000f + time_Caves + time_Bedrock)).AppendLine();
+                    logBuilder.AppendFormat("=> Total Actual:            {0:F3} ms", totalTime).AppendLine();
+                    Debug.Log(logBuilder.ToString());
+                }
+#endif
                 return true;
 
             case GenerationState.Complete:
@@ -211,15 +288,38 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
+        
+        int minWorldX;
+        int maxWorldX;
+        int minWorldY;
+        int maxWorldY;
+        int minWorldZ;
+        int maxWorldZ;
+
+        int alignedMinX;
+        int alignedMinY;
+        int alignedMinZ;
 
         if (currentStep == 0)
         {
-            // Initialize density field generation
-            // Calculate sample dimensions based on chunk size
-            // Use fixed sample spacing to ensure consistent alignment across chunks
-            workingSampleXZ = 5; // Fixed for consistent chunk boundaries
-            workingSampleY = Mathf.Max(5, (chunkSizeY / 8) + 1); // Scale with chunk height
-            
+            // FIXED: Calculate sample dimensions based on world-space sampling
+            // Always sample at DENSITY_SAMPLE_INTERVAL boundaries, with extra samples for overlap
+            minWorldX = currentChunkX * chunkSizeXZ;
+            maxWorldX = minWorldX + chunkSizeXZ;
+            minWorldY = currentChunkY * chunkSizeY;
+            maxWorldY = minWorldY + chunkSizeY;
+            minWorldZ = currentChunkZ * chunkSizeXZ;
+            maxWorldZ = minWorldZ + chunkSizeXZ;
+
+            // Align to sample grid and calculate required samples
+            alignedMinX = (minWorldX / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+            alignedMinY = (minWorldY / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+            alignedMinZ = (minWorldZ / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+
+            // Need samples up to and including the boundaries
+            workingSampleXZ = ((maxWorldX - alignedMinX + DENSITY_SAMPLE_INTERVAL - 1) / DENSITY_SAMPLE_INTERVAL) + 1;
+            workingSampleY = ((maxWorldY - alignedMinY + DENSITY_SAMPLE_INTERVAL - 1) / DENSITY_SAMPLE_INTERVAL) + 1;
+
             workingSamples = new float[workingSampleXZ * workingSampleY * workingSampleXZ];
             workingDensityField = new float[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
             currentStep++;
@@ -227,23 +327,29 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
 
         // Generate samples in steps
-        int samplesPerStep = 64; // Process 64 sample points per step
+        int samplesPerStep = 64;
         int totalSamples = workingSampleXZ * workingSampleY * workingSampleXZ;
         int startIndex = (currentStep - 1) * samplesPerStep;
         int endIndex = Mathf.Min(startIndex + samplesPerStep, totalSamples);
 
+        // FIXED: Calculate aligned world coordinates for sampling
+        minWorldX = currentChunkX * chunkSizeXZ;
+        minWorldY = currentChunkY * chunkSizeY;
+        minWorldZ = currentChunkZ * chunkSizeXZ;
+        alignedMinX = (minWorldX / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+        alignedMinY = (minWorldY / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+        alignedMinZ = (minWorldZ / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+
         for (int i = startIndex; i < endIndex; i++)
         {
-            // Convert linear index to 3D coordinates
             int sx = i % workingSampleXZ;
             int sy = (i / workingSampleXZ) % workingSampleY;
             int sz = i / (workingSampleXZ * workingSampleY);
 
-            // FIXED: Use consistent 4-unit spacing for all chunks
-            // This ensures samples at chunk boundaries align perfectly
-            float worldX = (currentChunkX * chunkSizeXZ) + (sx * 4.0f);
-            float worldY = (currentChunkY * chunkSizeY) + (sy * (chunkSizeY / 4.0f));
-            float worldZ = (currentChunkZ * chunkSizeXZ) + (sz * 4.0f);
+            // FIXED: Use aligned world coordinates
+            float worldX = alignedMinX + (sx * DENSITY_SAMPLE_INTERVAL);
+            float worldY = alignedMinY + (sy * DENSITY_SAMPLE_INTERVAL);
+            float worldZ = alignedMinZ + (sz * DENSITY_SAMPLE_INTERVAL);
 
             // Generate noise value
             float density = GenerateDensityAtPoint(worldX, worldY, worldZ);
@@ -252,11 +358,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
         currentStep++;
 
-        // Check if we're done with samples
         if (endIndex >= totalSamples)
         {
-            // Interpolate samples to full resolution
-            InterpolateDensityField();
+#if UNITY_EDITOR
+            if (enableVerboseLogging)
+            {
+                float timer = Time.realtimeSinceStartup;
+                InterpolateDensityField();
+                time_DensityInterp = (Time.realtimeSinceStartup - timer) * 1000f;
+            }
+            else
+            {
+                InterpolateDensityField();
+            }
+#endif
             return true;
         }
 
@@ -265,47 +380,58 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private float GenerateDensityAtPoint(float worldX, float worldY, float worldZ)
     {
+        if (!isInitialized)
+        {
+            Debug.LogError("[McTerrainGenerator] GenerateDensityAtPoint called before initialization!");
+            return 0;
+        }
+        
         if (mainNoise == null || minLimitNoise == null || maxLimitNoise == null || 
             selectorNoise == null || depthNoise == null)
         {
             return 0;
         }
 
-        // Beta 1.7.3 noise combination
+        float warpX = Mathf.Sin(_worldActualSeed * 0.1f) * 100.0f;
+        float warpZ = Mathf.Cos(_worldActualSeed * 0.1f) * 100.0f;
+        float warpedX = worldX + warpX;
+        float warpedZ = worldZ + warpZ;
+
+        // Beta 1.7.3 noise combination with proper scaling
         float mainVal = mainNoise.GenerateNoise(
-            worldX / 684.412f, 
+            warpedX / 684.412f, 
             worldY / 684.412f, 
-            worldZ / 684.412f, 
-            16, 0.5f
+            warpedZ / 684.412f, 
+            8, 0.5f
         );
         
         float minVal = minLimitNoise.GenerateNoise(
-            worldX / 512f, 
+            warpedX / 512f, 
             worldY / 512f, 
-            worldZ / 512f, 
-            16, 0.5f
+            warpedZ / 512f, 
+            8, 0.5f
         );
         
         float maxVal = maxLimitNoise.GenerateNoise(
-            worldX / 512f, 
+            warpedX / 512f, 
             worldY / 512f, 
-            worldZ / 512f, 
-            16, 0.5f
+            warpedZ / 512f, 
+            8, 0.5f
         );
         
         float selectorVal = selectorNoise.GenerateNoise(
-            worldX / 512f, 
+            warpedX / 512f, 
             worldY / 512f, 
-            worldZ / 512f, 
-            8, 0.5f
+            warpedZ / 512f, 
+            4, 0.5f
         );
         
         // Depth-based density reduction
         float depth = depthNoise.GenerateNoise(
-            worldX / 200f, 
+            warpedX / 200f, 
             0, 
-            worldZ / 200f, 
-            16, 0.5f
+            warpedZ / 200f, 
+            4, 0.5f
         );
         
         // Height gradient
@@ -324,10 +450,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
 
-        // FIXED: Use exact spacing that matches our sample generation
-        float sampleSpacingX = 4.0f;
-        float sampleSpacingY = chunkSizeY / 4.0f;
-        float sampleSpacingZ = 4.0f;
+        // FIXED: Calculate aligned offsets for proper interpolation
+        int minWorldX = currentChunkX * chunkSizeXZ;
+        int minWorldY = currentChunkY * chunkSizeY;
+        int minWorldZ = currentChunkZ * chunkSizeXZ;
+        int alignedMinX = (minWorldX / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+        int alignedMinY = (minWorldY / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+        int alignedMinZ = (minWorldZ / DENSITY_SAMPLE_INTERVAL) * DENSITY_SAMPLE_INTERVAL;
+        
+        float offsetX = (minWorldX - alignedMinX) / (float)DENSITY_SAMPLE_INTERVAL;
+        float offsetY = (minWorldY - alignedMinY) / (float)DENSITY_SAMPLE_INTERVAL;
+        float offsetZ = (minWorldZ - alignedMinZ) / (float)DENSITY_SAMPLE_INTERVAL;
 
         for (int x = 0; x < chunkSizeXZ; x++)
         {
@@ -335,16 +468,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
             {
                 for (int y = 0; y < chunkSizeY; y++)
                 {
-                    // Find sample positions
-                    float sx = x / sampleSpacingX;
-                    float sy = y / sampleSpacingY;
-                    float sz = z / sampleSpacingZ;
+                    // FIXED: Calculate sample positions with proper offset
+                    float sx = offsetX + (x / (float)DENSITY_SAMPLE_INTERVAL);
+                    float sy = offsetY + (y / (float)DENSITY_SAMPLE_INTERVAL);
+                    float sz = offsetZ + (z / (float)DENSITY_SAMPLE_INTERVAL);
                     
                     int sx0 = Mathf.FloorToInt(sx);
                     int sy0 = Mathf.FloorToInt(sy);
                     int sz0 = Mathf.FloorToInt(sz);
                     
-                    // FIXED: Clamp to valid sample indices
+                    // Ensure we stay within sample bounds
                     sx0 = Mathf.Clamp(sx0, 0, workingSampleXZ - 2);
                     sy0 = Mathf.Clamp(sy0, 0, workingSampleY - 2);
                     sz0 = Mathf.Clamp(sz0, 0, workingSampleXZ - 2);
@@ -353,10 +486,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     int sy1 = sy0 + 1;
                     int sz1 = sz0 + 1;
                     
-                    // Calculate interpolation factors
-                    float fx = Mathf.Clamp01(sx - sx0);
-                    float fy = Mathf.Clamp01(sy - sy0);
-                    float fz = Mathf.Clamp01(sz - sz0);
+                    // Calculate interpolation factors with smoothstep for smoother transitions
+                    float fx = SmoothStep(sx - sx0);
+                    float fy = SmoothStep(sy - sy0);
+                    float fz = SmoothStep(sz - sz0);
                     
                     // Get sample indices
                     int idx000 = sx0 + sy0 * workingSampleXZ * workingSampleXZ + sz0 * workingSampleXZ;
@@ -392,6 +525,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
     }
 
+    private float SmoothStep(float t)
+    {
+        return t * t * (3.0f - 2.0f * t);
+    }
+
     private bool StepBlockFilling()
     {
         int chunkSizeXZ = world.chunkSizeXZ;
@@ -413,7 +551,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
             {
                 int index3D = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
                 int worldY = currentChunkY * chunkSizeY + y;
-                
+
                 if (workingDensityField[index3D] > 0)
                 {
                     if (y == chunkSizeY - 1 || workingDensityField[x + (y + 1) * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ] <= 0)
@@ -423,15 +561,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                 }
             }
-            
+
             workingHeightMap[x + z * chunkSizeXZ] = surfaceWorldY;
-            
+
             // Fill blocks based on density
             for (int y = 0; y < chunkSizeY; y++)
             {
                 int worldY = currentChunkY * chunkSizeY + y;
                 int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                
+
                 if (workingDensityField[index] > 0)
                 {
                     workingChunkData[index] = stoneBlockID;
@@ -451,115 +589,153 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return endColumn >= totalColumns;
     }
 
-    private bool StepCaveGeneration()
-    {
-        // For simplicity, do all cave generation in one step
-        // Could be further subdivided if needed
-        GenerateCaves(workingChunkData, currentChunkX, currentChunkY, currentChunkZ);
-        return true;
-    }
-
-    // Keep existing methods below unchanged...
-    private void ApplySurfaceDecoration(ushort[] chunkData, int chunkX, int chunkY, int chunkZ, float[] heightMap)
+    private bool StepSurfaceDecoration()
     {
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
-        
-        // Generate biome data for this chunk
-        GenerateBiomeData(chunkX, chunkZ);
-        
-        for (int x = 0; x < chunkSizeXZ; x++)
+        int columnsPerStep = 4; // Process 4 columns per step
+
+        int totalColumns = chunkSizeXZ * chunkSizeXZ;
+        int startColumn = currentStep * columnsPerStep;
+        int endColumn = Mathf.Min(startColumn + columnsPerStep, totalColumns);
+
+        for (int col = startColumn; col < endColumn; col++)
         {
-            for (int z = 0; z < chunkSizeXZ; z++)
+            int x = col % chunkSizeXZ;
+            int z = col / chunkSizeXZ;
+
+            int biomeIndex = x + z * chunkSizeXZ;
+            float temp = biomeTemperature[biomeIndex];
+            float humidity = biomeHumidity[biomeIndex];
+
+            // Simple biome determination
+            bool isDesert = temp > 0.95f && humidity < 0.2f;
+            bool isTundra = temp < 0.2f;
+
+            int worldX = currentChunkX * chunkSizeXZ + x;
+            int worldZ = currentChunkZ * chunkSizeXZ + z;
+
+            // --- OPTIMIZATION: Use a global, cached heightmap ---
+            int heightMapX = worldX + world.globalVoxelOffsetX;
+            int heightMapZ = worldZ + world.globalVoxelOffsetZ;
+            int heightMapIndex = heightMapZ * (world.worldDimensionX * world.chunkSizeXZ) + heightMapX;
+            int surfaceWorldY;
+
+            if (globalHeightMapInitialized[heightMapIndex])
             {
-                int biomeIndex = x + z * chunkSizeXZ;
-                float temp = biomeTemperature[biomeIndex];
-                float humidity = biomeHumidity[biomeIndex];
-                
-                // Simple biome determination
-                bool isDesert = temp > 0.95f && humidity < 0.2f;
-                bool isTundra = temp < 0.2f;
-                
-                // Calculate WORLD position for this column
-                int worldX = chunkX * chunkSizeXZ + x;
-                int worldZ = chunkZ * chunkSizeXZ + z;
-                
-                // Find the highest solid block in this column
-                int surfaceWorldY = -1;
-                bool foundSurface = false;
-                
-                for (int y = chunkSizeY - 1; y >= 0; y--)
+                surfaceWorldY = globalHeightMap[heightMapIndex];
+            }
+            else
+            {
+                // This is the first time we've seen this column.
+                // OPTIMIZED: Use a coarse-to-fine search to find the surface quickly.
+                surfaceWorldY = -1;
+                int worldTopY = world.worldDimensionY * world.chunkSizeY;
+                int coarseStep = 8; // Scan in 8-block intervals
+
+                // 1. Coarse search downwards to find an area with land
+                int yCoarseStart = -1;
+                for (int yScan = worldTopY - 1; yScan >= 0; yScan -= coarseStep)
                 {
-                    int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                    if (chunkData[index] == stoneBlockID)
+                    if (GenerateDensityAtPoint(worldX, yScan, worldZ) > 0)
                     {
-                        surfaceWorldY = chunkY * chunkSizeY + y;
-                        foundSurface = true;
+                        yCoarseStart = yScan;
                         break;
                     }
                 }
-                
-                if (!foundSurface) continue;
-                
-                // Apply surface decoration based on WORLD surface height
-                for (int y = chunkSizeY - 1; y >= 0; y--)
+
+                // 2. Fine search in the identified vicinity if a potential surface was found
+                if (yCoarseStart != -1)
                 {
-                    int worldY = chunkY * chunkSizeY + y;
-                    int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                    
-                    if (chunkData[index] == stoneBlockID)
+                    int fineSearchTop = yCoarseStart + coarseStep;
+                    if (fineSearchTop >= worldTopY) fineSearchTop = worldTopY - 1;
+
+                    for (int yScan = fineSearchTop; yScan >= yCoarseStart; yScan--)
                     {
-                        int depthFromWorldSurface = surfaceWorldY - worldY;
-                        
-                        if (depthFromWorldSurface == 0)
+                        if (GenerateDensityAtPoint(worldX, yScan, worldZ) > 0)
                         {
-                            // This is the actual world surface block
-                            if (surfaceWorldY < seaLevel - 1)
+                            surfaceWorldY = yScan;
+                            break;
+                        }
+                    }
+                }
+
+                // Store the result in the cache for next time
+                globalHeightMap[heightMapIndex] = surfaceWorldY;
+                globalHeightMapInitialized[heightMapIndex] = true;
+            }
+
+            if (surfaceWorldY == -1) continue; // No ground in this column.
+
+            // Apply surface decoration based on the true WORLD surface height
+            for (int y = chunkSizeY - 1; y >= 0; y--)
+            {
+                int worldY = currentChunkY * chunkSizeY + y;
+                int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
+
+                if (workingChunkData[index] == stoneBlockID)
+                {
+                    int depthFromWorldSurface = surfaceWorldY - worldY;
+
+                    if (depthFromWorldSurface == 0)
+                    {
+                        // This is the actual world surface block
+                        if (surfaceWorldY < seaLevel - 1)
+                        {
+                            workingChunkData[index] = sandBlockID;
+                        }
+                        else if (isDesert)
+                        {
+                            workingChunkData[index] = sandBlockID;
+                        }
+                        else if (isTundra && surfaceWorldY > seaLevel + 20)
+                        {
+                            workingChunkData[index] = stoneBlockID; // Snow would go here
+                        }
+                        else
+                        {
+                            workingChunkData[index] = grassBlockID;
+                        }
+                    }
+                    else if (depthFromWorldSurface > 0 && depthFromWorldSurface < surfaceDepth)
+                    {
+                        // Subsurface blocks
+                        if (isDesert && depthFromWorldSurface < 4)
+                        {
+                            workingChunkData[index] = sandBlockID;
+                        }
+                        else if (surfaceWorldY < seaLevel - 1)
+                        {
+                            if (depthFromWorldSurface < 3)
                             {
-                                chunkData[index] = sandBlockID;
-                            }
-                            else if (isDesert)
-                            {
-                                chunkData[index] = sandBlockID;
-                            }
-                            else if (isTundra && surfaceWorldY > seaLevel + 20)
-                            {
-                                chunkData[index] = stoneBlockID; // Snow would go here
+                                workingChunkData[index] = sandBlockID;
                             }
                             else
                             {
-                                chunkData[index] = grassBlockID;
+                                workingChunkData[index] = sandStoneBlockID;
                             }
                         }
-                        else if (depthFromWorldSurface > 0 && depthFromWorldSurface < surfaceDepth)
+                        else
                         {
-                            // Subsurface blocks
-                            if (isDesert && depthFromWorldSurface < 4)
-                            {
-                                chunkData[index] = sandBlockID;
-                            }
-                            else if (surfaceWorldY < seaLevel - 1)
-                            {
-                                if (depthFromWorldSurface < 3)
-                                {
-                                    chunkData[index] = sandBlockID;
-                                }
-                                else
-                                {
-                                    chunkData[index] = sandStoneBlockID;
-                                }
-                            }
-                            else
-                            {
-                                chunkData[index] = dirtBlockID;
-                            }
+                            workingChunkData[index] = dirtBlockID;
                         }
                     }
                 }
             }
         }
+
+        currentStep++;
+        return endColumn >= totalColumns;
     }
 
+    private bool StepCaveGeneration()
+    {
+        // For simplicity, do all cave generation in one step
+        GenerateCaves(workingChunkData, currentChunkX, currentChunkY, currentChunkZ);
+        return true;
+    }
+
+    // Keep existing methods below unchanged...
     private void GenerateBiomeData(int chunkX, int chunkZ)
     {
         int chunkSizeXZ = world.chunkSizeXZ;
@@ -567,6 +743,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         // Initialize biome random state
         _biomeRandState = (uint)HashChunkCoord(chunkX, chunkZ, _worldActualSeed + 1000);
         if (_biomeRandState == 0) _biomeRandState = 1;
+        
+        // FIXED: Add world seed offset to prevent repetition
+        float biomeOffset = _worldActualSeed * 0.1f;
         
         // Generate temperature and humidity maps
         for (int x = 0; x < chunkSizeXZ; x++)
@@ -576,12 +755,18 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 float worldX = chunkX * chunkSizeXZ + x;
                 float worldZ = chunkZ * chunkSizeXZ + z;
                 
-                // Temperature noise
-                float temp = Mathf.PerlinNoise(worldX * 0.025f + 0.5f, worldZ * 0.025f + 0.5f);
+                // Temperature noise with offset
+                float temp = Mathf.PerlinNoise(
+                    worldX * 0.025f + 0.5f + biomeOffset, 
+                    worldZ * 0.025f + 0.5f + biomeOffset
+                );
                 temp = Mathf.Clamp01(temp);
                 
-                // Humidity noise  
-                float humidity = Mathf.PerlinNoise(worldX * 0.05f + 1000.5f, worldZ * 0.05f + 1000.5f);
+                // Humidity noise with different offset
+                float humidity = Mathf.PerlinNoise(
+                    worldX * 0.05f + 1000.5f + biomeOffset * 2f, 
+                    worldZ * 0.05f + 1000.5f + biomeOffset * 2f
+                );
                 humidity = Mathf.Clamp01(humidity * temp);
                 
                 biomeTemperature[x + z * chunkSizeXZ] = temp;

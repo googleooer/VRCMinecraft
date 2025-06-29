@@ -49,6 +49,7 @@ public class McCoordinator : UdonSharpBehaviour
     private int nextChunkIndexToAssign = 0;
     private int totalWorldChunks;
     private int chunksCompletedCount = 0;
+    private bool isGeneratorBusy = false;
     
     // --- Player-Initiated Rebuild Queue ---
     private McChunk[] chunkRebuildQueue;
@@ -128,6 +129,7 @@ public class McCoordinator : UdonSharpBehaviour
                         {
                             // Data generation is complete, move to waiting for mesh
                             worker_state[i] = STATE_WAITING_FOR_MESH;
+                            isGeneratorBusy = false; // Generator is now free
                             
                             #if UNITY_EDITOR
                             if (enableVerboseLogging) {
@@ -140,6 +142,7 @@ public class McCoordinator : UdonSharpBehaviour
                     {
                         // Fallback for chunks that complete instantly
                         worker_state[i] = STATE_WAITING_FOR_MESH;
+                        isGeneratorBusy = false; // Generator is now free
                     }
                     break; 
                     
@@ -198,7 +201,7 @@ public class McCoordinator : UdonSharpBehaviour
                 }
                 
                 // Priority 2: Process initial world generation
-                if (nextChunkIndexToAssign < totalWorldChunks)
+                if (nextChunkIndexToAssign < totalWorldChunks && !isGeneratorBusy)
                 {
                     int chunk1DIndex = radialChunkOrder[nextChunkIndexToAssign];
                     nextChunkIndexToAssign++;
@@ -210,12 +213,17 @@ public class McCoordinator : UdonSharpBehaviour
                     if (newChunk != null) {
                         worker_targetChunk[i] = newChunk;
                         worker_state[i] = STATE_DATA_GEN;
+                        isGeneratorBusy = true; // Generator is now busy
                         
                         #if UNITY_EDITOR
                         if (enableVerboseLogging) {
                             Debug.Log($"[McCoordinator] Started data generation for chunk ({newChunk.chunkX_world},{newChunk.chunkY_world},{newChunk.chunkZ_world})");
                         }
                         #endif
+
+                        // Only assign ONE new data generation task per ProcessWorkers call 
+                        // to prevent race conditions and to allow the rebuild queue to be checked next frame.
+                        break;
                     } else {
                         // If chunk already existed, we still need to count it as "completed" to not stall the progress counter.
                         chunksCompletedCount++;
