@@ -144,7 +144,7 @@ public class McCoordinator : UdonSharpBehaviour
                         worker_state[i] = STATE_WAITING_FOR_MESH;
                         isGeneratorBusy = false; // Generator is now free
                     }
-                    break; 
+                    break;
                     
                 case STATE_WAITING_FOR_MESH:
                     if (!chunk.isBuildingMesh && world.AreAllNeighborsReady(chunk))
