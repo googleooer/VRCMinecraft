@@ -4730,6 +4730,10 @@ MonoBehaviour:
     PrefabModifications: []
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 660800869}
+  terrainNoiseMaterial: {fileID: 2100000, guid: 11235737c3490484b926ba244212257e,
+    type: 2}
+  heightProcessorMaterial: {fileID: 2100000, guid: e0a129bb73e50d64a9a672916b6b21ce,
+    type: 2}
   seaLevel: 62
   surfaceDepth: 4
   airBlockID: 0
@@ -4740,11 +4744,6 @@ MonoBehaviour:
   bedrockBlockID: 5
   sandBlockID: 6
   sandStoneBlockID: 10
-  mainNoise: {fileID: 615657632}
-  minLimitNoise: {fileID: 867640769}
-  maxLimitNoise: {fileID: 1681099801}
-  depthNoise: {fileID: 649514701}
-  selectorNoise: {fileID: 1914483143}
   terrainHeightMultiplier: 1
   caveFrequency: 0.14
   generateCaves: 1
@@ -14616,10 +14615,10 @@ MonoBehaviour:
   _udonSharpBackingUdonBehaviour: {fileID: 1596987939}
   worldSeedString: 2147483647
   worldDimensionX: 16
-  worldDimensionY: 8
+  worldDimensionY: 1
   worldDimensionZ: 16
   chunkSizeXZ: 16
-  chunkSizeY: 16
+  chunkSizeY: 128
   chunkPrefab: {fileID: 2075272781}
   enableGenerationTimings: 1
   chunkOffsetX: 0
@@ -22714,7 +22713,7 @@ Transform:
   m_GameObject: {fileID: 919132148185376884}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -11, y: 64, z: -35}
+  m_LocalPosition: {x: -11, y: 128, z: -35}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children:
