@@ -1,7 +1,7 @@
 ﻿using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase; 
-// using VRRefAssist; // If McBlockTypeManager uses [Singleton] from VRRefAssist
+using VRRefAssist; // If McBlockTypeManager uses [Singleton] from VRRefAssist
 
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McParticleManager : UdonSharpBehaviour
@@ -34,7 +34,7 @@ public class McParticleManager : UdonSharpBehaviour
     private bool isInitialized = false;
     private AudioSource _audioSource; 
     [SerializeField] private McBlockTypeManager blockTypeManager; // Reference to the singleton
-    private McWorld world; // Reference to McWorld to get block ID under player
+    [SerializeField]private McWorld world; // Reference to McWorld to get block ID under player
 
     void Start()
     {
@@ -48,16 +48,6 @@ public class McParticleManager : UdonSharpBehaviour
         if (blockTypeManager == null) {
             Debug.LogError("[McParticleManager] Could not find McBlockTypeManager instance! Block-specific sounds/particles will not work.");
             
-        }
-        
-        // Get McWorld instance (needed for footsteps to determine block type under player)
-        // This assumes McWorld is also a singleton or easily findable.
-        // If McWorld is not a singleton, this reference needs to be assigned (e.g. via Inspector).
-        // For simplicity, let's assume you might assign it or it's part of a game manager.
-        // A more robust way: have a GameManager that provides these refs.
-        GameObject worldGO = GameObject.Find("McWorld"); // Example: Find by name, not ideal for performance/reliability
-        if (worldGO != null) {
-            world = worldGO.GetComponent<McWorld>();
         }
 #if ENABLE_LOGGING
         if (world == null) {

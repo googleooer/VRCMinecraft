@@ -156,8 +156,9 @@ public class McChunk : UdonSharpBehaviour
                 if(data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK)
                 {
                     ushort blockValue = data[1];
-                    bool isSolid = (blockValue & 0x0100) != 0;
-                    var visibility = (BlockVisibilityType)((blockValue >> 9) & 0x7);
+                    byte blockID = (byte)(blockValue & 0xFF);
+                    bool isSolid = world.blockTypeManager.GetBlockIsSolid(blockID);
+                    var visibility = world.blockTypeManager.GetBlockVisibilityType(blockID);
                     if(isSolid && visibility == BlockVisibilityType.Opaque) {
                         isSingleOpaqueSolid = true;
                     }
@@ -274,7 +275,7 @@ public class McChunk : UdonSharpBehaviour
                 int x = rem % z_stride;
                 
                 byte blockID = (byte)(blockData & 0xFF);
-                BlockVisibilityType visibility = (BlockVisibilityType)((blockData >> 9) & 0x3); // Only 2 bits needed now
+                BlockVisibilityType visibility = world.blockTypeManager.GetBlockVisibilityType(blockID);
                 Vector3 blockPos = new Vector3(x, y, z);
                 
                 ushort neighborData;
@@ -440,7 +441,7 @@ public class McChunk : UdonSharpBehaviour
         if (neighborID == 0) return true;
 
         // Get neighbor visibility
-        BlockVisibilityType neighborVisibility = (BlockVisibilityType)((neighborData >> 9) & 0x3); // Updated bit position
+        BlockVisibilityType neighborVisibility = world.blockTypeManager.GetBlockVisibilityType(neighborID);
         
         // Invisible blocks never draw faces
         if (selfVisibility == BlockVisibilityType.Invisible) return false;
@@ -584,7 +585,8 @@ public class McChunk : UdonSharpBehaviour
             ushort[] data = (ushort[])_chunkData;
             if(data.Length > 0 && data[0] == RLE_TYPE_3D_FULL_CHUNK) {
                 ushort blockValue = data[1];
-                if((blockValue & 0x0100) != 0 && ((BlockVisibilityType)((blockValue >> 9) & 0x7)) == BlockVisibilityType.Opaque) {
+                byte blockID = (byte)(blockValue & 0xFF);
+                if(world.blockTypeManager.GetBlockIsSolid(blockID) && world.blockTypeManager.GetBlockVisibilityType(blockID) == BlockVisibilityType.Opaque) {
                     isSingleOpaqueSolid = true;
                 }
             }

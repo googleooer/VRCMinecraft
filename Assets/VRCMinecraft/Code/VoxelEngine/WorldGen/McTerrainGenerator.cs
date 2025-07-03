@@ -7,14 +7,22 @@ using VRRefAssist;
 using System.Text;
 using VRC.SDK3.Rendering;
 using VRC.Udon.Common.Interfaces;
+using UnityEngine.Rendering;
+using Unity.Collections;
+using System;
+using Random = UnityEngine.Random;
 
+/// <summary>
+/// Updated generation states for a fully GPU-driven pipeline.
+/// The CPU no longer fills blocks or applies surfaces; it just orchestrates
+/// the GPU and applies post-processing like caves.
+/// </summary>
 public enum GenerationState
 {
     Idle,
-    GeneratingHeightMap,
-    ReadingHeightMap,
-    FillingBlocks,
-    ApplyingSurface,
+    GeneratingBlocksGPU,
+    ReadingBlocksGPU,
+    ApplyingGPUData,
     GeneratingCaves,
     GeneratingBedrock,
     Complete
@@ -25,18 +33,18 @@ public enum GenerationState
 public class McTerrainGenerator : UdonSharpBehaviour
 {
     [Header("GPU Acceleration")]
-    [SerializeField] private Material terrainNoiseMaterial;
-    [SerializeField] private Material heightProcessorMaterial;
+    [Tooltip("The material/shader that generates the final block ID data for a whole chunk.")]
+    [SerializeField] private Material terrainComputeMaterial;
     
-    // Render textures for GPU processing
-    private RenderTexture heightMapRT;
-    private RenderTexture biomeDataRT;
-    private RenderTexture tempRT;
+    // A single render texture to hold the entire chunk's block data.
+    private RenderTexture chunkDataRT;
+    
+    // Permutation texture for noise generation
+    private Texture2D permutationTexture;
     
     // GPU readback state
     private bool isReadbackPending = false;
-    private Color32[] heightMapData;
-    private Color32[] biomeMapData;
+    private byte[] gpuBlockData;
     
     [Header("Biome & Surface Settings")]
     [Tooltip("The Y-level at or below which water will be placed in open areas.")]
@@ -66,7 +74,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if UNITY_EDITOR
     [Header("Debugging")]
     public bool enableVerboseLogging = true;
-    private float time_Total, time_GPU, time_BlockFill, time_Surface, time_Caves, time_Bedrock;
+    private float time_Total, time_GPU, time_DataCopy, time_Caves, time_Bedrock;
 #endif
 
     [SerializeField, FindObjectOfType(true)]
@@ -77,24 +85,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private bool isInitialized = false;
     private int _worldActualSeed;
-    private uint _placementRandState;
-    private uint _biomeRandState;
-    private uint _caveRandState;
-    private uint _bedrockRandState;
-
-    // Global heightmap cache to avoid re-calculating surface Y
-    private int[] globalHeightMap;
-    private bool[] globalHeightMapInitialized;
-
+    private int _placementRandState;
+    
     // Time-slicing state
     private GenerationState currentState = GenerationState.Idle;
-    private int currentStep = 0;
     private int currentChunkX, currentChunkY, currentChunkZ;
     private ushort[] workingChunkData;
-    private float[] workingHeightMap;
-    private float[] workingBiomeTemp;
-    private float[] workingBiomeHumidity;
-
+    
     private StringBuilder logBuilder;
 
     public void InitializeGenerator(int seed)
@@ -105,21 +102,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
         logBuilder = new StringBuilder(256);
         _worldActualSeed = seed;
 
-        _placementRandState = (uint)seed;
+        _placementRandState = seed;
         if (_placementRandState == 0) _placementRandState = 1;
-
-        // Initialize GPU resources
+        
         InitializeGPUResources();
-
-        // Initialize the global heightmap cache
-        if (globalHeightMap == null)
-        {
-            int worldSizeX = world.worldDimensionX * world.chunkSizeXZ;
-            int worldSizeZ = world.worldDimensionZ * world.chunkSizeXZ;
-            globalHeightMap = new int[worldSizeX * worldSizeZ];
-            globalHeightMapInitialized = new bool[worldSizeX * worldSizeZ];
-        }
-
+        CreatePermutationTexture(seed);
+        
         isInitialized = true;
 
 #if UNITY_EDITOR
@@ -133,38 +121,52 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private void InitializeGPUResources()
     {
-        // Create render textures for height map and biome data
-        // Use ARGB32 format for compatibility with Color32 readback
-        int textureSize = world.chunkSizeXZ;
+        // The texture width is unrolled to contain all XZ data for a layer.
+        int textureWidth = world.chunkSizeXZ * world.chunkSizeXZ; // e.g., 16 * 16 = 256
+        int textureHeight = world.chunkSizeY;                     // e.g., 16
+
+        // Create a single render texture to hold all block IDs for the chunk.
+        // Format is R8, a single 8-bit channel, perfect for storing a byte (0-255).
+        chunkDataRT = new RenderTexture(textureWidth, textureHeight, 0, RenderTextureFormat.R8);
+        chunkDataRT.filterMode = FilterMode.Point;
+        chunkDataRT.wrapMode = TextureWrapMode.Clamp;
+        chunkDataRT.Create();
         
-        heightMapRT = new RenderTexture(textureSize, textureSize, 0, RenderTextureFormat.ARGB32);
-        heightMapRT.filterMode = FilterMode.Point;
-        heightMapRT.wrapMode = TextureWrapMode.Clamp;
-        heightMapRT.Create();
-
-        biomeDataRT = new RenderTexture(textureSize, textureSize, 0, RenderTextureFormat.ARGB32);
-        biomeDataRT.filterMode = FilterMode.Point;
-        biomeDataRT.wrapMode = TextureWrapMode.Clamp;
-        biomeDataRT.Create();
-
-        tempRT = new RenderTexture(textureSize, textureSize, 0, RenderTextureFormat.ARGB32);
-        tempRT.filterMode = FilterMode.Point;
-        tempRT.wrapMode = TextureWrapMode.Clamp;
-        tempRT.Create();
-
-        // Pre-allocate readback buffers
-        heightMapData = new Color32[textureSize * textureSize];
-        biomeMapData = new Color32[textureSize * textureSize];
+        // Pre-allocate the readback buffer. Its size is simply width * height for an R8 texture.
+        int bufferSize = textureWidth * textureHeight; // e.g., 256 * 16 = 4096
+        gpuBlockData = new byte[bufferSize];
     }
 
-    // Main entry point - now returns null to indicate processing needed
-    public ushort[] GenerateChunkData(int chunkX, int chunkY, int chunkZ)
+    private void CreatePermutationTexture(int seed)
     {
-        StartChunkGeneration(chunkX, chunkY, chunkZ);
-        return null;
+        // Generate the permutation table using the seed
+        byte[] permTable = McUtils.GetPermutationTable(seed);
+        
+        // Create a 256x2 R8 texture
+        permutationTexture = new Texture2D(256, 2, TextureFormat.R8, false);
+        permutationTexture.filterMode = FilterMode.Point;
+        permutationTexture.wrapMode = TextureWrapMode.Clamp;
+        
+        // Fill the texture with the permutation data
+        // First row (y=0): values 0-255
+        // Second row (y=1): duplicate values 256-511
+        Color32[] pixels = new Color32[512];
+        for (int i = 0; i < 512; i++)
+        {
+            pixels[i] = new Color32(permTable[i], 0, 0, 255);
+        }
+        
+        permutationTexture.SetPixels32(pixels);
+        permutationTexture.Apply(false, true); // Apply changes and make read-only
+        
+#if UNITY_EDITOR
+        if (enableVerboseLogging)
+        {
+            Debug.Log($"[McTerrainGenerator] Created permutation texture for seed {seed}. First few values: {permTable[0]}, {permTable[1]}, {permTable[2]}, {permTable[3]}");
+        }
+#endif
     }
 
-    // Initialize time-sliced generation
     public void StartChunkGeneration(int chunkX, int chunkY, int chunkZ)
     {
         if (!isInitialized)
@@ -176,30 +178,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
         currentChunkX = chunkX;
         currentChunkY = chunkY;
         currentChunkZ = chunkZ;
-        currentState = GenerationState.GeneratingHeightMap;
-        currentStep = 0;
+        currentState = GenerationState.GeneratingBlocksGPU;
         isReadbackPending = false;
 
         int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
         workingChunkData = new ushort[chunkSize];
-        workingHeightMap = new float[world.chunkSizeXZ * world.chunkSizeXZ];
-        workingBiomeTemp = new float[world.chunkSizeXZ * world.chunkSizeXZ];
-        workingBiomeHumidity = new float[world.chunkSizeXZ * world.chunkSizeXZ];
 
 #if UNITY_EDITOR
         if (enableVerboseLogging)
         {
             time_Total = Time.realtimeSinceStartup;
             time_GPU = 0f;
-            time_BlockFill = 0f;
-            time_Surface = 0f;
+            time_DataCopy = 0f;
             time_Caves = 0f;
             time_Bedrock = 0f;
         }
 #endif
     }
-
-    // Process one step of generation - returns true when complete
+    
     public bool StepChunkGeneration(out ushort[] completedData)
     {
         completedData = null;
@@ -211,57 +207,42 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
         switch (currentState)
         {
-            case GenerationState.GeneratingHeightMap:
-                GenerateHeightMapGPU();
+            case GenerationState.GeneratingBlocksGPU:
+                GenerateBlocksGPU();
 #if UNITY_EDITOR
                 if(enableVerboseLogging) time_GPU = (Time.realtimeSinceStartup - stepTimer);
 #endif
-                currentState = GenerationState.ReadingHeightMap;
+                currentState = GenerationState.ReadingBlocksGPU;
                 return false;
 
-            case GenerationState.ReadingHeightMap:
+            case GenerationState.ReadingBlocksGPU:
                 if (!isReadbackPending)
                 {
-                    // Start GPU readback from the final biome texture
-                    VRCAsyncGPUReadback.Request(biomeDataRT, 0, (IUdonEventReceiver)this);
+                    VRCAsyncGPUReadback.Request(chunkDataRT, 0, TextureFormat.R8, (IUdonEventReceiver)this);
                     isReadbackPending = true;
                 }
-                // Wait for readback to complete
+                // Wait for readback to complete via the OnAsyncGpuReadbackComplete callback
                 return false;
 
-            case GenerationState.FillingBlocks:
-                bool fillDone = StepBlockFilling();
+            case GenerationState.ApplyingGPUData:
+                ProcessGPUData();
 #if UNITY_EDITOR
-                if(enableVerboseLogging) time_BlockFill += (Time.realtimeSinceStartup - stepTimer);
+                if (enableVerboseLogging) time_DataCopy = (Time.realtimeSinceStartup - stepTimer);
 #endif
-                if (fillDone)
-                {
-                    currentState = GenerationState.ApplyingSurface;
-                    currentStep = 0;
-                }
-                return false;
-
-            case GenerationState.ApplyingSurface:
-                bool surfaceDone = StepSurfaceDecoration();
-#if UNITY_EDITOR
-                if (enableVerboseLogging) time_Surface += (Time.realtimeSinceStartup - stepTimer);
-#endif
-                if(surfaceDone)
-                {
-                    currentState = generateCaves ? GenerationState.GeneratingCaves : GenerationState.GeneratingBedrock;
-                    currentStep = 0;
-                }
+                currentState = generateCaves ? GenerationState.GeneratingCaves : GenerationState.GeneratingBedrock;
                 return false;
 
             case GenerationState.GeneratingCaves:
-                if (StepCaveGeneration())
+                // Cave generation is complex, so for now we'll do it in one step.
+                // This could be time-sliced in the future if needed.
+                if (generateCaves)
                 {
-#if UNITY_EDITOR
-                    if (enableVerboseLogging) time_Caves = (Time.realtimeSinceStartup - stepTimer) * 1000f;
-#endif
-                    currentState = GenerationState.GeneratingBedrock;
-                    currentStep = 0;
+                    GenerateCaves(workingChunkData, currentChunkX, currentChunkY, currentChunkZ);
                 }
+#if UNITY_EDITOR
+                if (enableVerboseLogging) time_Caves = (Time.realtimeSinceStartup - stepTimer) * 1000f;
+#endif
+                currentState = GenerationState.GeneratingBedrock;
                 return false;
 
             case GenerationState.GeneratingBedrock:
@@ -273,27 +254,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 if (enableVerboseLogging) time_Bedrock = (Time.realtimeSinceStartup - stepTimer) * 1000f;
 #endif
                 currentState = GenerationState.Complete;
-                completedData = workingChunkData;
+                return false;
 
+            case GenerationState.Complete:
+                completedData = workingChunkData;
 #if UNITY_EDITOR
                 if (enableVerboseLogging)
                 {
                     float totalTime = (Time.realtimeSinceStartup - time_Total) * 1000f;
                     logBuilder.Clear();
                     logBuilder.AppendFormat("--- GPU Terrain Gen Timings for Chunk ({0},{1},{2}) ---", currentChunkX, currentChunkY, currentChunkZ).AppendLine();
-                    logBuilder.AppendFormat("1. GPU Height Map Gen:      {0:F3} ms", time_GPU * 1000f).AppendLine();
-                    logBuilder.AppendFormat("2. Block Fill (total):      {0:F3} ms", time_BlockFill * 1000f).AppendLine();
-                    logBuilder.AppendFormat("3. Surface Decor (total):   {0:F3} ms", time_Surface * 1000f).AppendLine();
-                    logBuilder.AppendFormat("4. Cave Gen:                {0:F3} ms", time_Caves).AppendLine();
-                    logBuilder.AppendFormat("5. Bedrock Gen:             {0:F3} ms", time_Bedrock).AppendLine();
+                    logBuilder.AppendFormat("1. GPU Block Gen:           {0:F3} ms", time_GPU * 1000f).AppendLine();
+                    logBuilder.AppendFormat("2. Data Copy:               {0:F3} ms", time_DataCopy * 1000f).AppendLine();
+                    logBuilder.AppendFormat("3. Cave Gen:                {0:F3} ms", time_Caves).AppendLine();
+                    logBuilder.AppendFormat("4. Bedrock Gen:             {0:F3} ms", time_Bedrock).AppendLine();
                     logBuilder.AppendFormat("=> Total Actual:            {0:F3} ms", totalTime).AppendLine();
                     Debug.Log(logBuilder.ToString());
                 }
 #endif
-                return true;
-
-            case GenerationState.Complete:
-                completedData = workingChunkData;
                 return true;
 
             default:
@@ -301,244 +279,83 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
     }
 
-    // VRCAsyncGPUReadback callback
     public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
     {
         isReadbackPending = false;
         
-        if (!request.hasError && currentState == GenerationState.ReadingHeightMap)
+        if (!request.hasError && currentState == GenerationState.ReadingBlocksGPU)
         {
-            // Get the height map data
-            request.TryGetData(heightMapData);
+            request.TryGetData(gpuBlockData);
             
 #if UNITY_EDITOR
             if (enableVerboseLogging)
             {
                 Debug.Log($"[McTerrainGenerator] GPU readback complete for chunk ({currentChunkX},{currentChunkY},{currentChunkZ})");
+                Debug.Log($"GPU Block Data at index 0: {gpuBlockData[0]}, total array length: {gpuBlockData.Length}");
             }
 #endif
             
-            // Process the GPU data
-            ProcessGPUHeightMapData();
-            
-            // Move to next state
-            currentState = GenerationState.FillingBlocks;
-            currentStep = 0;
+            // Move to the next state to process the data in the main time-sliced loop
+            currentState = GenerationState.ApplyingGPUData;
         }
         else if (request.hasError)
         {
             Debug.LogError($"[McTerrainGenerator] GPU readback error for chunk ({currentChunkX},{currentChunkY},{currentChunkZ})");
+            currentState = GenerationState.Complete; // Fail gracefully
         }
     }
 
-    private void GenerateHeightMapGPU()
+    private void GenerateBlocksGPU()
     {
-        // Set shader parameters
-        terrainNoiseMaterial.SetInt("_ChunkX", currentChunkX);
-        terrainNoiseMaterial.SetInt("_ChunkY", currentChunkY); 
-        terrainNoiseMaterial.SetInt("_ChunkZ", currentChunkZ);
-        terrainNoiseMaterial.SetInt("_ChunkSizeXZ", world.chunkSizeXZ);
-        terrainNoiseMaterial.SetInt("_ChunkSizeY", world.chunkSizeY);
-        terrainNoiseMaterial.SetInt("_Seed", _worldActualSeed);
-        terrainNoiseMaterial.SetFloat("_SeaLevel", seaLevel);
-        terrainNoiseMaterial.SetFloat("_TerrainMultiplier", terrainHeightMultiplier);
+        // Set shader parameters based on the properties defined in the shader
+        // Assuming the terrainComputeMaterial will need these to generate world-aligned terrain
+        terrainComputeMaterial.SetInt("_Udon_ChunkX", currentChunkX);
+        terrainComputeMaterial.SetInt("_Udon_ChunkY", currentChunkY);
+        terrainComputeMaterial.SetInt("_Udon_ChunkZ", currentChunkZ);
         
-        // Generate height map on GPU
-        VRCGraphics.Blit(null, heightMapRT, terrainNoiseMaterial, 0);
+        // These properties are already in your shader
+        terrainComputeMaterial.SetInt("_Udon_WorldSeed", _worldActualSeed);
+        terrainComputeMaterial.SetFloat("_Udon_SeaLevel", seaLevel);
+        terrainComputeMaterial.SetFloat("_Udon_TerrainMultiplier", terrainHeightMultiplier);
+        terrainComputeMaterial.SetInt("_Udon_ChunkSizeXZ", world.chunkSizeXZ);
+        terrainComputeMaterial.SetInt("_Udon_ChunkSizeY", world.chunkSizeY);
         
-        // Generate biome data
-        VRCGraphics.Blit(heightMapRT, biomeDataRT, terrainNoiseMaterial, 1);
-    }
+        // Set the hardcoded parameters from Table 2.1 in the document.
+        // These could be exposed as public fields if you want to tweak them in the inspector.
+        terrainComputeMaterial.SetInt("_Udon_MinMaxLimitNoise_Octaves", 16);
+        terrainComputeMaterial.SetVector("_Udon_MinMaxLimitNoise_Scale", new Vector4(684.412f, 684.412f, 0, 0));
+        terrainComputeMaterial.SetInt("_Udon_MainNoise_Octaves", 8);
+        terrainComputeMaterial.SetVector("_Udon_MainNoise_Scale", new Vector4(80.0f, 160.0f, 0, 0));
+        terrainComputeMaterial.SetInt("_Udon_ScaleNoise_Octaves", 10);
+        terrainComputeMaterial.SetVector("_Udon_ScaleNoise_Scale", new Vector4(80.0f, 160.0f, 0, 0));
+        terrainComputeMaterial.SetInt("_Udon_SurfaceNoise_Octaves", 4);
+        terrainComputeMaterial.SetVector("_Udon_SurfaceNoise_Scale", new Vector4(200.0f, 200.0f, 0, 0));
 
-    private void ProcessGPUHeightMapData()
-    {
-        // Convert GPU data to usable format
-        int chunkArea = world.chunkSizeXZ * world.chunkSizeXZ;
-        int textureWidth = heightMapRT.width;
+        // Set the permutation texture for noise generation
+        terrainComputeMaterial.SetTexture("_Udon_PermutationTex", permutationTexture);
         
-        for (int z = 0; z < world.chunkSizeXZ; z++)
-        {
-            for (int x = 0; x < world.chunkSizeXZ; x++)
-            {
-                // Get pixel from the texture data array
-                int textureIndex = z * textureWidth + x;
-                Color32 pixel = heightMapData[textureIndex];
-                
-                // Local chunk index
-                int chunkIndex = z * world.chunkSizeXZ + x;
-                
-                // R channel: normalized height (0-1)
-                // G channel: temperature
-                // B channel: humidity  
-                // A channel: surface material hint
-                
-                float normalizedHeight = pixel.r / 255.0f;
-                workingHeightMap[chunkIndex] = normalizedHeight * 255.0f; // Height in blocks
-                
-                workingBiomeTemp[chunkIndex] = pixel.g / 255.0f;
-                workingBiomeHumidity[chunkIndex] = pixel.b / 255.0f;
-            }
-        }
+        // Generate all block data for the chunk in a single GPU pass
+        VRCGraphics.Blit(null, chunkDataRT, terrainComputeMaterial, 0);
     }
 
-    private bool StepBlockFilling()
+    /// <summary>
+    /// Processes the raw byte data from the GPU into the final ushort array for the chunk.
+    /// Since the GPU now generates final block IDs, this is a direct 1-to-1 copy.
+    /// </summary>
+    private void ProcessGPUData()
     {
-        int chunkSizeXZ = world.chunkSizeXZ;
-        int chunkSizeY = world.chunkSizeY;
-        int columnsPerStep = 4;
-
-        int totalColumns = chunkSizeXZ * chunkSizeXZ;
-        int startColumn = currentStep * columnsPerStep;
-        int endColumn = Mathf.Min(startColumn + columnsPerStep, totalColumns);
-
-        for (int col = startColumn; col < endColumn; col++)
-        {
-            int x = col % chunkSizeXZ;
-            int z = col / chunkSizeXZ;
-            
-            float surfaceHeight = workingHeightMap[x + z * chunkSizeXZ];
-            int surfaceWorldY = Mathf.FloorToInt(surfaceHeight);
-
-            // Fill blocks based on height
-            for (int y = 0; y < chunkSizeY; y++)
-            {
-                int worldY = currentChunkY * chunkSizeY + y;
-                int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-
-                if (worldY < surfaceWorldY)
-                {
-                    workingChunkData[index] = stoneBlockID;
-                }
-                else if (worldY <= seaLevel)
-                {
-                    workingChunkData[index] = waterBlockID;
-                }
-                else
-                {
-                    workingChunkData[index] = airBlockID;
-                }
-            }
-        }
-
-        currentStep++;
-        return endColumn >= totalColumns;
+        Array.Copy(gpuBlockData, workingChunkData, gpuBlockData.Length);
     }
 
-    private bool StepSurfaceDecoration()
-    {
-        int chunkSizeXZ = world.chunkSizeXZ;
-        int chunkSizeY = world.chunkSizeY;
-        int columnsPerStep = 4;
+    // This method is now obsolete as the GPU handles all block filling.
+    // private bool StepBlockFilling() { ... }
 
-        int totalColumns = chunkSizeXZ * chunkSizeXZ;
-        int startColumn = currentStep * columnsPerStep;
-        int endColumn = Mathf.Min(startColumn + columnsPerStep, totalColumns);
+    // This method is now obsolete as the GPU handles all surface decoration.
+    // private bool StepSurfaceDecoration() { ... }
 
-        for (int col = startColumn; col < endColumn; col++)
-        {
-            int x = col % chunkSizeXZ;
-            int z = col / chunkSizeXZ;
-
-            int biomeIndex = x + z * chunkSizeXZ;
-            float temp = workingBiomeTemp[biomeIndex];
-            float humidity = workingBiomeHumidity[biomeIndex];
-
-            // Simple biome determination
-            bool isDesert = temp > 0.95f && humidity < 0.2f;
-            bool isTundra = temp < 0.2f;
-
-            int worldX = currentChunkX * chunkSizeXZ + x;
-            int worldZ = currentChunkZ * chunkSizeXZ + z;
-
-            // Use cached heightmap
-            int heightMapX = worldX + world.globalVoxelOffsetX;
-            int heightMapZ = worldZ + world.globalVoxelOffsetZ;
-            int heightMapIndex = heightMapZ * (world.worldDimensionX * world.chunkSizeXZ) + heightMapX;
-            int surfaceWorldY;
-
-            if (globalHeightMapInitialized[heightMapIndex])
-            {
-                surfaceWorldY = globalHeightMap[heightMapIndex];
-            }
-            else
-            {
-                surfaceWorldY = Mathf.FloorToInt(workingHeightMap[biomeIndex]);
-                globalHeightMap[heightMapIndex] = surfaceWorldY;
-                globalHeightMapInitialized[heightMapIndex] = true;
-            }
-
-            if (surfaceWorldY == -1) continue;
-
-            // Apply surface decoration
-            for (int y = chunkSizeY - 1; y >= 0; y--)
-            {
-                int worldY = currentChunkY * chunkSizeY + y;
-                int index = x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ;
-                ushort currentBlock = workingChunkData[index];
-
-                if (currentBlock != stoneBlockID) continue;
-                
-                int depthFromWorldSurface = surfaceWorldY - worldY;
-
-                if (depthFromWorldSurface == 0)
-                {
-                    // Surface block
-                    if (surfaceWorldY < seaLevel - 1)
-                    {
-                        workingChunkData[index] = sandBlockID;
-                    }
-                    else if (isDesert)
-                    {
-                        workingChunkData[index] = sandBlockID;
-                    }
-                    else if (isTundra && surfaceWorldY > seaLevel + 20)
-                    {
-                        workingChunkData[index] = stoneBlockID;
-                    }
-                    else
-                    {
-                        workingChunkData[index] = grassBlockID;
-                    }
-                }
-                else if (depthFromWorldSurface > 0 && depthFromWorldSurface < surfaceDepth)
-                {
-                    // Subsurface blocks
-                    if (isDesert && depthFromWorldSurface < 4)
-                    {
-                        workingChunkData[index] = sandBlockID;
-                    }
-                    else if (surfaceWorldY < seaLevel - 1)
-                    {
-                        if (depthFromWorldSurface < 3)
-                        {
-                            workingChunkData[index] = sandBlockID;
-                        }
-                        else
-                        {
-                            workingChunkData[index] = sandStoneBlockID;
-                        }
-                    }
-                    else
-                    {
-                        workingChunkData[index] = dirtBlockID;
-                    }
-                }
-            }
-        }
-
-        currentStep++;
-        return endColumn >= totalColumns;
-    }
-
-    private bool StepCaveGeneration()
-    {
-        GenerateCaves(workingChunkData, currentChunkX, currentChunkY, currentChunkZ);
-        return true;
-    }
-
-    // Keep existing cave generation methods unchanged
     private void GenerateCaves(ushort[] chunkData, int chunkX, int chunkY, int chunkZ)
     {
+        /*
         int chunkSizeXZ = world.chunkSizeXZ;
         int chunkSizeY = world.chunkSizeY;
         
@@ -574,6 +391,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 }
             }
         }
+        */
     }
 
     private int HashChunkCoord(int x, int z, int seed)
@@ -693,21 +511,21 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     void OnDestroy()
     {
-        // Clean up GPU resources
-        if (heightMapRT != null) 
+        if (chunkDataRT != null) 
         {
-            heightMapRT.Release();
-            heightMapRT = null;
+            chunkDataRT.Release();
+            chunkDataRT = null;
         }
-        if (biomeDataRT != null) 
+        
+        if (permutationTexture != null)
         {
-            biomeDataRT.Release();
-            biomeDataRT = null;
-        }
-        if (tempRT != null) 
-        {
-            tempRT.Release();
-            tempRT = null;
+        #if UNITY_EDITOR && !COMPILER_UDONSHARP
+            if (Application.isPlaying)
+                Destroy(permutationTexture);
+            else
+                DestroyImmediate(permutationTexture);
+            permutationTexture = null;
+        #endif
         }
     }
 }
