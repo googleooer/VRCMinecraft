@@ -70,6 +70,13 @@ public class McWorld : UdonSharpBehaviour
         chunkSizeXZ = Mathf.Max(1, chunkSizeXZ);
         chunkSizeY = Mathf.Max(1, chunkSizeY);
         totalWorldChunks = worldDimensionX * worldDimensionY * worldDimensionZ;
+
+        #if UNITY_EDITOR
+        // Print seed converted with McUtils.GetMinecraftSeed
+        Debug.Log($"World Seed: {worldSeedString}");
+        Debug.Log($"Converted World Seed: {McUtils.GetMinecraftSeed(worldSeedString)}");
+        Debug.Log($"Permutation Table: {McUtils.GetPermutationTable(McUtils.GetMinecraftSeed(worldSeedString))}");
+        #endif
         
         // --- FIX: Remove vertical (Y-axis) centering ---
         // The world should be centered on XZ, but start at Y=0 and build upwards.

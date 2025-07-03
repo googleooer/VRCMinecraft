@@ -30,6 +30,12 @@
       "dependencies": {},
       "hash": "d44792a5cfe3bb0c45df607f25412a63a511239c"
     },
+    "com.merlin.udonsharp": {
+      "version": "file:com.merlin.UdonSharp",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
     "com.unity.2d.sprite": {
       "version": "1.0.0",
       "depth": 0,
