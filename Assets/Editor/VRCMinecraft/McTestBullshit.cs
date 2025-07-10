@@ -57,7 +57,7 @@ public class SeedTesterWindow : EditorWindow
             int seed = McUtils.GetMinecraftSeed(seedInput);
             seedResultText = $"Using Seed: {seed}";
             
-            byte[] permTable = McUtils.GetPermutationTable(seed);
+            int[] permTable = McUtils.GetPermutationTable(new JavaRandom(seed));
             
             // Format the byte array into a readable string
             StringBuilder sb = new StringBuilder();

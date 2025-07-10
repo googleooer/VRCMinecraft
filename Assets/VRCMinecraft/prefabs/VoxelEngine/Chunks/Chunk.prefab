@@ -63,14 +63,15 @@ MonoBehaviour:
   world: {fileID: 0}
   chunkSizeXZ: 16
   chunkSizeY: 16
+  chunkX_world: 0
+  chunkY_world: 0
+  chunkZ_world: 0
+  isDataReady: 0
+  isSingleOpaqueSolid: 0
   opaqueMeshFilter: {fileID: 4542999754728149421}
   transparentMeshFilter: {fileID: 5849383929936008181}
   cutoutMeshFilter: {fileID: 6541816647963542935}
   meshCollider: {fileID: 8783986418573569096}
-  chunkX_world: 0
-  chunkY_world: 0
-  chunkZ_world: 0
-  chunkPos_world: {x: 0, y: 0, z: 0}
   isBuildingMesh: 0
   enableVerboseLogging: 1
 --- !u!114 &7351894590968346449

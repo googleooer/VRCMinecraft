@@ -56,7 +56,7 @@ public class McWorld : UdonSharpBehaviour
         
         InitializeWorldParameters();
         InitializeChunkStorage();
-        terrainGenerator.InitializeGenerator(worldSeedString.GetHashCode());
+        terrainGenerator.init(McUtils.GetMinecraftSeed(worldSeedString));
         
         int[] radialChunkOrder = GenerateRadialChunkOrder();
         coordinator.InitializeAndStartProcessing(this, radialChunkOrder, totalWorldChunks);
@@ -75,7 +75,7 @@ public class McWorld : UdonSharpBehaviour
         // Print seed converted with McUtils.GetMinecraftSeed
         Debug.Log($"World Seed: {worldSeedString}");
         Debug.Log($"Converted World Seed: {McUtils.GetMinecraftSeed(worldSeedString)}");
-        Debug.Log($"Permutation Table: {McUtils.GetPermutationTable(McUtils.GetMinecraftSeed(worldSeedString))}");
+        Debug.Log($"Permutation Table: {McUtils.GetPermutationTable(new JavaRandom(McUtils.GetMinecraftSeed(worldSeedString)))}");
         #endif
         
         // --- FIX: Remove vertical (Y-axis) centering ---
@@ -140,6 +140,13 @@ public class McWorld : UdonSharpBehaviour
         
         return chunk.GetBlockLocal(localX, localY, localZ);
     }
+
+    public ushort GetBlockInChunk(McChunk chunk, int localX, int localY, int localZ, out byte blockType)
+    {
+        ushort blockData = chunk.GetBlockLocal(localX, localY, localZ);
+        blockType = (byte)(blockData & 0xFF);
+        return blockData;
+    }
     
     public void SetBlock(int globalX, int globalY, int globalZ, byte blockType)
     {
@@ -155,6 +162,11 @@ public class McWorld : UdonSharpBehaviour
         int localZ = globalZ - chunk.chunkZ_world * chunkSizeXZ;
 
         chunk.SetBlockLocal(localX, localY, localZ, blockType);
+    }
+
+    public void SetBlockInChunk(McChunk chunk, int localX, int localY, int localZ, byte blockType, bool updateMesh = true)
+    {
+        chunk.SetBlockLocal(localX, localY, localZ, blockType, updateMesh);
     }
     
     private void TriggerNeighborUpdate(int centeredCX, int cY, int centeredCZ)
@@ -224,19 +236,25 @@ public class McWorld : UdonSharpBehaviour
         int[] radialOrder = new int[totalWorldChunks];
         bool[] chunkAdded = new bool[totalWorldChunks];
         int count = 0;
-        int maxRadius = Mathf.Max(worldDimensionX / 2, Mathf.Max(worldDimensionY, worldDimensionZ / 2)) + 1;
+        int maxRadius = Mathf.Max(worldDimensionX / 2, worldDimensionZ / 2) + 1;
+
+        #if UNITY_EDITOR
+        Debug.Log($"[McWorld] Generating chunk order: full columns, top-to-bottom, radially.");
+        #endif
 
         for (int r = 0; r < maxRadius && count < totalWorldChunks; r++) {
-            // Y loop now starts from 0 since it's not centered
-            for (int y = 0; y < worldDimensionY; y++) {
-                for (int z = -r; z <= r; z++) {
-                    for (int x = -r; x <= r; x++) {
-                        // Only check XZ for radius, process all Y levels at that radius
-                        if (Mathf.Abs(x) == r || Mathf.Abs(z) == r) {
-                            int arrayX = x + chunkOffsetX;
-                            int arrayY = y; // No offset
-                            int arrayZ = z + chunkOffsetZ;
-                            int chunkIndex = ChunkArrayCoordsTo1D(arrayX, arrayY, arrayZ);
+            for (int z = -r; z <= r; z++) {
+                for (int x = -r; x <= r; x++) {
+                    if (Mathf.Abs(x) == r || Mathf.Abs(z) == r) {
+                        int arrayX = x + chunkOffsetX;
+                        int arrayZ = z + chunkOffsetZ;
+
+                        if (arrayX < 0 || arrayX >= worldDimensionX || arrayZ < 0 || arrayZ >= worldDimensionZ) {
+                            continue;
+                        }
+
+                        for (int y = worldDimensionY - 1; y >= 0; y--) {
+                            int chunkIndex = ChunkArrayCoordsTo1D(arrayX, y, arrayZ);
                             if (chunkIndex != -1 && !chunkAdded[chunkIndex]) {
                                 radialOrder[count++] = chunkIndex;
                                 chunkAdded[chunkIndex] = true;

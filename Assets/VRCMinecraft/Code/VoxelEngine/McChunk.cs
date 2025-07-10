@@ -6,8 +6,7 @@ using System.Text;
 /// <summary>
 /// This version of McChunk features a fully time-sliced generation and meshing pipeline.
 ///
-/// 1.  TIME-SLICED MESHING: BuildMesh() is a state machine that processes a
-///     configurable number of voxels per frame.
+/// 1.  GREEDY MESHING: A more advanced algorithm that iterates boundaries, not voxels.
 /// 2.  MULTI-LAYER RLE: Advanced Run-Length Encoding compresses chunk data for
 ///     maximum memory efficiency.
 /// </summary>
@@ -54,9 +53,9 @@ public class McChunk : UdonSharpBehaviour
     private ushort[] neighborCache_PZ; private ushort[] neighborCache_NZ;
     
     // --- Time-slicing State & Config ---
-    private int _meshing_progress_index = 0;
-    private int _voxelsPerMeshStep = 512;
-    // --- REMOVED old generation state variables ---
+    private int _voxelsPerMeshStep = 256; // Now represents columns/rows per step
+    private int _greedyAxis;
+    private int _greedyU, _greedyV;
     
     private McTerrainGenerator _terrainGenRef;
     
@@ -77,6 +76,9 @@ public class McChunk : UdonSharpBehaviour
     private const ushort RLE_TYPE_2D_XZ_PLANE = 1;
     private const ushort RLE_TYPE_3D_FULL_CHUNK = 2;
 
+    private const int COLLIDER_DEFER_FRAMES = 2;
+    private int _lastMeshStepFrame = 0;
+
 
     #if UNITY_EDITOR
     [Header("Debugging")]
@@ -92,6 +94,14 @@ public class McChunk : UdonSharpBehaviour
         #endif
     }
     
+    void Update()
+    {
+        if (isBuildingMesh && Time.frameCount - _lastMeshStepFrame > 5)
+        {
+            BuildMeshStep();
+        }
+    }
+    
     public void Initialize(McWorld worldRef, McTerrainGenerator terrainGen, int cX, int cY, int cZ, int noisePointsPerStep, int voxelsPerMeshStep, int voxelsPerTerrainStep)
     {
         this.world = worldRef;
@@ -102,7 +112,7 @@ public class McChunk : UdonSharpBehaviour
         this.chunkZ_world = cZ;
         this._terrainGenRef = terrainGen;
         
-        this._voxelsPerMeshStep = Mathf.Max(1, voxelsPerMeshStep);
+        this._voxelsPerMeshStep = Mathf.Max(1, voxelsPerMeshStep / 16); // Adjust step size for greedy mesher
         
         _chunkDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
         _localBlockData = new ushort[_chunkDataSize];
@@ -114,13 +124,11 @@ public class McChunk : UdonSharpBehaviour
         StartDataGeneration();
     }
     
-    // --- REWRITTEN --- The new, simplified data generation process.
     private void StartDataGeneration()
     {
         isGeneratingData = true;
         generationStep = 0;
         
-        // Initialize terrain generator for this chunk
         _terrainGenRef.StartChunkGeneration(chunkX_world, chunkY_world, chunkZ_world);
     }
     
@@ -133,7 +141,6 @@ public class McChunk : UdonSharpBehaviour
         
         if (isComplete)
         {
-            // Generation complete, compress the data
             ushort[] compressedRLEData = CompressChunkMultiLayerRLE(generatedData);
             float compressionRatio = (float)compressedRLEData.Length / generatedData.Length;
                 
@@ -175,7 +182,6 @@ public class McChunk : UdonSharpBehaviour
         return false;
     }
 
-    // Add a method to check if chunk is generating data:
     public bool IsGeneratingData()
     {
         return isGeneratingData;
@@ -188,7 +194,7 @@ public class McChunk : UdonSharpBehaviour
         if (world == null || _chunkData == null) return;
         isBuildingMesh = true;
 
-#if UNITY_EDITOR
+        #if UNITY_EDITOR
         time_TotalBuild = 0; time_MainLoop = 0;
         float timer_start_total = 0f; float timer_start_stage = 0f;
         if (enableVerboseLogging && logBuilder != null)
@@ -196,7 +202,7 @@ public class McChunk : UdonSharpBehaviour
             logBuilder.Clear(); logBuilder.AppendLine($"--- BuildMesh for Chunk ({chunkX_world},{chunkY_world},{chunkZ_world}) ---");
             timer_start_total = Time.realtimeSinceStartup; timer_start_stage = Time.realtimeSinceStartup;
         }
-#endif
+        #endif
 
         ClearAllBuffers();
 
@@ -225,25 +231,25 @@ public class McChunk : UdonSharpBehaviour
         CacheAllNeighbors();
         if (_isCompressed)
         {
-            // Use the temporary _localBlockData for meshing to avoid repeated decompression.
             _localBlockData = DecompressChunkMultiLayerRLE((ushort[])_chunkData);
         }
         else
         {
-            // If not compressed, we still need to copy it to the local buffer for meshing.
             System.Array.Copy((ushort[])_chunkData, _localBlockData, _chunkDataSize);
         }
 
-        _meshing_progress_index = 0;
+        _greedyAxis = 0;
+        _greedyU = 0;
+        _greedyV = 0;
 
-#if UNITY_EDITOR
+        #if UNITY_EDITOR
         if (enableVerboseLogging)
         {
             time_NeighborCache = (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
             timer_start_stage = Time.realtimeSinceStartup;
             time_DataPrep = (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
         }
-#endif
+        #endif
 
         SendCustomEventDelayedFrames(nameof(BuildMeshStep), 1);
     }
@@ -251,76 +257,80 @@ public class McChunk : UdonSharpBehaviour
     public void BuildMeshStep()
     {
         if (!isBuildingMesh) return;
+        _lastMeshStepFrame = Time.frameCount;
 
         #if UNITY_EDITOR
         float timer_start_stage = 0f;
-        if(enableVerboseLogging) timer_start_stage = Time.realtimeSinceStartup;
+        if (enableVerboseLogging) timer_start_stage = Time.realtimeSinceStartup;
         #endif
 
-        int y_stride = chunkSizeXZ * chunkSizeXZ;
-        int z_stride = chunkSizeXZ;
-        
-        int voxelsChecked = 0;
-        
-        while (voxelsChecked < _voxelsPerMeshStep && _meshing_progress_index < _chunkDataSize)
+        int steps_taken = 0;
+        while (steps_taken < _voxelsPerMeshStep && _greedyAxis <= 2)
         {
-            int index = _meshing_progress_index;
-            ushort blockData = _localBlockData[index];
+            int u = _greedyU;
+            int v = _greedyV;
 
-            if ((blockData & 0xFF) != 0) 
+            // Process one column/row along the current axis
+            if (_greedyAxis == 0) // Y Axis (column is along Y)
             {
-                int y = index / y_stride;
-                int rem = index % y_stride;
-                int z = rem / z_stride;
-                int x = rem % z_stride;
-                
-                byte blockID = (byte)(blockData & 0xFF);
-                BlockVisibilityType visibility = world.blockTypeManager.GetBlockVisibilityType(blockID);
-                Vector3 blockPos = new Vector3(x, y, z);
-                
-                ushort neighborData;
-
-                if (y + 1 >= chunkSizeY) { neighborData = (neighborCache_PY == null) ? (ushort)0 : neighborCache_PY[z * z_stride + x]; } 
-                else { neighborData = _localBlockData[index + y_stride]; }
-                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_Up, Normal_Up, blockPos, blockID, visibility, FACE_INDEX_TOP);
-
-                if (y - 1 < 0) { neighborData = (neighborCache_NY == null) ? (ushort)0 : neighborCache_NY[((chunkSizeY - 1) * y_stride) + (z * z_stride) + x]; } 
-                else { neighborData = _localBlockData[index - y_stride]; }
-                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_Down, Normal_Down, blockPos, blockID, visibility, FACE_INDEX_BOTTOM);
-
-                if (z + 1 >= chunkSizeXZ) { neighborData = (neighborCache_PZ == null) ? (ushort)0 : neighborCache_PZ[y * y_stride + x]; } 
-                else { neighborData = _localBlockData[index + z_stride]; }
-                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_North, Normal_North, blockPos, blockID, visibility, FACE_INDEX_SIDE);
-
-                if (z - 1 < 0) { neighborData = (neighborCache_NZ == null) ? (ushort)0 : neighborCache_NZ[y * y_stride + (chunkSizeXZ - 1) * z_stride + x]; } 
-                else { neighborData = _localBlockData[index - z_stride]; }
-                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_South, Normal_South, blockPos, blockID, visibility, FACE_INDEX_SIDE);
-
-                if (x + 1 >= chunkSizeXZ) { neighborData = (neighborCache_PX == null) ? (ushort)0 : neighborCache_PX[y * y_stride + z * z_stride]; } 
-                else { neighborData = _localBlockData[index + 1]; }
-                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_East, Normal_East, blockPos, blockID, visibility, FACE_INDEX_SIDE);
-
-                if (x - 1 < 0) { neighborData = (neighborCache_NX == null) ? (ushort)0 : neighborCache_NX[y * y_stride + z * z_stride + (chunkSizeXZ - 1)]; } 
-                else { neighborData = _localBlockData[index - 1]; }
-                if (ShouldDrawFace(blockID, visibility, neighborData)) AddFace(FaceVertices_West, Normal_West, blockPos, blockID, visibility, FACE_INDEX_SIDE);
+                for (int j = 0; j < chunkSizeY + 1; j++)
+                {
+                    ushort d1 = GetBlockForGreedyMesher(u, j - 1, v);
+                    ushort d2 = GetBlockForGreedyMesher(u, j, v);
+                    ProcessBoundary(d1, d2, new Vector3(u, j - 1, v), new Vector3(u, j, v), 0);
+                }
             }
-            
-            _meshing_progress_index++;
-            voxelsChecked++;
+            else if (_greedyAxis == 1) // Z Axis (row is along Z)
+            {
+                for (int k = 0; k < chunkSizeXZ + 1; k++)
+                {
+                    ushort d1 = GetBlockForGreedyMesher(u, v, k - 1);
+                    ushort d2 = GetBlockForGreedyMesher(u, v, k);
+                    ProcessBoundary(d1, d2, new Vector3(u, v, k - 1), new Vector3(u, v, k), 1);
+                }
+            }
+            else // X Axis (row is along X)
+            {
+                for (int i = 0; i < chunkSizeXZ + 1; i++)
+                {
+                    ushort d1 = GetBlockForGreedyMesher(i - 1, u, v);
+                    ushort d2 = GetBlockForGreedyMesher(i, u, v);
+                    ProcessBoundary(d1, d2, new Vector3(i - 1, u, v), new Vector3(i, u, v), 2);
+                }
+            }
+
+            steps_taken++;
+
+            // Advance greedy mesher state
+            _greedyU++;
+            int limitU = (_greedyAxis == 1 || _greedyAxis == 2) ? chunkSizeY : chunkSizeXZ;
+            int limitV = chunkSizeXZ;
+
+            if (_greedyU >= limitU)
+            {
+                _greedyU = 0;
+                _greedyV++;
+                if (_greedyV >= limitV)
+                {
+                    _greedyV = 0;
+                    _greedyAxis++;
+                }
+            }
         }
 
         #if UNITY_EDITOR
-        if(enableVerboseLogging) time_MainLoop += (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
+        if (enableVerboseLogging) time_MainLoop += (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
         #endif
 
-        if (_meshing_progress_index >= _chunkDataSize)
+        if (_greedyAxis > 2)
         {
             ApplyAllMeshData();
-            _localBlockData = null; // Clear temporary mesh data
+            _localBlockData = null; // Free up memory
             isBuildingMesh = false;
-            
+
             #if UNITY_EDITOR
-            if (enableVerboseLogging) {
+            if (enableVerboseLogging)
+            {
                 logBuilder.AppendLine("--- Timings ---");
                 logBuilder.AppendLine($"1. Neighbor Caching: {time_NeighborCache:F3} ms");
                 logBuilder.AppendLine($"2. Data Prep: {time_DataPrep:F3} ms");
@@ -332,13 +342,52 @@ public class McChunk : UdonSharpBehaviour
                 Debug.Log(logBuilder.ToString());
             }
             #endif
+
+            SendCustomEventDelayedFrames(nameof(ApplyColliderDeferred), COLLIDER_DEFER_FRAMES);
         }
         else
         {
             SendCustomEventDelayedFrames(nameof(BuildMeshStep), 1);
         }
     }
+    
+    private void ProcessBoundary(ushort data1, ushort data2, Vector3 pos1, Vector3 pos2, int axis)
+    {
+        byte id1 = (byte)(data1 & 0xFF);
+        byte id2 = (byte)(data2 & 0xFF);
 
+        if (id1 == id2) return;
+
+        BlockVisibilityType vis1 = world.blockTypeManager.GetBlockVisibilityType(id1);
+        BlockVisibilityType vis2 = world.blockTypeManager.GetBlockVisibilityType(id2);
+
+        if (ShouldDrawFace(id1, vis1, data2))
+        {
+            if (axis == 0) AddFace(FaceVertices_Up, Normal_Up, pos1, id1, vis1, FACE_INDEX_TOP);
+            else if (axis == 1) AddFace(FaceVertices_North, Normal_North, pos1, id1, vis1, FACE_INDEX_SIDE);
+            else AddFace(FaceVertices_East, Normal_East, pos1, id1, vis1, FACE_INDEX_SIDE);
+        }
+
+        if (ShouldDrawFace(id2, vis2, data1))
+        {
+            if (axis == 0) AddFace(FaceVertices_Down, Normal_Down, pos2, id2, vis2, FACE_INDEX_BOTTOM);
+            else if (axis == 1) AddFace(FaceVertices_South, Normal_South, pos2, id2, vis2, FACE_INDEX_SIDE);
+            else AddFace(FaceVertices_West, Normal_West, pos2, id2, vis2, FACE_INDEX_SIDE);
+        }
+    }
+
+    private ushort GetBlockForGreedyMesher(int x, int y, int z)
+    {
+        if (x < 0) return (neighborCache_NX != null) ? neighborCache_NX[y * chunkSizeXZ + z] : (ushort)0;
+        if (x >= chunkSizeXZ) return (neighborCache_PX != null) ? neighborCache_PX[y * chunkSizeXZ + z] : (ushort)0;
+        if (y < 0) return (neighborCache_NY != null) ? neighborCache_NY[z * chunkSizeXZ + x] : (ushort)0;
+        if (y >= chunkSizeY) return (neighborCache_PY != null) ? neighborCache_PY[z * chunkSizeXZ + x] : (ushort)0;
+        if (z < 0) return (neighborCache_NZ != null) ? neighborCache_NZ[y * chunkSizeXZ + x] : (ushort)0;
+        if (z >= chunkSizeXZ) return (neighborCache_PZ != null) ? neighborCache_PZ[y * chunkSizeXZ + x] : (ushort)0;
+
+        return _localBlockData[y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ + x];
+    }
+    
     private void AddFace(Vector3[] faceVertices, Vector3 faceNormal, Vector3 blockPos, byte blockID, BlockVisibilityType visibility, int faceIndex)
     {
         Vector3[] targetVertices; int[] targetTriangles; Vector3[] targetUVs; Vector3[] targetNormals;
@@ -358,8 +407,11 @@ public class McChunk : UdonSharpBehaviour
             currentVertexCount = _cutoutVertexCount; currentTriangleCount = _cutoutTriangleCount;
         }
         
-        targetVertices[currentVertexCount + 0] = blockPos + faceVertices[0]; targetVertices[currentVertexCount + 1] = blockPos + faceVertices[1];
-        targetVertices[currentVertexCount + 2] = blockPos + faceVertices[2]; targetVertices[currentVertexCount + 3] = blockPos + faceVertices[3];
+        float bx = blockPos.x, by = blockPos.y, bz = blockPos.z;
+        targetVertices[currentVertexCount + 0] = new Vector3(bx + faceVertices[0].x, by + faceVertices[0].y, bz + faceVertices[0].z);
+        targetVertices[currentVertexCount + 1] = new Vector3(bx + faceVertices[1].x, by + faceVertices[1].y, bz + faceVertices[1].z);
+        targetVertices[currentVertexCount + 2] = new Vector3(bx + faceVertices[2].x, by + faceVertices[2].y, bz + faceVertices[2].z);
+        targetVertices[currentVertexCount + 3] = new Vector3(bx + faceVertices[3].x, by + faceVertices[3].y, bz + faceVertices[3].z);
         for (int i=0; i<4; i++) targetNormals[currentVertexCount + i] = faceNormal;
         float textureSlice = world.blockTypeManager.GetFinalBlockTextureSlice(blockID, faceIndex);
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice); targetUVs[currentVertexCount + 1] = new Vector3(0, 1, textureSlice);
@@ -371,8 +423,10 @@ public class McChunk : UdonSharpBehaviour
         else if (visibility == BlockVisibilityType.Transparent) { _transparentVertexCount += 4; _transparentTriangleCount += 6; }
         else { _cutoutVertexCount += 4; _cutoutTriangleCount += 6; }
         if (visibility != BlockVisibilityType.Transparent && _collisionVertexCount < MAX_VERTS * 3 - 4) {
-            _collisionVertices[_collisionVertexCount + 0] = blockPos + faceVertices[0]; _collisionVertices[_collisionVertexCount + 1] = blockPos + faceVertices[1];
-            _collisionVertices[_collisionVertexCount + 2] = blockPos + faceVertices[2]; _collisionVertices[_collisionVertexCount + 3] = blockPos + faceVertices[3];
+            _collisionVertices[_collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
+            _collisionVertices[_collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
+            _collisionVertices[_collisionVertexCount + 2] = targetVertices[currentVertexCount + 2];
+            _collisionVertices[_collisionVertexCount + 3] = targetVertices[currentVertexCount + 3];
             _collisionTriangles[_collisionTriangleCount++] = _collisionVertexCount; _collisionTriangles[_collisionTriangleCount++] = _collisionVertexCount + 1;
             _collisionTriangles[_collisionTriangleCount++] = _collisionVertexCount + 2; _collisionTriangles[_collisionTriangleCount++] = _collisionVertexCount;
             _collisionTriangles[_collisionTriangleCount++] = _collisionVertexCount + 2; _collisionTriangles[_collisionTriangleCount++] = _collisionVertexCount + 3;
@@ -390,25 +444,148 @@ public class McChunk : UdonSharpBehaviour
     
     private void CacheAllNeighbors()
     {
-        neighborCache_PX = GetNeighborCache(world.GetChunkAt(chunkX_world + 1, chunkY_world, chunkZ_world));
-        neighborCache_NX = GetNeighborCache(world.GetChunkAt(chunkX_world - 1, chunkY_world, chunkZ_world));
-        neighborCache_PY = GetNeighborCache(world.GetChunkAt(chunkX_world, chunkY_world + 1, chunkZ_world));
-        neighborCache_NY = GetNeighborCache(world.GetChunkAt(chunkX_world, chunkY_world - 1, chunkZ_world));
-        neighborCache_PZ = GetNeighborCache(world.GetChunkAt(chunkX_world, chunkY_world, chunkZ_world + 1));
-        neighborCache_NZ = GetNeighborCache(world.GetChunkAt(chunkX_world, chunkY_world, chunkZ_world - 1));
+        neighborCache_PX = GetNeighborEdgeCache(world.GetChunkAt(chunkX_world + 1, chunkY_world, chunkZ_world), 0);
+        neighborCache_NX = GetNeighborEdgeCache(world.GetChunkAt(chunkX_world - 1, chunkY_world, chunkZ_world), 1);
+        neighborCache_PY = GetNeighborEdgeCache(world.GetChunkAt(chunkX_world, chunkY_world + 1, chunkZ_world), 2);
+        neighborCache_NY = GetNeighborEdgeCache(world.GetChunkAt(chunkX_world, chunkY_world - 1, chunkZ_world), 3);
+        neighborCache_PZ = GetNeighborEdgeCache(world.GetChunkAt(chunkX_world, chunkY_world, chunkZ_world + 1), 4);
+        neighborCache_NZ = GetNeighborEdgeCache(world.GetChunkAt(chunkX_world, chunkY_world, chunkZ_world - 1), 5);
     }
 
-    private ushort[] GetNeighborCache(McChunk neighbor)
+    private ushort[] GetNeighborEdgeCache(McChunk neighbor, int edgeType)
     {
-        if (neighbor == null) return null;
+        if (neighbor == null || !neighbor.isDataReady) return null;
+
+        int n_chunkSizeXZ = neighbor.chunkSizeXZ;
+        int n_chunkSizeY = neighbor.chunkSizeY;
+        
+        int edgeSize;
+        if (edgeType <= 1) edgeSize = n_chunkSizeY * n_chunkSizeXZ;      // X edge: YZ plane
+        else if (edgeType <= 3) edgeSize = n_chunkSizeXZ * n_chunkSizeXZ; // Y edge: XZ plane
+        else edgeSize = n_chunkSizeY * n_chunkSizeXZ;      // Z edge: XY plane
+            
+        ushort[] edgeCache = new ushort[edgeSize];
+        
         if (neighbor.isSingleOpaqueSolid)
         {
-            ushort[] dummyCache = new ushort[_chunkDataSize];
-            ushort blockValue = neighbor.GetHomogeneousBlockValue(); 
-            for (int i = 0; i < _chunkDataSize; i++) { dummyCache[i] = blockValue; }
-            return dummyCache;
+            ushort blockValue = neighbor.GetHomogeneousBlockValue();
+            for (int i = 0; i < edgeSize; i++) edgeCache[i] = blockValue;
+            return edgeCache;
         }
-        return neighbor.GetDecompressedData();
+        
+        if (!neighbor._isCompressed)
+        {
+            ushort[] fullData = (ushort[])neighbor._chunkData;
+            int index = 0;
+            switch (edgeType)
+            {
+                case 0: for (int y=0; y<n_chunkSizeY; y++) for (int z=0; z<n_chunkSizeXZ; z++) edgeCache[index++] = fullData[y*n_chunkSizeXZ*n_chunkSizeXZ + z*n_chunkSizeXZ + 0]; break;
+                case 1: for (int y=0; y<n_chunkSizeY; y++) for (int z=0; z<n_chunkSizeXZ; z++) edgeCache[index++] = fullData[y*n_chunkSizeXZ*n_chunkSizeXZ + z*n_chunkSizeXZ + (n_chunkSizeXZ-1)]; break;
+                case 2: for (int z=0; z<n_chunkSizeXZ; z++) for (int x=0; x<n_chunkSizeXZ; x++) edgeCache[index++] = fullData[0*n_chunkSizeXZ*n_chunkSizeXZ + z*n_chunkSizeXZ + x]; break;
+                case 3: for (int z=0; z<n_chunkSizeXZ; z++) for (int x=0; x<n_chunkSizeXZ; x++) edgeCache[index++] = fullData[(n_chunkSizeY-1)*n_chunkSizeXZ*n_chunkSizeXZ + z*n_chunkSizeXZ + x]; break;
+                case 4: for (int y=0; y<n_chunkSizeY; y++) for (int x=0; x<n_chunkSizeXZ; x++) edgeCache[index++] = fullData[y*n_chunkSizeXZ*n_chunkSizeXZ + 0*n_chunkSizeXZ + x]; break;
+                case 5: for (int y=0; y<n_chunkSizeY; y++) for (int x=0; x<n_chunkSizeXZ; x++) edgeCache[index++] = fullData[y*n_chunkSizeXZ*n_chunkSizeXZ + (n_chunkSizeXZ-1)*n_chunkSizeXZ + x]; break;
+            }
+            return edgeCache;
+        }
+
+        ushort[] rleData = (ushort[])neighbor._chunkData;
+        if (rleData == null || rleData.Length == 0) return edgeCache;
+
+        if (rleData[0] == RLE_TYPE_3D_FULL_CHUNK)
+        {
+            ushort blockValue = rleData[1];
+            for (int i = 0; i < edgeSize; i++) edgeCache[i] = blockValue;
+            return edgeCache;
+        }
+
+        int planeSize = n_chunkSizeXZ * n_chunkSizeXZ;
+        ushort[] planeBuffer = new ushort[planeSize];
+        int rleIndex = 0;
+        
+        if (edgeType == 2 || edgeType == 3) // Y-edge (XZ plane), most efficient case
+        {
+            int targetY = (edgeType == 2) ? 0 : n_chunkSizeY - 1;
+            for (int y = 0; y < targetY; y++) SkipNextPlaneFromRLE(neighbor, rleData, ref rleIndex);
+            DecompressNextPlaneFromRLE(neighbor, rleData, ref rleIndex, planeBuffer);
+            System.Array.Copy(planeBuffer, edgeCache, planeSize);
+        }
+        else // X or Z edge, requires iterating all Y planes
+        {
+            for (int y = 0; y < n_chunkSizeY; y++)
+            {
+                DecompressNextPlaneFromRLE(neighbor, rleData, ref rleIndex, planeBuffer);
+                int edgePlaneIndex = (edgeType <=1) ? (y * n_chunkSizeXZ) : (y * n_chunkSizeY);
+                switch (edgeType)
+                {
+                    case 0: // +X neighbor, copy Z-column at X=0
+                        for (int z = 0; z < n_chunkSizeXZ; z++) edgeCache[edgePlaneIndex + z] = planeBuffer[z * n_chunkSizeXZ + 0];
+                        break;
+                    case 1: // -X neighbor, copy Z-column at X=max
+                        for (int z = 0; z < n_chunkSizeXZ; z++) edgeCache[edgePlaneIndex + z] = planeBuffer[z * n_chunkSizeXZ + (n_chunkSizeXZ - 1)];
+                        break;
+                    case 4: // +Z neighbor, copy X-row at Z=0
+                        for (int x = 0; x < n_chunkSizeXZ; x++) edgeCache[y * n_chunkSizeXZ + x] = planeBuffer[0 * n_chunkSizeXZ + x];
+                        break;
+                    case 5: // -Z neighbor, copy X-row at Z=max
+                        for (int x = 0; x < n_chunkSizeXZ; x++) edgeCache[y * n_chunkSizeXZ + x] = planeBuffer[(n_chunkSizeXZ - 1) * n_chunkSizeXZ + x];
+                        break;
+                }
+            }
+        }
+        return edgeCache;
+    }
+
+    private void DecompressNextPlaneFromRLE(McChunk chunk, ushort[] rleData, ref int rleIndex, ushort[] planeBuffer)
+    {
+        int planeSize = chunk.chunkSizeXZ * chunk.chunkSizeXZ;
+        if (rleIndex >= rleData.Length) return;
+
+        ushort runType = rleData[rleIndex];
+        if (runType == RLE_TYPE_2D_XZ_PLANE)
+        {
+            rleIndex++;
+            ushort blockValue = rleData[rleIndex++];
+            for (int i = 0; i < planeSize; i++) planeBuffer[i] = blockValue;
+        }
+        else // RLE_TYPE_1D
+        {
+            int planeDecompressed = 0;
+            while (planeDecompressed < planeSize)
+            {
+                rleIndex++;
+                ushort runCount = rleData[rleIndex++];
+                ushort blockValue = rleData[rleIndex++];
+                for (int i = 0; i < runCount; i++)
+                {
+                    if (planeDecompressed + i < planeSize) planeBuffer[planeDecompressed + i] = blockValue;
+                }
+                planeDecompressed += runCount;
+            }
+        }
+    }
+
+    private void SkipNextPlaneFromRLE(McChunk chunk, ushort[] rleData, ref int rleIndex)
+    {
+        int planeSize = chunk.chunkSizeXZ * chunk.chunkSizeXZ;
+        if (rleIndex >= rleData.Length) return;
+
+        ushort runType = rleData[rleIndex];
+        if (runType == RLE_TYPE_2D_XZ_PLANE)
+        {
+            rleIndex += 2;
+        }
+        else
+        {
+            int planeDecompressed = 0;
+            while (planeDecompressed < planeSize)
+            {
+                rleIndex++;
+                ushort runCount = rleData[rleIndex++];
+                rleIndex++;
+                planeDecompressed += runCount;
+            }
+        }
     }
 
     public ushort GetHomogeneousBlockValue()
@@ -420,7 +597,6 @@ public class McChunk : UdonSharpBehaviour
     public ushort[] GetDecompressedData()
     {
         if (_isCompressed) { return DecompressChunkMultiLayerRLE((ushort[])_chunkData); }
-        // If not compressed, _chunkData is already the full array.
         return (ushort[])_chunkData;
     }
     
@@ -432,86 +608,53 @@ public class McChunk : UdonSharpBehaviour
         _collisionVertexCount = 0; _collisionTriangleCount = 0;
     }
     
-    // Updated ShouldDrawFace method signature and implementation
     private bool ShouldDrawFace(byte selfID, BlockVisibilityType selfVisibility, ushort neighborData)
     {
         byte neighborID = (byte)(neighborData & 0xFF);
-        
-        // Always draw if neighbor is air
         if (neighborID == 0) return true;
-
-        // Get neighbor visibility
         BlockVisibilityType neighborVisibility = world.blockTypeManager.GetBlockVisibilityType(neighborID);
-        
-        // Invisible blocks never draw faces
         if (selfVisibility == BlockVisibilityType.Invisible) return false;
-        
-        // Get culling type for this block
         BlockCullingType selfCulling = world.blockTypeManager.GetBlockCullingType(selfID);
         
-        // Apply culling rules
         switch (selfCulling)
         {
-            case BlockCullingType.NoCull:
-                // Never cull - always draw the face
-                return true;
-                
-            case BlockCullingType.CullSelf:
-                // Only cull if neighbor is the same block type
-                return neighborID != selfID;
-                
-            case BlockCullingType.CullSelfAndOpaque:
-                // Cull if neighbor is same block or opaque
-                return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Opaque);
-                
-            case BlockCullingType.CullSelfAndCutout:
-                // Cull if neighbor is same block or cutout
-                return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Cutout);
-                
-            case BlockCullingType.CullSelfAndTransparent:
-                // Cull if neighbor is same block or transparent
-                return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Transparent);
-                
-            case BlockCullingType.CullAll:
-                // Always cull (unless neighbor is air, which we already checked)
-                return false;
-                
-            default:
-                // Default to most conservative culling
-                return !(neighborVisibility == BlockVisibilityType.Opaque);
+            case BlockCullingType.NoCull: return true;
+            case BlockCullingType.CullSelf: return neighborID != selfID;
+            case BlockCullingType.CullSelfAndOpaque: return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Opaque);
+            case BlockCullingType.CullSelfAndCutout: return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Cutout);
+            case BlockCullingType.CullSelfAndTransparent: return !(neighborID == selfID || neighborVisibility == BlockVisibilityType.Transparent);
+            case BlockCullingType.CullAll: return false;
+            default: return !(neighborVisibility == BlockVisibilityType.Opaque);
         }
     }
     
     private void ApplyAllMeshData()
     {
         #if UNITY_EDITOR
-        float timer_start = 0.0f;
-        if(enableVerboseLogging) timer_start = Time.realtimeSinceStartup;
-        #endif
+        if(enableVerboseLogging) 
+        {
+            float timer_start = Time.realtimeSinceStartup;
+            ApplyDataToMesh(opaqueMeshFilter, _opaqueVertices, _opaqueTriangles, _opaqueUVs, _opaqueNormals, _opaqueVertexCount, _opaqueTriangleCount);
+            time_ApplyOpaque = (Time.realtimeSinceStartup - timer_start) * 1000f;
+
+            timer_start = Time.realtimeSinceStartup;
+            ApplyDataToMesh(transparentMeshFilter, _transparentVertices, _transparentTriangles, _transparentUVs, _transparentNormals, _transparentVertexCount, _transparentTriangleCount);
+            time_ApplyTransparent = (Time.realtimeSinceStartup - timer_start) * 1000f;
+
+            timer_start = Time.realtimeSinceStartup;
+            ApplyDataToMesh(cutoutMeshFilter, _cutoutVertices, _cutoutTriangles, _cutoutUVs, _cutoutNormals, _cutoutVertexCount, _cutoutTriangleCount);
+            time_ApplyCutout = (Time.realtimeSinceStartup - timer_start) * 1000f;
+        }
+        else
+        {
+            ApplyDataToMesh(opaqueMeshFilter, _opaqueVertices, _opaqueTriangles, _opaqueUVs, _opaqueNormals, _opaqueVertexCount, _opaqueTriangleCount);
+            ApplyDataToMesh(transparentMeshFilter, _transparentVertices, _transparentTriangles, _transparentUVs, _transparentNormals, _transparentVertexCount, _transparentTriangleCount);
+            ApplyDataToMesh(cutoutMeshFilter, _cutoutVertices, _cutoutTriangles, _cutoutUVs, _cutoutNormals, _cutoutVertexCount, _cutoutTriangleCount);
+        }
+        #else
         ApplyDataToMesh(opaqueMeshFilter, _opaqueVertices, _opaqueTriangles, _opaqueUVs, _opaqueNormals, _opaqueVertexCount, _opaqueTriangleCount);
-        #if UNITY_EDITOR
-        if(enableVerboseLogging) time_ApplyOpaque = (Time.realtimeSinceStartup - timer_start) * 1000f;
-        #endif
-        #if UNITY_EDITOR
-        if(enableVerboseLogging) timer_start = Time.realtimeSinceStartup;
-        #endif
         ApplyDataToMesh(transparentMeshFilter, _transparentVertices, _transparentTriangles, _transparentUVs, _transparentNormals, _transparentVertexCount, _transparentTriangleCount);
-        #if UNITY_EDITOR
-        if(enableVerboseLogging) time_ApplyTransparent = (Time.realtimeSinceStartup - timer_start) * 1000f;
-        #endif
-        #if UNITY_EDITOR
-        if(enableVerboseLogging) timer_start = Time.realtimeSinceStartup;
-        #endif
         ApplyDataToMesh(cutoutMeshFilter, _cutoutVertices, _cutoutTriangles, _cutoutUVs, _cutoutNormals, _cutoutVertexCount, _cutoutTriangleCount);
-        #if UNITY_EDITOR
-        if(enableVerboseLogging) time_ApplyCutout = (Time.realtimeSinceStartup - timer_start) * 1000f;
-        #endif
-        #if UNITY_EDITOR
-        if(enableVerboseLogging) timer_start = Time.realtimeSinceStartup;
-        #endif
-        ApplyDataToCollider();
-        #if UNITY_EDITOR
-        if(enableVerboseLogging) time_ApplyCollision = (Time.realtimeSinceStartup - timer_start) * 1000f;
         #endif
     }
 
@@ -560,7 +703,7 @@ public class McChunk : UdonSharpBehaviour
         return ((ushort[])_chunkData)[targetIndex];
     }
 
-    public void SetBlockLocal(int x, int y, int z, byte blockType)
+    public void SetBlockLocal(int x, int y, int z, byte blockType, bool updateMesh = true)
     {
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ) return;
         
@@ -592,6 +735,7 @@ public class McChunk : UdonSharpBehaviour
             }
         }
         
+        if (!updateMesh) return;
         world.RequestChunkMeshUpdate(this);
         if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
         {
@@ -605,7 +749,6 @@ public class McChunk : UdonSharpBehaviour
         int compressedIndex = 0;
         if (fullChunkData.Length == 0) return new ushort[0];
 
-        // 1. Check for 3D run (full chunk)
         ushort firstBlock = fullChunkData[0];
         bool isFullChunkRun = true;
         for (int i = 1; i < fullChunkData.Length; i++) {
@@ -619,7 +762,6 @@ public class McChunk : UdonSharpBehaviour
             tempCompressed[1] = firstBlock;
             compressedIndex = 2;
         } else {
-            // 2. Process layer by layer
             int planeSize = chunkSizeXZ * chunkSizeXZ;
             for (int y = 0; y < chunkSizeY; y++) {
                 int planeStartIndex = y * planeSize;
@@ -636,7 +778,6 @@ public class McChunk : UdonSharpBehaviour
                     tempCompressed[compressedIndex++] = RLE_TYPE_2D_XZ_PLANE;
                     tempCompressed[compressedIndex++] = firstBlockInPlane;
                 } else {
-                    // 3. Process as 1D runs within the layer
                     for (int i = 0; i < planeSize; ) {
                         ushort currentBlock = fullChunkData[planeStartIndex + i];
                         ushort runCount = 1;
@@ -678,7 +819,7 @@ public class McChunk : UdonSharpBehaviour
             int planeDecompressed = 0;
             
             while (planeDecompressed < planeSize) {
-                if (rleIndex >= rleData.Length) return fullData; // Bounds check
+                if (rleIndex >= rleData.Length) return fullData;
                 ushort runType = rleData[rleIndex++];
                 if (runType == RLE_TYPE_2D_XZ_PLANE) {
                     ushort blockValue = rleData[rleIndex++];
@@ -686,7 +827,7 @@ public class McChunk : UdonSharpBehaviour
                         fullData[planeStartIndex + i] = blockValue;
                     }
                     planeDecompressed = planeSize;
-                } else { // RLE_TYPE_1D
+                } else {
                     ushort runCount = rleData[rleIndex++];
                     ushort blockValue = rleData[rleIndex++];
                     for (int j = 0; j < runCount; j++) {
@@ -720,7 +861,7 @@ public class McChunk : UdonSharpBehaviour
 
             while(planeDecompressed < planeSize)
             {
-                if (rleIndex >= rleData.Length) return 0; // Bounds check
+                if (rleIndex >= rleData.Length) return 0;
                 ushort runType = rleData[rleIndex++];
 
                 if(runType == RLE_TYPE_2D_XZ_PLANE)
@@ -729,7 +870,7 @@ public class McChunk : UdonSharpBehaviour
                     if (currentY == y) return blockValue;
                     planeDecompressed = planeSize;
                 }
-                else // RLE_TYPE_1D
+                else
                 {
                     ushort runCount = rleData[rleIndex++];
                     ushort blockValue = rleData[rleIndex++];
@@ -742,5 +883,16 @@ public class McChunk : UdonSharpBehaviour
             }
         }
         return 0; 
+    }
+
+    public void ApplyColliderDeferred()
+    {
+        #if UNITY_EDITOR
+        float timer_start = Time.realtimeSinceStartup;
+        ApplyDataToCollider();
+        time_ApplyCollision = (Time.realtimeSinceStartup - timer_start) * 1000f;
+        #else
+        ApplyDataToCollider();
+        #endif
     }
 }
