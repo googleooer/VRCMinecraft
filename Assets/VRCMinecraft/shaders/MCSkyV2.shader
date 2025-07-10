@@ -12,9 +12,9 @@ Shader "Minecraft Sky (With Stars)"
         _FogColorDay ("Fog Color Day", Color) = (0.137, 0.168, 0.698, 1)
         _FogColorNight ("Fog Color Night", Color) = (0.137, 0.168, 0.698, 1)
         [Header(Gradient)]
-        _SkyRatio ("Sky Ratio", Range(0, 1)) = 0.5
-        _FogRatio ("Fog Ratio", Range(0, 1)) = 0.3
-        _BottomRatio ("Bottom Ratio", Range(0, 1)) = 0.2
+        _FogStart("Fog Start", Range(0, 1)) = 0.2
+		_FogSize("Fog Size", Range(0, 1)) = 0.1
+		_TransitionSize("Transition Size", Range(0, 1)) = 0.1
         [Header(Sun and Moon)]
         _SunTex ("Sun", 2D) = "white" {}
         _MoonTex ("Sun", 2D) = "white" {}
@@ -60,14 +60,14 @@ Shader "Minecraft Sky (With Stars)"
             half4 _WorldBottomColor;
             half4 _WorldBottomColorNight;
             half4 _FogColorDay, _FogColorNight;
-            float _SkyRatio;
-            float _FogRatio;
-            float _BottomRatio;
             int _StarCount;
             half _StarSize;
             half _StarBrightness;
             half _StarFadeRange;
             half _DayProgress;
+			float _FogStart;
+			float _FogSize;
+			float _TransitionSize;
 
             float3 RotateAroundZInDegrees(float3 vertex, float degrees)
             {
@@ -118,30 +118,35 @@ Shader "Minecraft Sky (With Stars)"
                 // Vertical gradient calculation
                 float t = dir.y * 0.5 + 0.5;
 
-                float totalRatio = _SkyRatio + _FogRatio + _BottomRatio;
-                _SkyRatio /= totalRatio;
-                _FogRatio /= totalRatio;
-                _BottomRatio /= totalRatio;
+				float bottom_to_fog_end = _FogStart;
+				float pure_fog_end = _FogStart + _FogSize;
+				float fog_to_sky_end = pure_fog_end + _TransitionSize;
 
-                half4 gradientColor;
-                if (t < _BottomRatio) {
-                    gradientColor = lerp(_WorldBottomColor, _FogColorDay, t / _BottomRatio);
-                } else if (t < _BottomRatio + _FogRatio) {
-                    float tAdjusted = (t - _BottomRatio) / _FogRatio;
-                    gradientColor = lerp(_FogColorDay, _SkyColorDay, tAdjusted);
-                } else {
-                    gradientColor = _SkyColorDay;
-                }
+				half4 gradientColor;
+				if (t < bottom_to_fog_end) {
+					float tAdjusted = smoothstep(bottom_to_fog_end - _TransitionSize, bottom_to_fog_end, t);
+					gradientColor = lerp(_WorldBottomColor, _FogColorDay, tAdjusted);
+				} else if (t < pure_fog_end) {
+					gradientColor = _FogColorDay;
+				} else if (t < fog_to_sky_end) {
+					float tAdjusted = smoothstep(pure_fog_end, fog_to_sky_end, t);
+					gradientColor = lerp(_FogColorDay, _SkyColorDay, tAdjusted);
+				} else {
+					gradientColor = _SkyColorDay;
+				}
 
-                half4 gradientColorNight;
-                if (t < _BottomRatio) {
-                    gradientColorNight = lerp(_WorldBottomColorNight, _FogColorNight, t / _BottomRatio);
-                } else if (t < _BottomRatio + _FogRatio) {
-                    float tAdjusted = (t - _BottomRatio) / _FogRatio;
-                    gradientColorNight = lerp(_FogColorNight, _SkyColorNight, tAdjusted);
-                } else {
-                    gradientColorNight = _SkyColorNight;
-                }
+				half4 gradientColorNight;
+				if (t < bottom_to_fog_end) {
+					float tAdjusted = smoothstep(bottom_to_fog_end - _TransitionSize, bottom_to_fog_end, t);
+					gradientColorNight = lerp(_WorldBottomColorNight, _FogColorNight, tAdjusted);
+				} else if (t < pure_fog_end) {
+					gradientColorNight = _FogColorNight;
+				} else if (t < fog_to_sky_end) {
+					float tAdjusted = smoothstep(pure_fog_end, fog_to_sky_end, t);
+					gradientColorNight = lerp(_FogColorNight, _SkyColorNight, tAdjusted);
+				} else {
+					gradientColorNight = _SkyColorNight;
+				}
 
                 // Day/Night sky color transition
                 half dayNightTransition;

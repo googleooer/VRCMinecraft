@@ -20,11 +20,13 @@ using Random = UnityEngine.Random;
 public enum GenerationState
 {
     Idle,
-    GeneratingBlocksGPU,
-    ReadingBlocksGPU,
-    ApplyingGPUData,
-    GeneratingCaves,
-    GeneratingBedrock,
+    Preparing,
+    Prepare_NoiseGen3D_1,
+    Prepare_NoiseGen3D_2,
+    Prepare_NoiseGen3D_3,
+    Prepare_CombineNoise,
+    GeneratingTerrain,
+    ReplacingBiomeBlocks,
     Complete
 }
 
@@ -32,25 +34,6 @@ public enum GenerationState
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McTerrainGenerator : UdonSharpBehaviour
 {
-    [Header("GPU Acceleration")]
-    [Tooltip("The material/shader that generates the final block ID data for a whole chunk.")]
-    [SerializeField] private Material terrainComputeMaterial;
-    
-    // A single render texture to hold the entire chunk's block data.
-    private RenderTexture chunkDataRT;
-    
-    // Permutation texture for noise generation
-    private Texture2D permutationTexture;
-    
-    // GPU readback state
-    private bool isReadbackPending = false;
-    private byte[] gpuBlockData;
-    
-    [Header("Biome & Surface Settings")]
-    [Tooltip("The Y-level at or below which water will be placed in open areas.")]
-    public int seaLevel = 62;
-    [Tooltip("The depth, in blocks, that grass/dirt will form on surfaces.")]
-    public int surfaceDepth = 4;
 
     [Header("Terrain Composition")]
     public byte airBlockID = 0;
@@ -63,6 +46,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public byte sandStoneBlockID = 24;
 
     [Header("Beta 1.7.3 Terrain Parameters")]
+    // Debugging offsets for chunk generation.
+    public int chunkOffsetX = 0;
+    public int chunkOffsetZ = 0;
     [Range(0.1f, 2.0f)] public float terrainHeightMultiplier = 1.0f;
     [Range(0.0f, 1.0f)] public float caveFrequency = 0.14f;
     public bool generateCaves = true;
@@ -74,39 +60,100 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if UNITY_EDITOR
     [Header("Debugging")]
     public bool enableVerboseLogging = true;
-    private float time_Total, time_GPU, time_DataCopy, time_Caves, time_Bedrock;
+    private float time_Total, time_Preparation, time_GeneratingTerrain, time_ReplacingBiomes;
 #endif
 
     [SerializeField, FindObjectOfType(true)]
     private McWorld world;
+    private WorldChunkManagerOld wcm;
+
+    [SerializeField, FindObjectOfType(true)]
+    private McCoordinator coordinator;
 
     [SerializeField, FindObjectOfType(true)]
     private McBlockTypeManager blockTypeManager;
 
+    // The random state for the generator, based on the seed
+    private JavaRandom rand;
+
+    private NoiseGeneratorOctaves3D noiseGen1;
+    private NoiseGeneratorOctaves3D noiseGen2;
+    private NoiseGeneratorOctaves3D noiseGen3;
+    private NoiseGeneratorOctaves3D noiseGen4;
+    private NoiseGeneratorOctaves3D noiseGen5;
+    private NoiseGeneratorOctaves3D noiseGen6;
+    private NoiseGeneratorOctaves3D noiseGen7;
+    private NoiseGeneratorOctaves3D treeNoise;
+
+    private double[] sandNoise;
+    private double[] gravelNoise;
+    private double[] stoneNoise;
+    private WorldGenCavesOld caves;
+    private double[] noise3;
+    private double[] noise1;
+    private double[] noise2;
+    private double[] noise6;
+    private double[] noise7;
+
+
     private bool isInitialized = false;
-    private int _worldActualSeed;
-    private int _placementRandState;
     
     // Time-slicing state
     private GenerationState currentState = GenerationState.Idle;
     private int currentChunkX, currentChunkY, currentChunkZ;
     private ushort[] workingChunkData;
+    private BetaBiomeEnum[] currentChunkBiomes;
     
-    private StringBuilder logBuilder;
+    // Cache for preserving surface generation state across vertical chunks
+    private int[] columnDepthCache;
+    private int cacheCoordX = int.MaxValue;
+    private int cacheCoordZ = int.MaxValue;
+    
+    // Cache for the main 3D noise field for a column
+    private double[] noiseCache;
 
-    public void InitializeGenerator(int seed)
+    // Time-slicing progress trackers for the preparation state
+    private int noiseCombine_x;
+    private int noiseCombine_k1;
+    private int noiseCombine_l1;
+
+    // Time-slicing progress trackers
+    private int terrain_xPiece, terrain_zPiece;
+    private int biome_x;
+
+#if UNITY_EDITOR
+    private StringBuilder logBuilder;
+#endif
+
+    public void init(int seed)
     {
         float startTime = Time.realtimeSinceStartup;
         if (isInitialized) return;
 
+        wcm = new WorldChunkManagerOld(seed);
+#if UNITY_EDITOR
         logBuilder = new StringBuilder(256);
-        _worldActualSeed = seed;
-
-        _placementRandState = seed;
-        if (_placementRandState == 0) _placementRandState = 1;
+#endif
         
-        InitializeGPUResources();
-        CreatePermutationTexture(seed);
+        // Initialize depth cache
+        if (world != null) {
+            columnDepthCache = new int[world.chunkSizeXZ * world.chunkSizeXZ];
+        } else {
+            // Fallback, though world should always be available.
+            columnDepthCache = new int[16 * 16];
+        }
+
+        rand = new JavaRandom(seed);
+        noiseGen1 = new NoiseGeneratorOctaves3D(rand, 16);
+        noiseGen2 = new NoiseGeneratorOctaves3D(rand, 16);
+        noiseGen3 = new NoiseGeneratorOctaves3D(rand, 8);
+        noiseGen4 = new NoiseGeneratorOctaves3D(rand, 4);
+        noiseGen5 = new NoiseGeneratorOctaves3D(rand, 4);
+        noiseGen6 = new NoiseGeneratorOctaves3D(rand, 10);
+        noiseGen7 = new NoiseGeneratorOctaves3D(rand, 16);
+        treeNoise = new NoiseGeneratorOctaves3D(rand, 8);
+
+        caves = new WorldGenCavesOld();
         
         isInitialized = true;
 
@@ -119,80 +166,47 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
     }
 
-    private void InitializeGPUResources()
-    {
-        // The texture width is unrolled to contain all XZ data for a layer.
-        int textureWidth = world.chunkSizeXZ * world.chunkSizeXZ; // e.g., 16 * 16 = 256
-        int textureHeight = world.chunkSizeY;                     // e.g., 16
-
-        // Create a single render texture to hold all block IDs for the chunk.
-        // Format is R8, a single 8-bit channel, perfect for storing a byte (0-255).
-        chunkDataRT = new RenderTexture(textureWidth, textureHeight, 0, RenderTextureFormat.R8);
-        chunkDataRT.filterMode = FilterMode.Point;
-        chunkDataRT.wrapMode = TextureWrapMode.Clamp;
-        chunkDataRT.Create();
-        
-        // Pre-allocate the readback buffer. Its size is simply width * height for an R8 texture.
-        int bufferSize = textureWidth * textureHeight; // e.g., 256 * 16 = 4096
-        gpuBlockData = new byte[bufferSize];
-    }
-
-    private void CreatePermutationTexture(int seed)
-    {
-        // Generate the permutation table using the seed
-        byte[] permTable = McUtils.GetPermutationTable(seed);
-        
-        // Create a 256x2 R8 texture
-        permutationTexture = new Texture2D(256, 2, TextureFormat.R8, false);
-        permutationTexture.filterMode = FilterMode.Point;
-        permutationTexture.wrapMode = TextureWrapMode.Clamp;
-        
-        // Fill the texture with the permutation data
-        // First row (y=0): values 0-255
-        // Second row (y=1): duplicate values 256-511
-        Color32[] pixels = new Color32[512];
-        for (int i = 0; i < 512; i++)
-        {
-            pixels[i] = new Color32(permTable[i], 0, 0, 255);
-        }
-        
-        permutationTexture.SetPixels32(pixels);
-        permutationTexture.Apply(false, true); // Apply changes and make read-only
-        
-#if UNITY_EDITOR
-        if (enableVerboseLogging)
-        {
-            Debug.Log($"[McTerrainGenerator] Created permutation texture for seed {seed}. First few values: {permTable[0]}, {permTable[1]}, {permTable[2]}, {permTable[3]}");
-        }
-#endif
-    }
-
     public void StartChunkGeneration(int chunkX, int chunkY, int chunkZ)
     {
         if (!isInitialized)
         {
-            Debug.LogError("[McTerrainGenerator] Not initialized! Call InitializeGenerator first.");
+            Debug.LogError("[McTerrainGenerator] Not initialized! Call init() first.");
             return;
         }
 
-        currentChunkX = chunkX;
+        currentChunkX = chunkX + (chunkOffsetX / world.chunkSizeXZ);
         currentChunkY = chunkY;
-        currentChunkZ = chunkZ;
-        currentState = GenerationState.GeneratingBlocksGPU;
-        isReadbackPending = false;
+        currentChunkZ = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+        currentState = GenerationState.Preparing;
+
+        // Reset the depth cache for each column if we are at the top of the world
+        if (currentChunkY == world.worldDimensionY - 1)
+        {
+            for (int i = 0; i < columnDepthCache.Length; i++)
+            {
+                columnDepthCache[i] = -1;
+            }
+        }
 
         int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
-        workingChunkData = new ushort[chunkSize];
+        if (workingChunkData == null || workingChunkData.Length != chunkSize)
+        {
+            workingChunkData = new ushort[chunkSize];
+        }
+        else
+        {
+            System.Array.Clear(workingChunkData, 0, workingChunkData.Length);
+        }
+
+        terrain_xPiece = 0;
+        terrain_zPiece = 0;
+        biome_x = 0;
 
 #if UNITY_EDITOR
-        if (enableVerboseLogging)
-        {
-            time_Total = Time.realtimeSinceStartup;
-            time_GPU = 0f;
-            time_DataCopy = 0f;
-            time_Caves = 0f;
-            time_Bedrock = 0f;
-        }
+        time_Total = Time.realtimeSinceStartup;
+        time_Preparation = 0f;
+        time_GeneratingTerrain = 0f;
+        time_ReplacingBiomes = 0f;
 #endif
     }
     
@@ -207,53 +221,368 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
         switch (currentState)
         {
-            case GenerationState.GeneratingBlocksGPU:
-                GenerateBlocksGPU();
+            case GenerationState.Preparing:
 #if UNITY_EDITOR
-                if(enableVerboseLogging) time_GPU = (Time.realtimeSinceStartup - stepTimer);
-#endif
-                currentState = GenerationState.ReadingBlocksGPU;
-                return false;
-
-            case GenerationState.ReadingBlocksGPU:
-                if (!isReadbackPending)
+                if (enableVerboseLogging)
                 {
-                    VRCAsyncGPUReadback.Request(chunkDataRT, 0, TextureFormat.R8, (IUdonEventReceiver)this);
-                    isReadbackPending = true;
+                    logBuilder.Clear();
+                    logBuilder.Append("[McTerrainGenerator.Step] State: Preparing for chunk (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(")");
+                    Debug.Log(logBuilder.ToString());
                 }
-                // Wait for readback to complete via the OnAsyncGpuReadbackComplete callback
-                return false;
-
-            case GenerationState.ApplyingGPUData:
-                ProcessGPUData();
-#if UNITY_EDITOR
-                if (enableVerboseLogging) time_DataCopy = (Time.realtimeSinceStartup - stepTimer);
 #endif
-                currentState = generateCaves ? GenerationState.GeneratingCaves : GenerationState.GeneratingBedrock;
-                return false;
-
-            case GenerationState.GeneratingCaves:
-                // Cave generation is complex, so for now we'll do it in one step.
-                // This could be time-sliced in the future if needed.
-                if (generateCaves)
+                if (currentChunkX != cacheCoordX || currentChunkZ != cacheCoordZ)
                 {
-                    GenerateCaves(workingChunkData, currentChunkX, currentChunkY, currentChunkZ);
-                }
+                    // New column, start the multi-step preparation
 #if UNITY_EDITOR
-                if (enableVerboseLogging) time_Caves = (Time.realtimeSinceStartup - stepTimer) * 1000f;
+                    if (enableVerboseLogging) Debug.Log($"[McTerrainGenerator] New column ({currentChunkX}, {currentChunkZ}), starting sliced preparation.");
 #endif
-                currentState = GenerationState.GeneratingBedrock;
-                return false;
 
-            case GenerationState.GeneratingBedrock:
-                if (generateBedrock && currentChunkY == 0)
+                    cacheCoordX = currentChunkX;
+                    cacheCoordZ = currentChunkZ;
+
+                    currentChunkBiomes = wcm.getBiomeBlock(currentChunkBiomes, currentChunkX * 16, currentChunkZ * 16, 16, 16);
+                    this.sandNoise = this.noiseGen4.generateNoiseOctaves(this.sandNoise, currentChunkX * 16, currentChunkZ * 16, 0.0D, 16, 16, 1, 0.03125D, 0.03125D, 1.0D);
+                    this.gravelNoise = this.noiseGen4.generateNoiseOctaves(this.gravelNoise, currentChunkX * 16, 109.0134D, currentChunkZ * 16, 16, 1, 16, 0.03125D, 1.0D, 0.03125D);
+                    this.stoneNoise = this.noiseGen5.generateNoiseOctaves(this.stoneNoise, currentChunkX * 16, currentChunkZ * 16, 0.0D, 16, 16, 1, 0.0625D, 0.0625D, 0.0625D);
+
+                    byte byte0 = 4;
+                    int xSize = byte0 + 1;
+                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                    int zSize = byte0 + 1;
+                    if (noiseCache == null || noiseCache.Length != xSize * ySize * zSize)
+                    {
+                        noiseCache = new double[xSize * ySize * zSize];
+                    }
+
+                    currentState = GenerationState.Prepare_NoiseGen3D_1;
+                }
+                else
                 {
-                    GenerateBedrock(workingChunkData);
+                    // Cached column, proceed as before
+#if UNITY_EDITOR
+                    if (enableVerboseLogging) Debug.Log($"[McTerrainGenerator] Cached column ({currentChunkX}, {currentChunkZ}), skipping preparation.");
+#endif
+                    initRand(currentChunkX, currentChunkZ);
+                    currentState = GenerationState.GeneratingTerrain;
                 }
 #if UNITY_EDITOR
-                if (enableVerboseLogging) time_Bedrock = (Time.realtimeSinceStartup - stepTimer) * 1000f;
+                if (enableVerboseLogging) time_Preparation += (Time.realtimeSinceStartup - stepTimer) * 1000f;
+#endif
+                return false;
+
+            case GenerationState.Prepare_NoiseGen3D_1:
+                {
+                    byte byte0 = 4;
+                    int xSize = byte0 + 1;
+                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                    int zSize = byte0 + 1;
+                    double d0 = 684.412D;
+                    double d1 = 684.412D;
+                    noise1 = noiseGen1.generateNoiseOctaves(noise1, currentChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0, d1, d0);
+                    currentState = GenerationState.Prepare_NoiseGen3D_2;
+                    return false;
+                }
+
+            case GenerationState.Prepare_NoiseGen3D_2:
+                {
+                    byte byte0 = 4;
+                    int xSize = byte0 + 1;
+                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                    int zSize = byte0 + 1;
+                    double d0 = 684.412D;
+                    double d1 = 684.412D;
+                    noise2 = noiseGen2.generateNoiseOctaves(noise2, currentChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0, d1, d0);
+                    currentState = GenerationState.Prepare_NoiseGen3D_3;
+                    return false;
+                }
+
+            case GenerationState.Prepare_NoiseGen3D_3:
+                {
+                    byte byte0 = 4;
+                    int xSize = byte0 + 1;
+                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                    int zSize = byte0 + 1;
+                    double d0 = 684.412D;
+                    double d1 = 684.412D;
+                    noise3 = noiseGen3.generateNoiseOctaves(noise3, currentChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0 / 80.0D, d1 / 160.0D, d0 / 80.0D);
+                    noise6 = noiseGen6.generateNoiseArray(noise6, currentChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 1.121D, 1.121D, 0.5D);
+                    noise7 = noiseGen7.generateNoiseArray(noise7, currentChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 200.0D, 200.0D, 0.5D);
+
+                    noiseCombine_x = 0;
+                    noiseCombine_k1 = 0;
+                    noiseCombine_l1 = 0;
+                    currentState = GenerationState.Prepare_CombineNoise;
+                    return false;
+                }
+
+            case GenerationState.Prepare_CombineNoise:
+                {
+                    byte byte0 = 4;
+                    int xSize = byte0 + 1;
+                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                    int zSize = byte0 + 1;
+                    int i2 = 16 / xSize;
+                    double[] temp = this.wcm.temperatures;
+                    double[] rain = this.wcm.rainfall;
+
+                    int x = noiseCombine_x;
+                    int k2 = x * i2 + i2 / 2;
+
+                    for (int z = 0; z < zSize; z++)
+                    {
+                        int i3 = z * i2 + i2 / 2;
+                        double d2 = temp[k2 * 16 + i3];
+                        double d3 = rain[k2 * 16 + i3] * d2;
+                        double d4 = 1.0D - d3;
+                        d4 *= d4;
+                        d4 *= d4;
+                        d4 = 1.0D - d4;
+                        double d5 = (noise6[noiseCombine_l1] + 256.0D) / 512.0D;
+                        d5 *= d4;
+                        if (d5 > 1.0D) d5 = 1.0D;
+                        
+                        double d6 = noise7[noiseCombine_l1] / 8000.0D;
+                        if (d6 < 0.0D) d6 = -d6 * 0.3D;
+                        
+                        d6 = d6 * 3.0D - 2.0D;
+                        if (d6 < 0.0D)
+                        {
+                            d6 /= 2D;
+                            if (d6 < -1D) d6 = -1D;
+                            d6 /= 1.4D;
+                            d6 /= 2.0D;
+                            d5 = 0.0D;
+                        }
+                        else
+                        {
+                            if (d6 > 1.0D) d6 = 1.0D;
+                            d6 /= 8.0D;
+                        }
+
+                        if (d5 < 0.0D) d5 = 0.0D;
+                        
+                        d5 += 0.5D;
+                        d6 = (d6 * (double)ySize) / 16.0D;
+                        double d7 = (double)ySize / 2.0D + d6 * 4.0D;
+
+                        for (int y = 0; y < ySize; y++)
+                        {
+                            double d8 = 0.0D;
+                            double d9 = (((double)y - d7) * 12D) / d5;
+                            if (d9 < 0.0D) d9 *= 4.0D;
+                            
+                            double d10 = noise1[noiseCombine_k1] / 512.0D;
+                            double d11 = noise2[noiseCombine_k1] / 512.0D;
+                            double d12 = (this.noise3[noiseCombine_k1] / 10.0D + 1.0D) / 2.0D;
+
+                            if (d12 < 0.0D) d8 = d10;
+                            else if (d12 > 1.0D) d8 = d11;
+                            else d8 = d10 + (d11 - d10) * d12;
+                            
+                            d8 -= d9;
+                            if (y > ySize - 4)
+                            {
+                                double d13 = (double)((float)(y - (ySize - 4)) / 3.0F);
+                                d8 = d8 * (1.0D - d13) + -10.0D * d13;
+                            }
+                            noiseCache[noiseCombine_k1] = d8;
+                            noiseCombine_k1++;
+                        }
+                        noiseCombine_l1++;
+                    }
+
+                    noiseCombine_x++;
+                    if (noiseCombine_x >= xSize)
+                    {
+                        noise1 = noise2 = noise3 = noise6 = noise7 = null;
+                        initRand(currentChunkX, currentChunkZ);
+                        currentState = GenerationState.GeneratingTerrain;
+                    }
+
+                    return false;
+                }
+
+            case GenerationState.GeneratingTerrain:
+#if UNITY_EDITOR
+                if (enableVerboseLogging && terrain_xPiece == 0 && terrain_zPiece == 0)
+                {
+                    logBuilder.Clear();
+                    logBuilder.Append("[McTerrainGenerator.Step] State: GeneratingTerrain for chunk (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(")");
+                    Debug.Log(logBuilder.ToString());
+                }
+#endif
+                byte byte0_gt = 4;
+                byte oceanHeight_gt = 64;
+                int l_gt = byte0_gt + 1;
+                byte b2_gt = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                int var10 = byte0_gt + 1;
+                
+                int yPiecesPerChunk = world.chunkSizeY / 8;
+                int startYPiece = currentChunkY * yPiecesPerChunk;
+                int endYPiece = startYPiece + yPiecesPerChunk;
+
+                for (int i = 0; i < 4; i++) 
+                {
+                    if (terrain_xPiece >= byte0_gt) break;
+
+                    for (int yPiece = startYPiece; yPiece < endYPiece; yPiece++)
+                    {
+                        double d_gt = 0.125D;
+                        double d1 = noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 0)];
+                        double d2 = noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 0)];
+                        double d3 = noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 0)];
+                        double d4 = noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 0)];
+                        double d5 = (noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 1)] - d1) * d_gt;
+                        double d6 = (noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 1)] - d2) * d_gt;
+                        double d7 = (noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 1)] - d3) * d_gt;
+                        double d8 = (noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 1)] - d4) * d_gt;
+                        for (int l1 = 0; l1 < 8; l1++)
+                        {
+                            double d9 = 0.25D;
+                            double d10 = d1;
+                            double d11 = d2;
+                            double d12 = (d3 - d1) * d9;
+                            double d13 = (d4 - d2) * d9;
+                            for (int i2 = 0; i2 < 4; i2++)
+                            {
+                                int xLoc = i2 + terrain_xPiece * 4;
+                                int yLoc = yPiece * 8 + l1;
+                                double d14 = 0.25D;
+                                double d15 = d10;
+                                double d16 = (d11 - d10) * d14;
+                                for (int k2 = 0; k2 < 4; k2++)
+                                {
+                                    int currentZ = k2 + terrain_zPiece * 4;
+                                    double d17 = wcm.temperatures[(terrain_xPiece * 4 + i2) * 16 + (terrain_zPiece * 4 + k2)];
+                                    BlockMaterial block = BlockMaterial.AIR;
+                                    if (yPiece * 8 + l1 < oceanHeight_gt)
+                                    {
+                                        if (d17 < 0.5D && yPiece * 8 + l1 >= oceanHeight_gt - 1) block = BlockMaterial.ICE;
+                                        else block = BlockMaterial.STATIONARY_WATER;
+                                    }
+                                    if (d15 > 0.0D) block = BlockMaterial.STONE;
+
+                                    int localY = yLoc - (currentChunkY * world.chunkSizeY);
+                                    if (localY >= 0 && localY < world.chunkSizeY)
+                                    {
+                                        int index = localY * world.chunkSizeXZ * world.chunkSizeXZ + currentZ * world.chunkSizeXZ + xLoc;
+                                        if (index >= 0 && index < workingChunkData.Length)
+                                        {
+                                            workingChunkData[index] = world.PackBlockData((byte)block);
+                                        }
+                                    }
+                                    d15 += d16;
+                                }
+                                d10 += d12;
+                                d11 += d13;
+                            }
+                            d1 += d5; d2 += d6; d3 += d7; d4 += d8;
+                        }
+                    }
+
+                    terrain_zPiece++;
+                    if (terrain_zPiece >= byte0_gt)
+                    {
+                        terrain_zPiece = 0;
+                        terrain_xPiece++;
+                    }
+                }
+
+#if UNITY_EDITOR
+                if (enableVerboseLogging) time_GeneratingTerrain += (Time.realtimeSinceStartup - stepTimer) * 1000f;
+#endif
+
+                if (terrain_xPiece >= byte0_gt)
+                {
+                    currentState = GenerationState.ReplacingBiomeBlocks;
+                }
+                return false;
+            
+            case GenerationState.ReplacingBiomeBlocks:
+#if UNITY_EDITOR
+                if (enableVerboseLogging)
+                {
+                    logBuilder.Clear();
+                    logBuilder.Append("[McTerrainGenerator.Step] State: ReplacingBiomeBlocks for chunk (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(")");
+                    Debug.Log(logBuilder.ToString());
+                }
+#endif
+                int columnsToProcess = (coordinator != null) ? coordinator.columnsPerDataGenStep : 4;
+                byte oceanHeight_rb = 64;
+
+                for (int x = 0; x < 16; x++)
+                {
+                    for (int z = 0; z < 16; z++)
+                    {
+                        BetaBiomeEnum biome = currentChunkBiomes[x + z * 16];
+                        bool sand = sandNoise[x + z * 16] + rand.NextDouble() * 0.2D > 0.0D;
+                        bool gravel = gravelNoise[x + z * 16] + rand.NextDouble() * 0.2D > 3D;
+                        int depth = (int)(stoneNoise[x + z * 16] / 3D + 3D + rand.NextDouble() * 0.25D);
+                        
+                        // Load the previous depth from the cache for this column
+                        int prevDepth = columnDepthCache[z * world.chunkSizeXZ + x];
+
+                        BlockMaterial topBlock = (BlockMaterial)BiomeOld.top(biome);
+                        BlockMaterial fillerBlock = (BlockMaterial)BiomeOld.filler(biome);
+
+                        for (int y = (currentChunkY * world.chunkSizeY) + world.chunkSizeY - 1; y >= (currentChunkY * world.chunkSizeY); y--)
+                        {
+                            int localY = y - (currentChunkY * world.chunkSizeY);
+                            if (localY < 0 || localY >= world.chunkSizeY) continue;
+
+                            int index = localY * world.chunkSizeXZ * world.chunkSizeXZ + z * world.chunkSizeXZ + x;
+
+                            if (y <= rand.NextInt(5))
+                            {
+                                workingChunkData[index] = world.PackBlockData(bedrockBlockID);
+                                continue;
+                            }
+                            
+                            ushort blockData = workingChunkData[index];
+                            BlockMaterial block = (BlockMaterial)(blockData & 0xFF);
+
+                            if (block == BlockMaterial.AIR) { prevDepth = -1; continue; }
+                            if (block != BlockMaterial.STONE) continue;
+
+                            if (prevDepth == -1)
+                            {
+                                if (depth <= 0) { topBlock = BlockMaterial.AIR; fillerBlock = BlockMaterial.STONE; }
+                                else if (y >= oceanHeight_rb - 4 && y <= oceanHeight_rb + 1)
+                                {
+                                    topBlock = (BlockMaterial)BiomeOld.top(biome);
+                                    fillerBlock = (BlockMaterial)BiomeOld.filler(biome);
+                                    if (gravel) { topBlock = BlockMaterial.AIR; fillerBlock = BlockMaterial.GRAVEL; }
+                                    if (sand) { topBlock = BlockMaterial.SAND; fillerBlock = BlockMaterial.SAND; }
+                                }
+                                if (y < oceanHeight_rb && topBlock == BlockMaterial.AIR) topBlock = BlockMaterial.STATIONARY_WATER;
+                                
+                                prevDepth = depth;
+                                if (y >= oceanHeight_rb - 1) workingChunkData[index] = world.PackBlockData((byte)topBlock);
+                                else workingChunkData[index] = world.PackBlockData((byte)fillerBlock);
+                                continue;
+                            }
+                            if (prevDepth > 0)
+                            {
+                                prevDepth--;
+                                workingChunkData[index] = world.PackBlockData((byte)fillerBlock);
+                                if (prevDepth == 0 && fillerBlock == BlockMaterial.SAND)
+                                {
+                                    prevDepth = rand.NextInt(4);
+                                    fillerBlock = BlockMaterial.SANDSTONE;
+                                }
+                            }
+                        }
+                        
+                        // Save the final depth back to the cache for the next chunk below
+                        columnDepthCache[z * world.chunkSizeXZ + x] = prevDepth;
+                    }
+                }
+                
+#if UNITY_EDITOR
+                if (enableVerboseLogging) time_ReplacingBiomes += (Time.realtimeSinceStartup - stepTimer) * 1000f;
 #endif
                 currentState = GenerationState.Complete;
+                
                 return false;
 
             case GenerationState.Complete:
@@ -263,89 +592,30 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 {
                     float totalTime = (Time.realtimeSinceStartup - time_Total) * 1000f;
                     logBuilder.Clear();
-                    logBuilder.AppendFormat("--- GPU Terrain Gen Timings for Chunk ({0},{1},{2}) ---", currentChunkX, currentChunkY, currentChunkZ).AppendLine();
-                    logBuilder.AppendFormat("1. GPU Block Gen:           {0:F3} ms", time_GPU * 1000f).AppendLine();
-                    logBuilder.AppendFormat("2. Data Copy:               {0:F3} ms", time_DataCopy * 1000f).AppendLine();
-                    logBuilder.AppendFormat("3. Cave Gen:                {0:F3} ms", time_Caves).AppendLine();
-                    logBuilder.AppendFormat("4. Bedrock Gen:             {0:F3} ms", time_Bedrock).AppendLine();
-                    logBuilder.AppendFormat("=> Total Actual:            {0:F3} ms", totalTime).AppendLine();
+                    logBuilder.Append("--- Terrain Gen Timings for Chunk (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(") ---").AppendLine();
+                    logBuilder.Append("1. Preparation:         ").Append(time_Preparation.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("2. Terrain Generation:  ").Append(time_GeneratingTerrain.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("3. Biome Block Replace: ").Append(time_ReplacingBiomes.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("Total Time-Sliced Gen:  ").Append(totalTime.ToString("F3")).Append(" ms").AppendLine();
                     Debug.Log(logBuilder.ToString());
                 }
 #endif
+                currentState = GenerationState.Idle;
                 return true;
 
             default:
+                currentState = GenerationState.Idle;
                 return true;
         }
     }
 
-    public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
+    public void initRand(int chunkX, int chunkZ)
     {
-        isReadbackPending = false;
-        
-        if (!request.hasError && currentState == GenerationState.ReadingBlocksGPU)
-        {
-            request.TryGetData(gpuBlockData);
-            
-#if UNITY_EDITOR
-            if (enableVerboseLogging)
-            {
-                Debug.Log($"[McTerrainGenerator] GPU readback complete for chunk ({currentChunkX},{currentChunkY},{currentChunkZ})");
-                Debug.Log($"GPU Block Data at index 0: {gpuBlockData[0]}, total array length: {gpuBlockData.Length}");
-            }
-#endif
-            
-            // Move to the next state to process the data in the main time-sliced loop
-            currentState = GenerationState.ApplyingGPUData;
-        }
-        else if (request.hasError)
-        {
-            Debug.LogError($"[McTerrainGenerator] GPU readback error for chunk ({currentChunkX},{currentChunkY},{currentChunkZ})");
-            currentState = GenerationState.Complete; // Fail gracefully
-        }
+        this.rand.SetSeed((long)chunkX * 341873128712L + (long)chunkZ * 132897987541L);
     }
 
-    private void GenerateBlocksGPU()
-    {
-        // Set shader parameters based on the properties defined in the shader
-        // Assuming the terrainComputeMaterial will need these to generate world-aligned terrain
-        terrainComputeMaterial.SetInt("_Udon_ChunkX", currentChunkX);
-        terrainComputeMaterial.SetInt("_Udon_ChunkY", currentChunkY);
-        terrainComputeMaterial.SetInt("_Udon_ChunkZ", currentChunkZ);
-        
-        // These properties are already in your shader
-        terrainComputeMaterial.SetInt("_Udon_WorldSeed", _worldActualSeed);
-        terrainComputeMaterial.SetFloat("_Udon_SeaLevel", seaLevel);
-        terrainComputeMaterial.SetFloat("_Udon_TerrainMultiplier", terrainHeightMultiplier);
-        terrainComputeMaterial.SetInt("_Udon_ChunkSizeXZ", world.chunkSizeXZ);
-        terrainComputeMaterial.SetInt("_Udon_ChunkSizeY", world.chunkSizeY);
-        
-        // Set the hardcoded parameters from Table 2.1 in the document.
-        // These could be exposed as public fields if you want to tweak them in the inspector.
-        terrainComputeMaterial.SetInt("_Udon_MinMaxLimitNoise_Octaves", 16);
-        terrainComputeMaterial.SetVector("_Udon_MinMaxLimitNoise_Scale", new Vector4(684.412f, 684.412f, 0, 0));
-        terrainComputeMaterial.SetInt("_Udon_MainNoise_Octaves", 8);
-        terrainComputeMaterial.SetVector("_Udon_MainNoise_Scale", new Vector4(80.0f, 160.0f, 0, 0));
-        terrainComputeMaterial.SetInt("_Udon_ScaleNoise_Octaves", 10);
-        terrainComputeMaterial.SetVector("_Udon_ScaleNoise_Scale", new Vector4(80.0f, 160.0f, 0, 0));
-        terrainComputeMaterial.SetInt("_Udon_SurfaceNoise_Octaves", 4);
-        terrainComputeMaterial.SetVector("_Udon_SurfaceNoise_Scale", new Vector4(200.0f, 200.0f, 0, 0));
-
-        // Set the permutation texture for noise generation
-        terrainComputeMaterial.SetTexture("_Udon_PermutationTex", permutationTexture);
-        
-        // Generate all block data for the chunk in a single GPU pass
-        VRCGraphics.Blit(null, chunkDataRT, terrainComputeMaterial, 0);
-    }
-
-    /// <summary>
-    /// Processes the raw byte data from the GPU into the final ushort array for the chunk.
-    /// Since the GPU now generates final block IDs, this is a direct 1-to-1 copy.
-    /// </summary>
-    private void ProcessGPUData()
-    {
-        Array.Copy(gpuBlockData, workingChunkData, gpuBlockData.Length);
-    }
+    // This function is now fully time-sliced and integrated into the state machine.
+    // private double[] initNoiseField(...)
 
     // This method is now obsolete as the GPU handles all block filling.
     // private bool StepBlockFilling() { ... }
@@ -355,177 +625,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private void GenerateCaves(ushort[] chunkData, int chunkX, int chunkY, int chunkZ)
     {
-        /*
-        int chunkSizeXZ = world.chunkSizeXZ;
-        int chunkSizeY = world.chunkSizeY;
-        
-        int caveRadius = Mathf.Max(8, chunkSizeXZ / 2);
-        
-        for (int cx = -caveRadius; cx <= caveRadius; cx++)
-        {
-            for (int cz = -caveRadius; cz <= caveRadius; cz++)
-            {
-                int otherChunkX = chunkX + cx;
-                int otherChunkZ = chunkZ + cz;
-                
-                int caveSeed = HashChunkCoord(otherChunkX, otherChunkZ, _worldActualSeed);
-                
-                Random.InitState(caveSeed);
-                
-                if (Random.value > caveFrequency) continue;
-                
-                int caveCount = Random.Range(1, 4);
-                
-                for (int i = 0; i < caveCount; i++)
-                {
-                    float startX = otherChunkX * chunkSizeXZ + Random.Range(0, chunkSizeXZ);
-                    float startY = Random.Range(32, 96);
-                    float startZ = otherChunkZ * chunkSizeXZ + Random.Range(0, chunkSizeXZ);
-                    
-                    float yaw = Random.Range(0f, Mathf.PI * 2);
-                    float pitch = Random.Range(-0.5f, 0.5f);
-                    
-                    CarveCaveSystem(chunkData, chunkX, chunkY, chunkZ, 
-                                startX, startY, startZ, yaw, pitch, 
-                                Random.Range(85, 112), 0);
-                }
-            }
-        }
-        */
-    }
-
-    private int HashChunkCoord(int x, int z, int seed)
-    {
-        int hash = -2128831035;
-        hash = (hash ^ seed) * 16777619;
-        hash = (hash ^ x) * 16777619;
-        hash = (hash ^ (x >> 16)) * 16777619;
-        hash = (hash ^ z) * 16777619;
-        hash = (hash ^ (z >> 16)) * 16777619;
-        hash ^= hash >> 13;
-        hash *= 16777619;
-        hash ^= hash >> 15;
-        return hash;
     }
 
     private void CarveCaveSystem(ushort[] chunkData, int chunkX, int chunkY, int chunkZ,
                                  float x, float y, float z, float yaw, float pitch,
                                  int length, int branch)
     {
-        if (branch > 3) return;
-
-        int chunkSizeXZ = world.chunkSizeXZ;
-        int chunkSizeY = world.chunkSizeY;
-
-        float radius = Random.Range(1.0f, 6.0f);
-
-        for (int i = 0; i < length; i++)
-        {
-            float scale = Mathf.Sin(i * Mathf.PI / length);
-            float currentRadius = radius * scale;
-
-            float relativeX = x - (chunkX * chunkSizeXZ);
-            float relativeY = y - (chunkY * chunkSizeY);
-            float relativeZ = z - (chunkZ * chunkSizeXZ);
-
-            if (relativeX >= -currentRadius && relativeX <= chunkSizeXZ - 1 + currentRadius &&
-                relativeY >= -currentRadius && relativeY <= chunkSizeY - 1 + currentRadius &&
-                relativeZ >= -currentRadius && relativeZ <= chunkSizeXZ - 1 + currentRadius)
-            {
-                int minX = Mathf.Max(0, Mathf.FloorToInt(relativeX - currentRadius));
-                int maxX = Mathf.Min(chunkSizeXZ - 1, Mathf.CeilToInt(relativeX + currentRadius));
-                int minY = Mathf.Max(0, Mathf.FloorToInt(relativeY - currentRadius));
-                int maxY = Mathf.Min(chunkSizeY - 1, Mathf.CeilToInt(relativeY + currentRadius));
-                int minZ = Mathf.Max(0, Mathf.FloorToInt(relativeZ - currentRadius));
-                int maxZ = Mathf.Min(chunkSizeXZ - 1, Mathf.CeilToInt(relativeZ + currentRadius));
-
-                for (int cx = minX; cx <= maxX; cx++)
-                {
-                    for (int cy = minY; cy <= maxY; cy++)
-                    {
-                        for (int cz = minZ; cz <= maxZ; cz++)
-                        {
-                            float dx = cx - relativeX;
-                            float dy = cy - relativeY;
-                            float dz = cz - relativeZ;
-
-                            if (dx * dx + dy * dy + dz * dz < currentRadius * currentRadius)
-                            {
-                                int index = cx + cy * chunkSizeXZ * chunkSizeXZ + cz * chunkSizeXZ;
-
-                                if (index >= 0 && index < chunkData.Length)
-                                {
-                                    if (chunkData[index] != waterBlockID)
-                                    {
-                                        chunkData[index] = airBlockID;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            x += Mathf.Cos(yaw) * Mathf.Cos(pitch);
-            y += Mathf.Sin(pitch);
-            z += Mathf.Sin(yaw) * Mathf.Cos(pitch);
-
-            yaw += Random.Range(-0.2f, 0.2f);
-            pitch = pitch * 0.9f + Random.Range(-0.1f, 0.1f);
-            pitch = Mathf.Clamp(pitch, -0.7f, 0.7f);
-
-            if (Random.value < 0.25f && branch < 3)
-            {
-                CarveCaveSystem(chunkData, chunkX, chunkY, chunkZ,
-                               x, y, z,
-                               Random.Range(0f, Mathf.PI * 2),
-                               Random.Range(-0.5f, 0.5f),
-                               length - i, branch + 1);
-            }
-        }
     }
 
     private void GenerateBedrock(ushort[] chunkData)
     {
-        int chunkSizeXZ = world.chunkSizeXZ;
-        int chunkSizeY = world.chunkSizeY;
-        
-        Random.InitState(HashChunkCoord(currentChunkX, currentChunkZ, _worldActualSeed + 2000));
-        
-        for (int x = 0; x < chunkSizeXZ; x++)
-        {
-            for (int z = 0; z < chunkSizeXZ; z++)
-            {
-                chunkData[x + 0 * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ] = bedrockBlockID;
-                
-                for (int y = 1; y <= 4 && y < chunkSizeY; y++)
-                {
-                    if (Random.value < (5 - y) / 5.0f)
-                    {
-                        chunkData[x + y * chunkSizeXZ * chunkSizeXZ + z * chunkSizeXZ] = bedrockBlockID;
-                    }
-                }
-            }
-        }
-    }
-
-    void OnDestroy()
-    {
-        if (chunkDataRT != null) 
-        {
-            chunkDataRT.Release();
-            chunkDataRT = null;
-        }
-        
-        if (permutationTexture != null)
-        {
-        #if UNITY_EDITOR && !COMPILER_UDONSHARP
-            if (Application.isPlaying)
-                Destroy(permutationTexture);
-            else
-                DestroyImmediate(permutationTexture);
-            permutationTexture = null;
-        #endif
-        }
     }
 }

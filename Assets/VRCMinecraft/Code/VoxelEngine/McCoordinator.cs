@@ -62,9 +62,8 @@ public class McCoordinator : UdonSharpBehaviour
     [Header("Debug")]
     #if UNITY_EDITOR
     public bool enableVerboseLogging = true;
-    #endif
     private int lastLoggedPercent = -1;
-    private StringBuilder logBuilder_McCoordinator;
+    #endif
 
     public void InitializeAndStartProcessing(McWorld worldInstance, int[] generatedRadialOrder, int worldTotalChunks)
     {
@@ -82,10 +81,6 @@ public class McCoordinator : UdonSharpBehaviour
             return;
         }
         
-        #if UNITY_EDITOR
-        logBuilder_McCoordinator = new StringBuilder(512);
-        #endif
-
         worker_targetChunk = new McChunk[maxConcurrentWorkers];
         worker_state = new int[maxConcurrentWorkers];
         for (int i = 0; i < maxConcurrentWorkers; i++)
@@ -181,54 +176,51 @@ public class McCoordinator : UdonSharpBehaviour
         }
 
         // --- 2. Assign new work to idle workers ---
+        bool workersBusyNow = AreAnyWorkersActive();
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
-            if (worker_state[i] == STATE_IDLE)
+            if (worker_state[i] != STATE_IDLE) continue;
+
+            // Defer any new assignments until current active chunk(s) complete
+            if (workersBusyNow) break;
+
+            // Priority 1: Process player-initiated rebuilds (only when all workers idle)
+            if (chunkRebuildQueue_count > 0)
             {
-                // Priority 1: Process player-initiated rebuilds
-                if (chunkRebuildQueue_count > 0)
+                McChunk chunkToRebuild = chunkRebuildQueue[chunkRebuildQueue_head];
+                chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
+                chunkRebuildQueue_count--;
+
+                if (chunkToRebuild != null)
                 {
-                    McChunk chunkToRebuild = chunkRebuildQueue[chunkRebuildQueue_head];
-                    chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
-                    chunkRebuildQueue_count--;
-
-                    if (chunkToRebuild != null)
-                    {
-                        worker_targetChunk[i] = chunkToRebuild;
-                        worker_state[i] = STATE_WAITING_FOR_MESH;
-                    }
-                    continue; 
+                    worker_targetChunk[i] = chunkToRebuild;
+                    worker_state[i] = STATE_WAITING_FOR_MESH;
+                    workersBusyNow = true;
                 }
-                
-                // Priority 2: Process initial world generation
-                if (nextChunkIndexToAssign < totalWorldChunks && !isGeneratorBusy)
+                break; // assign only one per frame
+            }
+            // Priority 2: Initial world generation (only when all workers idle)
+            if (nextChunkIndexToAssign < totalWorldChunks && !isGeneratorBusy)
+            {
+                int chunk1DIndex = radialChunkOrder[nextChunkIndexToAssign];
+                nextChunkIndexToAssign++;
+
+                world.Chunk1DToArrrayCoords(chunk1DIndex, out int array_cx, out int array_cy, out int array_cz);
+
+                McChunk newChunk = world.InstantiateAndConfigureChunk(array_cx, array_cy, array_cz, columnsPerDataGenStep, voxelsPerMeshStep, voxelsPerTerrainStep);
+
+                if (newChunk != null)
                 {
-                    int chunk1DIndex = radialChunkOrder[nextChunkIndexToAssign];
-                    nextChunkIndexToAssign++;
-
-                    world.Chunk1DToArrrayCoords(chunk1DIndex, out int array_cx, out int array_cy, out int array_cz);
-
-                    McChunk newChunk = world.InstantiateAndConfigureChunk(array_cx, array_cy, array_cz, columnsPerDataGenStep, voxelsPerMeshStep, voxelsPerTerrainStep);
-
-                    if (newChunk != null) {
-                        worker_targetChunk[i] = newChunk;
-                        worker_state[i] = STATE_DATA_GEN;
-                        isGeneratorBusy = true; // Generator is now busy
-                        
-                        #if UNITY_EDITOR
-                        if (enableVerboseLogging) {
-                            Debug.Log($"[McCoordinator] Started data generation for chunk ({newChunk.chunkX_world},{newChunk.chunkY_world},{newChunk.chunkZ_world})");
-                        }
-                        #endif
-
-                        // Only assign ONE new data generation task per ProcessWorkers call 
-                        // to prevent race conditions and to allow the rebuild queue to be checked next frame.
-                        break;
-                    } else {
-                        // If chunk already existed, we still need to count it as "completed" to not stall the progress counter.
-                        chunksCompletedCount++;
-                    }
+                    worker_targetChunk[i] = newChunk;
+                    worker_state[i] = STATE_DATA_GEN;
+                    isGeneratorBusy = true;
+                    workersBusyNow = true;
                 }
+                else
+                {
+                    chunksCompletedCount++; // already existed
+                }
+                break;
             }
         }
         
@@ -259,6 +251,15 @@ public class McCoordinator : UdonSharpBehaviour
 
         // Always reschedule the loop to keep the coordinator alive.
         SendCustomEventDelayedSeconds(nameof(ProcessWorkers), workerProcessingInterval);
+    }
+
+    private bool AreAnyWorkersActive()
+    {
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (worker_state[i] != STATE_IDLE) return true;
+        }
+        return false;
     }
 
     /// <summary>
