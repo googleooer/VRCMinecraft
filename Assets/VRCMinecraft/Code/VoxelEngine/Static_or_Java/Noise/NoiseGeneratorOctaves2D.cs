@@ -19,20 +19,25 @@ public class NoiseGeneratorOctaves2D {
 
     public double[] generateNoiseArray(double[] array, double xPos, double zPos, int xSize, int zSize,
             double gridX, double gridZ, double fq, double persistance) {
-        gridX /= 1.5D;
-        gridZ /= 1.5D;
-        if(array == null || array.Length < xSize * zSize) {
-            array = new double[xSize * zSize];
+        // Optimized: Pre-calculate divided values
+        double gridXDiv = gridX / 1.5D;
+        double gridZDiv = gridZ / 1.5D;
+        int totalSize = xSize * zSize;
+        
+        if(array == null || array.Length < totalSize) {
+            array = new double[totalSize];
         } else {
-            for(int k = 0; k < array.Length; k++) {
-                array[k] = 0.0D;
-            }
-
+            // Optimized: Use System.Array.Clear for faster zeroing
+            System.Array.Clear(array, 0, array.Length);
         }
+        
         double amplitude = 1.0D;
         double frequency = 1.0D;
-        for(int l = 0; l < octaves; l++) {
-            noiseGenerators[l].generateNoiseArray(array, xPos, zPos, xSize, zSize, gridX * frequency, gridZ * frequency, 0.55D / amplitude);
+        NoiseGenerator2D[] gens = noiseGenerators;
+        int octCount = octaves;
+        
+        for(int l = 0; l < octCount; l++) {
+            gens[l].generateNoiseArray(array, xPos, zPos, xSize, zSize, gridXDiv * frequency, gridZDiv * frequency, 0.55D / amplitude);
             frequency *= fq;
             amplitude *= persistance;
         }

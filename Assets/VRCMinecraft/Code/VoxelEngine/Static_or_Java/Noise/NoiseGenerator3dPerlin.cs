@@ -3,6 +3,12 @@ using System;
 public class NoiseGenerator3dPerlin
 {
     private int[] permutations;
+    
+    // Pre-computed gradient lookup tables to eliminate branching
+    // Note: These are instance fields instead of static due to UdonSharp limitations
+    private readonly double[] GRAD_X = new double[16] {1,  -1,  1, -1, 1, -1, 1, -1, 0,  0,  0,  0,  1,  0, -1,  0};
+    private readonly double[] GRAD_Y = new double[16] {1,   1, -1, -1, 0,  0,  0,  0,  1, -1,  1, -1, 1, -1,  1, -1};
+    private readonly double[] GRAD_Z = new double[16] {0,   0,  0,  0,  1,  1, -1, -1, 1,  1, -1, -1, 0,  1,  0, -1};
 
     public double xCoord;
     public double yCoord;
@@ -43,25 +49,17 @@ public class NoiseGenerator3dPerlin
         return a + t * (b - a);
     }
     
-    // This is the original grad function from NoiseGeneratorPerlin.java
-    // It's used for 3D noise and, confusingly, for parts of the "optimized" 2D noise.
+    // Optimized: Use pre-computed gradient table for maximum performance
     public double grad(int hash, double x, double y, double z)
     {
         int h = hash & 15;
-        double u = h < 8 ? x : y;
-        double v = h < 4 ? y : (h == 12 || h == 14 ? x : z);
-        return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+        return GRAD_X[h] * x + GRAD_Y[h] * y + GRAD_Z[h] * z;
     }
 
-    // This is a new function added to match the original grad2d from NoiseGeneratorPerlin.java
-    // It was missing from your implementation and is used for one specific calculation
-    // in the optimized 2D noise generation path.
     public double grad2d(int hash, double x, double z)
     {
         int h = hash & 15;
-        double u = (1 - ((h & 8) >> 3)) * x;
-        double v = h < 4 ? 0.0D : (h != 12 && h != 14 ? z : x);
-        return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+        return GRAD_X[h] * x + GRAD_Z[h] * z;
     }
 
     public double generateNoise(double xPos, double yPos, double zPos)
@@ -110,110 +108,155 @@ public class NoiseGenerator3dPerlin
         return generateNoise(d, d1, 0.0D);
     }
     
-    // This method has been significantly corrected to match the original Java implementation.
-
+    // Optimized: Cache fade function results, reduce array lookups
     public void generateNoiseArray(double[] array, double xPos, double yPos, double zPos, int xSize,
             int ySize, int zSize, double gridX, double gridY, double gridZ, double amplitudeFactor)
     {
         double amplitude = 1.0D / amplitudeFactor;
         
-        // This is the optimized path for 2D noise generation (e.g., for terrain heightmaps).
-        // Your original C# code used the wrong gradient functions here.
+        // Optimized 2D noise path
         if (ySize == 1)
         {
             int index = 0;
+            // Cache permutations locally for faster access
+            int[] perm = this.permutations;
+            double xc = this.xCoord;
+            double zc = this.zCoord;
+            
             for (int dx = 0; dx < xSize; dx++)
             {
-                double x = (xPos + (double)dx) * gridX + this.xCoord;
+                double x = (xPos + (double)dx) * gridX + xc;
                 int intX = floor_and_clamp_int(x);
                 int p1 = intX & 0xff;
                 double relX = x - intX;
+                // Cache fade function
                 double fx = relX * relX * relX * (relX * (relX * 6D - 15D) + 10D);
 
                 for (int dz = 0; dz < zSize; dz++)
                 {
-                    double z = (zPos + (double)dz) * gridZ + this.zCoord;
+                    double z = (zPos + (double)dz) * gridZ + zc;
                     int intZ = floor_and_clamp_int(z);
                     int p3 = intZ & 0xff;
                     double relZ = z - intZ;
+                    // Cache fade function
                     double fz = relZ * relZ * relZ * (relZ * (relZ * 6D - 15D) + 10D);
 
-                    // DISCREPANCY FIX: The original Java code uses a bizarre mix of grad2d and grad (the 3D version).
-                    // This has been corrected to match the original logic exactly.
-                    // Your C# code was incorrectly using a different grad2d function for all of these.
+                    int a1 = perm[p1];
+                    int a2 = perm[a1] + p3;
                     
-                    int a1 = permutations[p1] + 0; // y is 0
-                    int a2 = permutations[a1] + p3;
-                    
-                    int b1 = permutations[p1 + 1] + 0; // y is 0
-                    int b2 = permutations[b1] + p3;
+                    int b1 = perm[p1 + 1];
+                    int b2 = perm[b1] + p3;
 
-                    // The original code uses grad2d for the first point...
-                    double val1 = lerp(fx, 
-                        grad2d(permutations[a2], relX, relZ), 
-                        grad(permutations[b2], relX - 1.0D, 0.0D, relZ));
+                    // Optimized gradient lookups with pre-computed table
+                    int h0 = perm[a2] & 15;
+                    double g0 = GRAD_X[h0] * relX + GRAD_Z[h0] * relZ;
                     
-                    // ...and grad (the 3D version with y=0) for the second point.
-                    double val2 = lerp(fx, 
-                        grad(permutations[a2 + 1], relX, 0.0D, relZ - 1.0D), 
-                        grad(permutations[b2 + 1], relX - 1.0D, 0.0D, relZ - 1.0D));
+                    int h1 = perm[b2] & 15;
+                    double g1 = GRAD_X[h1] * (relX - 1.0D) + GRAD_Z[h1] * relZ;
+                    
+                    double val1 = g0 + fx * (g1 - g0);
+                    
+                    int h2 = perm[a2 + 1] & 15;
+                    double g2 = GRAD_X[h2] * relX + GRAD_Z[h2] * (relZ - 1.0D);
+                    
+                    int h3 = perm[b2 + 1] & 15;
+                    double g3 = GRAD_X[h3] * (relX - 1.0D) + GRAD_Z[h3] * (relZ - 1.0D);
+                    
+                    double val2 = g2 + fx * (g3 - g2);
 
-                    double value = lerp(fz, val1, val2);
+                    double value = val1 + fz * (val2 - val1);
                     array[index++] += value * amplitude;
                 }
             }
             return;
         }
 
-        // This is the full 3D noise generation path. Your original C# code for this part was mostly correct,
-        // but it has been cleaned up for clarity and to ensure it matches the Java logic precisely.
+        // Optimized 3D noise path
         int arrayIndex = 0;
         int lastIntY = -1;
         double d13 = 0.0D, d15 = 0.0D, d16 = 0.0D, d18 = 0.0D;
+        
+        // Cache permutations and coords locally
+        int[] perm3d = this.permutations;
+        double xCoord3d = this.xCoord;
+        double yCoord3d = this.yCoord;
+        double zCoord3d = this.zCoord;
 
         for (int dx = 0; dx < xSize; dx++)
         {
-            double x = (xPos + (double)dx) * gridX + this.xCoord;
+            double x = (xPos + (double)dx) * gridX + xCoord3d;
             int intX = floor_and_clamp_int(x);
             int p1 = intX & 0xff;
             double relX = x - intX;
+            // Cache fade function
             double fx = relX * relX * relX * (relX * (relX * 6D - 15D) + 10D);
 
             for (int dz = 0; dz < zSize; dz++)
             {
-                double z = (zPos + (double)dz) * gridZ + this.zCoord;
+                double z = (zPos + (double)dz) * gridZ + zCoord3d;
                 int intZ = floor_and_clamp_int(z);
                 int p3 = intZ & 0xff;
                 double relZ = z - intZ;
+                // Cache fade function
                 double fz = relZ * relZ * relZ * (relZ * (relZ * 6D - 15D) + 10D);
 
                 for (int dy = 0; dy < ySize; dy++)
                 {
-                    double y = (yPos + (double)dy) * gridY + this.yCoord;
+                    double y = (yPos + (double)dy) * gridY + yCoord3d;
                     int intY = floor_and_clamp_int(y);
                     int p2 = intY & 0xff;
                     double relY = y - intY;
+                    // Cache fade function
                     double fy = relY * relY * relY * (relY * (relY * 6D - 15D) + 10D);
 
                     if (dy == 0 || p2 != lastIntY)
                     {
                         lastIntY = p2;
-                        int a1 = permutations[p1] + p2;
-                        int a2 = permutations[a1] + p3;
-                        int a3 = permutations[a1 + 1] + p3;
-                        int b1 = permutations[p1 + 1] + p2;
-                        int b2 = permutations[b1] + p3;
-                        int b3 = permutations[b1 + 1] + p3;
+                        int a1 = perm3d[p1] + p2;
+                        int a2 = perm3d[a1] + p3;
+                        int a3 = perm3d[a1 + 1] + p3;
+                        int b1 = perm3d[p1 + 1] + p2;
+                        int b2 = perm3d[b1] + p3;
+                        int b3 = perm3d[b1 + 1] + p3;
 
-                        d13 = lerp(fx, grad(permutations[a2], relX, relY, relZ), grad(permutations[b2], relX - 1.0D, relY, relZ));
-                        d15 = lerp(fx, grad(permutations[a3], relX, relY - 1.0D, relZ), grad(permutations[b3], relX - 1.0D, relY - 1.0D, relZ));
-                        d16 = lerp(fx, grad(permutations[a2 + 1], relX, relY, relZ - 1.0D), grad(permutations[b2 + 1], relX - 1.0D, relY, relZ - 1.0D));
-                        d18 = lerp(fx, grad(permutations[a3 + 1], relX, relY - 1.0D, relZ - 1.0D), grad(permutations[b3 + 1], relX - 1.0D, relY - 1.0D, relZ - 1.0D));
+                        // Optimized gradient lookups with pre-computed table
+                        int h0 = perm3d[a2] & 15;
+                        double g0 = GRAD_X[h0] * relX + GRAD_Y[h0] * relY + GRAD_Z[h0] * relZ;
+                        
+                        int h1 = perm3d[b2] & 15;
+                        double g1 = GRAD_X[h1] * (relX - 1.0D) + GRAD_Y[h1] * relY + GRAD_Z[h1] * relZ;
+                        
+                        d13 = g0 + fx * (g1 - g0);
+                        
+                        int h2 = perm3d[a3] & 15;
+                        double g2 = GRAD_X[h2] * relX + GRAD_Y[h2] * (relY - 1.0D) + GRAD_Z[h2] * relZ;
+                        
+                        int h3 = perm3d[b3] & 15;
+                        double g3 = GRAD_X[h3] * (relX - 1.0D) + GRAD_Y[h3] * (relY - 1.0D) + GRAD_Z[h3] * relZ;
+                        
+                        d15 = g2 + fx * (g3 - g2);
+                        
+                        int h4 = perm3d[a2 + 1] & 15;
+                        double g4 = GRAD_X[h4] * relX + GRAD_Y[h4] * relY + GRAD_Z[h4] * (relZ - 1.0D);
+                        
+                        int h5 = perm3d[b2 + 1] & 15;
+                        double g5 = GRAD_X[h5] * (relX - 1.0D) + GRAD_Y[h5] * relY + GRAD_Z[h5] * (relZ - 1.0D);
+                        
+                        d16 = g4 + fx * (g5 - g4);
+                        
+                        int h6 = perm3d[a3 + 1] & 15;
+                        double g6 = GRAD_X[h6] * relX + GRAD_Y[h6] * (relY - 1.0D) + GRAD_Z[h6] * (relZ - 1.0D);
+                        
+                        int h7 = perm3d[b3 + 1] & 15;
+                        double g7 = GRAD_X[h7] * (relX - 1.0D) + GRAD_Y[h7] * (relY - 1.0D) + GRAD_Z[h7] * (relZ - 1.0D);
+                        
+                        d18 = g6 + fx * (g7 - g6);
                     }
 
-                    double val1 = lerp(fy, d13, d15);
-                    double val2 = lerp(fy, d16, d18);
-                    double value = lerp(fz, val1, val2);
+                    // Inline lerp to eliminate method calls
+                    double val1 = d13 + fy * (d15 - d13);
+                    double val2 = d16 + fy * (d18 - d16);
+                    double value = val1 + fz * (val2 - val1);
                     array[arrayIndex++] += value * amplitude;
                 }
             }

@@ -12,6 +12,7 @@
  * which is critical for feature placement.
  */
 
+using System;
 using UnityEngine;
 
 public class JavaRandom
@@ -52,7 +53,8 @@ public class JavaRandom
     protected int Next(int bits)
     {
         seed = (seed * multiplier + addend) & mask;
-        return (int)((ulong)seed >> (48 - bits));
+        ulong clamped = (ulong)seed >> (48 - bits);
+        return clamped > int.MaxValue ? int.MaxValue : (int)clamped;
     }
 
     public int NextInt()

@@ -53,16 +53,25 @@ public class NoiseGenerator2D {
     public void generateNoiseArray(double[] array, double xPos, double zPos, int xSize, int zSize,
             double gridX, double gridZ, double amplitude) {
         int k = 0;
+        // Cache locals for faster access
+        int[] perm = this.permutations;
+        int[][] grad = this.arrayI;
+        double c1 = this.const1;
+        double c2 = this.const2;
+        double const2x2 = 2D * c2;
+        double rDX = this.randomDX;
+        double rDY = this.randomDY;
+        
         for(int x = 0; x < xSize; x++) {
-            double cx = (xPos + (double)x) * gridX + randomDX;
+            double cx = (xPos + (double)x) * gridX + rDX;
             for(int z = 0; z < zSize; z++) {
                 // CRITICAL FIX: Use randomDY for the Z-axis offset, matching the original's field_4291_b
-                double cz = (zPos + (double)z) * gridZ + randomDY;
+                double cz = (zPos + (double)z) * gridZ + rDY;
                 
-                double d10 = (cx + cz) * const1;
+                double d10 = (cx + cz) * c1;
                 int j1 = wrap(cx + d10);
                 int k1 = wrap(cz + d10);
-                double d11 = (double)(j1 + k1) * const2;
+                double d11 = (double)(j1 + k1) * c2;
                 double d12 = (double)j1 - d11;
                 double d13 = (double)k1 - d11;
                 double d14 = cx - d12;
@@ -76,22 +85,24 @@ public class NoiseGenerator2D {
                     l1 = 0;
                     i2 = 1;
                 }
-                double d16 = (d14 - (double)l1) + const2;
-                double d17 = (d15 - (double)i2) + const2;
-                double d18 = (d14 - 1.0D) + 2D * const2;
-                double d19 = (d15 - 1.0D) + 2D * const2;
+                double d16 = (d14 - (double)l1) + c2;
+                double d17 = (d15 - (double)i2) + c2;
+                double d18 = (d14 - 1.0D) + const2x2;
+                double d19 = (d15 - 1.0D) + const2x2;
                 int j2 = j1 & 0xff;
                 int k2 = k1 & 0xff;
-                int l2 = this.permutations[j2 + this.permutations[k2]] % 12;
-                int i3 = this.permutations[j2 + l1 + this.permutations[k2 + i2]] % 12;
-                int j3 = this.permutations[j2 + 1 + this.permutations[k2 + 1]] % 12;
+                int l2 = perm[j2 + perm[k2]] % 12;
+                int i3 = perm[j2 + l1 + perm[k2 + i2]] % 12;
+                int j3 = perm[j2 + 1 + perm[k2 + 1]] % 12;
                 double d20 = 0.5D - d14 * d14 - d15 * d15;
                 double d7;
                 if(d20 < 0.0D) {
                     d7 = 0.0D;
                 } else {
                     d20 *= d20;
-                    d7 = d20 * d20 * method1(arrayI[l2], d14, d15);
+                    // Inline method1
+                    int[] g0 = grad[l2];
+                    d7 = d20 * d20 * ((double)g0[0] * d14 + (double)g0[1] * d15);
                 }
                 double d21 = 0.5D - d16 * d16 - d17 * d17;
                 double d8;
@@ -99,7 +110,9 @@ public class NoiseGenerator2D {
                     d8 = 0.0D;
                 } else {
                     d21 *= d21;
-                    d8 = d21 * d21 * method1(arrayI[i3], d16, d17);
+                    // Inline method1
+                    int[] g1 = grad[i3];
+                    d8 = d21 * d21 * ((double)g1[0] * d16 + (double)g1[1] * d17);
                 }
                 double d22 = 0.5D - d18 * d18 - d19 * d19;
                 double d9;
@@ -107,7 +120,9 @@ public class NoiseGenerator2D {
                     d9 = 0.0D;
                 } else {
                     d22 *= d22;
-                    d9 = d22 * d22 * method1(arrayI[j3], d18, d19);
+                    // Inline method1
+                    int[] g2 = grad[j3];
+                    d9 = d22 * d22 * ((double)g2[0] * d18 + (double)g2[1] * d19);
                 }
                 array[k++] += 70.0D * (d7 + d8 + d9) * amplitude;
             }

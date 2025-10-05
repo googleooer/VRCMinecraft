@@ -265,12 +265,6 @@
       "dependencies": {},
       "hash": "2590c6a14a7230b8571383c379124c32d0712090"
     },
-    "si.iwa.udontask": {
-      "version": "file:si.iwa.udontask",
-      "depth": 0,
-      "source": "embedded",
-      "dependencies": {}
-    },
     "com.unity.modules.ai": {
       "version": "1.0.0",
       "depth": 0,
