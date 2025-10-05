@@ -145,4 +145,62 @@ public static class McUtils
     {
         return new Vector3Int(chunkPos.x * chunkSizeXZ, chunkPos.y * chunkSizeY, chunkPos.z * chunkSizeXZ);
     }
+    
+    /// <summary>
+    /// Converts Unity world coordinates to Minecraft Beta 1.7.3 coordinates.
+    /// Handles X-axis flip for right-handed coordinate system.
+    /// </summary>
+    /// <param name="unityPos">Position in Unity world space</param>
+    /// <param name="flipXAxis">Whether to flip X-axis (true for Minecraft compatibility)</param>
+    /// <returns>Position in Minecraft coordinate system</returns>
+    public static Vector3Int UnityToMinecraftCoords(Vector3 unityPos, bool flipXAxis)
+    {
+        int x = Mathf.FloorToInt(unityPos.x);
+        int y = Mathf.FloorToInt(unityPos.y);
+        int z = Mathf.FloorToInt(unityPos.z);
+        
+        if (flipXAxis)
+        {
+            x = -x;
+        }
+        
+        return new Vector3Int(x, y, z);
+    }
+    
+    /// <summary>
+    /// Converts Minecraft Beta 1.7.3 coordinates to Unity world coordinates.
+    /// Handles X-axis flip for right-handed coordinate system.
+    /// </summary>
+    /// <param name="mcPos">Position in Minecraft coordinate system</param>
+    /// <param name="flipXAxis">Whether to flip X-axis (true for Minecraft compatibility)</param>
+    /// <returns>Position in Unity world space</returns>
+    public static Vector3 MinecraftToUnityCoords(Vector3Int mcPos, bool flipXAxis)
+    {
+        float x = mcPos.x;
+        float y = mcPos.y;
+        float z = mcPos.z;
+        
+        if (flipXAxis)
+        {
+            x = -x;
+        }
+        
+        return new Vector3(x, y, z);
+    }
+    
+    /// <summary>
+    /// Converts Unity world coordinates to Minecraft coordinates with world offset.
+    /// </summary>
+    /// <param name="unityPos">Position in Unity world space</param>
+    /// <param name="worldOffsetX">World X offset (centering)</param>
+    /// <param name="worldOffsetZ">World Z offset (centering)</param>
+    /// <param name="flipXAxis">Whether to flip X-axis</param>
+    /// <returns>Position in Minecraft coordinate system</returns>
+    public static Vector3Int UnityToMinecraftCoordsWithOffset(Vector3 unityPos, int worldOffsetX, int worldOffsetZ, bool flipXAxis)
+    {
+        Vector3Int mcCoords = UnityToMinecraftCoords(unityPos, flipXAxis);
+        mcCoords.x += worldOffsetX;
+        mcCoords.z += worldOffsetZ;
+        return mcCoords;
+    }
 }

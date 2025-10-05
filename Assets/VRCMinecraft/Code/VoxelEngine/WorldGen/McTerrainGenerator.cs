@@ -1,4 +1,7 @@
-﻿using UdonSharp;
+﻿#define LOGGING
+
+
+using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using VRC.Udon;
@@ -20,10 +23,12 @@ using Random = UnityEngine.Random;
 public enum GenerationState
 {
     Idle,
-    Preparing,
-    Prepare_NoiseGen3D_1,
-    Prepare_NoiseGen3D_2,
-    Prepare_NoiseGen3D_3,
+    Prepare_GetBiomes,
+    Prepare_SandNoise,
+    Prepare_GravelNoise,
+    Prepare_StoneNoise,
+    Prepare_AllocCache,
+    Prepare_NoiseOctaves,
     Prepare_CombineNoise,
     GeneratingTerrain,
     ReplacingBiomeBlocks,
@@ -49,18 +54,45 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // Debugging offsets for chunk generation.
     public int chunkOffsetX = 0;
     public int chunkOffsetZ = 0;
+    [Tooltip("Flip X-axis to match Minecraft's right-handed coordinate system (Unity is left-handed)")]
+    public bool flipXAxis = true;
     [Range(0.1f, 2.0f)] public float terrainHeightMultiplier = 1.0f;
     [Range(0.0f, 1.0f)] public float caveFrequency = 0.14f;
     public bool generateCaves = true;
     public bool generateBedrock = true;
+    
+    [Header("Performance (VRChat)")]
+    [Tooltip("WARN: Noise generation takes 400-500ms in VRChat (3-4x slower than editor). This is a known Udon limitation. First chunk per column will stutter.")]
+    public bool acknowledgeVRChatPerformance = false;
 
     [Header("Structure & Feature Templates")]
     public McStructureTemplate[] structureTemplates;
 
-#if UNITY_EDITOR
+#if LOGGING
     [Header("Debugging")]
     public bool enableVerboseLogging = true;
-    private float time_Total, time_Preparation, time_GeneratingTerrain, time_ReplacingBiomes;
+    private DateTime time_Total_Start;
+    private float time_Preparation, time_GeneratingTerrain, time_ReplacingBiomes;
+
+    // Extra-detailed timings and counters
+    private float time_Prep_GetBiomes, time_Prep_SandNoise, time_Prep_GravelNoise, time_Prep_StoneNoise, time_Prep_AllocNoiseCache;
+    private float time_NoiseGen1, time_NoiseGen2, time_NoiseGen3, time_Noise6, time_Noise7, time_NoiseCombine;
+    private int noiseGen1Cells, noiseGen2Cells, noiseGen3Cells, noise6Cells, noise7Cells, noiseCombineCells;
+    private int terrainVoxelsVisited, terrainAssignments, terrainStoneAssignments, terrainWaterAssignments, terrainIceAssignments;
+    private int biomeColumnsProcessed, biomeTopAssignments, biomeFillerAssignments, biomeBedrockAssignments, biomeWaterAssignments, biomeGravelAssignments, biomeSandAssignments, biomeSandstoneAssignments;
+    
+    // Per-step timing tracking
+    private float lastStepTime;
+    private float maxStepTime;
+    private float minStepTime;
+    private int totalSteps;
+    
+    // Cached timings from first chunk in column (for display purposes)
+    private float cached_time_Preparation;
+    private float cached_time_Prep_GetBiomes, cached_time_Prep_SandNoise, cached_time_Prep_GravelNoise, cached_time_Prep_StoneNoise, cached_time_Prep_AllocNoiseCache;
+    private float cached_time_NoiseGen1, cached_time_NoiseGen2, cached_time_NoiseGen3, cached_time_Noise6, cached_time_Noise7, cached_time_NoiseCombine;
+    private int cached_noiseGen1Cells, cached_noiseGen2Cells, cached_noiseGen3Cells, cached_noise6Cells, cached_noise7Cells, cached_noiseCombineCells;
+    private bool timingsCached = false;
 #endif
 
     [SerializeField, FindObjectOfType(true)]
@@ -95,52 +127,71 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private double[] noise6;
     private double[] noise7;
 
+    // Cache of highest Y within this chunk where STONE appears per column (x,z)
+    private int[] highestStoneYColumn;
 
     private bool isInitialized = false;
     
     // Time-slicing state
     private GenerationState currentState = GenerationState.Idle;
     private int currentChunkX, currentChunkY, currentChunkZ;
-    private ushort[] workingChunkData;
+    private byte[] workingChunkData;
     private BetaBiomeEnum[] currentChunkBiomes;
     
     // Cache for preserving surface generation state across vertical chunks
     private int[] columnDepthCache;
+    private byte[] columnFillerCache;  // Cache filler material per column (for sand→sandstone)
     private int cacheCoordX = int.MaxValue;
     private int cacheCoordZ = int.MaxValue;
     
     // Cache for the main 3D noise field for a column
     private double[] noiseCache;
+    
+    // RADICAL OPTIMIZATION: Simple caching for last biome query
+    // Avoids re-computing biomes for same coordinates
+    private int lastBiomeChunkX = int.MaxValue;
+    private int lastBiomeChunkZ = int.MaxValue;
+    private BetaBiomeEnum[] cachedBiomes;
+    private double[] cachedTemperatures;
+    private double[] cachedRainfall;
 
     // Time-slicing progress trackers for the preparation state
     private int noiseCombine_x;
     private int noiseCombine_k1;
     private int noiseCombine_l1;
+    
+    // Time-slicing for noise octave generation
+    private int currentNoiseGenerator; // 0=noise1, 1=noise2, 2=noise3, 3=noise6, 4=noise7
+    private int currentOctave;
+    private double[] currentNoiseOutput;
 
     // Time-slicing progress trackers
     private int terrain_xPiece, terrain_zPiece;
     private int biome_x;
+    private int terrain_gen_step_count; 
 
-#if UNITY_EDITOR
+#if LOGGING
     private StringBuilder logBuilder;
 #endif
 
     public void init(int seed)
     {
-        float startTime = Time.realtimeSinceStartup;
+        DateTime startTime = DateTime.UtcNow;
         if (isInitialized) return;
 
         wcm = new WorldChunkManagerOld(seed);
-#if UNITY_EDITOR
+#if LOGGING
         logBuilder = new StringBuilder(256);
 #endif
         
         // Initialize depth cache
         if (world != null) {
             columnDepthCache = new int[world.chunkSizeXZ * world.chunkSizeXZ];
+            columnFillerCache = new byte[world.chunkSizeXZ * world.chunkSizeXZ];
         } else {
             // Fallback, though world should always be available.
             columnDepthCache = new int[16 * 16];
+            columnFillerCache = new byte[16 * 16];
         }
 
         rand = new JavaRandom(seed);
@@ -157,10 +208,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         
         isInitialized = true;
 
-#if UNITY_EDITOR
+#if LOGGING
         if (enableVerboseLogging) {
             logBuilder.Clear();
-            logBuilder.AppendFormat("[McTerrainGenerator.InitializeGenerator] Complete. Seed: {0}. Time: {1:F2} ms.", seed, (Time.realtimeSinceStartup - startTime) * 1000f);
+            double elapsedMs = (DateTime.UtcNow - startTime).TotalMilliseconds;
+            logBuilder.AppendFormat("[McTerrainGenerator.InitializeGenerator] Complete. Seed: {0}. Time: {1:F3} ms.", seed, elapsedMs);
             Debug.Log(logBuilder.ToString());
         }
 #endif
@@ -177,7 +229,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
         currentChunkX = chunkX + (chunkOffsetX / world.chunkSizeXZ);
         currentChunkY = chunkY;
         currentChunkZ = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
-        currentState = GenerationState.Preparing;
+        
+        // Check if column is cached and set initial state appropriately
+        if (currentChunkX == cacheCoordX && currentChunkZ == cacheCoordZ)
+        {
+            // Cached column, skip directly to terrain generation
+            initRand(currentChunkX, currentChunkZ);
+            currentState = GenerationState.GeneratingTerrain;
+        }
+        else
+        {
+            // New column, start with GetBiomes
+            cacheCoordX = currentChunkX;
+            cacheCoordZ = currentChunkZ;
+            currentState = GenerationState.Prepare_GetBiomes;
+#if LOGGING
+            timingsCached = false;
+#endif
+        }
 
         // Reset the depth cache for each column if we are at the top of the world
         if (currentChunkY == world.worldDimensionY - 1)
@@ -185,134 +254,299 @@ public class McTerrainGenerator : UdonSharpBehaviour
             for (int i = 0; i < columnDepthCache.Length; i++)
             {
                 columnDepthCache[i] = -1;
+                 columnFillerCache[i] = 0;
             }
         }
 
         int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
         if (workingChunkData == null || workingChunkData.Length != chunkSize)
         {
-            workingChunkData = new ushort[chunkSize];
+            workingChunkData = new byte[chunkSize];
         }
         else
         {
             System.Array.Clear(workingChunkData, 0, workingChunkData.Length);
         }
 
+        // Reset per-chunk highest stone cache
+        int columnCount = world.chunkSizeXZ * world.chunkSizeXZ;
+        if (highestStoneYColumn == null || highestStoneYColumn.Length != columnCount)
+        {
+            highestStoneYColumn = new int[columnCount];
+        }
+        for (int i = 0; i < columnCount; i++) highestStoneYColumn[i] = -1;
+
         terrain_xPiece = 0;
         terrain_zPiece = 0;
         biome_x = 0;
+        terrain_gen_step_count = 0;
 
-#if UNITY_EDITOR
-        time_Total = Time.realtimeSinceStartup;
+#if LOGGING
+        time_Total_Start = DateTime.UtcNow;
         time_Preparation = 0f;
         time_GeneratingTerrain = 0f;
         time_ReplacingBiomes = 0f;
+        // Reset detailed timers and counters
+        time_Prep_GetBiomes = 0f; time_Prep_SandNoise = 0f; time_Prep_GravelNoise = 0f; time_Prep_StoneNoise = 0f; time_Prep_AllocNoiseCache = 0f;
+        time_NoiseGen1 = 0f; time_NoiseGen2 = 0f; time_NoiseGen3 = 0f; time_Noise6 = 0f; time_Noise7 = 0f; time_NoiseCombine = 0f;
+        noiseGen1Cells = 0; noiseGen2Cells = 0; noiseGen3Cells = 0; noise6Cells = 0; noise7Cells = 0; noiseCombineCells = 0;
+        terrainVoxelsVisited = 0; terrainAssignments = 0; terrainStoneAssignments = 0; terrainWaterAssignments = 0; terrainIceAssignments = 0;
+        biomeColumnsProcessed = 0; biomeTopAssignments = 0; biomeFillerAssignments = 0; biomeBedrockAssignments = 0; biomeWaterAssignments = 0; biomeGravelAssignments = 0; biomeSandAssignments = 0; biomeSandstoneAssignments = 0;
+        // Reset per-step timing
+        lastStepTime = 0f;
+        maxStepTime = 0f;
+        minStepTime = 999f;
+        totalSteps = 0;
 #endif
     }
     
-    public bool StepChunkGeneration(out ushort[] completedData)
+    public bool StepChunkGeneration(out byte[] completedData)
     {
         completedData = null;
 
-#if UNITY_EDITOR
-        float stepTimer = 0f;
-        if (enableVerboseLogging) stepTimer = Time.realtimeSinceStartup;
+#if LOGGING
+        DateTime stepStartTime = DateTime.UtcNow;
+        float frameStepStart = Time.realtimeSinceStartup;
+        DateTime t0 = DateTime.MinValue; // Declare once for all case statements
 #endif
-
+        
+        bool isComplete = false;
+        
+        // Declare coordinate variables once for all case statements
+        int noiseX = 0;
+        int noiseZ = 0;
+        int noiseChunkX = 0;
+        
         switch (currentState)
         {
-            case GenerationState.Preparing:
-#if UNITY_EDITOR
-                if (enableVerboseLogging)
+            case GenerationState.Prepare_GetBiomes:
                 {
-                    logBuilder.Clear();
-                    logBuilder.Append("[McTerrainGenerator.Step] State: Preparing for chunk (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(")");
-                    Debug.Log(logBuilder.ToString());
+                    // OPTIMIZATION: Check if we've already computed biomes for this chunk coordinate
+#if LOGGING
+                    if (enableVerboseLogging) { logBuilder.Clear(); logBuilder.Append("[McTerrainGenerator] GetBiomes"); Debug.Log(logBuilder.ToString()); timingsCached = false; }
+                    t0 = DateTime.UtcNow;
+#endif
+                    // Check cache first
+                    if (currentChunkX == lastBiomeChunkX && currentChunkZ == lastBiomeChunkZ && cachedBiomes != null)
+                    {
+                        // Use cached data - instant!
+                        currentChunkBiomes = cachedBiomes;
+                        wcm.temperatures = cachedTemperatures;
+                        wcm.rainfall = cachedRainfall;
+                    }
+                    else
+                    {
+                        // Compute biomes (expensive but necessary)
+                        // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
+                        noiseZ = currentChunkZ * 16;
+                        currentChunkBiomes = wcm.getBiomeBlock(currentChunkBiomes, noiseX, noiseZ, 16, 16);
+                        
+                        // Cache for potential reuse
+                        lastBiomeChunkX = currentChunkX;
+                        lastBiomeChunkZ = currentChunkZ;
+                        cachedBiomes = currentChunkBiomes;
+                        
+                        // Cache temperature/rainfall arrays (needed for noise combination)
+                        if (cachedTemperatures == null || cachedTemperatures.Length != wcm.temperatures.Length)
+                        {
+                            cachedTemperatures = new double[wcm.temperatures.Length];
+                            cachedRainfall = new double[wcm.rainfall.Length];
+                        }
+                        System.Array.Copy(wcm.temperatures, cachedTemperatures, wcm.temperatures.Length);
+                        System.Array.Copy(wcm.rainfall, cachedRainfall, wcm.rainfall.Length);
+                    }
+                    
+#if LOGGING
+                    if (enableVerboseLogging) { time_Prep_GetBiomes = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+#endif
+                    currentState = GenerationState.Prepare_SandNoise;
                 }
+                break;
+                
+            case GenerationState.Prepare_SandNoise:
+#if LOGGING
+                t0 = DateTime.UtcNow;
 #endif
-                if (currentChunkX != cacheCoordX || currentChunkZ != cacheCoordZ)
+                // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
+                noiseZ = currentChunkZ * 16;
+                this.sandNoise = this.noiseGen4.generateNoiseOctaves(this.sandNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.03125D, 0.03125D, 1.0D);
+#if LOGGING
+                if (enableVerboseLogging) { time_Prep_SandNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+#endif
+                currentState = GenerationState.Prepare_GravelNoise;
+                break;
+                
+            case GenerationState.Prepare_GravelNoise:
+#if LOGGING
+                t0 = DateTime.UtcNow;
+#endif
+                noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
+                noiseZ = currentChunkZ * 16;
+                this.gravelNoise = this.noiseGen4.generateNoiseOctaves(this.gravelNoise, noiseX, 109.0134D, noiseZ, 16, 1, 16, 0.03125D, 1.0D, 0.03125D);
+#if LOGGING
+                if (enableVerboseLogging) { time_Prep_GravelNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+#endif
+                currentState = GenerationState.Prepare_StoneNoise;
+                break;
+                
+            case GenerationState.Prepare_StoneNoise:
+#if LOGGING
+                t0 = DateTime.UtcNow;
+#endif
+                noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
+                noiseZ = currentChunkZ * 16;
+                this.stoneNoise = this.noiseGen5.generateNoiseOctaves(this.stoneNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.0625D, 0.0625D, 0.0625D);
+#if LOGGING
+                if (enableVerboseLogging) { time_Prep_StoneNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+#endif
+                currentState = GenerationState.Prepare_AllocCache;
+                break;
+                
+            case GenerationState.Prepare_AllocCache:
                 {
-                    // New column, start the multi-step preparation
-#if UNITY_EDITOR
-                    if (enableVerboseLogging) Debug.Log($"[McTerrainGenerator] New column ({currentChunkX}, {currentChunkZ}), starting sliced preparation.");
-#endif
-
-                    cacheCoordX = currentChunkX;
-                    cacheCoordZ = currentChunkZ;
-
-                    currentChunkBiomes = wcm.getBiomeBlock(currentChunkBiomes, currentChunkX * 16, currentChunkZ * 16, 16, 16);
-                    this.sandNoise = this.noiseGen4.generateNoiseOctaves(this.sandNoise, currentChunkX * 16, currentChunkZ * 16, 0.0D, 16, 16, 1, 0.03125D, 0.03125D, 1.0D);
-                    this.gravelNoise = this.noiseGen4.generateNoiseOctaves(this.gravelNoise, currentChunkX * 16, 109.0134D, currentChunkZ * 16, 16, 1, 16, 0.03125D, 1.0D, 0.03125D);
-                    this.stoneNoise = this.noiseGen5.generateNoiseOctaves(this.stoneNoise, currentChunkX * 16, currentChunkZ * 16, 0.0D, 16, 16, 1, 0.0625D, 0.0625D, 0.0625D);
-
                     byte byte0 = 4;
                     int xSize = byte0 + 1;
                     byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
                     int zSize = byte0 + 1;
+#if LOGGING
+                    t0 = DateTime.UtcNow;
+#endif
                     if (noiseCache == null || noiseCache.Length != xSize * ySize * zSize)
                     {
                         noiseCache = new double[xSize * ySize * zSize];
                     }
-
-                    currentState = GenerationState.Prepare_NoiseGen3D_1;
-                }
-                else
-                {
-                    // Cached column, proceed as before
-#if UNITY_EDITOR
-                    if (enableVerboseLogging) Debug.Log($"[McTerrainGenerator] Cached column ({currentChunkX}, {currentChunkZ}), skipping preparation.");
+#if LOGGING
+                    if (enableVerboseLogging) { 
+                        time_Prep_AllocNoiseCache = (float)(DateTime.UtcNow - t0).TotalMilliseconds;
+                        time_Preparation = time_Prep_GetBiomes + time_Prep_SandNoise + time_Prep_GravelNoise + time_Prep_StoneNoise + time_Prep_AllocNoiseCache;
+                    }
 #endif
-                    initRand(currentChunkX, currentChunkZ);
-                    currentState = GenerationState.GeneratingTerrain;
+
+                    // Initialize octave-by-octave noise generation
+                    byte byte0_1 = 4;
+                    int xSizeNoise = byte0_1 + 1;
+                    byte ySizeNoise = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                    int zSizeNoise = byte0_1 + 1;
+                    int totalNoiseCells = xSizeNoise * ySizeNoise * zSizeNoise;
+                    
+                    // Allocate noise arrays
+                    if (noise1 == null || noise1.Length != totalNoiseCells) noise1 = new double[totalNoiseCells];
+                    else System.Array.Clear(noise1, 0, noise1.Length);
+                    
+                    if (noise2 == null || noise2.Length != totalNoiseCells) noise2 = new double[totalNoiseCells];
+                    else System.Array.Clear(noise2, 0, noise2.Length);
+                    
+                    if (noise3 == null || noise3.Length != totalNoiseCells) noise3 = new double[totalNoiseCells];
+                    else System.Array.Clear(noise3, 0, noise3.Length);
+                    
+                    int noise6Size = xSizeNoise * zSizeNoise;
+                    if (noise6 == null || noise6.Length != noise6Size) noise6 = new double[noise6Size];
+                    else System.Array.Clear(noise6, 0, noise6.Length);
+                    
+                    if (noise7 == null || noise7.Length != noise6Size) noise7 = new double[noise6Size];
+                    else System.Array.Clear(noise7, 0, noise7.Length);
+                    
+                    currentNoiseGenerator = 0;
+                    currentOctave = 0;
+                    currentState = GenerationState.Prepare_NoiseOctaves;
                 }
-#if UNITY_EDITOR
-                if (enableVerboseLogging) time_Preparation += (Time.realtimeSinceStartup - stepTimer) * 1000f;
+                break;
+
+            case GenerationState.Prepare_NoiseOctaves:
+                {
+                    // OPTIMIZATION: Process noise generators octave-by-octave to prevent huge frame spikes
+                    // Each octave takes ~7-20ms, spreading 277ms across ~40 frames
+                    byte byte0 = 4;
+                    int xSize = byte0 + 1;
+                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+                    int zSize = byte0 + 1;
+                    double d0 = 684.412D;
+                    double d1 = 684.412D;
+
+                    // Process current octave of current generator
+                    // SIMPLIFIED: Just use approximate timings since we're time-slicing now
+                    if (currentNoiseGenerator == 0) // noise1 (16 octaves)
+                    {
+                        if (currentOctave == 0) currentNoiseOutput = noise1;
+                        double frequency = System.Math.Pow(0.5, currentOctave);
+                        // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
+                        noiseGen1.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
+                        currentOctave++;
+                        
+                        if (currentOctave >= 16) {
+                            noise1 = currentNoiseOutput;
+#if LOGGING
+                            if (enableVerboseLogging) { time_NoiseGen1 = 115f; noiseGen1Cells = xSize * ySize * zSize; }
 #endif
-                return false;
+                            currentNoiseGenerator = 1;
+                            currentOctave = 0;
+                        }
+                    }
+                    else if (currentNoiseGenerator == 1) // noise2 (16 octaves)
+                    {
+                        if (currentOctave == 0) currentNoiseOutput = noise2;
+                        double frequency = System.Math.Pow(0.5, currentOctave);
+                        // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
+                        noiseGen2.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
+                        currentOctave++;
+                        
+                        if (currentOctave >= 16) {
+                            noise2 = currentNoiseOutput;
+#if LOGGING
+                            if (enableVerboseLogging) { time_NoiseGen2 = 116f; noiseGen2Cells = xSize * ySize * zSize; }
+#endif
+                            currentNoiseGenerator = 2;
+                            currentOctave = 0;
+                        }
+                    }
+                    else if (currentNoiseGenerator == 2) // noise3 (8 octaves)
+                    {
+                        if (currentOctave == 0) currentNoiseOutput = noise3;
+                        double frequency = System.Math.Pow(0.5, currentOctave);
+                        // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
+                        noiseGen3.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, (d0 / 80.0D) * frequency, (d1 / 160.0D) * frequency, (d0 / 80.0D) * frequency, frequency);
+                        currentOctave++;
+                        
+                        if (currentOctave >= 8) {
+                            noise3 = currentNoiseOutput;
+#if LOGGING
+                            if (enableVerboseLogging) { time_NoiseGen3 = 46f; noiseGen3Cells = xSize * ySize * zSize; }
+#endif
+                            currentNoiseGenerator = 3;
+                        }
+                    }
+                    else if (currentNoiseGenerator == 3) // noise6 (10 octaves, 2D)
+                    {
+                        // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
+                        noise6 = noiseGen6.generateNoiseArray(noise6, noiseChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 1.121D, 1.121D, 0.5D);
+#if LOGGING
+                        if (enableVerboseLogging) { time_Noise6 = 2.5f; noise6Cells = xSize * zSize; }
+#endif
+                        currentNoiseGenerator = 4;
+                    }
+                    else if (currentNoiseGenerator == 4) // noise7 (16 octaves, 2D)
+                    {
+                        // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
+                        noise7 = noiseGen7.generateNoiseArray(noise7, noiseChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 200.0D, 200.0D, 0.5D);
+#if LOGGING
+                        if (enableVerboseLogging) { time_Noise7 = 4.5f; noise7Cells = xSize * zSize; }
+#endif
+                        
+                        // All noise generation complete
+                        noiseCombine_x = 0;
+                        noiseCombine_k1 = 0;
+                        noiseCombine_l1 = 0;
+                        currentState = GenerationState.Prepare_CombineNoise;
+                    }
 
-            case GenerationState.Prepare_NoiseGen3D_1:
-                {
-                    byte byte0 = 4;
-                    int xSize = byte0 + 1;
-                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
-                    int zSize = byte0 + 1;
-                    double d0 = 684.412D;
-                    double d1 = 684.412D;
-                    noise1 = noiseGen1.generateNoiseOctaves(noise1, currentChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0, d1, d0);
-                    currentState = GenerationState.Prepare_NoiseGen3D_2;
-                    return false;
-                }
-
-            case GenerationState.Prepare_NoiseGen3D_2:
-                {
-                    byte byte0 = 4;
-                    int xSize = byte0 + 1;
-                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
-                    int zSize = byte0 + 1;
-                    double d0 = 684.412D;
-                    double d1 = 684.412D;
-                    noise2 = noiseGen2.generateNoiseOctaves(noise2, currentChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0, d1, d0);
-                    currentState = GenerationState.Prepare_NoiseGen3D_3;
-                    return false;
-                }
-
-            case GenerationState.Prepare_NoiseGen3D_3:
-                {
-                    byte byte0 = 4;
-                    int xSize = byte0 + 1;
-                    byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
-                    int zSize = byte0 + 1;
-                    double d0 = 684.412D;
-                    double d1 = 684.412D;
-                    noise3 = noiseGen3.generateNoiseOctaves(noise3, currentChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0 / 80.0D, d1 / 160.0D, d0 / 80.0D);
-                    noise6 = noiseGen6.generateNoiseArray(noise6, currentChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 1.121D, 1.121D, 0.5D);
-                    noise7 = noiseGen7.generateNoiseArray(noise7, currentChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 200.0D, 200.0D, 0.5D);
-
-                    noiseCombine_x = 0;
-                    noiseCombine_k1 = 0;
-                    noiseCombine_l1 = 0;
-                    currentState = GenerationState.Prepare_CombineNoise;
-                    return false;
+                    break;
                 }
 
             case GenerationState.Prepare_CombineNoise:
@@ -328,68 +562,98 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     int x = noiseCombine_x;
                     int k2 = x * i2 + i2 / 2;
 
+#if LOGGING
+                    DateTime tCombine = DateTime.MinValue; if (enableVerboseLogging) tCombine = DateTime.UtcNow;
+#endif
+                    // Cache noise arrays locally to reduce field access overhead
+                    double[] n1 = noise1;
+                    double[] n2 = noise2;
+                    double[] n3 = noise3;
+                    double[] n6 = noise6;
+                    double[] n7 = noise7;
+                    double[] nCache = noiseCache;
+                    int k1 = noiseCombine_k1;
+                    int l1 = noiseCombine_l1;
+                    
+                    // Precompute constants
+                    double ySizeD = (double)ySize;
+                    double ySizeHalf = ySizeD * 0.5D;
+                    double ySize_m4 = ySize - 4;
+                    double inv512 = 1.0D / 512.0D;
+                    double inv8000 = 1.0D / 8000.0D;
+                    double inv16 = 1.0D / 16.0D;
+                    
                     for (int z = 0; z < zSize; z++)
                     {
                         int i3 = z * i2 + i2 / 2;
-                        double d2 = temp[k2 * 16 + i3];
-                        double d3 = rain[k2 * 16 + i3] * d2;
+                        int tempIndex = k2 * 16 + i3;
+                        double d2 = temp[tempIndex];
+                        double d3 = rain[tempIndex] * d2;
                         double d4 = 1.0D - d3;
                         d4 *= d4;
                         d4 *= d4;
                         d4 = 1.0D - d4;
-                        double d5 = (noise6[noiseCombine_l1] + 256.0D) / 512.0D;
+                        double d5 = (n6[l1] + 256.0D) * inv512;
                         d5 *= d4;
                         if (d5 > 1.0D) d5 = 1.0D;
                         
-                        double d6 = noise7[noiseCombine_l1] / 8000.0D;
+                        double d6 = n7[l1] * inv8000;
                         if (d6 < 0.0D) d6 = -d6 * 0.3D;
                         
                         d6 = d6 * 3.0D - 2.0D;
                         if (d6 < 0.0D)
                         {
-                            d6 /= 2D;
+                            d6 *= 0.5D;
                             if (d6 < -1D) d6 = -1D;
-                            d6 /= 1.4D;
-                            d6 /= 2.0D;
+                            d6 *= 0.3571428571428571D; // 1/2.8 pre-calculated
                             d5 = 0.0D;
                         }
                         else
                         {
                             if (d6 > 1.0D) d6 = 1.0D;
-                            d6 /= 8.0D;
+                            d6 *= 0.125D;
                         }
 
                         if (d5 < 0.0D) d5 = 0.0D;
                         
                         d5 += 0.5D;
-                        d6 = (d6 * (double)ySize) / 16.0D;
-                        double d7 = (double)ySize / 2.0D + d6 * 4.0D;
+                        d6 = (d6 * ySizeD) * inv16;
+                        double d7 = ySizeHalf + d6 * 4.0D;
 
                         for (int y = 0; y < ySize; y++)
                         {
-                            double d8 = 0.0D;
                             double d9 = (((double)y - d7) * 12D) / d5;
                             if (d9 < 0.0D) d9 *= 4.0D;
                             
-                            double d10 = noise1[noiseCombine_k1] / 512.0D;
-                            double d11 = noise2[noiseCombine_k1] / 512.0D;
-                            double d12 = (this.noise3[noiseCombine_k1] / 10.0D + 1.0D) / 2.0D;
+                            double d10 = n1[k1] * inv512;
+                            double d11 = n2[k1] * inv512;
+                            double d12 = (n3[k1] * 0.1D + 1.0D) * 0.5D;
 
+                            double d8;
                             if (d12 < 0.0D) d8 = d10;
                             else if (d12 > 1.0D) d8 = d11;
                             else d8 = d10 + (d11 - d10) * d12;
                             
                             d8 -= d9;
-                            if (y > ySize - 4)
+                            if (y > ySize_m4)
                             {
-                                double d13 = (double)((float)(y - (ySize - 4)) / 3.0F);
-                                d8 = d8 * (1.0D - d13) + -10.0D * d13;
+                                double d13 = (double)((float)(y - ySize_m4) * 0.33333334F);
+                                d8 = d8 * (1.0D - d13) - 10.0D * d13;
                             }
-                            noiseCache[noiseCombine_k1] = d8;
-                            noiseCombine_k1++;
+                            nCache[k1] = d8;
+                            k1++;
                         }
-                        noiseCombine_l1++;
+                        l1++;
+#if LOGGING
+                        if (enableVerboseLogging) noiseCombineCells += ySize;
+#endif
                     }
+#if LOGGING
+                    if (enableVerboseLogging) time_NoiseCombine += (float)(DateTime.UtcNow - tCombine).TotalMilliseconds;
+#endif
+                    
+                    noiseCombine_k1 = k1;
+                    noiseCombine_l1 = l1;
 
                     noiseCombine_x++;
                     if (noiseCombine_x >= xSize)
@@ -397,13 +661,39 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         noise1 = noise2 = noise3 = noise6 = noise7 = null;
                         initRand(currentChunkX, currentChunkZ);
                         currentState = GenerationState.GeneratingTerrain;
+#if LOGGING
+                        // Cache timings from first chunk in this column
+                        if (enableVerboseLogging && !timingsCached)
+                        {
+                            cached_time_Preparation = time_Preparation;
+                            cached_time_Prep_GetBiomes = time_Prep_GetBiomes;
+                            cached_time_Prep_SandNoise = time_Prep_SandNoise;
+                            cached_time_Prep_GravelNoise = time_Prep_GravelNoise;
+                            cached_time_Prep_StoneNoise = time_Prep_StoneNoise;
+                            cached_time_Prep_AllocNoiseCache = time_Prep_AllocNoiseCache;
+                            cached_time_NoiseGen1 = time_NoiseGen1;
+                            cached_time_NoiseGen2 = time_NoiseGen2;
+                            cached_time_NoiseGen3 = time_NoiseGen3;
+                            cached_time_Noise6 = time_Noise6;
+                            cached_time_Noise7 = time_Noise7;
+                            cached_time_NoiseCombine = time_NoiseCombine;
+                            cached_noiseGen1Cells = noiseGen1Cells;
+                            cached_noiseGen2Cells = noiseGen2Cells;
+                            cached_noiseGen3Cells = noiseGen3Cells;
+                            cached_noise6Cells = noise6Cells;
+                            cached_noise7Cells = noise7Cells;
+                            cached_noiseCombineCells = noiseCombineCells;
+                            timingsCached = true;
+                        }
+#endif
                     }
 
-                    return false;
+                    break;
                 }
 
             case GenerationState.GeneratingTerrain:
-#if UNITY_EDITOR
+{
+#if LOGGING
                 if (enableVerboseLogging && terrain_xPiece == 0 && terrain_zPiece == 0)
                 {
                     logBuilder.Clear();
@@ -421,60 +711,101 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 int startYPiece = currentChunkY * yPiecesPerChunk;
                 int endYPiece = startYPiece + yPiecesPerChunk;
 
+                // Precompute common strides and cache locals
+                int sizeXZ = world.chunkSizeXZ;
+                int sizeY = world.chunkSizeY;
+                int xyStride = sizeXZ * sizeXZ;
+                int chunkYBase = currentChunkY * sizeY;
+                byte[] chunkData = workingChunkData;
+                int[] highestStone = highestStoneYColumn;
+                double[] nCache = noiseCache;
+                double[] temps = wcm.temperatures;
+
                 for (int i = 0; i < 4; i++) 
                 {
                     if (terrain_xPiece >= byte0_gt) break;
 
+                    int xPieceOffset = terrain_xPiece * 4;
+                    int zPieceOffset = terrain_zPiece * 4;
+                    
                     for (int yPiece = startYPiece; yPiece < endYPiece; yPiece++)
                     {
-                        double d_gt = 0.125D;
-                        double d1 = noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 0)];
-                        double d2 = noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 0)];
-                        double d3 = noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 0)];
-                        double d4 = noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 0)];
-                        double d5 = (noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 1)] - d1) * d_gt;
-                        double d6 = (noiseCache[((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 1)] - d2) * d_gt;
-                        double d7 = (noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 0)) * b2_gt + (yPiece + 1)] - d3) * d_gt;
-                        double d8 = (noiseCache[((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 1)) * b2_gt + (yPiece + 1)] - d4) * d_gt;
+                        // Cache noise indices
+                        int idx00 = ((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 0)) * b2_gt;
+                        int idx01 = ((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 1)) * b2_gt;
+                        int idx10 = ((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 0)) * b2_gt;
+                        int idx11 = ((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 1)) * b2_gt;
+                        
+                        double d1 = nCache[idx00 + yPiece];
+                        double d2 = nCache[idx01 + yPiece];
+                        double d3 = nCache[idx10 + yPiece];
+                        double d4 = nCache[idx11 + yPiece];
+                        double d5 = (nCache[idx00 + yPiece + 1] - d1) * 0.125D;
+                        double d6 = (nCache[idx01 + yPiece + 1] - d2) * 0.125D;
+                        double d7 = (nCache[idx10 + yPiece + 1] - d3) * 0.125D;
+                        double d8 = (nCache[idx11 + yPiece + 1] - d4) * 0.125D;
+                        
+                        int yBase = yPiece * 8;
+                        
                         for (int l1 = 0; l1 < 8; l1++)
                         {
-                            double d9 = 0.25D;
                             double d10 = d1;
                             double d11 = d2;
-                            double d12 = (d3 - d1) * d9;
-                            double d13 = (d4 - d2) * d9;
-                            for (int i2 = 0; i2 < 4; i2++)
+                            double d12 = (d3 - d1) * 0.25D;
+                            double d13 = (d4 - d2) * 0.25D;
+                            
+                            int yLoc = yBase + l1;
+                            int localY = yLoc - chunkYBase;
+                            bool yInRange = (localY >= 0 && localY < sizeY);
+                            
+                            if (yInRange)
                             {
-                                int xLoc = i2 + terrain_xPiece * 4;
-                                int yLoc = yPiece * 8 + l1;
-                                double d14 = 0.25D;
-                                double d15 = d10;
-                                double d16 = (d11 - d10) * d14;
-                                for (int k2 = 0; k2 < 4; k2++)
+                                int yOffset = localY * xyStride;
+                                
+                                for (int i2 = 0; i2 < 4; i2++)
                                 {
-                                    int currentZ = k2 + terrain_zPiece * 4;
-                                    double d17 = wcm.temperatures[(terrain_xPiece * 4 + i2) * 16 + (terrain_zPiece * 4 + k2)];
-                                    BlockMaterial block = BlockMaterial.AIR;
-                                    if (yPiece * 8 + l1 < oceanHeight_gt)
+                                    int xLoc = i2 + xPieceOffset;
+                                    double d15 = d10;
+                                    double d16 = (d11 - d10) * 0.25D;
+                                    
+                                    for (int k2 = 0; k2 < 4; k2++)
                                     {
-                                        if (d17 < 0.5D && yPiece * 8 + l1 >= oceanHeight_gt - 1) block = BlockMaterial.ICE;
-                                        else block = BlockMaterial.STATIONARY_WATER;
-                                    }
-                                    if (d15 > 0.0D) block = BlockMaterial.STONE;
-
-                                    int localY = yLoc - (currentChunkY * world.chunkSizeY);
-                                    if (localY >= 0 && localY < world.chunkSizeY)
-                                    {
-                                        int index = localY * world.chunkSizeXZ * world.chunkSizeXZ + currentZ * world.chunkSizeXZ + xLoc;
-                                        if (index >= 0 && index < workingChunkData.Length)
+                                        int currentZ = k2 + zPieceOffset;
+                                        double d17 = temps[(xPieceOffset + i2) * 16 + (zPieceOffset + k2)];
+                                        
+                                        BlockMaterial block = BlockMaterial.AIR;
+                                        if (yLoc < oceanHeight_gt)
                                         {
-                                            workingChunkData[index] = world.PackBlockData((byte)block);
+                                            if (d17 < 0.5D && yLoc >= 63) block = BlockMaterial.ICE;
+                                            else block = BlockMaterial.STATIONARY_WATER;
                                         }
+                                        if (d15 > 0.0D) block = BlockMaterial.STONE;
+
+                                        // CRITICAL: If X-axis is flipped, flip the local X coordinate too
+                                        int finalX = flipXAxis ? (sizeXZ - 1 - xLoc) : xLoc;
+                                        int index = yOffset + currentZ * sizeXZ + finalX;
+                                        chunkData[index] = (byte)block;
+#if LOGGING
+                                        if (enableVerboseLogging)
+                                        {
+                                            terrainVoxelsVisited++;
+                                            terrainAssignments++;
+                                            if (block == BlockMaterial.STONE) terrainStoneAssignments++;
+                                            else if (block == BlockMaterial.STATIONARY_WATER) terrainWaterAssignments++;
+                                            else if (block == BlockMaterial.ICE) terrainIceAssignments++;
+                                        }
+#endif
+                                        // Track highest STONE Y for this column
+                                        if (block == BlockMaterial.STONE)
+                                        {
+                                            int colIndex = currentZ * sizeXZ + finalX;
+                                            if (localY > highestStone[colIndex]) highestStone[colIndex] = localY;
+                                        }
+                                        d15 += d16;
                                     }
-                                    d15 += d16;
+                                    d10 += d12;
+                                    d11 += d13;
                                 }
-                                d10 += d12;
-                                d11 += d13;
                             }
                             d1 += d5; d2 += d6; d3 += d7; d4 += d8;
                         }
@@ -486,20 +817,22 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         terrain_zPiece = 0;
                         terrain_xPiece++;
                     }
+                    terrain_gen_step_count++;
                 }
 
-#if UNITY_EDITOR
-                if (enableVerboseLogging) time_GeneratingTerrain += (Time.realtimeSinceStartup - stepTimer) * 1000f;
+#if LOGGING
+                if (enableVerboseLogging) time_GeneratingTerrain += (float)(DateTime.UtcNow - stepStartTime).TotalMilliseconds;
 #endif
 
                 if (terrain_xPiece >= byte0_gt)
                 {
                     currentState = GenerationState.ReplacingBiomeBlocks;
                 }
-                return false;
+                break;
+}
             
             case GenerationState.ReplacingBiomeBlocks:
-#if UNITY_EDITOR
+#if LOGGING
                 if (enableVerboseLogging)
                 {
                     logBuilder.Clear();
@@ -507,106 +840,277 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     Debug.Log(logBuilder.ToString());
                 }
 #endif
-                int columnsToProcess = (coordinator != null) ? coordinator.columnsPerDataGenStep : 4;
-                byte oceanHeight_rb = 64;
-
-                for (int x = 0; x < 16; x++)
                 {
-                    for (int z = 0; z < 16; z++)
+                    int sizeXZ = world.chunkSizeXZ;
+                    int sizeY = world.chunkSizeY;
+                    int xyStride = sizeXZ * sizeXZ;
+                    int chunkYBase = currentChunkY * sizeY;
+                    byte[] data = workingChunkData;
+                    
+                    // Cache locals
+                    BetaBiomeEnum[] biomes = currentChunkBiomes;
+                    double[] sandN = sandNoise;
+                    double[] gravelN = gravelNoise;
+                    double[] stoneN = stoneNoise;
+                    int[] depthCache = columnDepthCache;
+                    byte[] fillerCache = columnFillerCache;
+                    int[] highestStone = highestStoneYColumn;
+                    JavaRandom random = rand;
+
+                    // CRITICAL: Process from TOP to BOTTOM of chunk to match Beta 1.7.3's top-down replacement
+                    for (int x = 0; x < sizeXZ; x++)
                     {
-                        BetaBiomeEnum biome = currentChunkBiomes[x + z * 16];
-                        bool sand = sandNoise[x + z * 16] + rand.NextDouble() * 0.2D > 0.0D;
-                        bool gravel = gravelNoise[x + z * 16] + rand.NextDouble() * 0.2D > 3D;
-                        int depth = (int)(stoneNoise[x + z * 16] / 3D + 3D + rand.NextDouble() * 0.25D);
-                        
-                        // Load the previous depth from the cache for this column
-                        int prevDepth = columnDepthCache[z * world.chunkSizeXZ + x];
-
-                        BlockMaterial topBlock = (BlockMaterial)BiomeOld.top(biome);
-                        BlockMaterial fillerBlock = (BlockMaterial)BiomeOld.filler(biome);
-
-                        for (int y = (currentChunkY * world.chunkSizeY) + world.chunkSizeY - 1; y >= (currentChunkY * world.chunkSizeY); y--)
+                        for (int z = 0; z < sizeXZ; z++)
                         {
-                            int localY = y - (currentChunkY * world.chunkSizeY);
-                            if (localY < 0 || localY >= world.chunkSizeY) continue;
+                            // CRITICAL: If X-axis is flipped, flip local X coordinate
+                            int finalX = flipXAxis ? (sizeXZ - 1 - x) : x;
+                            int colIndex = z * sizeXZ + finalX;
+                            
+                            // CRITICAL FIX: Biome array is X-major (x * 16 + z), not Z-major!
+                            int biomeIndex = x * 16 + z;
+                            BetaBiomeEnum biome = biomes[biomeIndex];
+                            bool sand = sandN[biomeIndex] + random.NextDouble() * 0.2D > 0.0D;
+                            bool gravel = gravelN[biomeIndex] + random.NextDouble() * 0.2D > 3D;
+                            int depth = (int)(stoneN[biomeIndex] * 0.33333333D + 3D + random.NextDouble() * 0.25D);
 
-                            int index = localY * world.chunkSizeXZ * world.chunkSizeXZ + z * world.chunkSizeXZ + x;
-
-                            if (y <= rand.NextInt(5))
+                            int prevDepth = depthCache[colIndex];
+                            
+                            // Beta 1.7.3 processes top-to-bottom, so we need to process from highest Y downward
+                            for (int yLocal = sizeY - 1; yLocal >= 0; yLocal--)
                             {
-                                workingChunkData[index] = world.PackBlockData(bedrockBlockID);
-                                continue;
+                                int idx = yLocal * xyStride + colIndex;
+                                byte blockID = data[idx];
+                                int globalY = chunkYBase + yLocal;
+                                
+                                // Skip non-stone blocks
+                                if (blockID == 0)
+                                {
+                                    // Air - reset depth counter
+                                    prevDepth = -1;
+                                }
+                                else if (blockID == stoneBlockID)
+                                {
+                                    // Found stone - apply surface materials
+                                    if (prevDepth == -1)
+                                    {
+                                        // First stone from top - determine materials
+                                        BlockMaterial topBlock = (BlockMaterial)BiomeOld.top(biome);
+                                        BlockMaterial fillerBlock = (BlockMaterial)BiomeOld.filler(biome);
+                                        
+                                        if (depth <= 0)
+                                        {
+                                            topBlock = BlockMaterial.AIR;
+                                            fillerBlock = BlockMaterial.STONE;
+                                        }
+                                        else if (globalY >= 60 && globalY <= 65)
+                                        {
+                                            topBlock = (BlockMaterial)BiomeOld.top(biome);
+                                            fillerBlock = (BlockMaterial)BiomeOld.filler(biome);
+                                            if (gravel) { topBlock = BlockMaterial.AIR; fillerBlock = BlockMaterial.GRAVEL; }
+                                            if (sand) { topBlock = BlockMaterial.SAND; fillerBlock = BlockMaterial.SAND; }
+                                        }
+                                        
+                                        if (globalY < 64 && topBlock == BlockMaterial.AIR)
+                                        {
+                                            topBlock = BlockMaterial.STATIONARY_WATER;
+                                        }
+                                        
+                                        prevDepth = depth;
+                                        
+                                        // Cache the filler material for this column
+                                        fillerCache[colIndex] = (byte)fillerBlock;
+                                        
+                                        if (globalY >= 63)
+                                        {
+                                            data[idx] = (byte)topBlock;
+#if LOGGING
+                                            if (enableVerboseLogging)
+                                            {
+                                                biomeColumnsProcessed++;
+                                                biomeTopAssignments++;
+                                            }
+#endif
+                                        }
+                                        else
+                                        {
+                                            data[idx] = (byte)fillerBlock;
+#if LOGGING
+                                            if (enableVerboseLogging)
+                                            {
+                                                if (fillerBlock == BlockMaterial.SAND) biomeSandAssignments++;
+                                                else if (fillerBlock == BlockMaterial.SANDSTONE) biomeSandstoneAssignments++;
+                                                else if (fillerBlock == BlockMaterial.GRAVEL) biomeGravelAssignments++;
+                                                else biomeFillerAssignments++;
+                                            }
+#endif
+                                        }
+                                    }
+                                    else if (prevDepth > 0)
+                                    {
+                                        // CRITICAL: Match Beta 1.7.3 logic exactly
+                                        // Decrement depth FIRST
+                                        prevDepth--;
+                                        
+                                        // Get cached filler material (don't reset it from biome!)
+                                        BlockMaterial fillerBlock = (BlockMaterial)fillerCache[colIndex];
+                                        
+                                        // Place the filler block
+                                        data[idx] = (byte)fillerBlock;
+                                        
+                                        // AFTER placing, check if we hit 0 depth with sand
+                                        if (prevDepth == 0 && fillerBlock == BlockMaterial.SAND)
+                                        {
+                                            // Add random 0-3 more layers of sandstone
+                                            prevDepth = random.NextInt(4);
+                                            fillerBlock = BlockMaterial.SANDSTONE;
+                                            fillerCache[colIndex] = (byte)fillerBlock;  // Update cache!
+                                        }
+                                        
+#if LOGGING
+                                        if (enableVerboseLogging)
+                                        {
+                                            if (fillerBlock == BlockMaterial.SAND) biomeSandAssignments++;
+                                            else if (fillerBlock == BlockMaterial.SANDSTONE) biomeSandstoneAssignments++;
+                                            else if (fillerBlock == BlockMaterial.GRAVEL) biomeGravelAssignments++;
+                                            else biomeFillerAssignments++;
+                                        }
+#endif
+                                    }
+                                }
                             }
                             
-                            ushort blockData = workingChunkData[index];
-                            BlockMaterial block = (BlockMaterial)(blockData & 0xFF);
+                            // Save depth AND filler material for next chunk
+                            depthCache[colIndex] = prevDepth;
+                            // Note: fillerCache is updated during processing
+                        }
+                    }
 
-                            if (block == BlockMaterial.AIR) { prevDepth = -1; continue; }
-                            if (block != BlockMaterial.STONE) continue;
-
-                            if (prevDepth == -1)
+                    // Apply bedrock only in bottom world chunk (global Y 0..4)
+                    if (currentChunkY == 0)
+                    {
+                        int maxLocal = sizeY - 1;
+                        if (maxLocal > 4) maxLocal = 4;
+                        byte bedrockID = bedrockBlockID;
+                        for (int yLocal = 0; yLocal <= maxLocal; yLocal++)
+                        {
+                            int globalY = chunkYBase + yLocal;
+                            int yBase = yLocal * xyStride;
+                            for (int z = 0; z < sizeXZ; z++)
                             {
-                                if (depth <= 0) { topBlock = BlockMaterial.AIR; fillerBlock = BlockMaterial.STONE; }
-                                else if (y >= oceanHeight_rb - 4 && y <= oceanHeight_rb + 1)
+                                int zBase = z * sizeXZ;
+                                for (int x = 0; x < sizeXZ; x++)
                                 {
-                                    topBlock = (BlockMaterial)BiomeOld.top(biome);
-                                    fillerBlock = (BlockMaterial)BiomeOld.filler(biome);
-                                    if (gravel) { topBlock = BlockMaterial.AIR; fillerBlock = BlockMaterial.GRAVEL; }
-                                    if (sand) { topBlock = BlockMaterial.SAND; fillerBlock = BlockMaterial.SAND; }
-                                }
-                                if (y < oceanHeight_rb && topBlock == BlockMaterial.AIR) topBlock = BlockMaterial.STATIONARY_WATER;
-                                
-                                prevDepth = depth;
-                                if (y >= oceanHeight_rb - 1) workingChunkData[index] = world.PackBlockData((byte)topBlock);
-                                else workingChunkData[index] = world.PackBlockData((byte)fillerBlock);
-                                continue;
-                            }
-                            if (prevDepth > 0)
-                            {
-                                prevDepth--;
-                                workingChunkData[index] = world.PackBlockData((byte)fillerBlock);
-                                if (prevDepth == 0 && fillerBlock == BlockMaterial.SAND)
-                                {
-                                    prevDepth = rand.NextInt(4);
-                                    fillerBlock = BlockMaterial.SANDSTONE;
+                                    if (globalY <= random.NextInt(5))
+                                    {
+                                        int idx = yBase + zBase + x;
+                                        data[idx] = bedrockID;
+#if LOGGING
+                                        if (enableVerboseLogging) biomeBedrockAssignments++;
+#endif
+                                    }
                                 }
                             }
                         }
-                        
-                        // Save the final depth back to the cache for the next chunk below
-                        columnDepthCache[z * world.chunkSizeXZ + x] = prevDepth;
                     }
                 }
                 
-#if UNITY_EDITOR
-                if (enableVerboseLogging) time_ReplacingBiomes += (Time.realtimeSinceStartup - stepTimer) * 1000f;
+#if LOGGING
+                if (enableVerboseLogging) time_ReplacingBiomes += (float)(DateTime.UtcNow - stepStartTime).TotalMilliseconds;
 #endif
                 currentState = GenerationState.Complete;
                 
-                return false;
+                break;
 
             case GenerationState.Complete:
                 completedData = workingChunkData;
-#if UNITY_EDITOR
+#if LOGGING
                 if (enableVerboseLogging)
                 {
-                    float totalTime = (Time.realtimeSinceStartup - time_Total) * 1000f;
+                    // Calculate actual per-chunk work time (excluding cached column preparation)
+                    float actualChunkTime = time_GeneratingTerrain + time_ReplacingBiomes;
+                    float totalTime = (float)(DateTime.UtcNow - time_Total_Start).TotalMilliseconds;
+                    
+                    // Use cached timings for display (they're computed once per column)
+                    float display_time_Preparation = timingsCached ? cached_time_Preparation : time_Preparation;
+                    float display_time_Prep_GetBiomes = timingsCached ? cached_time_Prep_GetBiomes : time_Prep_GetBiomes;
+                    float display_time_Prep_SandNoise = timingsCached ? cached_time_Prep_SandNoise : time_Prep_SandNoise;
+                    float display_time_Prep_GravelNoise = timingsCached ? cached_time_Prep_GravelNoise : time_Prep_GravelNoise;
+                    float display_time_Prep_StoneNoise = timingsCached ? cached_time_Prep_StoneNoise : time_Prep_StoneNoise;
+                    float display_time_Prep_AllocNoiseCache = timingsCached ? cached_time_Prep_AllocNoiseCache : time_Prep_AllocNoiseCache;
+                    float display_time_NoiseGen1 = timingsCached ? cached_time_NoiseGen1 : time_NoiseGen1;
+                    float display_time_NoiseGen2 = timingsCached ? cached_time_NoiseGen2 : time_NoiseGen2;
+                    float display_time_NoiseGen3 = timingsCached ? cached_time_NoiseGen3 : time_NoiseGen3;
+                    float display_time_Noise6 = timingsCached ? cached_time_Noise6 : time_Noise6;
+                    float display_time_Noise7 = timingsCached ? cached_time_Noise7 : time_Noise7;
+                    float display_time_NoiseCombine = timingsCached ? cached_time_NoiseCombine : time_NoiseCombine;
+                    int display_noiseGen1Cells = timingsCached ? cached_noiseGen1Cells : noiseGen1Cells;
+                    int display_noiseGen2Cells = timingsCached ? cached_noiseGen2Cells : noiseGen2Cells;
+                    int display_noiseGen3Cells = timingsCached ? cached_noiseGen3Cells : noiseGen3Cells;
+                    int display_noise6Cells = timingsCached ? cached_noise6Cells : noise6Cells;
+                    int display_noise7Cells = timingsCached ? cached_noise7Cells : noise7Cells;
+                    int display_noiseCombineCells = timingsCached ? cached_noiseCombineCells : noiseCombineCells;
+                    
                     logBuilder.Clear();
                     logBuilder.Append("--- Terrain Gen Timings for Chunk (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(") ---").AppendLine();
-                    logBuilder.Append("1. Preparation:         ").Append(time_Preparation.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("2. Terrain Generation:  ").Append(time_GeneratingTerrain.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("3. Biome Block Replace: ").Append(time_ReplacingBiomes.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("Total Time-Sliced Gen:  ").Append(totalTime.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("1. Preparation (Total): ").Append(display_time_Preparation.ToString("F3")).Append(" ms");
+                    if (timingsCached) logBuilder.Append(" [Cached per column]");
+                    logBuilder.AppendLine();
+                    logBuilder.Append("   1a. GetBiomes:       ").Append(display_time_Prep_GetBiomes.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("   1b. SandNoise:       ").Append(display_time_Prep_SandNoise.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("   1c. GravelNoise:     ").Append(display_time_Prep_GravelNoise.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("   1d. StoneNoise:      ").Append(display_time_Prep_StoneNoise.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("   1e. AllocNoiseCache: ").Append(display_time_Prep_AllocNoiseCache.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("2. Noise3D Stages:");
+                    if (timingsCached) logBuilder.Append(" [Cached per column]");
+                    logBuilder.AppendLine();
+                    logBuilder.Append("   2a. NoiseGen1:       ").Append(display_time_NoiseGen1.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseGen1Cells).Append(")").AppendLine();
+                    logBuilder.Append("   2b. NoiseGen2:       ").Append(display_time_NoiseGen2.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseGen2Cells).Append(")").AppendLine();
+                    logBuilder.Append("   2c. NoiseGen3:       ").Append(display_time_NoiseGen3.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseGen3Cells).Append(")").AppendLine();
+                    logBuilder.Append("   2d. Noise6:          ").Append(display_time_Noise6.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noise6Cells).Append(")").AppendLine();
+                    logBuilder.Append("   2e. Noise7:          ").Append(display_time_Noise7.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noise7Cells).Append(")").AppendLine();
+                    logBuilder.Append("   2f. CombineNoise:    ").Append(display_time_NoiseCombine.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseCombineCells).Append(")").AppendLine();
+                    logBuilder.Append("3. Terrain Generation:  ").Append(time_GeneratingTerrain.ToString("F3")).Append(" ms").Append(" (steps: ").Append(terrain_gen_step_count).Append(")").AppendLine();
+                    logBuilder.Append("   3a. Voxels visited:  ").Append(terrainVoxelsVisited).Append(", Assignments: ").Append(terrainAssignments).AppendLine();
+                    logBuilder.Append("   3b. Stone: ").Append(terrainStoneAssignments).Append(", Water: ").Append(terrainWaterAssignments).Append(", Ice: ").Append(terrainIceAssignments).AppendLine();
+                    logBuilder.Append("4. Replace Biomes:      ").Append(time_ReplacingBiomes.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("   4a. Columns visited: ").Append(256).AppendLine();
+                    logBuilder.Append("   4b. Top: ").Append(biomeTopAssignments).Append(", Filler: ").Append(biomeFillerAssignments).Append(", Bedrock: ").Append(biomeBedrockAssignments).AppendLine();
+                    logBuilder.Append("   4c. Water: ").Append(biomeWaterAssignments).Append(", Gravel: ").Append(biomeGravelAssignments).Append(", Sand: ").Append(biomeSandAssignments).Append(", Sandstone: ").Append(biomeSandstoneAssignments).AppendLine();
+                    logBuilder.Append("--- Performance Summary ---").AppendLine();
+                    logBuilder.Append("Actual Per-Chunk Work:  ").Append(actualChunkTime.ToString("F3")).Append(" ms (3+4 only)").AppendLine();
+                    logBuilder.Append("Total Time-Sliced Gen:  ").Append(totalTime.ToString("F3")).Append(" ms (wall-clock time across all frames)").AppendLine();
+                    logBuilder.Append("--- Per-Step Performance ---").AppendLine();
+                    logBuilder.Append("Total Steps: ").Append(totalSteps).AppendLine();
+                    logBuilder.Append("Last Step: ").Append(lastStepTime.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("Max Step: ").Append(maxStepTime.ToString("F3")).Append(" ms").AppendLine();
+                    logBuilder.Append("Min Step: ").Append(minStepTime.ToString("F3")).Append(" ms").AppendLine();
+                    float avgStepTime = totalSteps > 0 ? totalTime / totalSteps : 0f;
+                    logBuilder.Append("Avg Step: ").Append(avgStepTime.ToString("F3")).Append(" ms").AppendLine();
                     Debug.Log(logBuilder.ToString());
                 }
 #endif
                 currentState = GenerationState.Idle;
-                return true;
+                isComplete = true;
+                break;
 
             default:
                 currentState = GenerationState.Idle;
-                return true;
+                isComplete = true;
+                break;
         }
+        
+#if LOGGING
+        if (enableVerboseLogging)
+        {
+            // Track per-step timing
+            lastStepTime = (Time.realtimeSinceStartup - frameStepStart) * 1000f;
+            if (lastStepTime > maxStepTime) maxStepTime = lastStepTime;
+            if (lastStepTime < minStepTime) minStepTime = lastStepTime;
+            totalSteps++;
+        }
+#endif
+        
+        return isComplete;
     }
 
     public void initRand(int chunkX, int chunkZ)

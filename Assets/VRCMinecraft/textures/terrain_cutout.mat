@@ -103,6 +103,8 @@ Material:
     - _Metallic: 0
     - _Mode: 0
     - _OcclusionStrength: 1
+    - _OffsetFactor: -0.7
+    - _OffsetUnits: -0.7
     - _Parallax: 0.02
     - _Shininess: 0.2
     - _SkyLight: 15

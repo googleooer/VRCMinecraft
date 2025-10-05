@@ -96,7 +96,7 @@ Material:
     - _Exposure: 1
     - _FogEnd: 0.35
     - _FogRatio: 0.08
-    - _FogSize: 0.2
+    - _FogSize: 0.12
     - _FogStart: 0.35
     - _GlossMapScale: 1
     - _Glossiness: 0.5
@@ -128,7 +128,7 @@ Material:
     - _SunMoonSize: 0.25
     - _SunSize: 0.05
     - _TimeOfDay: 0
-    - _TransitionSize: 0.01
+    - _TransitionSize: 0.09
     - _UVSec: 0
     - _ZWrite: 1
     - _mult: 7.56

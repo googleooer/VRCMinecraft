@@ -102,11 +102,6 @@ public class McBlockTypeManager : UdonSharpBehaviour
     private AudioClip[] _prefilteredFallbackPlaceSounds;
     private AudioClip[] _prefilteredFallbackFootstepSounds;
 
-    private byte[] _cache_isSolid; // NEW – 1 == solid, 0 == not
-    private byte[] _cache_visibility; // NEW – BlockVisibilityType as byte
-    private byte[] _cache_culling; // NEW – BlockCullingType as byte
-
-
     void Start()
     {
         float startTime = Time.realtimeSinceStartup;
@@ -140,9 +135,6 @@ public class McBlockTypeManager : UdonSharpBehaviour
         // Pre-filtering sounds is always needed for runtime.
         PreFilterAllSounds();
 
-        // --- NEW: Build fast lookup caches for runtime ---
-        BuildMetadataCaches();
-
         #if UNITY_EDITOR
         if (enableVerboseLogging)
         {
@@ -169,17 +161,6 @@ public class McBlockTypeManager : UdonSharpBehaviour
     private void BuildMetadataCaches()
     {
         int total = (finalDataArray != null) ? finalDataArray.Length : 0;
-        _cache_isSolid = new byte[total <= 0 ? 256 : total];
-        _cache_visibility = new byte[_cache_isSolid.Length];
-        _cache_culling = new byte[_cache_isSolid.Length];
-
-        for (int i = 0; i < _cache_isSolid.Length; i++)
-        {
-            ushort packed = (i < total) ? finalDataArray[i] : (ushort)0;
-            _cache_isSolid[i] = (byte)((packed & 1) != 0 ? 1 : 0);
-            _cache_visibility[i] = (byte)((packed >> 1) & 0x3);
-            _cache_culling[i] = (byte)((packed >> 3) & 0x7);
-        }
     }
     
     /// <summary>
@@ -275,14 +256,13 @@ public class McBlockTypeManager : UdonSharpBehaviour
         if (blockNames != null && blockID >= 0 && blockID < blockNames.Length) return blockNames[blockID];
         if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockName] Invalid ID {blockID}.");
         return "Unknown Block";
-        #else
+        #else 
         return "N/A in build";
         #endif
     }
 
     public bool GetBlockIsSolid(byte blockID)
     {
-        if (_cache_isSolid != null && blockID < _cache_isSolid.Length) return _cache_isSolid[blockID] == 1;
         if (finalDataArray != null && blockID < finalDataArray.Length)
             return (finalDataArray[blockID] & 1) != 0;
         return false;
@@ -290,7 +270,6 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public BlockVisibilityType GetBlockVisibilityType(byte blockID)
     {
-        if (_cache_visibility != null && blockID < _cache_visibility.Length) return (BlockVisibilityType)_cache_visibility[blockID];
         if (finalDataArray != null && blockID < finalDataArray.Length)
             return (BlockVisibilityType)((finalDataArray[blockID] >> 1) & 0x3);
         return BlockVisibilityType.Opaque;
@@ -298,7 +277,6 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public BlockCullingType GetBlockCullingType(byte blockID)
     {
-        if (_cache_culling != null && blockID < _cache_culling.Length) return (BlockCullingType)_cache_culling[blockID];
         if (finalDataArray != null && blockID < finalDataArray.Length)
             return (BlockCullingType)((finalDataArray[blockID] >> 3) & 0x7);
         return BlockCullingType.CullAll;

@@ -18,6 +18,8 @@ public class MCTerrainCombinedShaderGUI : ShaderGUI
     private MaterialProperty dstBlendProp;
     private MaterialProperty zWriteProp;
     private MaterialProperty cullProp;
+    private MaterialProperty offsetFactorProp;
+    private MaterialProperty offsetUnitsProp;
 
     public override void OnGUI(MaterialEditor materialEditor, MaterialProperty[] props)
     {
@@ -34,6 +36,8 @@ public class MCTerrainCombinedShaderGUI : ShaderGUI
         dstBlendProp = FindProperty("_DstBlend", props);
         zWriteProp = FindProperty("_ZWrite", props);
         cullProp = FindProperty("_Cull", props);
+        offsetFactorProp = FindProperty("_OffsetFactor", props);
+        offsetUnitsProp = FindProperty("_OffsetUnits", props);
 
         // Cast materialEditor.target to Material
         Material material = materialEditor.target as Material;
@@ -79,6 +83,11 @@ public class MCTerrainCombinedShaderGUI : ShaderGUI
         EditorGUILayout.EnumPopup("Cull Mode", (CullMode)material.GetInt("_Cull"));
         EditorGUILayout.IntField("Render Queue", material.renderQueue);
         EditorGUI.EndDisabledGroup();
+         
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField("Depth Offset (Manual Control)", EditorStyles.boldLabel);
+        materialEditor.ShaderProperty(offsetFactorProp, "Offset Factor");
+        materialEditor.ShaderProperty(offsetUnitsProp, "Offset Units");
 
 
         // Apply changes to the material

@@ -1,6 +1,6 @@
 public class NoiseGeneratorOctaves3D
 {
-    private readonly NoiseGenerator3dPerlin[] generatorCollection;
+    public readonly NoiseGenerator3dPerlin[] generatorCollection; // OPTIMIZED: Public for octave-by-octave generation
     private readonly int octaves;
 
     // Converted from Java to C#
@@ -29,18 +29,21 @@ public class NoiseGeneratorOctaves3D
 
     public double[] generateNoiseOctaves(double[] array, double x, double y, double z, int xSize, int ySize, int zSize, double gridX, double gridY, double gridZ)
     {
+        int totalSize = xSize * ySize * zSize;
         if(array == null)
         {
-            array = new double[xSize * ySize * zSize];
+            array = new double[totalSize];
         } else {
-            for(int i = 0; i < array.Length; i++){
-                array[i] = 0.0D;
-            }
+            // Optimized: Use System.Array.Clear for faster zeroing
+            System.Array.Clear(array, 0, array.Length);
         }
         double frequency = 1.0D;
-        for(int i = 0; i < octaves; i++){
-            generatorCollection[i].generateNoiseArray(array, x, y, z, xSize, ySize, zSize, gridX * frequency, gridY * frequency, gridZ * frequency, frequency);
-            frequency /= 2.0D;
+        NoiseGenerator3dPerlin[] gens = generatorCollection;
+        int octCount = octaves;
+        
+        for(int i = 0; i < octCount; i++){
+            gens[i].generateNoiseArray(array, x, y, z, xSize, ySize, zSize, gridX * frequency, gridY * frequency, gridZ * frequency, frequency);
+            frequency *= 0.5D;
         }
         return array;
     }

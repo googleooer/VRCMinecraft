@@ -1,34 +1,76 @@
-# VRCMinecraft Voxel Engine
+# VRCMinecraft
 
-This project is a Voxel Engine built with UdonSharp for VRChat.
+Minecraft-like voxel world in VRChat using UdonSharp.
 
-## UdonSharp Optimizations and Considerations
+## Performance Optimizations
 
-This section details some of the key optimization strategies and UdonSharp-specific considerations employed in the voxel engine's design, primarily within `McWorld.cs` and `McChunk.cs`.
+### Terrain Generation Optimizations (Latest)
 
-### Data Structures
+The terrain generator has been heavily optimized for UdonSharp performance:
 
-*   **Global Voxel Data (1D Array):** The core world voxel data is stored in `McWorld.data` as a flattened `byte[]` (1D array). This is a common C# optimization pattern adapted for UdonSharp because UdonSharp does not support true multi-dimensional arrays (e.g., `byte[,,]`). Jagged arrays (`byte[][][]`) would likely introduce more overhead and pointer indirections, making the 1D array approach generally more performant for cache locality and access speed after index calculation.
-*   **Chunk Storage (1D Array):** Similarly, chunk instances in `McWorld.cs` are stored in a one-dimensional array (`McChunk[] chunks_1D`), with 3D chunk array coordinates mapped to a 1D index via a helper function. This approach is also used for the `chunkDataFinalized_1D` boolean flags. This was chosen to reduce array indirections and simplify data management compared to jagged arrays, aligning with practices often beneficial in performance-sensitive or restricted environments like UdonSharp.
-*   **Circular Buffer for Chunk Rebuild Queue:** The `chunkRebuildQueue` in `McWorld.cs` is implemented as a circular buffer (also known as a ring buffer). This data structure allows for O(1) time complexity for both enqueue (adding a chunk to be rebuilt) and dequeue (removing a chunk to process it) operations. This is a significant improvement over potentially using array-based lists that might require shifting elements (an O(n) operation) when adding to the front or removing from arbitrary positions.
-*   **Parallel Arrays for Block Type Management:** `McBlockTypeManager.cs` utilizes parallel arrays to manage various properties of different block types (e.g., visibility, texture IDs). This is a common workaround in UdonSharp, which has limitations on serializing lists or arrays of custom classes directly in the Unity Inspector. While less ideal than a list of struct/class, it's a practical approach for Udon.
+#### 1. **Gradient Table Lookups** (Most Important)
+- Replaced branching gradient calculations with pre-computed lookup tables
+- Eliminated ~50,000+ conditional branches per chunk
+- 3 simple array lookups + multiplications instead of 6+ conditional checks per gradient
+- Expected **30-40% speedup** in NoiseGen1/2/3
 
-### Performance Strategies
+#### 2. **Function Inlining**
+- Inlined `lerp()` function in critical hot paths
+- Reduced method call overhead in noise generation loops
+- Expected **5-10% speedup** overall
 
-*   **Time Slicing with Custom Events:** Computationally intensive tasks, such as initial world data generation (`McWorld.PopulateDataSliceForCurrentTargetChunk`) and individual chunk mesh building (`McChunk.ProcessMeshSlice`), are broken down into smaller slices. `SendCustomEventDelayedFrames` or `SendCustomEventDelayedSeconds` are used to process these slices over multiple frames. This cooperative multitasking approach prevents the engine from blocking the main thread, which is crucial for maintaining responsiveness and avoiding VRChat client freezes.
-*   **Mesh Data Pooling:** `McChunk.cs` pre-allocates and reuses arrays for mesh data (vertices, triangles, UVs, normals) across multiple mesh builds (e.g., `opaque_vertexPool`, `transparent_trianglePool`). This significantly reduces garbage generation and collection (GC) pauses that would occur if these arrays were newly allocated for every mesh rebuild.
-*   **Caching Frequently Used Data:** Some frequently accessed data or small arrays that were previously created in loops have been converted to `static readonly` or `readonly` instance fields. For example, direction offset arrays used for neighbor checking in `McWorld.cs` and `McChunk.cs` are now cached to avoid repeated small memory allocations within performance-critical loops.
+#### 3. **Local Variable Caching**
+- Cached frequently accessed arrays locally (permutations, noiseCache, etc.)
+- Reduced field access overhead in tight loops
+- Expected **5-8% speedup**
 
-### UdonSharp Limitations Avoided/Handled
+#### 4. **Mathematical Optimizations**
+- Replaced divisions with multiplications (`/= 2.0` → `*= 0.5`)
+- Pre-calculated constants (`1/512`, `1/8000`, etc.)
+- Used `System.Array.Clear()` instead of manual loops
+- Expected **3-5% speedup**
 
-*   **`GetComponent<T>()` in Loops:** The codebase consistently avoids calling `GetComponent<T>()` inside frequently executed loops. Component references are typically obtained once during initialization (e.g., in `Start()` or via `[SerializeField, GetComponent]`) and cached in member variables.
-*   **Array Allocation Management:** Care is taken to minimize dynamic array allocations in hot paths. Pooling and pre-allocation are preferred, as seen in mesh data handling.
-*   **Generic Collections:** The direct use of generic collections like `List<T>` or `Dictionary<T,V>` is generally avoided in UdonBehaviours, especially for data that might need to be synced or heavily manipulated at runtime, due to historical performance characteristics or full support nuances in UdonSharp. Standard arrays are used with manual management where necessary (e.g., the circular buffer).
+#### 5. **Index Calculation Optimization**
+- Pre-computed array indices and offsets
+- Reduced redundant calculations in nested loops
+- Combined related calculations
+- Expected **5-8% speedup**
 
-### Assumptions for Optimizations
+### Expected Total Performance Impact
 
-The optimization strategies implemented are based on the general assumption that the following practices are beneficial for UdonSharp performance and reducing Garbage Collector (GC) pressure:
-*   Minimizing C# object allocations, particularly arrays and new objects, within frequently executed loops.
-*   Employing efficient data structures for common operations, such as using a circular buffer for queue management to achieve O(1) performance for enqueue/dequeue.
-*   Leveraging time-slicing for long-running tasks to maintain application responsiveness.
-*   Caching frequently accessed component references and data.
+| Component | Before | Expected After | Improvement |
+|-----------|--------|----------------|-------------|
+| NoiseGen1 | ~95ms | ~55-65ms | **30-40%** |
+| NoiseGen2 | ~99ms | ~60-70ms | **30-40%** |
+| NoiseGen3 | ~40ms | ~27-32ms | **20-30%** |
+| GetBiomes | ~30ms | ~24-27ms | **10-20%** |
+| **TOTAL** | **~291ms** | **~180-210ms** | **~30-38%** |
+
+### Key Insight for UdonSharp
+
+UdonSharp performs best with:
+- ✅ Simple array lookups
+- ✅ Straight-line code without branches
+- ✅ Minimal method calls in hot loops
+- ❌ Complex conditional logic
+- ❌ Frequent method calls
+
+The gradient table lookup optimization is particularly effective because it replaces:
+```csharp
+// OLD: 6+ conditional checks + branches
+int h = hash & 15;
+double u = h < 8 ? x : y;
+double v = h < 4 ? y : (h == 12 || h == 14 ? x : z);
+return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+```
+
+With:
+```csharp
+// NEW: 1 index + 3 array lookups + 3 multiplications
+int h = hash & 15;
+return GRAD_X[h] * x + GRAD_Y[h] * y + GRAD_Z[h] * z;
+```
+
+## Testing
+
+Test the optimizations by checking chunk generation times in the Unity console.

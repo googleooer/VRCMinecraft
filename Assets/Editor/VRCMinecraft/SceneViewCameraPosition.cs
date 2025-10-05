@@ -36,15 +36,21 @@ public class SceneViewCameraPosition
         }
 
         Vector3 camPos = sceneView.camera.transform.position;
-        string text = $"XYZ: {Mathf.Floor(camPos.x):F2}, {Mathf.Floor(camPos.y):F2}, {Mathf.Floor(camPos.z):F2}";
+        
+        // Show both Unity and Minecraft coordinates
+        Vector3Int mcCoords = McUtils.UnityToMinecraftCoords(camPos, true);
+        string unityText = $"Unity XYZ: {Mathf.Floor(camPos.x)}, {Mathf.Floor(camPos.y)}, {Mathf.Floor(camPos.z)}";
+        string mcText = $"MC XYZ: {mcCoords.x}, {mcCoords.y}, {mcCoords.z}";
 
         Handles.BeginGUI();
         
-        // Define the rectangle for the label in the bottom-left corner
-        Rect rect = new(10, sceneView.position.height - 40*2, 220, 20);
+        // Draw Unity coordinates
+        Rect rect1 = new(10, sceneView.position.height - 40*3, 280, 20);
+        GUI.Label(rect1, unityText, style);
         
-        // Draw the label
-        GUI.Label(rect, text, style);
+        // Draw Minecraft coordinates
+        Rect rect2 = new(10, sceneView.position.height - 40*2, 280, 20);
+        GUI.Label(rect2, mcText, style);
         
         Handles.EndGUI();
     }

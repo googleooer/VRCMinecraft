@@ -15,6 +15,8 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
         [HideInInspector] _DstBlend ("DstBlend Mode", Int) = 0 // MODIFIED: Float to Int. Default: UnityEngine.Rendering.BlendMode.Zero
         [HideInInspector] _ZWrite ("ZWrite", Int) = 1       // MODIFIED: Float to Int. Default: On (1)
         [HideInInspector] _Cull ("Cull Mode", Int) = 2        // MODIFIED: Float to Int. Default: UnityEngine.Rendering.CullMode.Back (2)
+        [HideInInspector] _OffsetFactor ("Offset Factor", Float) = 0 // ADDED: Depth offset factor
+        [HideInInspector] _OffsetUnits ("Offset Units", Float) = 0 // ADDED: Depth offset units
     }
     SubShader
     {
@@ -32,6 +34,7 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             Blend [_SrcBlend] [_DstBlend]
             ZWrite [_ZWrite]
             Cull [_Cull]
+            Offset [_OffsetFactor], [_OffsetUnits]
 
             // Default states for Opaque/Cutout: ZWrite On, Cull Back, Blend Off
             // For Transparent mode, these need to be changed manually on the material:
@@ -43,6 +46,7 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             // make fog work  
             #pragma multi_compile_fog
             #pragma shader_feature_local _SURFACETYPE_OPAQUE _SURFACETYPE_CUTOUT _SURFACETYPE_TRANSPARENT // ADDED: Shader features for surface types
+
 
             #include "UnityCG.cginc"
 
