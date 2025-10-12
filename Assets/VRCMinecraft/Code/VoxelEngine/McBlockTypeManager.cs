@@ -67,6 +67,8 @@ public class McBlockTypeManager : UdonSharpBehaviour
     public int[] blockCullingTypeData;  // NEW
     public int[] blockShapeTypeData; 
     public int[] textureMappingTypeData;
+    public int[] lightOpacityData; // NEW: 0=air/tallgrass, 1=leaves, 3=water, 15=solid blocks
+    public int[] lightEmissionData; // NEW: Light emission 0-15 (0=none, 7=redstone torch, 14=torch, 15=glowstone/lava)
 
     [Header("UV Data (Runtime)")]
     public int[] uv_allFacesData;
@@ -119,6 +121,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
         if (blockCullingTypeData == null || blockCullingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockCullingTypeData", numberOfBlockTypes, (blockCullingTypeData != null ? blockCullingTypeData.Length : -1))); arraysValid = false; }
         if (blockShapeTypeData == null || blockShapeTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockShapeTypeData", numberOfBlockTypes, (blockShapeTypeData != null ? blockShapeTypeData.Length : -1))); arraysValid = false; }
         if (textureMappingTypeData == null || textureMappingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "textureMappingTypeData", numberOfBlockTypes, (textureMappingTypeData != null ? textureMappingTypeData.Length : -1))); arraysValid = false; }
+        if (lightOpacityData == null || lightOpacityData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "lightOpacityData", numberOfBlockTypes, (lightOpacityData != null ? lightOpacityData.Length : -1))); arraysValid = false; }
         if (uv_allFacesData == null || uv_allFacesData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_allFacesData", numberOfBlockTypes, (uv_allFacesData != null ? uv_allFacesData.Length : -1))); arraysValid = false; }
         if (uv_topFaceData == null || uv_topFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_topFaceData", numberOfBlockTypes, (uv_topFaceData != null ? uv_topFaceData.Length : -1))); arraysValid = false; }
         if (uv_bottomFaceData == null || uv_bottomFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_bottomFaceData", numberOfBlockTypes, (uv_bottomFaceData != null ? uv_bottomFaceData.Length : -1))); arraysValid = false; }
@@ -178,13 +181,24 @@ public class McBlockTypeManager : UdonSharpBehaviour
             // Bits 3-5:      CullingType (3 bits)
             // Bits 6-7:      ShapeType (2 bits)
             // Bits 8-9:      TextureMappingType (2 bits)
-            // Bits 10-15:    Unused (6 bits)
+            // Bits 10-13:    LightOpacity (4 bits) - 0-15
+            // Bits 14-15:    LightEmission (2 bits) - compressed: 0=none, 1=weak(7), 2=medium(12), 3=full(15)
 
             if (isSolidData[i]) data |= (1 << 0);
             data |= (ushort)(blockVisibilityTypeData[i] << 1);
             data |= (ushort)(blockCullingTypeData[i] << 3);
             data |= (ushort)(blockShapeTypeData[i] << 6);
             data |= (ushort)(textureMappingTypeData[i] << 8);
+            data |= (ushort)((lightOpacityData[i] & 0xF) << 10);
+            
+            // Compress light emission: 0-7 → 0 or 1, 8-13 → 2, 14-15 → 3
+            int emission = lightEmissionData != null && i < lightEmissionData.Length ? lightEmissionData[i] : 0;
+            int compressed = 0;
+            if (emission >= 14) compressed = 3;      // 14-15 → full (15)
+            else if (emission >= 10) compressed = 2; // 10-13 → medium (12)
+            else if (emission >= 5) compressed = 1;  // 5-9 → weak (7)
+            else compressed = 0;                     // 0-4 → none (0)
+            data |= (ushort)(compressed << 14);
             
             finalDataArray[i] = data;
         }
@@ -294,6 +308,27 @@ public class McBlockTypeManager : UdonSharpBehaviour
         if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
             return (finalDataArray[blockID] >> 8) & 0x3; // Bits 8-9
         return (int)McBlockTextureMappingType.AllFacesSame;
+    }
+    
+    public int GetBlockLightOpacity(byte blockID)
+    {
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+            return (finalDataArray[blockID] >> 10) & 0xF; // Bits 10-13
+        return 0;
+    }
+    
+    public int GetBlockLightEmission(byte blockID)
+    {
+        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+        {
+            int compressed = (finalDataArray[blockID] >> 14) & 0x3; // Bits 14-15
+            // Decompress: 0=none(0), 1=weak(7), 2=medium(12), 3=full(15)
+            if (compressed == 3) return 15;
+            if (compressed == 2) return 12;
+            if (compressed == 1) return 7;
+            return 0;
+        }
+        return 0;
     }
     
     public int GetBlockTextureSlice_AllFaces(byte blockID)

@@ -18,7 +18,9 @@ public class McBlockTypeManagerEditor : Editor
     private SerializedProperty isSolidDataProp;
     private SerializedProperty blockVisibilityTypeDataProp;
     private SerializedProperty blockCullingTypeDataProp; // NEW
-    private SerializedProperty blockShapeTypeDataProp; 
+    private SerializedProperty blockShapeTypeDataProp;
+    private SerializedProperty lightOpacityDataProp; // NEW: Light opacity for lighting system
+    private SerializedProperty lightEmissionDataProp; // NEW: Light emission for lighting system
     private SerializedProperty uv_allFacesDataProp;
     private SerializedProperty uv_topFaceDataProp;
     private SerializedProperty uv_bottomFaceDataProp;
@@ -165,7 +167,9 @@ public class McBlockTypeManagerEditor : Editor
         isSolidDataProp = soTarget.FindProperty("isSolidData");
         blockVisibilityTypeDataProp = soTarget.FindProperty("blockVisibilityTypeData");
         blockCullingTypeDataProp = soTarget.FindProperty("blockCullingTypeData"); // NEW
-        blockShapeTypeDataProp = soTarget.FindProperty("blockShapeTypeData"); 
+        blockShapeTypeDataProp = soTarget.FindProperty("blockShapeTypeData");
+        lightOpacityDataProp = soTarget.FindProperty("lightOpacityData"); // NEW
+        lightEmissionDataProp = soTarget.FindProperty("lightEmissionData"); // NEW
         uv_allFacesDataProp = soTarget.FindProperty("uv_allFacesData"); 
         uv_topFaceDataProp = soTarget.FindProperty("uv_topFaceData"); 
         uv_bottomFaceDataProp = soTarget.FindProperty("uv_bottomFaceData"); 
@@ -382,7 +386,7 @@ public class McBlockTypeManagerEditor : Editor
         {
             float height = EditorGUIUtility.singleLineHeight; // Foldout header
             // Add heights for all properties shown when unfolded
-            height += (EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing) * 12; // Added 1 for culling type
+            height += (EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing) * 14; // Added 1 for light opacity, 1 for light emission
             
             // Texture Mapping
             var mappingTypeProp = textureMappingTypeDataProp.GetArrayElementAtIndex(index);
@@ -436,6 +440,8 @@ public class McBlockTypeManagerEditor : Editor
                 DrawEnumPopup<BlockVisibilityType>(ref propertyRect, blockVisibilityTypeDataProp.GetArrayElementAtIndex(index), "Visibility Type");
                 DrawEnumPopup<BlockCullingType>(ref propertyRect, blockCullingTypeDataProp.GetArrayElementAtIndex(index), "Culling Type"); // NEW
                 DrawEnumPopup<McBlockShapeType>(ref propertyRect, blockShapeTypeDataProp.GetArrayElementAtIndex(index), "Shape Type");
+                DrawIntSlider(ref propertyRect, lightOpacityDataProp.GetArrayElementAtIndex(index), 0, 15, "Light Opacity", "0=air, 1=leaves, 3=water, 15=opaque");
+                DrawIntSlider(ref propertyRect, lightEmissionDataProp.GetArrayElementAtIndex(index), 0, 15, "Light Emission", "0=none, 7=redstone torch, 12=furnace, 14=torch, 15=glowstone/lava");
                 
                 DrawLabel(ref propertyRect, "Texturing");
                 DrawEnumPopup<McBlockTextureMappingType>(ref propertyRect, textureMappingTypeDataProp.GetArrayElementAtIndex(index), "Texture Mapping");
@@ -490,6 +496,12 @@ public class McBlockTypeManagerEditor : Editor
         blockShapeTypeDataProp.arraySize = blockNamesProp.arraySize;
         blockShapeTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)McBlockShapeType.Cube;
 
+        lightOpacityDataProp.arraySize = blockNamesProp.arraySize;
+        lightOpacityDataProp.GetArrayElementAtIndex(index).intValue = 15; // Default to opaque
+
+        lightEmissionDataProp.arraySize = blockNamesProp.arraySize;
+        lightEmissionDataProp.GetArrayElementAtIndex(index).intValue = 0; // Default to no emission
+
         textureMappingTypeDataProp.arraySize = blockNamesProp.arraySize;
         textureMappingTypeDataProp.GetArrayElementAtIndex(index).intValue = (int)McBlockTextureMappingType.AllFacesSame;
 
@@ -540,6 +552,8 @@ public class McBlockTypeManagerEditor : Editor
         blockVisibilityTypeDataProp.MoveArrayElement(oldIndex, newIndex);
         blockCullingTypeDataProp.MoveArrayElement(oldIndex, newIndex); // NEW
         blockShapeTypeDataProp.MoveArrayElement(oldIndex, newIndex);
+        lightOpacityDataProp.MoveArrayElement(oldIndex, newIndex); // NEW
+        lightEmissionDataProp.MoveArrayElement(oldIndex, newIndex); // NEW
         textureMappingTypeDataProp.MoveArrayElement(oldIndex, newIndex);
         uv_allFacesDataProp.MoveArrayElement(oldIndex, newIndex);
         uv_topFaceDataProp.MoveArrayElement(oldIndex, newIndex);
@@ -575,6 +589,8 @@ public class McBlockTypeManagerEditor : Editor
         ResizeSerializedArray(blockVisibilityTypeDataProp, masterSize, () => (int)BlockVisibilityType.Opaque);
         ResizeSerializedArray(blockCullingTypeDataProp, masterSize, () => (int)BlockCullingType.CullAll); // NEW
         ResizeSerializedArray(blockShapeTypeDataProp, masterSize, () => (int)McBlockShapeType.Cube);
+        ResizeSerializedArray(lightOpacityDataProp, masterSize, () => 15); // NEW: Default to opaque
+        ResizeSerializedArray(lightEmissionDataProp, masterSize, () => 0); // NEW: Default to no emission
         ResizeSerializedArray(textureMappingTypeDataProp, masterSize, () => (int)McBlockTextureMappingType.AllFacesSame);
         ResizeSerializedArray(uv_allFacesDataProp, masterSize, () => 0);
         ResizeSerializedArray(uv_topFaceDataProp, masterSize, () => 0);
@@ -618,7 +634,8 @@ public class McBlockTypeManagerEditor : Editor
         if (count < 0) count = 0;
         return blockNamesProp.arraySize != count || isSolidDataProp.arraySize != count ||
             blockVisibilityTypeDataProp.arraySize != count || blockCullingTypeDataProp.arraySize != count ||
-            blockShapeTypeDataProp.arraySize != count ||
+            blockShapeTypeDataProp.arraySize != count || lightOpacityDataProp.arraySize != count ||
+            lightEmissionDataProp.arraySize != count ||
             uv_allFacesDataProp.arraySize != count || uv_topFaceDataProp.arraySize != count ||
             uv_bottomFaceDataProp.arraySize != count || uv_sideFacesDataProp.arraySize != count ||
             textureMappingTypeDataProp.arraySize != count || (manager.breakSounds != null && manager.breakSounds.Length != count) ||
@@ -631,7 +648,8 @@ public class McBlockTypeManagerEditor : Editor
         if (index >= count) return false;
         return !(index >= blockNamesProp.arraySize || index >= isSolidDataProp.arraySize ||
             index >= blockVisibilityTypeDataProp.arraySize || index >= blockCullingTypeDataProp.arraySize ||
-            index >= blockShapeTypeDataProp.arraySize ||
+            index >= blockShapeTypeDataProp.arraySize || index >= lightOpacityDataProp.arraySize ||
+            index >= lightEmissionDataProp.arraySize ||
             index >= uv_allFacesDataProp.arraySize || index >= uv_topFaceDataProp.arraySize ||
             index >= uv_bottomFaceDataProp.arraySize || index >= uv_sideFacesDataProp.arraySize ||
             index >= textureMappingTypeDataProp.arraySize || (manager.breakSounds != null && index >= manager.breakSounds.Length) ||
@@ -645,6 +663,8 @@ public class McBlockTypeManagerEditor : Editor
         blockVisibilityTypeDataProp.DeleteArrayElementAtIndex(index);
         blockCullingTypeDataProp.DeleteArrayElementAtIndex(index); // NEW
         blockShapeTypeDataProp.DeleteArrayElementAtIndex(index);
+        lightOpacityDataProp.DeleteArrayElementAtIndex(index); // NEW
+        lightEmissionDataProp.DeleteArrayElementAtIndex(index); // NEW
         textureMappingTypeDataProp.DeleteArrayElementAtIndex(index);
         uv_allFacesDataProp.DeleteArrayElementAtIndex(index);
         uv_topFaceDataProp.DeleteArrayElementAtIndex(index);
@@ -707,6 +727,11 @@ public class McBlockTypeManagerEditor : Editor
 
     private void DrawEnumPopup<T>(ref Rect rect, SerializedProperty prop, string label) where T : System.Enum {
         prop.intValue = System.Convert.ToInt32(EditorGUI.EnumPopup(rect, new GUIContent(label), (T)System.Enum.ToObject(typeof(T), prop.intValue)));
+        rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
+    }
+
+    private void DrawIntSlider(ref Rect rect, SerializedProperty prop, int min, int max, string label, string tooltip = "") {
+        prop.intValue = EditorGUI.IntSlider(rect, new GUIContent(label, tooltip), prop.intValue, min, max);
         rect.y += EditorGUIUtility.singleLineHeight + EditorGUIUtility.standardVerticalSpacing;
     }
 

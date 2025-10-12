@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+description: When consulting the Minecraft Beta 1.7.3 source code, only check *.java files.
+---

@@ -1,15 +1,15 @@
 ---
-description: Anything code-related
-globs: .cs
-alwaysApply: false
+alwaysApply: true
 ---
-
 # UdonSharp limitations
 Local method declarations are not currently supported by UdonSharp.
 Multidimensional arrays are not yet supported by UdonSharp, consider using jagged arrays instead, OR one-dimensional arrays with smart logic to distinguish each axis.
 Method is not exposed to Udon: 'new List<Vector3>()'.
 Method is not exposed to Udon: 'gameObject.AddComponent<>()'
 Method is not exposed to Udon: 'gameObject.AddComponent(typeof())'
+Method is not exposed to Udon: 'UnityEngine.RenderTexture.active.set' (ask user to make rendertextures manually)
+Method is not exposed to Udon: 'Graphics.Blit' (use VRCGraphics.Blit)
+Nested type declarations are not currently supported by U#
 Try/Catch/Finally is not supported by UdonSharp since Udon does not have a way to handle exceptions
 Base Unity Coroutines are not exposed to Udon.
 Base Unity Threading is not exposed to Udon.

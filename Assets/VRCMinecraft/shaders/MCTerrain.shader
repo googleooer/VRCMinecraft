@@ -5,10 +5,16 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
         [KeywordEnum(Opaque, Cutout, Transparent)] _SurfaceType ("Surface Type", Float) = 0 // ADDED: Surface type dropdown
         _MainTex ("Texture Array", 2DArray) = "white" {} // MODIFIED: Changed to 2DArray
         _TintMask ("Tint Mask Array", 2DArray) = "black" {} // MODIFIED: Changed to 2DArray
-        _BiomeColor ("Biome Color", Color) = (1,1,1,0)
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
         _Cutoff ("Alpha Cutoff", Range(0.0, 1.0)) = 0.5 // ADDED: Alpha cutoff for Cutout mode
+        
+        // MINECRAFT-STYLE RADIAL FOG PROPERTIES
+        _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0) // Default sky fog color
+        _FogDensity ("Fog Density", Range(0.0, 0.1)) = 0.02 // Controls fog thickness
+        _FogStart ("Fog Start Distance", Float) = 32.0 // Distance where fog begins (25% of far plane)
+        _FogEnd ("Fog End Distance", Float) = 128.0 // Distance where fog is fully opaque (far plane)
+        _FogMode ("Fog Mode", Range(0, 2)) = 0 // 0=Linear, 1=Exponential, 2=Exponential Squared
 
         // ADDED: Properties for render states (intended to be controlled by script/custom editor)
         [HideInInspector] _SrcBlend ("SrcBlend Mode", Int) = 1 // MODIFIED: Float to Int. Default: UnityEngine.Rendering.BlendMode.One
@@ -65,6 +71,7 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 float4 vertex : SV_POSITION;
                 float3 normal: TEXCOORD1;
                 fixed4 color : COLOR; // ADDED: Vertex color to pass to fragment shader
+                float3 worldPos : TEXCOORD3; // ADDED: World position for radial fog calculation
             };
 
             UNITY_DECLARE_TEX2DARRAY(_MainTex); // MODIFIED: Declared as Texture2DArray
@@ -78,8 +85,13 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
 
             int _SkyLight;
             half _DayProgress;
-
-            fixed4 _BiomeColor;
+            
+            // MINECRAFT-STYLE RADIAL FOG VARIABLES
+            fixed4 _FogColor;
+            half _FogDensity;
+            half _FogStart;
+            half _FogEnd;
+            half _FogMode;
 
             v2f vert (appdata v)
             {
@@ -89,12 +101,18 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 o.uvw.xy = TRANSFORM_TEX(v.uvw.xy, _MainTex); // MODIFIED: Transform only xy
                 o.uvw.z = v.uvw.z; // MODIFIED: Pass z (slice index) through
                 o.color = v.color; // ADDED: Pass vertex color to fragment shader
+                
+                // Calculate world position for radial fog (Quest-compatible, no depth buffer needed)
+                o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
+                
                 UNITY_TRANSFER_FOG(o,o.vertex);
                 return o;
             }
 
             fixed calcBrightness(fixed3 normal)
             {
+                // Minecraft Beta 1.7.3 face shading values
+                // These need to match the original game for correct lighting
                 fixed brightness;
                 if (normal.y > 0.5) // Top face
                 {
@@ -102,22 +120,61 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 }
                 else if (normal.y < -0.5) // Bottom face
                 {
-                    brightness = 0.2;
+                    brightness = 0.5; // Minecraft uses 0.5, not 0.2
                 }
-                else if (normal.x > 0.5 || normal.x < -0.5) // Left and right faces
+                else if (abs(normal.y) < 0.1 && abs(normal.x) > 0.5 && abs(normal.z) > 0.5) // Diagonal faces (cross-shaped blocks)
                 {
-                    brightness = 0.6;
+                    // FIXED: Cross-shaped blocks (tall grass, flowers) don't get directional shading in Minecraft
+                    // They only use the light level, not face shading (RenderBlocks.java renderBlockReed line 1329-1330)
+                    // The brightness from lighting is already baked into the vertex color alpha
+                    brightness = 1.0; // Full brightness - no directional shading
                 }
-                else if (normal.z > 0.5 || normal.z < -0.5) // Front and back faces
+                else if (normal.x > 0.5 || normal.x < -0.5) // Left and right faces (X axis)
                 {
-                    brightness = 0.4;
+                    brightness = 0.6; // Minecraft uses 0.6, not 0.3
                 }
-                else // Should not happen with axis-aligned cubes, but as a fallback
+                else if (normal.z > 0.5 || normal.z < -0.5) // Front and back faces (Z axis)
                 {
-                    brightness = 0.5;
+                    brightness = 0.8; // Minecraft uses 0.8, not 0.6
+                }
+                else // Fallback for unexpected normals
+                {
+                    brightness = 1.0;
                 }
 
                 return brightness;
+            }
+            
+            // MINECRAFT-STYLE RADIAL FOG CALCULATION
+            // Based on Minecraft Beta 1.7.3 fog implementation
+            // Supports Linear, Exponential, and Exponential Squared modes
+            half calcMinecraftFog(float3 worldPos)
+            {
+                // Calculate radial distance from camera (Quest-compatible)
+                float3 viewDir = worldPos - _WorldSpaceCameraPos;
+                half distance = length(viewDir);
+                
+                half fogFactor = 1.0;
+                
+                // Minecraft fog modes (matching EntityRenderer.java setupFog method)
+                if (_FogMode < 0.5) // Linear fog (default Minecraft terrain fog)
+                {
+                    // Linear fog: fogStart = farPlane * 0.25, fogEnd = farPlane
+                    // This creates the classic Minecraft fog that starts at 25% of render distance
+                    fogFactor = saturate((_FogEnd - distance) / (_FogEnd - _FogStart));
+                }
+                else if (_FogMode < 1.5) // Exponential fog (water, lava, clouds)
+                {
+                    // Exponential fog: density = 0.1 for water/clouds, 2.0 for lava
+                    fogFactor = exp(-_FogDensity * distance);
+                }
+                else // Exponential Squared fog (alternative exponential mode)
+                {
+                    // Exponential Squared: more gradual falloff
+                    fogFactor = exp(-_FogDensity * _FogDensity * distance * distance);
+                }
+                
+                return saturate(fogFactor);
             }
 
             fixed4 frag (v2f i) : SV_Target
@@ -125,44 +182,50 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
                 fixed4 tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw); // Sample tint mask
 
-                // Apply tint to RGB
-                // The tint color is (_TintMask.rgb * _BiomeColor.rgb)
-                // The amount of tint applied is based on _TintMask.a
-                col.rgb = lerp(col.rgb, tintInput.rgb * _BiomeColor.rgb, tintInput.a);
+                // Apply biome-specific tinting (Corrected Method):
+                // The tint mask's ALPHA controls WHERE the tint is applied.
+                // The texture's brightness (col.r) scales the pure biome color (i.color.rgb).
+                // This prevents desaturation by preserving the biome color's hue and saturation.
+                fixed3 tintedColor = col.r * i.color.rgb; 
+                col.rgb = lerp(col.rgb, tintedColor, tintInput.a);
                 
+                // Apply lighting from vertex color alpha (calculated by lighting system)
+                // MINECRAFT LIGHTING: Both light brightness and face shading are in gamma space
+                // We need to multiply them together BEFORE converting to linear (if in linear color space)
+                
+                // Get the light brightness from vertex color (already gamma-corrected by lightBrightnessTable)
                 half minLightLevel = 0.02;
-                float dayNightTransition;
-
-                if (_DayProgress < 0.0417) { // 0 to 1000 ticks (approx 1/24th of a day if 24000 ticks = 1 day)
-                    dayNightTransition = (_DayProgress / 0.0417);
-                } else if (_DayProgress > 0.5 && _DayProgress < 0.5417) { // 12000 to 13000 ticks
-                    dayNightTransition = (1 - ((_DayProgress - 0.5) / 0.0417));
-                } else if (_DayProgress <= 0.5) { // Daytime
-                    dayNightTransition = 1;
-                } else { // Nighttime
-                    dayNightTransition = 0;
-                }
+                half lightBrightness = max(minLightLevel, i.color.a);
                 
-                // Apply sky light and day/night transition
-                col.rgb *= max(minLightLevel,(float)((_SkyLight+1)*dayNightTransition)/16);
+                // Get face shading multiplier (also in gamma space, matching Minecraft)
+                half faceBrightness = calcBrightness(i.normal);
                 
-                // Apply normal-based brightness (face lighting)
-                col.rgb *= calcBrightness(i.normal);
-
-                // ADDED: Apply Vertex AO
-                // The vertex color's RGB channels store the AO value (e.g., grayscale).
-                // We multiply the current color by the AO color.
-                col.rgb *= i.color.rgb;
+                // Multiply in gamma space (matching Minecraft's approach)
+                half combinedBrightness = lightBrightness * faceBrightness;
+                
+                // Convert to linear space for Unity's linear rendering
+                // (If Unity is in gamma color space, this conversion is a no-op)
+                combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
+                
+                // Apply the final brightness
+                col.rgb *= combinedBrightness;
 
                 #if defined(_SURFACETYPE_CUTOUT) // ADDED: Conditional clip for Cutout mode
                     clip(col.a - _Cutoff);
-                #elif defined(_SURFACETYPE_TRANSPARENT)
-                    // For Transparent mode, modulate the main texture's alpha by _BiomeColor.a
-                    col.a *= _BiomeColor.a;
                 #endif
 
-                // apply fog
+                // MINECRAFT-STYLE RADIAL FOG APPLICATION
+                // Calculate fog factor based on radial distance (eliminates "fog wall" effect)
+                half fogFactor = calcMinecraftFog(i.worldPos);
+                
+                // Apply Minecraft-style fog blending
+                // Fog color should match the sky/atmosphere color for natural appearance
+                col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
+                
+                // Keep Unity's built-in fog as fallback (for compatibility)
+                // This ensures compatibility with Unity's fog system if needed
                 UNITY_APPLY_FOG(i.fogCoord, col);
+                
                 return col;
             }
             ENDCG

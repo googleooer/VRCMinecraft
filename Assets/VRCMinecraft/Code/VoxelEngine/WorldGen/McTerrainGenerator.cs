@@ -32,6 +32,7 @@ public enum GenerationState
     Prepare_CombineNoise,
     GeneratingTerrain,
     ReplacingBiomeBlocks,
+    DecoratingTerrain,
     Complete
 }
 
@@ -49,6 +50,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public byte bedrockBlockID = 7;
     public byte sandBlockID = 12;
     public byte sandStoneBlockID = 24;
+    public byte logBlockID = 17;
+    public byte leavesBlockID = 18;
+    public byte tallGrassBlockID = 31;
+    public byte flowerYellowBlockID = 37;
+    public byte flowerRedBlockID = 38;
 
     [Header("Beta 1.7.3 Terrain Parameters")]
     // Debugging offsets for chunk generation.
@@ -56,6 +62,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public int chunkOffsetZ = 0;
     [Tooltip("Flip X-axis to match Minecraft's right-handed coordinate system (Unity is left-handed)")]
     public bool flipXAxis = true;
+    [Tooltip("Built-in block offset on X-axis to align with Minecraft coordinate system")]
+    private const int BUILTIN_OFFSET_X = -16;
+    private const int BUILTIN_OFFSET_Z = 0;
+    
+    [Header("Debug Features")]
+    [Tooltip("Generate a debug pillar at world origin (0,0) spanning full height")]
+    public bool generateDebugPillar = true;
     [Range(0.1f, 2.0f)] public float terrainHeightMultiplier = 1.0f;
     [Range(0.0f, 1.0f)] public float caveFrequency = 0.14f;
     public bool generateCaves = true;
@@ -169,6 +182,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int terrain_xPiece, terrain_zPiece;
     private int biome_x;
     private int terrain_gen_step_count; 
+    
+    // Decoration state variables
+    private int decoration_step;
+    private int decoration_feature_count;
+    private int decoration_feature_index; 
 
 #if LOGGING
     private StringBuilder logBuilder;
@@ -226,6 +244,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
             return;
         }
 
+        // CRITICAL: Receive absolute Minecraft chunk coordinates from McWorld
+        // The chunkOffsetX/Z parameters are for manual debugging only and should be 0
+        // DO NOT add world.chunkOffsetX here - that conversion happens in McWorld
         currentChunkX = chunkX + (chunkOffsetX / world.chunkSizeXZ);
         currentChunkY = chunkY;
         currentChunkZ = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
@@ -338,8 +359,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     {
                         // Compute biomes (expensive but necessary)
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
-                        noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
-                        noiseZ = currentChunkZ * 16;
+                        // Apply built-in -15 block offset to align with Minecraft
+                        noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
+                        noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
                         currentChunkBiomes = wcm.getBiomeBlock(currentChunkBiomes, noiseX, noiseZ, 16, 16);
                         
                         // Cache for potential reuse
@@ -369,8 +391,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 t0 = DateTime.UtcNow;
 #endif
                 // CRITICAL: Handle coordinate flip for Minecraft right-handed system
-                noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
-                noiseZ = currentChunkZ * 16;
+                // Apply built-in -15 block offset to align with Minecraft
+                noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
+                noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
                 this.sandNoise = this.noiseGen4.generateNoiseOctaves(this.sandNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.03125D, 0.03125D, 1.0D);
 #if LOGGING
                 if (enableVerboseLogging) { time_Prep_SandNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
@@ -382,8 +405,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
                 t0 = DateTime.UtcNow;
 #endif
-                noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
-                noiseZ = currentChunkZ * 16;
+                // Apply built-in -15 block offset to align with Minecraft
+                noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
+                noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
                 this.gravelNoise = this.noiseGen4.generateNoiseOctaves(this.gravelNoise, noiseX, 109.0134D, noiseZ, 16, 1, 16, 0.03125D, 1.0D, 0.03125D);
 #if LOGGING
                 if (enableVerboseLogging) { time_Prep_GravelNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
@@ -395,8 +419,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
                 t0 = DateTime.UtcNow;
 #endif
-                noiseX = flipXAxis ? -currentChunkX * 16 : currentChunkX * 16;
-                noiseZ = currentChunkZ * 16;
+                // Apply built-in -15 block offset to align with Minecraft
+                noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
+                noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
                 this.stoneNoise = this.noiseGen5.generateNoiseOctaves(this.stoneNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.0625D, 0.0625D, 0.0625D);
 #if LOGGING
                 if (enableVerboseLogging) { time_Prep_StoneNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
@@ -465,21 +490,27 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     double d0 = 684.412D;
                     double d1 = 684.412D;
 
+#if LOGGING
+                    DateTime tNoiseStart = DateTime.UtcNow;
+#endif
+
                     // Process current octave of current generator
-                    // SIMPLIFIED: Just use approximate timings since we're time-slicing now
                     if (currentNoiseGenerator == 0) // noise1 (16 octaves)
                     {
                         if (currentOctave == 0) currentNoiseOutput = noise1;
                         double frequency = System.Math.Pow(0.5, currentOctave);
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        // Apply built-in offset (converted to noise grid scale: blocks/4)
                         noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        noiseGen1.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
+                        int noiseOffsetX = BUILTIN_OFFSET_X / 4; // Noise grid is 1/4 resolution
+                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
+                        noiseGen1.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0 + noiseOffsetX, 0, currentChunkZ * byte0 + noiseOffsetZ, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
                         currentOctave++;
                         
                         if (currentOctave >= 16) {
                             noise1 = currentNoiseOutput;
 #if LOGGING
-                            if (enableVerboseLogging) { time_NoiseGen1 = 115f; noiseGen1Cells = xSize * ySize * zSize; }
+                            if (enableVerboseLogging) { noiseGen1Cells = xSize * ySize * zSize; }
 #endif
                             currentNoiseGenerator = 1;
                             currentOctave = 0;
@@ -490,14 +521,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         if (currentOctave == 0) currentNoiseOutput = noise2;
                         double frequency = System.Math.Pow(0.5, currentOctave);
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        // Apply built-in offset (converted to noise grid scale: blocks/4)
                         noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        noiseGen2.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
+                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
+                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
+                        noiseGen2.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0 + noiseOffsetX, 0, currentChunkZ * byte0 + noiseOffsetZ, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
                         currentOctave++;
                         
                         if (currentOctave >= 16) {
                             noise2 = currentNoiseOutput;
 #if LOGGING
-                            if (enableVerboseLogging) { time_NoiseGen2 = 116f; noiseGen2Cells = xSize * ySize * zSize; }
+                            if (enableVerboseLogging) { noiseGen2Cells = xSize * ySize * zSize; }
 #endif
                             currentNoiseGenerator = 2;
                             currentOctave = 0;
@@ -508,14 +542,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         if (currentOctave == 0) currentNoiseOutput = noise3;
                         double frequency = System.Math.Pow(0.5, currentOctave);
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        // Apply built-in offset (converted to noise grid scale: blocks/4)
                         noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        noiseGen3.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0, 0, currentChunkZ * byte0, xSize, ySize, zSize, (d0 / 80.0D) * frequency, (d1 / 160.0D) * frequency, (d0 / 80.0D) * frequency, frequency);
+                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
+                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
+                        noiseGen3.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0 + noiseOffsetX, 0, currentChunkZ * byte0 + noiseOffsetZ, xSize, ySize, zSize, (d0 / 80.0D) * frequency, (d1 / 160.0D) * frequency, (d0 / 80.0D) * frequency, frequency);
                         currentOctave++;
                         
                         if (currentOctave >= 8) {
                             noise3 = currentNoiseOutput;
 #if LOGGING
-                            if (enableVerboseLogging) { time_NoiseGen3 = 46f; noiseGen3Cells = xSize * ySize * zSize; }
+                            if (enableVerboseLogging) { noiseGen3Cells = xSize * ySize * zSize; }
 #endif
                             currentNoiseGenerator = 3;
                         }
@@ -523,20 +560,26 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     else if (currentNoiseGenerator == 3) // noise6 (10 octaves, 2D)
                     {
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        // Apply built-in offset (converted to noise grid scale: blocks/4)
                         noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        noise6 = noiseGen6.generateNoiseArray(noise6, noiseChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 1.121D, 1.121D, 0.5D);
+                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
+                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
+                        noise6 = noiseGen6.generateNoiseArray(noise6, noiseChunkX * byte0 + noiseOffsetX, currentChunkZ * byte0 + noiseOffsetZ, xSize, zSize, 1.121D, 1.121D, 0.5D);
 #if LOGGING
-                        if (enableVerboseLogging) { time_Noise6 = 2.5f; noise6Cells = xSize * zSize; }
+                        if (enableVerboseLogging) { noise6Cells = xSize * zSize; }
 #endif
                         currentNoiseGenerator = 4;
                     }
                     else if (currentNoiseGenerator == 4) // noise7 (16 octaves, 2D)
                     {
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
+                        // Apply built-in offset (converted to noise grid scale: blocks/4)
                         noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        noise7 = noiseGen7.generateNoiseArray(noise7, noiseChunkX * byte0, currentChunkZ * byte0, xSize, zSize, 200.0D, 200.0D, 0.5D);
+                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
+                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
+                        noise7 = noiseGen7.generateNoiseArray(noise7, noiseChunkX * byte0 + noiseOffsetX, currentChunkZ * byte0 + noiseOffsetZ, xSize, zSize, 200.0D, 200.0D, 0.5D);
 #if LOGGING
-                        if (enableVerboseLogging) { time_Noise7 = 4.5f; noise7Cells = xSize * zSize; }
+                        if (enableVerboseLogging) { noise7Cells = xSize * zSize; }
 #endif
                         
                         // All noise generation complete
@@ -545,6 +588,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         noiseCombine_l1 = 0;
                         currentState = GenerationState.Prepare_CombineNoise;
                     }
+
+#if LOGGING
+                    // Accumulate timing for noise generation (across all octaves)
+                    if (enableVerboseLogging)
+                    {
+                        float elapsed = (float)(DateTime.UtcNow - tNoiseStart).TotalMilliseconds;
+                        if (currentNoiseGenerator == 0) time_NoiseGen1 += elapsed;
+                        else if (currentNoiseGenerator == 1) time_NoiseGen2 += elapsed;
+                        else if (currentNoiseGenerator == 2) time_NoiseGen3 += elapsed;
+                        else if (currentNoiseGenerator == 3) time_Noise6 += elapsed;
+                        else if (currentNoiseGenerator == 4) time_Noise7 += elapsed;
+                    }
+#endif
 
                     break;
                 }
@@ -826,6 +882,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
                 if (terrain_xPiece >= byte0_gt)
                 {
+                    // Generate debug pillar if enabled
+                    if (generateDebugPillar)
+                    {
+                        GenerateDebugPillar();
+                    }
+                    
                     currentState = GenerationState.ReplacingBiomeBlocks;
                 }
                 break;
@@ -1017,8 +1079,160 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
                 if (enableVerboseLogging) time_ReplacingBiomes += (float)(DateTime.UtcNow - stepStartTime).TotalMilliseconds;
 #endif
-                currentState = GenerationState.Complete;
                 
+                // CRITICAL: Only decorate the TOP chunk in a column (highest Y chunk)
+                // Beta 1.7.3 decorates per-column, not per-chunk
+                if (currentChunkY == world.worldDimensionY - 1)
+                {
+                    decoration_step = 0;
+                    decoration_feature_index = 0;
+                    decoration_feature_count = 0;
+                    currentState = GenerationState.DecoratingTerrain;
+                }
+                else
+                {
+                    currentState = GenerationState.Complete;
+                }
+                
+                break;
+
+            case GenerationState.DecoratingTerrain:
+                {
+                    // BETA 1.7.3 DECORATION: Trees, tall grass, and flowers
+                    // This runs ONLY for the top chunk in each column
+                    
+                    if (decoration_step == 0)
+                    {
+                        // Step 0: Initialize decoration random seed (EXACTLY like Beta 1.7.3)
+                        // From ChunkProviderGenerate.java line 315-318
+                        // Use the world seed to initialize a temporary random for decoration
+                        int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+                        JavaRandom seedRand = new JavaRandom(worldSeed);
+                        long var7 = seedRand.NextLong() / 2L * 2L + 1L;
+                        long var9 = seedRand.NextLong() / 2L * 2L + 1L;
+                        rand.SetSeed((long)currentChunkX * var7 + (long)currentChunkZ * var9 ^ (long)worldSeed);
+                        decoration_step++;
+                    }
+                    else if (decoration_step == 1)
+                    {
+                        // Step 1: Generate trees
+                        // Get biome at center of chunk (EXACTLY like Beta 1.7.3 line 314)
+                        // Use the center biome from the already-computed biome grid
+                        // Beta 1.7.3 gets biome at chunk center (8,8)
+                        int centerBiomeIndex = 8 * 16 + 8; // Center of 16x16 grid
+                        BetaBiomeEnum centerBiome = currentChunkBiomes[centerBiomeIndex];
+                        
+                        // Calculate tree count EXACTLY like Beta 1.7.3 (lines 410-443)
+                        decoration_feature_count = BetaBiome.getTreesPerChunk(rand, treeNoise, currentChunkX, currentChunkZ, centerBiome);
+                        decoration_feature_index = 0;
+                        decoration_step++;
+                    }
+                    else if (decoration_step == 2)
+                    {
+                        // Step 2: Place trees one at a time (time-sliced)
+                        if (decoration_feature_index < decoration_feature_count)
+                        {
+                            // currentChunkX is centered chunk coordinate (same as Minecraft chunk coord)
+                            int worldX = currentChunkX * 16;
+                            int worldZ = currentChunkZ * 16;
+                            int treeX = worldX + rand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
+                            int treeZ = worldZ + rand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+                            
+                            // Apply built-in offset to match terrain coordinate system
+                            
+                            // Find the highest solid block at this X,Z
+                            int treeY = GetHighestSolidBlock(treeX, treeZ);
+                            if (treeY > 0 && treeY < world.worldDimensionY * world.chunkSizeY - 7)
+                            {
+                                GenerateTree(treeX, treeY, treeZ);
+                            }
+                            
+                            decoration_feature_index++;
+                        }
+                        else
+                        {
+                            decoration_step++;
+                        }
+                    }
+                    else if (decoration_step == 3)
+                    {
+                        // Step 3: Generate yellow flowers
+                        int centerBiomeIndex = 8 * 16 + 8; // Center of 16x16 grid
+                        BetaBiomeEnum centerBiome = currentChunkBiomes[centerBiomeIndex];
+                        
+                        decoration_feature_count = BetaBiome.getFlowersPerChunk(centerBiome);
+                        decoration_feature_index = 0;
+                        decoration_step++;
+                    }
+                    else if (decoration_step == 4)
+                    {
+                        // Step 4: Place yellow flowers (time-sliced)
+                        if (decoration_feature_index < decoration_feature_count)
+                        {
+                            int worldX = currentChunkX * 16;
+                            int worldZ = currentChunkZ * 16;
+                            int flowerX = worldX + rand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
+                            int flowerZ = worldZ + rand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+                            int flowerY = rand.NextInt(world.worldDimensionY * world.chunkSizeY);
+                            
+                            GenerateFlower(flowerX, flowerY, flowerZ, flowerYellowBlockID);
+                            decoration_feature_index++;
+                        }
+                        else
+                        {
+                            decoration_step++;
+                        }
+                    }
+                    else if (decoration_step == 5)
+                    {
+                        // Step 5: Generate tall grass
+                        int centerBiomeIndex = 8 * 16 + 8; // Center of 16x16 grid
+                        BetaBiomeEnum centerBiome = currentChunkBiomes[centerBiomeIndex];
+                        
+                        decoration_feature_count = BetaBiome.getGrassPerChunk(centerBiome);
+                        decoration_feature_index = 0;
+                        decoration_step++;
+                    }
+                    else if (decoration_step == 6)
+                    {
+                        // Step 6: Place tall grass (time-sliced, 128 attempts per placement like Beta 1.7.3)
+                        if (decoration_feature_index < decoration_feature_count)
+                        {
+                            int worldX = currentChunkX * 16;
+                            int worldZ = currentChunkZ * 16;
+                            int grassX = worldX + rand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
+                            int grassZ = worldZ + rand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+                            int grassY = rand.NextInt(world.worldDimensionY * world.chunkSizeY);
+                            
+                            GenerateTallGrass(grassX, grassY, grassZ);
+                            decoration_feature_index++;
+                        }
+                        else
+                        {
+                            decoration_step++;
+                        }
+                    }
+                    else if (decoration_step == 7)
+                    {
+                        // Step 7: Generate red flowers (Beta 1.7.3 lines 527-532: 50% chance)
+                        if (rand.NextInt(2) == 0)
+                        {
+                            int worldX = currentChunkX * 16;
+                            int worldZ = currentChunkZ * 16;
+                            int flowerX = worldX + rand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
+                            int flowerZ = worldZ + rand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+                            int flowerY = rand.NextInt(world.worldDimensionY * world.chunkSizeY);
+                            
+                            GenerateFlower(flowerX, flowerY, flowerZ, flowerRedBlockID);
+                        }
+                        decoration_step++;
+                    }
+                    else
+                    {
+                        // Decoration complete
+                currentState = GenerationState.Complete;
+                    }
+                }
                 break;
 
             case GenerationState.Complete:
@@ -1118,6 +1332,32 @@ public class McTerrainGenerator : UdonSharpBehaviour
         this.rand.SetSeed((long)chunkX * 341873128712L + (long)chunkZ * 132897987541L);
     }
 
+    /// <summary>
+    /// Get biome temperature and rainfall data for a chunk column.
+    /// This data is cached during terrain generation and can be retrieved here.
+    /// </summary>
+    public void GetBiomeDataForChunk(int chunkX, int chunkZ, double[] outTemperatures, double[] outRainfall)
+    {
+        // Check if we have cached data for this chunk
+        if (chunkX == lastBiomeChunkX && chunkZ == lastBiomeChunkZ && cachedTemperatures != null && cachedRainfall != null)
+        {
+            // Copy cached data to output arrays
+            int copySize = System.Math.Min(outTemperatures.Length, cachedTemperatures.Length);
+            System.Array.Copy(cachedTemperatures, outTemperatures, copySize);
+            System.Array.Copy(cachedRainfall, outRainfall, copySize);
+        }
+        else
+        {
+            // Data not cached, fill with default values
+            // This shouldn't happen if called right after generation
+            for (int i = 0; i < outTemperatures.Length; i++)
+            {
+                outTemperatures[i] = 0.5;
+                outRainfall[i] = 0.5;
+            }
+        }
+    }
+
     // This function is now fully time-sliced and integrated into the state machine.
     // private double[] initNoiseField(...)
 
@@ -1139,5 +1379,187 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private void GenerateBedrock(ushort[] chunkData)
     {
+    }
+
+    // ===== DECORATION METHODS (Beta 1.7.3 WorldGenTrees, WorldGenTallGrass, WorldGenFlowers) =====
+    
+    private int GetHighestSolidBlock(int globalX, int globalZ)
+    {
+        // Find the highest non-air block at this X,Z coordinate
+        for (int y = world.worldDimensionY * world.chunkSizeY - 1; y >= 0; y--)
+        {
+            byte blockID = world.GetBlock(globalX, y, globalZ);
+            if (blockID != airBlockID)
+            {
+                return y + 1; // Return the air block above the solid block
+            }
+        }
+        return 0;
+    }
+    
+    private void GenerateTree(int x, int y, int z)
+    {
+        // EXACT port of Beta 1.7.3 WorldGenTrees.java
+        int treeHeight = rand.NextInt(3) + 4; // Random height 4-6
+        
+        // Check if there's space for the tree
+        if (y < 1 || y + treeHeight + 1 > world.worldDimensionY * world.chunkSizeY) return;
+        
+        // Check if trunk can be placed (must be on grass or dirt)
+        byte blockBelow = world.GetBlock(x, y - 1, z);
+        if (blockBelow != grassBlockID && blockBelow != dirtBlockID) return;
+        
+        // Check if there's enough space for the canopy
+        for (int checkY = y; checkY <= y + 1 + treeHeight; checkY++)
+        {
+            int radius = 1;
+            if (checkY == y) radius = 0;
+            if (checkY >= y + 1 + treeHeight - 2) radius = 2;
+            
+            for (int checkX = x - radius; checkX <= x + radius; checkX++)
+            {
+                for (int checkZ = z - radius; checkZ <= z + radius; checkZ++)
+                {
+                    if (checkY >= 0 && checkY < world.worldDimensionY * world.chunkSizeY)
+                    {
+                        byte checkBlock = world.GetBlock(checkX, checkY, checkZ);
+                        if (checkBlock != airBlockID && checkBlock != leavesBlockID)
+                        {
+                            return; // Not enough space
+                        }
+                    }
+                    else
+                    {
+                        return; // Out of bounds
+                    }
+                }
+            }
+        }
+        
+        // Place dirt under the tree
+        world.SetBlock(x, y - 1, z, dirtBlockID);
+        
+        // Generate leaves (canopy)
+        for (int leafY = y - 3 + treeHeight; leafY <= y + treeHeight; leafY++)
+        {
+            int yOffset = leafY - (y + treeHeight);
+            int leafRadius = 1 - yOffset / 2;
+            
+            for (int leafX = x - leafRadius; leafX <= x + leafRadius; leafX++)
+            {
+                int xOffset = leafX - x;
+                for (int leafZ = z - leafRadius; leafZ <= z + leafRadius; leafZ++)
+                {
+                    int zOffset = leafZ - z;
+                    
+                    // Beta 1.7.3 logic: skip corners randomly, except at top
+                    if ((System.Math.Abs(xOffset) != leafRadius || System.Math.Abs(zOffset) != leafRadius || rand.NextInt(2) != 0 && yOffset != 0))
+                    {
+                        byte blockAtPos = world.GetBlock(leafX, leafY, leafZ);
+                        // Only place leaves if air or existing leaves
+                        if (blockAtPos == airBlockID || blockAtPos == leavesBlockID)
+                        {
+                            world.SetBlock(leafX, leafY, leafZ, leavesBlockID);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Generate trunk (wood blocks)
+        for (int trunkY = 0; trunkY < treeHeight; trunkY++)
+        {
+            byte blockAtPos = world.GetBlock(x, y + trunkY, z);
+            if (blockAtPos == airBlockID || blockAtPos == leavesBlockID)
+            {
+                world.SetBlock(x, y + trunkY, z, logBlockID);
+            }
+        }
+    }
+    
+    private void GenerateTallGrass(int x, int y, int z)
+    {
+        // EXACT port of Beta 1.7.3 WorldGenTallGrass.java
+        // Find the surface by moving down
+        while (true)
+        {
+            byte blockAtPos = world.GetBlock(x, y, z);
+            if ((blockAtPos != airBlockID && blockAtPos != leavesBlockID) || y <= 0)
+            {
+                // Found surface or bedrock, now try 128 random placements
+                for (int attempt = 0; attempt < 128; attempt++)
+                {
+                    int grassX = x + rand.NextInt(8) - rand.NextInt(8);
+                    int grassY = y + rand.NextInt(4) - rand.NextInt(4);
+                    int grassZ = z + rand.NextInt(8) - rand.NextInt(8);
+                    
+                    // Check if air block
+                    if (grassY >= 0 && grassY < world.worldDimensionY * world.chunkSizeY)
+                    {
+                        byte blockAbove = world.GetBlock(grassX, grassY, grassZ);
+                        if (blockAbove == airBlockID)
+                        {
+                            // Check if can stay (grass/dirt below, enough light)
+                            if (grassY > 0)
+                            {
+                                byte blockBelow = world.GetBlock(grassX, grassY - 1, grassZ);
+                                if (blockBelow == grassBlockID || blockBelow == dirtBlockID)
+                                {
+                                    // METADATA: Beta 1.7.3 uses metadata 1 for standard tall grass
+                                    // We don't have metadata support yet, so just place the block
+                                    world.SetBlock(grassX, grassY, grassZ, tallGrassBlockID);
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            y--;
+        }
+    }
+    
+    private void GenerateFlower(int x, int y, int z, byte flowerBlockID)
+    {
+        // EXACT port of Beta 1.7.3 WorldGenFlowers.java
+        // Try to place a single flower at this location
+        if (y >= 0 && y < world.worldDimensionY * world.chunkSizeY)
+        {
+            byte blockAtPos = world.GetBlock(x, y, z);
+            if (blockAtPos == airBlockID)
+            {
+                // Check if can stay (grass/dirt below, enough light)
+                if (y > 0)
+                {
+                    byte blockBelow = world.GetBlock(x, y - 1, z);
+                    if (blockBelow == grassBlockID || blockBelow == dirtBlockID)
+                    {
+                        world.SetBlock(x, y, z, flowerBlockID);
+                    }
+                }
+            }
+        }
+    }
+    
+    private void GenerateDebugPillar()
+    {
+        // Generate a debug pillar at world origin (0,0) spanning full height
+        // This helps visualize lighting and chunk boundaries
+        int pillarX = 0;
+        int pillarZ = 0;
+        int worldHeight = world.worldDimensionY * world.chunkSizeY;
+        
+        // Use stone blocks for the pillar
+        for (int y = 0; y < worldHeight; y++)
+        {
+            world.SetBlock(pillarX, y, pillarZ, stoneBlockID);
+        }
+        
+#if LOGGING
+        if (enableVerboseLogging)
+        {
+            Debug.Log($"[McTerrainGenerator] Generated debug pillar at ({pillarX}, {pillarZ}) spanning height 0-{worldHeight-1}");
+        }
+#endif
     }
 }
