@@ -46,8 +46,9 @@ public class McCoordinator : UdonSharpBehaviour
     private int[] worker_skipCheckCounter; // Skip state checks for N cycles to reduce overhead
     private const int STATE_IDLE = 0;
     private const int STATE_DATA_GEN = 1;
-    private const int STATE_WAITING_FOR_MESH = 2;
-    private const int STATE_MESHING = 3;
+    private const int STATE_LIGHTING = 2; // FIXED: New lighting state
+    private const int STATE_WAITING_FOR_MESH = 3;
+    private const int STATE_MESHING = 4;
 
     // --- World Generation State ---
     private int[] radialChunkOrder;
@@ -179,10 +180,13 @@ public class McCoordinator : UdonSharpBehaviour
                 // Check if data generation is complete
                 if (!chunk.isGeneratingData)
                 {
-                    // Data generation is complete, move to waiting for mesh
-                    worker_state[i] = STATE_WAITING_FOR_MESH;
-                    worker_skipCheckCounter[i] = 0; // Check immediately for neighbors
+                    // Data generation is complete, move to lighting
+                    worker_state[i] = STATE_LIGHTING;
+                    worker_skipCheckCounter[i] = 0; // Start lighting immediately
                     isGeneratorBusy = false;
+                    
+                    // FIXED: Start incremental lighting processing
+                    world.StartChunkLighting(chunkIndex);
 #if LOGGING
                     if (enableDetailedTimings) workers_DataGenCompleted++;
 #endif
@@ -191,6 +195,24 @@ public class McCoordinator : UdonSharpBehaviour
                 {
                     // Data gen takes multiple cycles, skip checking for a bit
                     worker_skipCheckCounter[i] = skipCheckCycles;
+                }
+            }
+            else if (state == STATE_LIGHTING)
+            {
+                // FIXED: Step through lighting incrementally
+                world.StepChunkLighting(chunkIndex);
+                
+                // Check if lighting is complete
+                if (!chunk.isProcessingLighting)
+                {
+                    // Lighting is complete, move to waiting for mesh
+                    worker_state[i] = STATE_WAITING_FOR_MESH;
+                    worker_skipCheckCounter[i] = 0; // Check immediately for neighbors
+                }
+                else
+                {
+                    // Continue processing lighting (don't skip, process every frame)
+                    worker_skipCheckCounter[i] = 0;
                 }
             }
             else if (state == STATE_WAITING_FOR_MESH)

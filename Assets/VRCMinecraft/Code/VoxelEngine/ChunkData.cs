@@ -15,7 +15,8 @@ public class ChunkData
     public MeshFilter opaqueMeshFilter;
     public MeshFilter transparentMeshFilter;
     public MeshFilter cutoutMeshFilter;
-    public MeshCollider meshCollider;
+    public MeshCollider meshCollider; // Player collision (solid blocks only)
+    public MeshCollider selectionCollider; // Selection/focus collision (includes focusable non-solid blocks)
 
     // --- Data & State ---
     public object _chunkData;
@@ -44,6 +45,36 @@ public class ChunkData
     public int _cutoutVertexCount; public int _cutoutTriangleCount; 
     public Vector3[] _collisionVertices; public int[] _collisionTriangles;
     public int _collisionVertexCount; public int _collisionTriangleCount;
+    public Vector3[] _selectionVertices; public int[] _selectionTriangles;
+    public int _selectionVertexCount; public int _selectionTriangleCount;
+    
+    // --- Vertex Colors (for biome tinting and AO) ---
+    public Color[] _opaqueColors;
+    public Color[] _transparentColors;
+    public Color[] _cutoutColors;
+
+    // --- Biome Data (for tinting during mesh generation) ---
+    // Arrays of temperature and rainfall values per XZ column (16x16)
+    // Populated during terrain generation and used during meshing
+    public double[] _biomeTemperatures;
+    public double[] _biomeRainfall;
+
+    // --- Lighting Data (Minecraft Beta 1.7.3 style) ---
+    // One byte per voxel: high 4 bits = sky light (0-15), low 4 bits = block light (0-15)
+    // Array size: 16x16x16 = 4096 bytes
+    // Index: y * 256 + z * 16 + x
+    public byte[] lightData;
+    
+    // Flag to prevent recursive BFS during cross-chunk propagation
+    public bool isPropagatingLight = false;
+    
+    // --- FIXED: Incremental Lighting State (for coordinator-managed lighting) ---
+    public bool isProcessingLighting = false;
+    public int lightingPhase = 0; // 0=sky, 1=block, 2=complete
+    public int lightingQueueStart = 0;
+    public int lightingQueueEnd = 0;
+    public int lightingIteration = 0;
+    public int[] lightingQueue; // Persistent queue for this chunk
 
     // --- Sentinel Occupancy Buffer (for boundary-mask meshing) ---
     // Stores block IDs for the current chunk plus a 1-voxel border copied from neighbors.
@@ -63,7 +94,7 @@ public class ChunkData
 
 #if LOGGING
     // --- Debugging & Timings ---
-    public float time_DataPrep, time_NeighborCache, time_MainLoop, time_ApplyOpaque, time_ApplyTransparent, time_ApplyCutout, time_ApplyCollision;
+    public float time_DataPrep, time_NeighborCache, time_MainLoop, time_ApplyOpaque, time_ApplyTransparent, time_ApplyCutout, time_ApplyCollision, time_ApplySelection;
     public float timer_start_stage; // Helper to carry state between steps
     public int mesh_step_count;
 
@@ -74,5 +105,15 @@ public class ChunkData
     public int shouldDrawTests, shouldDrawTrue;
     public int facesOpaque, facesTransparent, facesCutout, facesTotal;
     public int sentinelInteriorCopied, sentinelBorderCopied;
+    
+    // --- Lighting Performance Profiling ---
+    public float time_LightingInit, time_LightingImport, time_LightingBFS_Sky, time_LightingBFS_Block, time_LightingReconcile;
+    public int lightingBlocksProcessed_Sky, lightingBlocksProcessed_Block;
+    public int lightingQueueOps_Sky, lightingQueueOps_Block;
+    public int lightingNeighborQueries_Sky, lightingNeighborQueries_Block;
+    public int lightingCrossChunkOps_Sky, lightingCrossChunkOps_Block;
+    public int lightingUpdatesApplied_Sky, lightingUpdatesApplied_Block;
+    public int lightingSkylightReachedBlocks; // Blocks that got skylight=15 (early optimization)
+    public int lightingSkylightZeroBlocks; // Blocks that got skylight=0 (need BFS)
 #endif
 } 

@@ -8,7 +8,6 @@ public class MCTerrainCombinedShaderGUI : ShaderGUI
     private MaterialProperty surfaceTypeProp;
     private MaterialProperty mainTexProp;
     private MaterialProperty tintMaskProp;
-    private MaterialProperty biomeColorProp;
     private MaterialProperty skyLightProp;
     private MaterialProperty dayProgressProp;
     private MaterialProperty cutoffProp;
@@ -27,7 +26,6 @@ public class MCTerrainCombinedShaderGUI : ShaderGUI
         surfaceTypeProp = FindProperty("_SurfaceType", props);
         mainTexProp = FindProperty("_MainTex", props);
         tintMaskProp = FindProperty("_TintMask", props);
-        biomeColorProp = FindProperty("_BiomeColor", props);
         skyLightProp = FindProperty("_SkyLight", props);
         dayProgressProp = FindProperty("_DayProgress", props);
         cutoffProp = FindProperty("_Cutoff", props);
@@ -62,8 +60,7 @@ public class MCTerrainCombinedShaderGUI : ShaderGUI
         // --- Display other properties ---
         EditorGUILayout.Space();
         materialEditor.TexturePropertySingleLine(new GUIContent("Main Texture Array", "Base Texture Array (RGB), Alpha for Opacity/Cutout"), mainTexProp);
-        materialEditor.TexturePropertySingleLine(new GUIContent("Tint Mask Array", "Tint Mask (RGBA)"), tintMaskProp);
-        materialEditor.ColorProperty(biomeColorProp, "Biome Color");
+        materialEditor.TexturePropertySingleLine(new GUIContent("Tint Mask Array", "Tint Mask (RGBA) - Biome colors applied via vertex colors"), tintMaskProp);
         materialEditor.RangeProperty(dayProgressProp, "Day Progress");
         materialEditor.ShaderProperty(skyLightProp, "Sky Light");
 
