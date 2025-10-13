@@ -587,7 +587,7 @@ MeshRenderer:
   m_RenderingLayerMask: 1
   m_RendererPriority: 0
   m_Materials:
-  - {fileID: 2100000, guid: 6ffd481a607465347b4812e0d2d77d4d, type: 2}
+  - {fileID: 2100000, guid: 7ba2e10ef311573438146a61613282b8, type: 2}
   m_StaticBatchInfo:
     firstSubMesh: 0
     subMeshCount: 0
@@ -4763,6 +4763,9 @@ MonoBehaviour:
   acknowledgeVRChatPerformance: 0
   structureTemplates: []
   enableVerboseLogging: 1
+  enableDetailedTimings: 1
+  enableCounters: 1
+  enableMemoryTracking: 1
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
@@ -10751,111 +10754,6 @@ RectTransform:
   m_AnchoredPosition: {x: 2500, y: 0}
   m_SizeDelta: {x: 3324, y: 1000}
   m_Pivot: {x: 0.5, y: 0}
---- !u!1 &885767238
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 885767242}
-  - component: {fileID: 885767241}
-  - component: {fileID: 885767240}
-  - component: {fileID: 885767239}
-  m_Layer: 0
-  m_Name: Cube (4)
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!65 &885767239
-BoxCollider:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 885767238}
-  m_Material: {fileID: 0}
-  m_IncludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_ExcludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_LayerOverridePriority: 0
-  m_IsTrigger: 0
-  m_ProvidesContacts: 0
-  m_Enabled: 1
-  serializedVersion: 3
-  m_Size: {x: 1, y: 1, z: 1}
-  m_Center: {x: 0, y: 0, z: 0}
---- !u!23 &885767240
-MeshRenderer:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 885767238}
-  m_Enabled: 1
-  m_CastShadows: 0
-  m_ReceiveShadows: 0
-  m_DynamicOccludee: 1
-  m_StaticShadowCaster: 0
-  m_MotionVectors: 1
-  m_LightProbeUsage: 0
-  m_ReflectionProbeUsage: 0
-  m_RayTracingMode: 2
-  m_RayTraceProcedural: 0
-  m_RenderingLayerMask: 1
-  m_RendererPriority: 0
-  m_Materials:
-  - {fileID: 2100000, guid: 919076b4323f7ce468bcd80da64cb450, type: 2}
-  m_StaticBatchInfo:
-    firstSubMesh: 0
-    subMeshCount: 0
-  m_StaticBatchRoot: {fileID: 0}
-  m_ProbeAnchor: {fileID: 0}
-  m_LightProbeVolumeOverride: {fileID: 0}
-  m_ScaleInLightmap: 1
-  m_ReceiveGI: 1
-  m_PreserveUVs: 0
-  m_IgnoreNormalsForChartDetection: 0
-  m_ImportantGI: 0
-  m_StitchLightmapSeams: 1
-  m_SelectedEditorRenderState: 3
-  m_MinimumChartSize: 4
-  m_AutoUVMaxDistance: 0.5
-  m_AutoUVMaxAngle: 89
-  m_LightmapParameters: {fileID: 0}
-  m_SortingLayerID: 0
-  m_SortingLayer: 0
-  m_SortingOrder: 0
-  m_AdditionalVertexStreams: {fileID: 0}
---- !u!33 &885767241
-MeshFilter:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 885767238}
-  m_Mesh: {fileID: 10210, guid: 0000000000000000e000000000000000, type: 0}
---- !u!4 &885767242
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 885767238}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: -0.7071068, w: 0.7071068}
-  m_LocalPosition: {x: -9, y: 133, z: 10}
-  m_LocalScale: {x: 4, y: 4, z: 4}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: -90}
 --- !u!1 &890272896
 GameObject:
   m_ObjectHideFlags: 0
@@ -12158,13 +12056,16 @@ MonoBehaviour:
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 1156113853}
   maxConcurrentWorkers: 4
-  updateTimeBudgetMs: 8
+  updateTimeBudgetMs: 2
   skipCheckCycles: 2
-  columnsPerDataGenStep: 2
-  voxelsPerMeshStep: 1024
-  voxelsPerTerrainStep: 1024
+  columnsPerDataGenStep: 4
+  voxelsPerMeshStep: 2048
+  voxelsPerTerrainStep: 2048
   enableVerboseLogging: 1
   enableDetailedTimings: 1
+  enableCounters: 1
+  enableAggregateLogging: 1
+  aggregateLogInterval: 300
 --- !u!114 &1156113853
 MonoBehaviour:
   m_ObjectHideFlags: 2
@@ -15740,8 +15641,8 @@ MonoBehaviour:
   chunkSizeY: 16
   chunkPrefab: {fileID: 1697751968}
   voxelsPerMeshStep: 2048
-  meshStepTimeBudgetMs: 6
-  updateTimeBudgetMs: 6
+  meshStepTimeBudgetMs: 2
+  updateTimeBudgetMs: 2
   terrainGenerator: {fileID: 660800870}
   blockTypeManager: {fileID: 1410233257}
   coordinator: {fileID: 1156113852}
@@ -15757,6 +15658,13 @@ MonoBehaviour:
   globalVoxelOffsetY: 0
   globalVoxelOffsetZ: 0
   skylightSubtracted: 0
+  enableFrameLogging: 0
+  enableAggregateLogging: 1
+  enableDetailedTimings: 1
+  enableCounters: 1
+  enableMemoryTracking: 1
+  enableCacheTracking: 1
+  aggregateLogInterval: 300
 --- !u!4 &1596987941
 Transform:
   m_ObjectHideFlags: 0
@@ -17318,7 +17226,7 @@ MeshRenderer:
   m_RenderingLayerMask: 1
   m_RendererPriority: 0
   m_Materials:
-  - {fileID: 2100000, guid: 80cf6f210528e0644a644435bad9f839, type: 2}
+  - {fileID: 2100000, guid: 2a8ada064ca89d54b9bd51465419a0bf, type: 2}
   m_StaticBatchInfo:
     firstSubMesh: 0
     subMeshCount: 0
@@ -25150,7 +25058,6 @@ SceneRoots:
   - {fileID: 1069902877}
   - {fileID: 1787983411}
   - {fileID: 1792950946}
-  - {fileID: 885767242}
   - {fileID: 91666609}
   - {fileID: 1605686892}
   - {fileID: 656183841}

@@ -115,5 +115,31 @@ public class ChunkData
     public int lightingUpdatesApplied_Sky, lightingUpdatesApplied_Block;
     public int lightingSkylightReachedBlocks; // Blocks that got skylight=15 (early optimization)
     public int lightingSkylightZeroBlocks; // Blocks that got skylight=0 (need BFS)
+    
+    // --- RLE Compression Stats ---
+    public float rle_compressionTime, rle_decompressionTime;
+    public int rle_compressionCount, rle_decompressionCount;
+    public int rle_bytesIn, rle_bytesOut;
+    public float rle_compressionRatio;
+    public int rle_homogeneousDetections;
+    
+    // --- Block Access Stats ---
+    public int block_getLocalCalls, block_setLocalCalls;
+    public int block_rleTraversalDepthTotal, block_rleTraversalDepthCount;
+    public int block_decompressionTriggers;
+    
+    // --- Cache Stats ---
+    public int cache_decompHits, cache_decompMisses;
+    public int cache_neighborHits, cache_neighborMisses;
+    public int cache_sentinelReuses;
+    
+    // --- Memory Tracking ---
+    public int memory_meshBufferBytes;
+    public int memory_lightDataBytes;
+    public int memory_sentinelBytes;
+    public int memory_totalAllocated;
+    
+    // --- Mesh Build Tracking ---
+    public float meshBuildStartTime;
 #endif
 } 
