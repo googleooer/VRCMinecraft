@@ -67,7 +67,13 @@ public class McCoordinator : UdonSharpBehaviour
 #if LOGGING
     [Header("Debug")] 
     public bool enableVerboseLogging = true;
+    
+    [Header("Performance Profiling")]
     public bool enableDetailedTimings = false;
+    public bool enableCounters = true;
+    public bool enableAggregateLogging = true;
+    public int aggregateLogInterval = 300; // frames
+    
     private int lastLoggedPercent = -1;
     
     // Detailed timing metrics

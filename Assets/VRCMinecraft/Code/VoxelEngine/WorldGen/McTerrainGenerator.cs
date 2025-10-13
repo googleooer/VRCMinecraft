@@ -84,6 +84,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
     [Header("Debugging")]
     public bool enableVerboseLogging = true;
+    
+    [Header("Performance Profiling")]
+    public bool enableDetailedTimings = true;
+    public bool enableCounters = true;
+    public bool enableMemoryTracking = true;
+    
     private DateTime time_Total_Start;
     private float time_Preparation, time_GeneratingTerrain, time_ReplacingBiomes;
 

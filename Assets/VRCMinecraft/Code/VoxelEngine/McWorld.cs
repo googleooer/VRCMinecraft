@@ -136,6 +136,93 @@ public class McWorld : UdonSharpBehaviour
 
 #if LOGGING
     private System.Text.StringBuilder logBuilder;
+    
+    // --- Performance Profiling Configuration ---
+    [Header("Performance Profiling")]
+    public bool enableFrameLogging = false;
+    public bool enableAggregateLogging = true;
+    public bool enableDetailedTimings = true;
+    public bool enableCounters = true;
+    public bool enableMemoryTracking = true;
+    public bool enableCacheTracking = true;
+    public int aggregateLogInterval = 300; // frames
+    
+    // --- Frame/Update Stats ---
+    private int stats_frameCount = 0;
+    private float stats_updateTotalTime = 0f;
+    private float stats_updateTimeMin = float.MaxValue;
+    private float stats_updateTimeMax = 0f;
+    private int stats_budgetExceededCount = 0;
+    private float stats_processActiveChunksTime = 0f;
+    private float stats_reconciliationTime = 0f;
+    private float stats_aggregateWindowStart = 0f;
+    
+    // --- Chunk Management Stats ---
+    private int stats_chunkCreations = 0;
+    private int stats_chunkDestructions = 0;
+    private int stats_chunkStateTransitions = 0;
+    private int stats_chunk1DLookups = 0;
+    private int stats_chunk3DLookups = 0;
+    
+    // --- Mesh Building Stats (aggregate) ---
+    private int stats_meshBuildTotal = 0;
+    private float stats_meshBuildTimeTotal = 0f;
+    private float stats_meshBuildTimeMin = float.MaxValue;
+    private float stats_meshBuildTimeMax = 0f;
+    private int stats_meshStepsTotal = 0;
+    private float stats_greedyAxisYTime = 0f;
+    private float stats_greedyAxisZTime = 0f;
+    private float stats_greedyAxisXTime = 0f;
+    private int stats_sentinelBuilds = 0;
+    private float stats_sentinelBuildTime = 0f;
+    private int stats_faceCullingTests = 0;
+    private int stats_facesCulled = 0;
+    private int stats_facesDrawn = 0;
+    private int stats_verticesOpaque = 0;
+    private int stats_verticesTransparent = 0;
+    private int stats_verticesCutout = 0;
+    private float stats_meshApplyOpaqueTime = 0f;
+    private float stats_meshApplyTransparentTime = 0f;
+    private float stats_meshApplyCutoutTime = 0f;
+    private float stats_meshApplyColliderTime = 0f;
+    
+    // --- Lighting Stats (aggregate) ---
+    private int stats_lightingInitsTotal = 0;
+    private float stats_lightingInitTime = 0f;
+    private int stats_lightingStepsTotal = 0;
+    private float stats_lightingStepTime = 0f;
+    private int stats_lightingBFSOps = 0;
+    private int stats_lightingMaxQueueSize = 0;
+    private int stats_lightingSkylightBlocks = 0;
+    private int stats_lightingBlocklightBlocks = 0;
+    private int stats_lightingCrossChunkQueries = 0;
+    private int stats_lightingPoolAllocations = 0;
+    private int stats_lightingPoolReuses = 0;
+    
+    // --- RLE Stats (aggregate) ---
+    private int stats_rleCompressions = 0;
+    private int stats_rleDecompressions = 0;
+    private float stats_rleCompressionTime = 0f;
+    private float stats_rleDecompressionTime = 0f;
+    private int stats_rleTotalBytesIn = 0;
+    private int stats_rleTotalBytesOut = 0;
+    private int stats_rleHomogeneousChunks = 0;
+    
+    // --- Block Operation Stats ---
+    private int stats_getBlockCalls = 0;
+    private int stats_setBlockCalls = 0;
+    private int stats_blockModifications = 0;
+    private int stats_neighborRebuildTriggers = 0;
+    
+    // --- Cache Stats ---
+    private int stats_decompCacheHits = 0;
+    private int stats_decompCacheMisses = 0;
+    private int stats_neighborCacheHits = 0;
+    private int stats_neighborCacheMisses = 0;
+    
+    // --- Reconciliation Stats ---
+    private int stats_reconciliationOps = 0;
+    private int stats_reconciliationBlocks = 0;
 #endif
 
     void Start()
@@ -166,6 +253,10 @@ public class McWorld : UdonSharpBehaviour
         
         int[] radialChunkOrder = GenerateRadialChunkOrder();
         coordinator.InitializeAndStartProcessing(this, radialChunkOrder, totalWorldChunks);
+        
+#if LOGGING
+        stats_aggregateWindowStart = Time.realtimeSinceStartup;
+#endif
         
         // No longer using SendCustomEventDelayedSeconds - Update() will handle processing
     }
@@ -250,6 +341,10 @@ public class McWorld : UdonSharpBehaviour
         
         newChunkGO.SetActive(true);
 
+#if LOGGING
+        if (enableCounters) stats_chunkCreations++;
+#endif
+
         return chunk1DIndex;
     }
 
@@ -258,13 +353,49 @@ public class McWorld : UdonSharpBehaviour
         // Safety check: Don't process if not initialized
         if (chunks_1D == null || terrainGenerator == null) return;
         
+#if LOGGING
+        float updateStartTime = 0f;
+        if (enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
+        {
+            updateStartTime = Time.realtimeSinceStartup;
+        }
+#endif
+        
         ProcessActiveChunks();
+        
+#if LOGGING
+        if (enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
+        {
+            float updateTime = (Time.realtimeSinceStartup - updateStartTime) * 1000f;
+            stats_updateTotalTime += updateTime;
+            if (updateTime < stats_updateTimeMin) stats_updateTimeMin = updateTime;
+            if (updateTime > stats_updateTimeMax) stats_updateTimeMax = updateTime;
+            if (updateTime > updateTimeBudgetMs) stats_budgetExceededCount++;
+            stats_frameCount++;
+            
+            // Per-frame logging
+            if (enableFrameLogging)
+            {
+                LogFrameStats(updateTime);
+            }
+            
+            // Aggregate logging
+            if (enableAggregateLogging && stats_frameCount % aggregateLogInterval == 0)
+            {
+                LogAggregateStats();
+            }
+        }
+#endif
     }
     
     private void ProcessActiveChunks()
     {
         float frameStart = Time.realtimeSinceStartup;
         float frameBudget = updateTimeBudgetMs * 0.001f;
+        
+#if LOGGING
+        float processStartTime = frameStart;
+#endif
         
         // --- Process Data Generation ---
         for (int i = 0; i < activeDataGenCount; i++)
@@ -312,7 +443,23 @@ public class McWorld : UdonSharpBehaviour
         // Note: Lighting is now handled by coordinator's STATE_LIGHTING, not here
         
         // --- OPTIMIZATION: Process Deferred Reconciliation ---
+#if LOGGING
+        float reconcilStartTime = Time.realtimeSinceStartup;
+#endif
         ProcessDeferredReconciliation(frameStart, frameBudget);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_reconciliationTime += (Time.realtimeSinceStartup - reconcilStartTime) * 1000f;
+        }
+#endif
+        
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_processActiveChunksTime += (Time.realtimeSinceStartup - processStartTime) * 1000f;
+        }
+#endif
         
         // No longer need to reschedule - Update() runs every frame automatically!
     }
@@ -744,6 +891,10 @@ public class McWorld : UdonSharpBehaviour
         chunk.isBuildingMesh = true;
 
 #if LOGGING
+        chunk.meshBuildStartTime = Time.realtimeSinceStartup;
+        if (enableCounters) stats_meshBuildTotal++;
+        if (enableCounters) stats_chunkStateTransitions++;
+        
         if (enableVerboseLogging)
         {
             logBuilder.Clear();
@@ -1185,6 +1336,37 @@ public class McWorld : UdonSharpBehaviour
             _AddCrossShapedBlocks(chunk);
             
             _ApplyAllMeshData(chunk);
+            
+#if LOGGING
+            // Track aggregate mesh building stats
+            if (enableDetailedTimings)
+            {
+                float meshBuildTime = (Time.realtimeSinceStartup - chunk.meshBuildStartTime) * 1000f;
+                stats_meshBuildTimeTotal += meshBuildTime;
+                if (meshBuildTime < stats_meshBuildTimeMin) stats_meshBuildTimeMin = meshBuildTime;
+                if (meshBuildTime > stats_meshBuildTimeMax) stats_meshBuildTimeMax = meshBuildTime;
+                stats_meshStepsTotal += chunk.mesh_step_count;
+                stats_greedyAxisYTime += chunk.time_AxisY;
+                stats_greedyAxisZTime += chunk.time_AxisZ;
+                stats_greedyAxisXTime += chunk.time_AxisX;
+                stats_sentinelBuildTime += chunk.time_SentinelBuild;
+                stats_meshApplyOpaqueTime += chunk.time_ApplyOpaque;
+                stats_meshApplyTransparentTime += chunk.time_ApplyTransparent;
+                stats_meshApplyCutoutTime += chunk.time_ApplyCutout;
+                stats_meshApplyColliderTime += chunk.time_ApplyCollision;
+            }
+            if (enableCounters)
+            {
+                stats_sentinelBuilds++;
+                stats_faceCullingTests += chunk.shouldDrawTests;
+                stats_facesCulled += (chunk.shouldDrawTests - chunk.shouldDrawTrue);
+                stats_facesDrawn += chunk.facesTotal;
+                stats_verticesOpaque += chunk._opaqueVertexCount;
+                stats_verticesTransparent += chunk._transparentVertexCount;
+                stats_verticesCutout += chunk._cutoutVertexCount;
+            }
+#endif
+            
             chunk.isBuildingMesh = false;
             
             // Null out neighbor references to free memory
@@ -1753,8 +1935,15 @@ public class McWorld : UdonSharpBehaviour
         // OPTIMIZED: Use global persistent cache to avoid repeated decompression
         if (decompressionCacheValid.ContainsKey(chunk) && decompressionCacheValid[chunk] && decompressionCache.ContainsKey(chunk))
         {
+#if LOGGING
+            if (enableCacheTracking) stats_decompCacheHits++;
+#endif
             return decompressionCache[chunk];
         }
+        
+#if LOGGING
+        if (enableCacheTracking) stats_decompCacheMisses++;
+#endif
         
         byte[] decompressed = _DecompressChunkColumnRLE(chunk);
         decompressionCache[chunk] = decompressed;
@@ -1856,6 +2045,10 @@ public class McWorld : UdonSharpBehaviour
 
     private byte _GetBlockLocal(ChunkData chunk, int x, int y, int z)
     {
+#if LOGGING
+        if (enableCounters) stats_getBlockCalls++;
+#endif
+        
         if (chunk._chunkData == null || !chunk.isDataReady) return 0;
         
         System.Type dataType = chunk._chunkData.GetType();
@@ -1878,13 +2071,26 @@ public class McWorld : UdonSharpBehaviour
             if (rlePairs == null) return 0;
 
             int currentY = 0;
+#if LOGGING
+            int traversalDepth = 0;
+#endif
             for (int i = 0; i < rlePairs.Length; i += 2)
             {
                 ushort blockID = rlePairs[i];
                 ushort runLength = rlePairs[i + 1];
                 currentY += runLength;
+#if LOGGING
+                traversalDepth++;
+#endif
                 if (y < currentY)
                 {
+#if LOGGING
+                    if (enableCounters)
+                    {
+                        chunk.block_rleTraversalDepthTotal += traversalDepth;
+                        chunk.block_rleTraversalDepthCount++;
+                    }
+#endif
                     return (byte)blockID;
                 }
             }
@@ -1895,6 +2101,10 @@ public class McWorld : UdonSharpBehaviour
 
     private void _SetBlockLocal(ChunkData chunk, int x, int y, int z, byte blockType, bool updateMesh)
     {
+#if LOGGING
+        if (enableCounters) stats_setBlockCalls++;
+#endif
+        
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ) return;
         // Safety check: ensure chunk exists
         if (chunk == null) return;
@@ -1904,6 +2114,10 @@ public class McWorld : UdonSharpBehaviour
         
         // Optimization: check if the block is actually changing before doing any work.
         if (blockType == _GetBlockLocal(chunk, x, y, z)) return;
+
+#if LOGGING
+        if (enableCounters) stats_blockModifications++;
+#endif
 
         // OPTIMIZATION: Invalidate decompression cache since data is changing
         if (decompressionCacheValid.ContainsKey(chunk))
@@ -1996,6 +2210,13 @@ public class McWorld : UdonSharpBehaviour
 
     private object _CompressChunkColumnRLE(byte[] fullChunkData, out bool isHomogeneous)
     {
+#if LOGGING
+        float compressStartTime = 0f;
+        if (enableDetailedTimings) compressStartTime = Time.realtimeSinceStartup;
+        if (enableCounters) stats_rleCompressions++;
+        int bytesIn = fullChunkData != null ? fullChunkData.Length : 0;
+#endif
+        
         isHomogeneous = true;
         byte firstBlock = fullChunkData[0];
         for (int i = 1; i < fullChunkData.Length; i++) {
@@ -2006,6 +2227,15 @@ public class McWorld : UdonSharpBehaviour
         }
 
         if (isHomogeneous) {
+#if LOGGING
+            if (enableCounters) stats_rleHomogeneousChunks++;
+            if (enableDetailedTimings)
+            {
+                stats_rleCompressionTime += (Time.realtimeSinceStartup - compressStartTime) * 1000f;
+                stats_rleTotalBytesIn += bytesIn;
+                stats_rleTotalBytesOut += 1; // single byte
+            }
+#endif
             return firstBlock;
         }
 
@@ -2032,11 +2262,33 @@ public class McWorld : UdonSharpBehaviour
                 columnRLEData[columnIndex] = columnRuns.ToArray();
             }
         }
+        
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_rleCompressionTime += (Time.realtimeSinceStartup - compressStartTime) * 1000f;
+            stats_rleTotalBytesIn += bytesIn;
+            // Approximate output size: columnCount arrays * avg pairs * 2 bytes
+            int bytesOut = 0;
+            for (int i = 0; i < columnRLEData.Length; i++)
+            {
+                if (columnRLEData[i] != null) bytesOut += columnRLEData[i].Length * 2;
+            }
+            stats_rleTotalBytesOut += bytesOut;
+        }
+#endif
+        
         return columnRLEData;
     }
     
     private byte[] _DecompressChunkColumnRLE(ChunkData chunk)
     {
+#if LOGGING
+        float decompressStartTime = 0f;
+        if (enableDetailedTimings) decompressStartTime = Time.realtimeSinceStartup;
+        if (enableCounters) stats_rleDecompressions++;
+#endif
+        
         byte[] fullData = new byte[chunk._chunkDataSize];
         if (chunk._chunkData == null) return fullData;
         
@@ -2105,6 +2357,13 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
+        
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_rleDecompressionTime += (Time.realtimeSinceStartup - decompressStartTime) * 1000f;
+        }
+#endif
         
         return fullData;
     }
@@ -2239,8 +2498,15 @@ public class McWorld : UdonSharpBehaviour
     {
         if (neighborCacheValid.ContainsKey(chunk) && neighborCacheValid[chunk] && neighborCache.ContainsKey(chunk))
         {
+#if LOGGING
+            if (enableCacheTracking) stats_neighborCacheHits++;
+#endif
             return neighborCache[chunk];
         }
+        
+#if LOGGING
+        if (enableCacheTracking) stats_neighborCacheMisses++;
+#endif
         
         ChunkData[] neighbors = new ChunkData[6];
         neighbors[0] = GetChunkAt(chunk.chunkX_world + 1, chunk.chunkY_world, chunk.chunkZ_world); // PX
@@ -4621,4 +4887,176 @@ public class McWorld : UdonSharpBehaviour
             }
         }
     }
+    
+#if LOGGING
+    // --- Performance Logging Methods ---
+    
+    private void LogFrameStats(float updateTime)
+    {
+        logBuilder.Clear();
+        logBuilder.AppendLine($"=== Frame {stats_frameCount} Performance ===");
+        logBuilder.AppendLine($"Update: {updateTime:F2}ms (budget: {updateTimeBudgetMs:F1}ms, {(updateTime / updateTimeBudgetMs * 100f):F0}% used)");
+        logBuilder.AppendLine($"  DataGen: {activeDataGenCount} chunks active");
+        logBuilder.AppendLine($"  Meshing: {activeMeshingCount} chunks active");
+        logBuilder.AppendLine($"  Reconciliation Queue: {deferredReconciliationQueue.Count}");
+        
+        if (enableCacheTracking)
+        {
+            int totalDecomp = stats_decompCacheHits + stats_decompCacheMisses;
+            int totalNeighbor = stats_neighborCacheHits + stats_neighborCacheMisses;
+            float decompHitRate = totalDecomp > 0 ? (stats_decompCacheHits / (float)totalDecomp * 100f) : 0f;
+            float neighborHitRate = totalNeighbor > 0 ? (stats_neighborCacheHits / (float)totalNeighbor * 100f) : 0f;
+            logBuilder.AppendLine($"Cache: Decomp {decompHitRate:F0}% hit ({stats_decompCacheHits}/{totalDecomp}), Neighbor {neighborHitRate:F0}% hit ({stats_neighborCacheHits}/{totalNeighbor})");
+        }
+        
+        Debug.Log(logBuilder.ToString());
+    }
+    
+    private void LogAggregateStats()
+    {
+        float windowDuration = Time.realtimeSinceStartup - stats_aggregateWindowStart;
+        
+        logBuilder.Clear();
+        logBuilder.AppendLine($"=== Performance Summary (last {aggregateLogInterval} frames, {windowDuration:F1} seconds) ===");
+        
+        // Update stats
+        if (stats_frameCount > 0)
+        {
+            float avgUpdateTime = stats_updateTotalTime / stats_frameCount;
+            logBuilder.AppendLine($"Update: avg {avgUpdateTime:F2}ms, min {stats_updateTimeMin:F2}ms, max {stats_updateTimeMax:F2}ms");
+            logBuilder.AppendLine($"  Budget exceeded: {stats_budgetExceededCount} times ({(stats_budgetExceededCount / (float)stats_frameCount * 100f):F1}%)");
+        }
+        
+        // Mesh building stats
+        if (stats_meshBuildTotal > 0)
+        {
+            float avgMeshTime = stats_meshBuildTimeTotal / stats_meshBuildTotal;
+            float avgStepsPerChunk = stats_meshStepsTotal / (float)stats_meshBuildTotal;
+            logBuilder.AppendLine($"Mesh Building: {stats_meshBuildTotal} chunks, avg {avgMeshTime:F2}ms (min {stats_meshBuildTimeMin:F2}ms, max {stats_meshBuildTimeMax:F2}ms)");
+            logBuilder.AppendLine($"  Steps: avg {avgStepsPerChunk:F1} per chunk");
+            
+            if (enableDetailedTimings)
+            {
+                float totalGreedy = stats_greedyAxisYTime + stats_greedyAxisZTime + stats_greedyAxisXTime;
+                if (totalGreedy > 0)
+                {
+                    logBuilder.AppendLine($"  Greedy Meshing: Y={stats_greedyAxisYTime / totalGreedy * 100f:F0}% ({stats_greedyAxisYTime:F1}ms), Z={stats_greedyAxisZTime / totalGreedy * 100f:F0}% ({stats_greedyAxisZTime:F1}ms), X={stats_greedyAxisXTime / totalGreedy * 100f:F0}% ({stats_greedyAxisXTime:F1}ms)");
+                }
+            }
+            
+            if (enableCounters && stats_faceCullingTests > 0)
+            {
+                float cullRate = stats_facesCulled / (float)stats_faceCullingTests * 100f;
+                logBuilder.AppendLine($"  Face Culling: {stats_faceCullingTests} tests, {stats_facesCulled} culled ({cullRate:F1}%), {stats_facesDrawn} drawn");
+                logBuilder.AppendLine($"  Vertices: {stats_verticesOpaque} opaque, {stats_verticesTransparent} transparent, {stats_verticesCutout} cutout");
+            }
+        }
+        
+        // RLE stats
+        if (stats_rleCompressions > 0 || stats_rleDecompressions > 0)
+        {
+            float compressionRatio = stats_rleTotalBytesIn > 0 ? (stats_rleTotalBytesOut / (float)stats_rleTotalBytesIn) : 0f;
+            logBuilder.AppendLine($"RLE: {compressionRatio * 100f:F0}% compression ratio ({stats_rleTotalBytesIn / 1024f:F1}KB→{stats_rleTotalBytesOut / 1024f:F1}KB)");
+            
+            if (enableDetailedTimings)
+            {
+                float avgCompTime = stats_rleCompressions > 0 ? stats_rleCompressionTime / stats_rleCompressions : 0f;
+                float avgDecompTime = stats_rleDecompressions > 0 ? stats_rleDecompressionTime / stats_rleDecompressions : 0f;
+                logBuilder.AppendLine($"  Compressions: {stats_rleCompressions} (avg {avgCompTime:F2}ms), Decompressions: {stats_rleDecompressions} (avg {avgDecompTime:F2}ms)");
+                logBuilder.AppendLine($"  Homogeneous chunks: {stats_rleHomogeneousChunks}");
+            }
+            
+            if (enableCacheTracking)
+            {
+                int totalDecomp = stats_decompCacheHits + stats_decompCacheMisses;
+                float decompHitRate = totalDecomp > 0 ? (stats_decompCacheHits / (float)totalDecomp * 100f) : 0f;
+                logBuilder.AppendLine($"  Cache hit rate: {decompHitRate:F1}% ({stats_decompCacheHits}/{totalDecomp})");
+            }
+        }
+        
+        // Block operation stats
+        if (enableCounters && stats_getBlockCalls > 0)
+        {
+            logBuilder.AppendLine($"Block Ops: {stats_getBlockCalls} gets, {stats_setBlockCalls} sets, {stats_blockModifications} modifications");
+            if (stats_neighborRebuildTriggers > 0)
+            {
+                logBuilder.AppendLine($"  Neighbor rebuilds triggered: {stats_neighborRebuildTriggers}");
+            }
+        }
+        
+        // Cache stats
+        if (enableCacheTracking)
+        {
+            int totalDecomp = stats_decompCacheHits + stats_decompCacheMisses;
+            int totalNeighbor = stats_neighborCacheHits + stats_neighborCacheMisses;
+            float decompHitRate = totalDecomp > 0 ? (stats_decompCacheHits / (float)totalDecomp * 100f) : 0f;
+            float neighborHitRate = totalNeighbor > 0 ? (stats_neighborCacheHits / (float)totalNeighbor * 100f) : 0f;
+            logBuilder.AppendLine($"Cache: Decomp {decompHitRate:F1}% ({stats_decompCacheHits}/{totalDecomp}), Neighbor {neighborHitRate:F1}% ({stats_neighborCacheHits}/{totalNeighbor})");
+        }
+        
+        // Reconciliation stats
+        if (stats_reconciliationOps > 0)
+        {
+            float avgReconcilTime = stats_reconciliationTime / stats_reconciliationOps;
+            logBuilder.AppendLine($"Reconciliation: {stats_reconciliationOps} ops, {stats_reconciliationBlocks} blocks, avg {avgReconcilTime:F2}ms");
+        }
+        
+        // Chunk management stats
+        if (enableCounters)
+        {
+            logBuilder.AppendLine($"Chunks: {stats_chunkCreations} created, {stats_chunkStateTransitions} state transitions");
+        }
+        
+        Debug.Log(logBuilder.ToString());
+        
+        // Reset aggregate stats for next window
+        stats_aggregateWindowStart = Time.realtimeSinceStartup;
+        stats_frameCount = 0;
+        stats_updateTotalTime = 0f;
+        stats_updateTimeMin = float.MaxValue;
+        stats_updateTimeMax = 0f;
+        stats_budgetExceededCount = 0;
+        stats_processActiveChunksTime = 0f;
+        stats_reconciliationTime = 0f;
+        stats_meshBuildTotal = 0;
+        stats_meshBuildTimeTotal = 0f;
+        stats_meshBuildTimeMin = float.MaxValue;
+        stats_meshBuildTimeMax = 0f;
+        stats_meshStepsTotal = 0;
+        stats_greedyAxisYTime = 0f;
+        stats_greedyAxisZTime = 0f;
+        stats_greedyAxisXTime = 0f;
+        stats_sentinelBuilds = 0;
+        stats_sentinelBuildTime = 0f;
+        stats_faceCullingTests = 0;
+        stats_facesCulled = 0;
+        stats_facesDrawn = 0;
+        stats_verticesOpaque = 0;
+        stats_verticesTransparent = 0;
+        stats_verticesCutout = 0;
+        stats_meshApplyOpaqueTime = 0f;
+        stats_meshApplyTransparentTime = 0f;
+        stats_meshApplyCutoutTime = 0f;
+        stats_meshApplyColliderTime = 0f;
+        stats_rleCompressions = 0;
+        stats_rleDecompressions = 0;
+        stats_rleCompressionTime = 0f;
+        stats_rleDecompressionTime = 0f;
+        stats_rleTotalBytesIn = 0;
+        stats_rleTotalBytesOut = 0;
+        stats_rleHomogeneousChunks = 0;
+        stats_getBlockCalls = 0;
+        stats_setBlockCalls = 0;
+        stats_blockModifications = 0;
+        stats_neighborRebuildTriggers = 0;
+        stats_decompCacheHits = 0;
+        stats_decompCacheMisses = 0;
+        stats_neighborCacheHits = 0;
+        stats_neighborCacheMisses = 0;
+        stats_reconciliationOps = 0;
+        stats_reconciliationBlocks = 0;
+        stats_chunkCreations = 0;
+        stats_chunkStateTransitions = 0;
+    }
+#endif
 }
