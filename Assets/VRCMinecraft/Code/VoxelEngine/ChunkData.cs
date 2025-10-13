@@ -91,7 +91,17 @@ public class ChunkData
     // --- Neighbor Caches (for meshing) ---
     // These are direct references to neighbor data, fetched once at the start of meshing.
     public ChunkData neighborPX, neighborNX, neighborPY, neighborNY, neighborPZ, neighborNZ;
-
+    
+    // --- OPTIMIZATION: Pre-computed brightness cache (Phase 3) ---
+    // Cache brightness values (0-15) for all blocks in chunk to avoid repeated lighting calculations
+    // Size: 16x16x16 = 4096 bytes, indexed by: y * 256 + z * 16 + x
+    public byte[] _cachedBrightness;
+    
+    // --- OPTIMIZATION: Pre-computed biome color cache (Phase 6) ---
+    // Cache biome colors per XZ column (256 values for 16x16 grid)
+    // Indexed by: z * 16 + x. Reduces biome texture lookups from ~10,000 to 256 per chunk
+    public Color[] _cachedBiomeColors;
+    
 #if LOGGING
     // --- Debugging & Timings ---
     public float time_DataPrep, time_NeighborCache, time_MainLoop, time_ApplyOpaque, time_ApplyTransparent, time_ApplyCutout, time_ApplyCollision, time_ApplySelection;
