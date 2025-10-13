@@ -601,8 +601,9 @@ MonoBehaviour:
       Data: 33|UnityEngine.TooltipAttribute, UnityEngine.CoreModule
     - Name: tooltip
       Entry: 1
-      Data: 'Approximate time budget per mesh step in milliseconds. OPTIMIZED: Increased
-        from 0.5ms to 1.5ms due to mesh loop optimizations.'
+      Data: 'Approximate time budget per mesh step in milliseconds. OPTIMIZATION
+        Phase 4: Increased from 1.5ms to 8.0ms to reduce loop overhead (fewer, larger
+        steps).'
     - Name: 
       Entry: 8
       Data: 
