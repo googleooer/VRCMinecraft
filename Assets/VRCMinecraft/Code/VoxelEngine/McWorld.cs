@@ -2728,6 +2728,13 @@ public class McWorld : UdonSharpBehaviour
                 _ScheduleNeighborUpdate(chunk, nx, ny, nz, queue, ref queueEnd);
             }
             
+            // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
+            // This ensures neighbors update their meshes when lighting changes at chunk boundaries
+            if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
+            {
+                TriggerNeighborMeshRebuilds(chunk);
+            }
+            
             return true; // Light was updated
         }
         
@@ -3590,6 +3597,13 @@ public class McWorld : UdonSharpBehaviour
             _ScheduleNeighborUpdate(chunk, x, y, z-1, queue, ref queueEnd);  // Z-
             _ScheduleNeighborUpdate(chunk, x, y, z+1, queue, ref queueEnd);  // Z+
             
+            // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
+            // This ensures neighbors update their meshes when lighting changes at chunk boundaries
+            if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
+            {
+                TriggerNeighborMeshRebuilds(chunk);
+            }
+            
 #if LOGGING
             if (isSkyLight)
                 chunk.lightingQueueOps_Sky += 6;
@@ -3855,6 +3869,10 @@ public class McWorld : UdonSharpBehaviour
         // FIXED: Trigger lightweight boundary BFS instead of full chunk BFS
         // This allows the light we just added to spread through the neighbor efficiently
         _PropagateBoundaryLighting(neighborChunk, neighborData);
+        
+        // FIXED: Trigger neighbor mesh rebuilds for cross-chunk lighting updates
+        // This ensures the neighbor chunk updates its mesh when light propagates across boundaries
+        TriggerNeighborMeshRebuilds(neighborChunk);
     }
     
     private void _UpdateBlockLighting(ChunkData chunk, int x, int y, int z, byte oldBlockID, byte newBlockID)
@@ -3877,6 +3895,13 @@ public class McWorld : UdonSharpBehaviour
         
         // Recalculate lighting at this position and propagate
         _RecalculateLightAtPosition(chunk, fullData, x, y, z);
+        
+        // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
+        // This ensures neighbors update their meshes when lighting changes at chunk boundaries
+        if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
+        {
+            TriggerNeighborMeshRebuilds(chunk);
+        }
     }
     
     private void _RecalculateLightAtPosition(ChunkData chunk, byte[] fullData, int x, int y, int z)
@@ -4671,6 +4696,10 @@ public class McWorld : UdonSharpBehaviour
         if (readyNeighbors > 0)
         {
             _PerformLightweightBFS(chunk, chunkData);
+            
+            // FIXED: Trigger neighbor mesh rebuilds after lighting reconciliation
+            // This ensures neighbors update their meshes when lighting changes
+            TriggerNeighborMeshRebuilds(chunk);
         }
         
 #if LOGGING
@@ -4768,6 +4797,10 @@ public class McWorld : UdonSharpBehaviour
             }
         }
         
+        // FIXED: Trigger neighbor mesh rebuilds after lightweight BFS
+        // This ensures neighbors update their meshes when boundary lighting changes
+        TriggerNeighborMeshRebuilds(chunk);
+        
         ReturnBFSQueue(lightQueue);
     }
     
@@ -4806,6 +4839,13 @@ public class McWorld : UdonSharpBehaviour
         {
             int blockLight = currentByte & 0xF;
             chunk.lightData[blockIndex] = (byte)((newLight << 4) | blockLight);
+            
+            // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
+            // This ensures neighbors update their meshes when lighting changes at chunk boundaries
+            if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
+            {
+                TriggerNeighborMeshRebuilds(chunk);
+            }
         }
     }
     
@@ -5013,6 +5053,10 @@ public class McWorld : UdonSharpBehaviour
             if (queueStart == queueEnd) break;
         }
         
+        // FIXED: Trigger neighbor mesh rebuilds after boundary lighting propagation
+        // This ensures neighbors update their meshes when boundary lighting changes
+        TriggerNeighborMeshRebuilds(chunk);
+        
         ReturnBFSQueue(lightQueue);
     }
     
@@ -5126,6 +5170,10 @@ public class McWorld : UdonSharpBehaviour
                 chunk.lightData[chunkIndex] = (byte)((ourSkyLight << 4) | ourBlockLight);
             }
         }
+        
+        // FIXED: Trigger neighbor mesh rebuilds after importing light from neighbors
+        // This ensures neighbors update their meshes when light is imported across boundaries
+        TriggerNeighborMeshRebuilds(chunk);
     }
     
 #if LOGGING

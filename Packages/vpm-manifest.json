@@ -6,8 +6,11 @@
     "com.nessie.udon.movement": {
       "version": "0.4.2"
     },
+    "com.vrchat.base": {
+      "version": "3.10.2"
+    },
     "com.vrchat.worlds": {
-      "version": "3.9.0"
+      "version": "3.10.2"
     }
   },
   "locked": {
@@ -21,15 +24,15 @@
         "com.vrchat.worlds": "^3.4.0"
       }
     },
-    "com.vrchat.worlds": {
-      "version": "3.9.0",
-      "dependencies": {
-        "com.vrchat.base": "3.9.0"
-      }
-    },
     "com.vrchat.base": {
-      "version": "3.9.0",
+      "version": "3.10.2",
       "dependencies": {}
+    },
+    "com.vrchat.worlds": {
+      "version": "3.10.2",
+      "dependencies": {
+        "com.vrchat.base": "3.10.2"
+      }
     }
   }
 }
