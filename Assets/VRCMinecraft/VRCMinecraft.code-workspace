@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "C:/Users/maxiv/Documents/RetroMCP/minecraft/src/net/minecraft"
+		}
+	],
+	"settings": {
+		"dotnet.defaultSolution": "VRCMinecraft.sln"
+	}
+}

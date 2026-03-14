@@ -1,0 +1,1 @@
+Please read AGENT.md fully before doing anything.
