@@ -191,12 +191,11 @@ public class ModifyTerrain : UdonSharpBehaviour
         {
             blockOutline.position = (Vector3)_currentLookingAtPos + new Vector3(0.5f, 0.5f, 0.5f);
             
-            // Normalize progress for the shader (assuming it's a 0-1 value)
-            blockOutlineMaterial.SetInteger("_Progress", _currentDestructionProgress);
+            blockOutlineMaterial.SetFloat("_Progress", _currentDestructionProgress);
         }
         else
         {
-            blockOutlineMaterial.SetInteger("_Progress", 0);
+            blockOutlineMaterial.SetFloat("_Progress", 0f);
             blockOutline.position = new Vector3(0, -100, 0); // Move outline out of sight
         }
     }

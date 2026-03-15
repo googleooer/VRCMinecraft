@@ -92,6 +92,13 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             half _FogStart;
             half _FogEnd;
             half _FogMode;
+            sampler2D _UdonVRCM_GpuLightAtlas;
+            sampler2D _UdonVRCM_GpuSlotLookup;
+            float4 _UdonVRCM_GpuAtlasInfo;
+            float4 _UdonVRCM_GpuWorldInfo;
+            float4 _UdonVRCM_GpuChunkInfo;
+            float4 _UdonVRCM_GpuVoxelOffset;
+            float _UdonVRCM_GpuEnabled;
 
             v2f vert (appdata v)
             {
@@ -177,6 +184,64 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 return saturate(fogFactor);
             }
 
+            half calcBetaLightBrightnessFromLevel(float lightLevel)
+            {
+                float darkness = 1.0 - saturate(lightLevel / 15.0);
+                return (1.0 - darkness) / (darkness * 3.0 + 1.0) * 0.95 + 0.05;
+            }
+
+            half sampleGpuLightBrightnessAtPosition(float3 samplePos)
+            {
+                float coordinateBias = 0.0001;
+                float globalX = floor(samplePos.x + coordinateBias) + _UdonVRCM_GpuVoxelOffset.x;
+                float globalY = floor(samplePos.y + coordinateBias) + _UdonVRCM_GpuVoxelOffset.y;
+                float globalZ = floor(samplePos.z + coordinateBias) + _UdonVRCM_GpuVoxelOffset.z;
+
+                float maxWorldX = _UdonVRCM_GpuWorldInfo.x * _UdonVRCM_GpuChunkInfo.x;
+                float maxWorldY = _UdonVRCM_GpuWorldInfo.y * _UdonVRCM_GpuChunkInfo.y;
+                float maxWorldZ = _UdonVRCM_GpuWorldInfo.z * _UdonVRCM_GpuChunkInfo.x;
+                if (globalX < 0.0 || globalY < 0.0 || globalZ < 0.0) return -1.0;
+                if (globalX >= maxWorldX || globalY >= maxWorldY || globalZ >= maxWorldZ) return -1.0;
+
+                float chunkX = floor(globalX / _UdonVRCM_GpuChunkInfo.x);
+                float chunkY = floor(globalY / _UdonVRCM_GpuChunkInfo.y);
+                float chunkZ = floor(globalZ / _UdonVRCM_GpuChunkInfo.x);
+                float localX = globalX - chunkX * _UdonVRCM_GpuChunkInfo.x;
+                float localY = globalY - chunkY * _UdonVRCM_GpuChunkInfo.y;
+                float localZ = globalZ - chunkZ * _UdonVRCM_GpuChunkInfo.x;
+
+                float lookupRow = chunkY * _UdonVRCM_GpuWorldInfo.z + chunkZ;
+                float2 lookupUv = float2(
+                    (chunkX + 0.5) / _UdonVRCM_GpuWorldInfo.x,
+                    (lookupRow + 0.5) / (_UdonVRCM_GpuWorldInfo.y * _UdonVRCM_GpuWorldInfo.z)
+                );
+                float4 slotData = tex2D(_UdonVRCM_GpuSlotLookup, lookupUv);
+                if (slotData.a < 0.5) return -1.0;
+
+                float slotLow = floor(slotData.r * 255.0 + 0.5);
+                float slotHigh = floor(slotData.g * 255.0 + 0.5);
+                float slotIndex = slotLow + slotHigh * 256.0;
+                float tileX = fmod(slotIndex, _UdonVRCM_GpuAtlasInfo.z);
+                float tileY = floor(slotIndex / _UdonVRCM_GpuAtlasInfo.z);
+                float atlasU = (tileX * _UdonVRCM_GpuChunkInfo.x + localX + 0.5) / _UdonVRCM_GpuAtlasInfo.x;
+                float atlasV = (tileY * (_UdonVRCM_GpuChunkInfo.y * _UdonVRCM_GpuChunkInfo.x) + localY * _UdonVRCM_GpuChunkInfo.x + localZ + 0.5) / _UdonVRCM_GpuAtlasInfo.y;
+                float4 lightSample = tex2D(_UdonVRCM_GpuLightAtlas, float2(atlasU, atlasV));
+                if (lightSample.a < 0.5) return -1.0;
+                float lightLevel = floor(max(lightSample.r, lightSample.g) * 15.0 + 0.5);
+                return calcBetaLightBrightnessFromLevel(lightLevel);
+            }
+
+            half sampleGpuLightBrightness(float3 worldPos, float3 faceNormal)
+            {
+                if (_UdonVRCM_GpuEnabled < 0.5) return -1.0;
+                if (max(max(abs(faceNormal.x), abs(faceNormal.y)), abs(faceNormal.z)) < 0.9)
+                {
+                    return sampleGpuLightBrightnessAtPosition(worldPos);
+                }
+
+                return sampleGpuLightBrightnessAtPosition(worldPos + normalize(faceNormal) * 0.501);
+            }
+
             fixed4 frag (v2f i) : SV_Target
             {
                 fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
@@ -195,7 +260,16 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 
                 // Get the light brightness from vertex color (already gamma-corrected by lightBrightnessTable)
                 half minLightLevel = 0.02;
-                half lightBrightness = max(minLightLevel, i.color.a);
+                half gpuLightBrightness = sampleGpuLightBrightness(i.worldPos, i.normal);
+                half lightBrightness;
+                if (gpuLightBrightness >= 0.0)
+                {
+                    lightBrightness = max(minLightLevel, gpuLightBrightness);
+                }
+                else
+                {
+                    lightBrightness = max(minLightLevel, i.color.a);
+                }
                 
                 // Get face shading multiplier (also in gamma space, matching Minecraft)
                 half faceBrightness = calcBrightness(i.normal);

@@ -2,13 +2,13 @@ using System;
 
 public class NoiseGenerator3dPerlin
 {
-    private int[] permutations;
+    public readonly int[] permutations;
     
     // Pre-computed gradient lookup tables to eliminate branching
     // Note: These are instance fields instead of static due to UdonSharp limitations
-    private readonly double[] GRAD_X = new double[16] {1,  -1,  1, -1, 1, -1, 1, -1, 0,  0,  0,  0,  1,  0, -1,  0};
-    private readonly double[] GRAD_Y = new double[16] {1,   1, -1, -1, 0,  0,  0,  0,  1, -1,  1, -1, 1, -1,  1, -1};
-    private readonly double[] GRAD_Z = new double[16] {0,   0,  0,  0,  1,  1, -1, -1, 1,  1, -1, -1, 0,  1,  0, -1};
+    public readonly double[] GRAD_X = new double[16] {1,  -1,  1, -1, 1, -1, 1, -1, 0,  0,  0,  0,  1,  0, -1,  0};
+    public readonly double[] GRAD_Y = new double[16] {1,   1, -1, -1, 0,  0,  0,  0,  1, -1,  1, -1, 1, -1,  1, -1};
+    public readonly double[] GRAD_Z = new double[16] {0,   0,  0,  0,  1,  1, -1, -1, 1,  1, -1, -1, 0,  1,  0, -1};
 
     public double xCoord;
     public double yCoord;
@@ -36,7 +36,7 @@ public class NoiseGenerator3dPerlin
         }
     }
 
-    private static int floor_and_clamp_int(double val)
+    public static int floor_and_clamp_int(double val)
     {
         val = Math.Floor(val);
         if (val < int.MinValue) return int.MinValue;

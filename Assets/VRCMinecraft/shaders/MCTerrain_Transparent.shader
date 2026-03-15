@@ -6,6 +6,13 @@ Shader "Unlit/MCTerrain (Transparent)"
         _BiomeColor ("Biome Color", Color) = (1,1,1,0)
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
+
+        // MINECRAFT-STYLE RADIAL FOG PROPERTIES
+        _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0)
+        _FogDensity ("Fog Density", Range(0.0, 0.1)) = 0.02
+        _FogStart ("Fog Start Distance", Float) = 32.0
+        _FogEnd ("Fog End Distance", Float) = 128.0
+        _FogMode ("Fog Mode", Range(0, 2)) = 0
     }
     SubShader
     {
@@ -13,17 +20,14 @@ Shader "Unlit/MCTerrain (Transparent)"
         LOD 100
 
         Cull Off
-        
-        
 
         Pass
         {
             Blend SrcAlpha OneMinusSrcAlpha
-            
+
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
-            // make fog work
             #pragma multi_compile_fog
 
             #include "UnityCG.cginc"
@@ -33,6 +37,7 @@ Shader "Unlit/MCTerrain (Transparent)"
                 float4 vertex : POSITION;
                 float2 uv : TEXCOORD0;
                 float3 normal : NORMAL;
+                float4 color : COLOR;
             };
 
             struct v2f
@@ -41,6 +46,8 @@ Shader "Unlit/MCTerrain (Transparent)"
                 UNITY_FOG_COORDS(2)
                 float4 vertex : SV_POSITION;
                 float3 normal: TEXCOORD1;
+                fixed4 color : COLOR;
+                float3 worldPos : TEXCOORD3;
             };
 
             sampler2D _MainTex;
@@ -51,12 +58,30 @@ Shader "Unlit/MCTerrain (Transparent)"
 
             fixed4 _BiomeColor;
 
+            // MINECRAFT-STYLE RADIAL FOG
+            fixed4 _FogColor;
+            half _FogDensity;
+            half _FogStart;
+            half _FogEnd;
+            half _FogMode;
+
+            // GPU LIGHT ATLAS GLOBALS
+            sampler2D _UdonVRCM_GpuLightAtlas;
+            sampler2D _UdonVRCM_GpuSlotLookup;
+            float4 _UdonVRCM_GpuAtlasInfo;
+            float4 _UdonVRCM_GpuWorldInfo;
+            float4 _UdonVRCM_GpuChunkInfo;
+            float4 _UdonVRCM_GpuVoxelOffset;
+            float _UdonVRCM_GpuEnabled;
+
             v2f vert (appdata v)
             {
                 v2f o;
                 o.vertex = UnityObjectToClipPos(v.vertex);
                 o.normal = v.normal;
                 o.uv = TRANSFORM_TEX(v.uv, _MainTex);
+                o.color = v.color;
+                o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
                 UNITY_TRANSFER_FOG(o,o.vertex);
                 return o;
             }
@@ -69,48 +94,133 @@ Shader "Unlit/MCTerrain (Transparent)"
             fixed calcBrightness(fixed3 normal)
             {
                 fixed brightness;
-                if (normal.y > 0.5) // Top face
+                if (normal.y > 0.5)
                 {
                     brightness = 1.0;
                 }
-                else if (normal.y < -0.5) // Bottom face
+                else if (normal.y < -0.5)
                 {
-                    brightness = 0.2;
+                    brightness = 0.5;
                 }
-                else if (normal.x > 0.5 || normal.x < -0.5) // Left and right faces
+                else if (normal.x > 0.5 || normal.x < -0.5)
                 {
                     brightness = 0.6;
                 }
-                else if (normal.z > 0.5 || normal.z < -0.5) // Front and back faces
+                else if (normal.z > 0.5 || normal.z < -0.5)
                 {
-                    brightness = 0.4;
+                    brightness = 0.8;
+                }
+                else
+                {
+                    brightness = 1.0;
                 }
 
                 return brightness;
             }
 
+            half calcMinecraftFog(float3 worldPos)
+            {
+                float3 viewDir = worldPos - _WorldSpaceCameraPos;
+                half distance = length(viewDir);
+                half fogFactor = 1.0;
+                if (_FogMode < 0.5)
+                {
+                    fogFactor = saturate((_FogEnd - distance) / (_FogEnd - _FogStart));
+                }
+                else if (_FogMode < 1.5)
+                {
+                    fogFactor = exp(-_FogDensity * distance);
+                }
+                else
+                {
+                    fogFactor = exp(-_FogDensity * _FogDensity * distance * distance);
+                }
+                return saturate(fogFactor);
+            }
+
+            half calcBetaLightBrightnessFromLevel(float lightLevel)
+            {
+                float darkness = 1.0 - saturate(lightLevel / 15.0);
+                return (1.0 - darkness) / (darkness * 3.0 + 1.0) * 0.95 + 0.05;
+            }
+
+            half sampleGpuLightBrightnessAtPosition(float3 samplePos)
+            {
+                float coordinateBias = 0.0001;
+                float globalX = floor(samplePos.x + coordinateBias) + _UdonVRCM_GpuVoxelOffset.x;
+                float globalY = floor(samplePos.y + coordinateBias) + _UdonVRCM_GpuVoxelOffset.y;
+                float globalZ = floor(samplePos.z + coordinateBias) + _UdonVRCM_GpuVoxelOffset.z;
+
+                float maxWorldX = _UdonVRCM_GpuWorldInfo.x * _UdonVRCM_GpuChunkInfo.x;
+                float maxWorldY = _UdonVRCM_GpuWorldInfo.y * _UdonVRCM_GpuChunkInfo.y;
+                float maxWorldZ = _UdonVRCM_GpuWorldInfo.z * _UdonVRCM_GpuChunkInfo.x;
+                if (globalX < 0.0 || globalY < 0.0 || globalZ < 0.0) return -1.0;
+                if (globalX >= maxWorldX || globalY >= maxWorldY || globalZ >= maxWorldZ) return -1.0;
+
+                float chunkX = floor(globalX / _UdonVRCM_GpuChunkInfo.x);
+                float chunkY = floor(globalY / _UdonVRCM_GpuChunkInfo.y);
+                float chunkZ = floor(globalZ / _UdonVRCM_GpuChunkInfo.x);
+                float localX = globalX - chunkX * _UdonVRCM_GpuChunkInfo.x;
+                float localY = globalY - chunkY * _UdonVRCM_GpuChunkInfo.y;
+                float localZ = globalZ - chunkZ * _UdonVRCM_GpuChunkInfo.x;
+
+                float lookupRow = chunkY * _UdonVRCM_GpuWorldInfo.z + chunkZ;
+                float2 lookupUv = float2(
+                    (chunkX + 0.5) / _UdonVRCM_GpuWorldInfo.x,
+                    (lookupRow + 0.5) / (_UdonVRCM_GpuWorldInfo.y * _UdonVRCM_GpuWorldInfo.z)
+                );
+                float4 slotData = tex2D(_UdonVRCM_GpuSlotLookup, lookupUv);
+                if (slotData.a < 0.5) return -1.0;
+
+                float slotLow = floor(slotData.r * 255.0 + 0.5);
+                float slotHigh = floor(slotData.g * 255.0 + 0.5);
+                float slotIndex = slotLow + slotHigh * 256.0;
+                float tileX = fmod(slotIndex, _UdonVRCM_GpuAtlasInfo.z);
+                float tileY = floor(slotIndex / _UdonVRCM_GpuAtlasInfo.z);
+                float atlasU = (tileX * _UdonVRCM_GpuChunkInfo.x + localX + 0.5) / _UdonVRCM_GpuAtlasInfo.x;
+                float atlasV = (tileY * (_UdonVRCM_GpuChunkInfo.y * _UdonVRCM_GpuChunkInfo.x) + localY * _UdonVRCM_GpuChunkInfo.x + localZ + 0.5) / _UdonVRCM_GpuAtlasInfo.y;
+                float4 lightSample = tex2D(_UdonVRCM_GpuLightAtlas, float2(atlasU, atlasV));
+                if (lightSample.a < 0.5) return -1.0;
+                float lightLevel = floor(max(lightSample.r, lightSample.g) * 15.0 + 0.5);
+                return calcBetaLightBrightnessFromLevel(lightLevel);
+            }
+
+            half sampleGpuLightBrightness(float3 worldPos, float3 faceNormal)
+            {
+                if (_UdonVRCM_GpuEnabled < 0.5) return -1.0;
+                if (max(max(abs(faceNormal.x), abs(faceNormal.y)), abs(faceNormal.z)) < 0.9)
+                {
+                    return sampleGpuLightBrightnessAtPosition(worldPos);
+                }
+
+                return sampleGpuLightBrightnessAtPosition(worldPos + normalize(faceNormal) * 0.501);
+            }
+
             fixed4 frag (v2f i) : SV_Target
             {
-                // Snap the UVs to a 0.0625 grid
-                //float2 snappedUV = floor(i.uv / 0.0625) * 0.0625;
-                // sample the texture
-                //fixed4 col = tex2D(_MainTex, snappedUV) * _BiomeColor;
                 fixed4 col = tex2D(_MainTex, round(i.uv)) * half4(_BiomeColor.rgb,1);
+
                 half minLightLevel = 0.02;
-                float dayNightTransition;
-                if (_DayProgress < 0.0417) { // 0 to 1000 ticks
-                    dayNightTransition = (_DayProgress / 0.0417);
-                } else if (_DayProgress > 0.5 && _DayProgress < 0.5417) { // 12000 to 13000 ticks
-                    dayNightTransition = (1 - ((_DayProgress - 0.5) / 0.0417));
-                } else if (_DayProgress <= 0.5) {
-                    dayNightTransition = 1;
-                } else {
-                    dayNightTransition = 0;
+                half gpuLightBrightness = sampleGpuLightBrightness(i.worldPos, i.normal);
+                half lightBrightness;
+                if (gpuLightBrightness >= 0.0)
+                {
+                    lightBrightness = max(minLightLevel, gpuLightBrightness);
                 }
-                dayNightTransition = dayNightTransition;
-                col.rgb *= max(minLightLevel,(float)((_SkyLight+1)*dayNightTransition)/16);
-                col.rgb *= calcBrightness(i.normal);
-                // apply fog
+                else
+                {
+                    lightBrightness = max(minLightLevel, i.color.a);
+                }
+
+                half faceBrightness = calcBrightness(i.normal);
+                half combinedBrightness = lightBrightness * faceBrightness;
+                combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
+                col.rgb *= combinedBrightness;
+
+                // MINECRAFT-STYLE RADIAL FOG
+                half fogFactor = calcMinecraftFog(i.worldPos);
+                col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
+
                 UNITY_APPLY_FOG(i.fogCoord, col);
                 return col;
             }

@@ -1,4 +1,4 @@
-﻿#define LOGGING
+#define LOGGING
 
 
 using UdonSharp;
@@ -16,9 +16,8 @@ using System;
 using Random = UnityEngine.Random;
 
 /// <summary>
-/// Updated generation states for a fully GPU-driven pipeline.
-/// The CPU no longer fills blocks or applies surfaces; it just orchestrates
-/// the GPU and applies post-processing like caves.
+/// Terrain generator with an optional GPU-accelerated density/base-terrain path.
+/// Biome surface replacement and bedrock can also run on GPU; decoration and gameplay-facing block mutation remain CPU-side.
 /// </summary>
 public enum GenerationState
 {
@@ -27,6 +26,10 @@ public enum GenerationState
     Prepare_SandNoise,
     Prepare_GravelNoise,
     Prepare_StoneNoise,
+    Prepare_GpuNoise,
+    Prepare_GpuFinalize,
+    Prepare_GpuReadback,
+    Copy_GpuChunkSlice,
     Prepare_AllocCache,
     Prepare_NoiseOctaves,
     Prepare_CombineNoise,
@@ -34,6 +37,12 @@ public enum GenerationState
     ReplacingBiomeBlocks,
     DecoratingTerrain,
     Complete
+}
+
+public enum GpuWorldgenReadbackPhase
+{
+    None,
+    BaseColumn
 }
 
 [Singleton]
@@ -60,6 +69,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // Debugging offsets for chunk generation.
     public int chunkOffsetX = 0;
     public int chunkOffsetZ = 0;
+    [Tooltip("When enabled, terrain sampling matches the legacy 1to1 branch exactly: no X flip, no built-in offsets, and legacy surface-biome indexing.")]
+    public bool match1to1TerrainBaseline = false;
     [Tooltip("Flip X-axis to match Minecraft's right-handed coordinate system (Unity is left-handed)")]
     public bool flipXAxis = true;
     [Tooltip("Built-in block offset on X-axis to align with Minecraft coordinate system")]
@@ -77,6 +88,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
     [Header("Performance (VRChat)")]
     [Tooltip("WARN: Noise generation takes 400-500ms in VRChat (3-4x slower than editor). This is a known Udon limitation. First chunk per column will stutter.")]
     public bool acknowledgeVRChatPerformance = false;
+
+    [Header("GPU Worldgen")]
+    public bool enableGpuWorldgen = true;
+    public Material gpuNoiseOctaveMaterial;
+    public Material gpuNoiseCombineMaterial;
+    public Material gpuColumnBaseFillMaterial;
+    public Material gpuColumnSurfaceInfoMaterial;
+    public Material gpuColumnSurfaceReplaceMaterial;
 
     [Header("Structure & Feature Templates")]
     public McStructureTemplate[] structureTemplates;
@@ -174,6 +193,114 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private double[] cachedTemperatures;
     private double[] cachedRainfall;
 
+    // GPU worldgen runtime state
+    private bool gpuWorldgenReady = false;
+    private bool gpuColumnReadbackPending = false;
+    private bool gpuColumnReadbackReady = false;
+    private bool gpuColumnReadbackFailed = false;
+    private int gpuCachedColumnX = int.MaxValue;
+    private int gpuCachedColumnZ = int.MaxValue;
+    private int gpuPendingColumnX = int.MaxValue;
+    private int gpuPendingColumnZ = int.MaxValue;
+    private GpuWorldgenReadbackPhase gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
+    private int gpuWorldHeightBlocks = 0;
+    private Texture2D gpuPermTexture;
+    private Texture2D gpuTemperatureTexture;
+    private Texture2D gpuRainfallTexture;
+    private Texture2D gpuSurfaceParamsTextureA;
+    private Texture2D gpuSurfaceParamsTextureB;
+    private Texture2D gpuBedrockMaskTexture;
+    private RenderTexture gpuNoiseWork3D_A;
+    private RenderTexture gpuNoiseWork3D_B;
+    private RenderTexture gpuNoiseWork2D_A;
+    private RenderTexture gpuNoiseWork2D_B;
+    // CPU noise upload textures (reusable, pre-allocated)
+    private Texture2D gpuNoiseUpload3D;
+    private Texture2D gpuNoiseUpload2D;
+    private Color[] gpuNoiseUpload3DPixels;
+    private Color[] gpuNoiseUpload2DPixels;
+    private RenderTexture gpuNoise1Texture;
+    private RenderTexture gpuNoise2Texture;
+    private RenderTexture gpuNoise3Texture;
+    private RenderTexture gpuNoise6Texture;
+    private RenderTexture gpuNoise7Texture;
+    private RenderTexture gpuDensityTexture;
+    private RenderTexture gpuColumnBaseTexture;
+    private RenderTexture gpuColumnSurfaceInfoTexture;
+    private RenderTexture gpuColumnFinalTexture;
+    private Texture2D gpuColumnUploadTexture;
+    private Texture2D gpuClearTexture;
+    private Color[] gpuClimatePixels;
+    private Color[] gpuPermutationPixels; // 256 * MAX_OCTAVES for batched upload
+    private const int GPU_MAX_OCTAVES = 16;
+    private Color[] gpuSurfaceParamPixelsA;
+    private Color[] gpuSurfaceParamPixelsB;
+    private Color[] gpuBedrockMaskPixels;
+    private Color[] gpuColumnUploadPixels;
+    private Color32[] gpuColumnReadbackPixels;
+    private Color32[] gpuSurfaceInfoReadbackPixels;
+    private int gpuPropPermTexId;
+    private int gpuPropAccumulationTexId;
+    private int gpuPropOctaveId;
+    private int gpuPropFrequencyId;
+    private int gpuPropAmplitudeId;
+    private int gpuPropXCoordId;
+    private int gpuPropYCoordId;
+    private int gpuPropZCoordId;
+    private int gpuPropXPosId;
+    private int gpuPropYPosId;
+    private int gpuPropZPosId;
+    private int gpuPropGridXId;
+    private int gpuPropGridYId;
+    private int gpuPropGridZId;
+    private int gpuPropXSizeId;
+    private int gpuPropYSizeId;
+    private int gpuPropZSizeId;
+    private int gpuPropIs2DId;
+    private int gpuPropNoise1TexId;
+    private int gpuPropNoise2TexId;
+    private int gpuPropNoise3TexId;
+    private int gpuPropNoise6TexId;
+    private int gpuPropNoise7TexId;
+    private int gpuPropTemperatureTexId;
+    private int gpuPropRainfallTexId;
+    private int gpuPropChunkXId;
+    private int gpuPropChunkZId;
+    private int gpuPropFlipXAxisId;
+    private int gpuPropBuiltinOffsetXId;
+    private int gpuPropBuiltinOffsetZId;
+    private int gpuPropDensityTexId;
+    private int gpuPropWorldHeightId;
+    private int gpuPropChunkSizeXZId;
+    private int gpuPropOceanHeightId;
+    private int gpuPropStoneBlockId;
+    private int gpuPropWaterBlockId;
+    private int gpuPropIceBlockId;
+    private int gpuPropBaseColumnTexId;
+    private int gpuPropSurfaceParamsTexAId;
+    private int gpuPropSurfaceParamsTexBId;
+    private int gpuPropBedrockMaskTexId;
+    private int gpuPropBedrockBlockId;
+    private int gpuPropSandBlockId;
+    private int gpuPropSandstoneBlockId;
+
+    // Precomputed coordinate data for double-precision noise on GPU.
+    // CPU computes floor() & 0xFF and fractional parts in double,
+    // then uploads as float arrays so the GPU never does precision-sensitive coord math.
+    private const int GPU_MAX_XZSIZE = 5;
+    private const int GPU_MAX_YSIZE = 65; // supports up to height=512
+    private float[] gpuPrePermX, gpuPreFracX;
+    private float[] gpuPrePermY, gpuPreFracY;
+    private float[] gpuPrePermZ, gpuPreFracZ;
+    // Gradient-cache fractional Y: stores the relY of the first sample in each
+    // Perlin cell, replicating Minecraft Beta 1.7.3's Y-level caching behaviour
+    // where gradient dot products reuse stale relY within the same cell.
+    private float[] gpuPreGradFracY;
+    private int gpuPropPermIdxXId, gpuPropFracXId;
+    private int gpuPropPermIdxYId, gpuPropFracYId;
+    private int gpuPropPermIdxZId, gpuPropFracZId;
+    private int gpuPropGradFracYId;
+
     // Time-slicing progress trackers for the preparation state
     private int noiseCombine_x;
     private int noiseCombine_k1;
@@ -197,6 +324,62 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
     private StringBuilder logBuilder;
 #endif
+
+    public Texture GetGpuDensityDebugTexture()
+    {
+        return gpuDensityTexture;
+    }
+
+    public Texture GetGpuColumnBaseDebugTexture()
+    {
+        return gpuColumnBaseTexture;
+    }
+
+    public Texture GetGpuColumnSurfaceInfoDebugTexture()
+    {
+        return gpuColumnSurfaceInfoTexture;
+    }
+
+    public Texture GetGpuColumnFinalDebugTexture()
+    {
+        return gpuColumnFinalTexture;
+    }
+
+    private int _GetTerrainBlockStartX(int chunkX)
+    {
+        if (match1to1TerrainBaseline) return chunkX * world.chunkSizeXZ;
+        return (flipXAxis ? -chunkX * world.chunkSizeXZ : chunkX * world.chunkSizeXZ) + BUILTIN_OFFSET_X;
+    }
+
+    private int _GetTerrainBlockStartZ(int chunkZ)
+    {
+        if (match1to1TerrainBaseline) return chunkZ * world.chunkSizeXZ;
+        return chunkZ * world.chunkSizeXZ + BUILTIN_OFFSET_Z;
+    }
+
+    private int _GetTerrainNoiseStartX(int chunkX, int pieceSize)
+    {
+        if (match1to1TerrainBaseline) return chunkX * pieceSize;
+        return (flipXAxis ? -chunkX : chunkX) * pieceSize + (BUILTIN_OFFSET_X / pieceSize);
+    }
+
+    private int _GetTerrainNoiseStartZ(int chunkZ, int pieceSize)
+    {
+        if (match1to1TerrainBaseline) return chunkZ * pieceSize;
+        return chunkZ * pieceSize + (BUILTIN_OFFSET_Z / pieceSize);
+    }
+
+    private int _MapTerrainLocalX(int localX, int sizeXZ)
+    {
+        if (match1to1TerrainBaseline) return localX;
+        return flipXAxis ? (sizeXZ - 1 - localX) : localX;
+    }
+
+    private int _GetSurfaceBiomeIndex(int x, int z, int sizeXZ)
+    {
+        if (match1to1TerrainBaseline) return x + z * sizeXZ;
+        return x * sizeXZ + z;
+    }
 
     public void init(int seed)
     {
@@ -229,6 +412,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         treeNoise = new NoiseGeneratorOctaves3D(rand, 8);
 
         caves = new WorldGenCavesOld();
+        _InitializeGpuWorldgen();
         
         isInitialized = true;
 
@@ -240,6 +424,1061 @@ public class McTerrainGenerator : UdonSharpBehaviour
             Debug.Log(logBuilder.ToString());
         }
 #endif
+    }
+
+    private Texture2D _CreateGpuFloatTexture(int width, int height, TextureWrapMode wrapMode)
+    {
+        Texture2D texture = new Texture2D(width, height, TextureFormat.RGBAHalf, false, true);
+        texture.filterMode = FilterMode.Point;
+        texture.wrapMode = wrapMode;
+        return texture;
+    }
+
+    private Texture2D _CreateGpuColorTexture(int width, int height, TextureWrapMode wrapMode)
+    {
+        Texture2D texture = new Texture2D(width, height, TextureFormat.RGBA32, false, true);
+        texture.filterMode = FilterMode.Point;
+        texture.wrapMode = wrapMode;
+        return texture;
+    }
+
+    private RenderTexture _CreateGpuFloatRenderTexture(int width, int height, string textureName)
+    {
+        // Use ARGBFloat (32-bit per channel) instead of ARGBHalf (16-bit) for noise accumulation.
+        // Half-float only has ~3 decimal digits of mantissa precision which destroys
+        // early-octave detail when accumulated against later-octave large amplitude values.
+        RenderTexture rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGBFloat, RenderTextureReadWrite.Linear);
+        rt.name = textureName;
+        rt.filterMode = FilterMode.Point;
+        rt.wrapMode = TextureWrapMode.Clamp;
+        rt.useMipMap = false;
+        rt.autoGenerateMips = false;
+        rt.Create();
+        return rt;
+    }
+
+    private RenderTexture _CreateGpuColorRenderTexture(int width, int height, string textureName)
+    {
+        RenderTexture rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+        rt.name = textureName;
+        rt.filterMode = FilterMode.Point;
+        rt.wrapMode = TextureWrapMode.Clamp;
+        rt.useMipMap = false;
+        rt.autoGenerateMips = false;
+        rt.Create();
+        return rt;
+    }
+
+    private void _InitializeGpuWorldgen()
+    {
+        gpuWorldgenReady = false;
+        gpuColumnReadbackPending = false;
+        gpuColumnReadbackReady = false;
+        gpuColumnReadbackFailed = false;
+        gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
+        if (!enableGpuWorldgen) return;
+        if (world == null || gpuNoiseOctaveMaterial == null || gpuNoiseCombineMaterial == null || gpuColumnBaseFillMaterial == null || gpuColumnSurfaceInfoMaterial == null || gpuColumnSurfaceReplaceMaterial == null) return;
+
+        gpuWorldHeightBlocks = world.worldDimensionY * world.chunkSizeY;
+        int densityXSize = 5;
+        int densityYSize = gpuWorldHeightBlocks / 8 + 1;
+        int densityZSize = 5;
+        int densityPackedWidth = densityXSize * densityZSize;
+
+        // CRITICAL: Use RGBA32 (8-bit unorm) NOT RGBAHalf for permutation data.
+        // Values 0-255 divided by 255 are NOT exactly representable in half-float,
+        // causing permutation indices to be off-by-one when read back in the shader.
+        // RGBA32 preserves exact integers via the round-trip: store(v/255)→8bit(v)→read(v/255)→×255=v
+        gpuPermTexture = _CreateGpuColorTexture(256, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuTemperatureTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
+        gpuRainfallTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
+        gpuSurfaceParamsTextureA = _CreateGpuColorTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
+        gpuSurfaceParamsTextureB = _CreateGpuColorTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
+        gpuBedrockMaskTexture = _CreateGpuColorTexture(world.chunkSizeXZ, 5 * world.chunkSizeXZ, TextureWrapMode.Clamp);
+        gpuClearTexture = _CreateGpuColorTexture(1, 1, TextureWrapMode.Clamp);
+        gpuClearTexture.SetPixel(0, 0, new Color(0f, 0f, 0f, 1f));
+        gpuClearTexture.Apply(false, false);
+
+        gpuNoiseWork3D_A = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_NoiseWork3D_A");
+        gpuNoiseWork3D_B = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_NoiseWork3D_B");
+        gpuNoiseWork2D_A = _CreateGpuFloatRenderTexture(densityXSize, densityZSize, "GPU_NoiseWork2D_A");
+        gpuNoiseWork2D_B = _CreateGpuFloatRenderTexture(densityXSize, densityZSize, "GPU_NoiseWork2D_B");
+        // Pre-allocate reusable textures for CPU noise upload
+        gpuNoiseUpload3D = _CreateGpuFloatTexture(densityPackedWidth, densityYSize, TextureWrapMode.Clamp);
+        gpuNoiseUpload2D = _CreateGpuFloatTexture(densityXSize, densityZSize, TextureWrapMode.Clamp);
+        gpuNoiseUpload3DPixels = new Color[densityPackedWidth * densityYSize];
+        gpuNoiseUpload2DPixels = new Color[densityXSize * densityZSize];
+        gpuNoise1Texture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Noise1");
+        gpuNoise2Texture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Noise2");
+        gpuNoise3Texture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Noise3");
+        gpuNoise6Texture = _CreateGpuFloatRenderTexture(densityXSize, densityZSize, "GPU_Noise6");
+        gpuNoise7Texture = _CreateGpuFloatRenderTexture(densityXSize, densityZSize, "GPU_Noise7");
+        gpuDensityTexture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Density");
+        gpuColumnBaseTexture = _CreateGpuColorRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_ColumnBase");
+        gpuColumnSurfaceInfoTexture = _CreateGpuColorRenderTexture(world.chunkSizeXZ, world.chunkSizeXZ, "GPU_ColumnSurfaceInfo");
+        gpuColumnFinalTexture = _CreateGpuColorRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_ColumnFinal");
+        gpuColumnUploadTexture = _CreateGpuColorTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, TextureWrapMode.Clamp);
+
+        gpuClimatePixels = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
+        gpuPermutationPixels = new Color[256 * GPU_MAX_OCTAVES];
+        gpuSurfaceParamPixelsA = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
+        gpuSurfaceParamPixelsB = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
+        gpuBedrockMaskPixels = new Color[world.chunkSizeXZ * 5 * world.chunkSizeXZ];
+        gpuColumnUploadPixels = new Color[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
+        gpuColumnReadbackPixels = new Color32[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
+        gpuSurfaceInfoReadbackPixels = new Color32[world.chunkSizeXZ * world.chunkSizeXZ];
+
+        gpuPropPermTexId = VRCShader.PropertyToID("_PermTex");
+        gpuPropAccumulationTexId = VRCShader.PropertyToID("_AccumulationTex");
+        gpuPropOctaveId = VRCShader.PropertyToID("_Octave");
+        gpuPropFrequencyId = VRCShader.PropertyToID("_Frequency");
+        gpuPropAmplitudeId = VRCShader.PropertyToID("_Amplitude");
+        gpuPropXCoordId = VRCShader.PropertyToID("_XCoord");
+        gpuPropYCoordId = VRCShader.PropertyToID("_YCoord");
+        gpuPropZCoordId = VRCShader.PropertyToID("_ZCoord");
+        gpuPropXPosId = VRCShader.PropertyToID("_XPos");
+        gpuPropYPosId = VRCShader.PropertyToID("_YPos");
+        gpuPropZPosId = VRCShader.PropertyToID("_ZPos");
+        gpuPropGridXId = VRCShader.PropertyToID("_GridX");
+        gpuPropGridYId = VRCShader.PropertyToID("_GridY");
+        gpuPropGridZId = VRCShader.PropertyToID("_GridZ");
+        gpuPropXSizeId = VRCShader.PropertyToID("_XSize");
+        gpuPropYSizeId = VRCShader.PropertyToID("_YSize");
+        gpuPropZSizeId = VRCShader.PropertyToID("_ZSize");
+        gpuPropIs2DId = VRCShader.PropertyToID("_Is2D");
+        gpuPropNoise1TexId = VRCShader.PropertyToID("_Noise1Tex");
+        gpuPropNoise2TexId = VRCShader.PropertyToID("_Noise2Tex");
+        gpuPropNoise3TexId = VRCShader.PropertyToID("_Noise3Tex");
+        gpuPropNoise6TexId = VRCShader.PropertyToID("_Noise6Tex");
+        gpuPropNoise7TexId = VRCShader.PropertyToID("_Noise7Tex");
+        gpuPropTemperatureTexId = VRCShader.PropertyToID("_TemperatureTex");
+        gpuPropRainfallTexId = VRCShader.PropertyToID("_RainfallTex");
+        gpuPropChunkXId = VRCShader.PropertyToID("_ChunkX");
+        gpuPropChunkZId = VRCShader.PropertyToID("_ChunkZ");
+        gpuPropFlipXAxisId = VRCShader.PropertyToID("_FlipXAxis");
+        gpuPropBuiltinOffsetXId = VRCShader.PropertyToID("_BuiltinOffsetX");
+        gpuPropBuiltinOffsetZId = VRCShader.PropertyToID("_BuiltinOffsetZ");
+        gpuPropDensityTexId = VRCShader.PropertyToID("_DensityTex");
+        gpuPropWorldHeightId = VRCShader.PropertyToID("_WorldHeight");
+        gpuPropChunkSizeXZId = VRCShader.PropertyToID("_ChunkSizeXZ");
+        gpuPropOceanHeightId = VRCShader.PropertyToID("_OceanHeight");
+        gpuPropStoneBlockId = VRCShader.PropertyToID("_StoneBlockId");
+        gpuPropWaterBlockId = VRCShader.PropertyToID("_WaterBlockId");
+        gpuPropIceBlockId = VRCShader.PropertyToID("_IceBlockId");
+        gpuPropBaseColumnTexId = VRCShader.PropertyToID("_BaseColumnTex");
+        gpuPropSurfaceParamsTexAId = VRCShader.PropertyToID("_SurfaceParamsTexA");
+        gpuPropSurfaceParamsTexBId = VRCShader.PropertyToID("_SurfaceParamsTexB");
+        gpuPropBedrockMaskTexId = VRCShader.PropertyToID("_BedrockMaskTex");
+        gpuPropBedrockBlockId = VRCShader.PropertyToID("_BedrockBlockId");
+        gpuPropSandBlockId = VRCShader.PropertyToID("_SandBlockId");
+        gpuPropSandstoneBlockId = VRCShader.PropertyToID("_SandstoneBlockId");
+
+        // Precomputed coordinate property IDs
+        gpuPropPermIdxXId = VRCShader.PropertyToID("_PermIdxX");
+        gpuPropFracXId = VRCShader.PropertyToID("_FracX");
+        gpuPropPermIdxYId = VRCShader.PropertyToID("_PermIdxY");
+        gpuPropFracYId = VRCShader.PropertyToID("_FracY");
+        gpuPropGradFracYId = VRCShader.PropertyToID("_GradFracY");
+        gpuPropPermIdxZId = VRCShader.PropertyToID("_PermIdxZ");
+        gpuPropFracZId = VRCShader.PropertyToID("_FracZ");
+
+        // Allocate precompute arrays
+        gpuPrePermX = new float[GPU_MAX_XZSIZE];
+        gpuPreFracX = new float[GPU_MAX_XZSIZE];
+        gpuPrePermY = new float[GPU_MAX_YSIZE];
+        gpuPreFracY = new float[GPU_MAX_YSIZE];
+        gpuPreGradFracY = new float[GPU_MAX_YSIZE];
+        gpuPrePermZ = new float[GPU_MAX_XZSIZE];
+        gpuPreFracZ = new float[GPU_MAX_XZSIZE];
+
+        gpuWorldgenReady = true;
+    }
+
+
+
+    private void _UploadGpuPermutationTexture(NoiseGenerator3dPerlin perlin)
+    {
+        if (gpuPermTexture == null || perlin == null || perlin.permutations == null) return;
+
+        for (int i = 0; i < 256; i++)
+        {
+            gpuPermutationPixels[i] = new Color(perlin.permutations[i] / 255.0f, 0f, 0f, 1f);
+        }
+
+        gpuPermTexture.SetPixels(gpuPermutationPixels);
+        gpuPermTexture.Apply(false, false);
+    }
+
+    private void _UploadGpuClimateTextures()
+    {
+        if (gpuTemperatureTexture == null || gpuRainfallTexture == null || wcm == null || wcm.temperatures == null || wcm.rainfall == null) return;
+
+        int sizeXZ = world.chunkSizeXZ;
+        for (int x = 0; x < sizeXZ; x++)
+        {
+            int xBase = x * sizeXZ;
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                int sourceIndex = xBase + z;
+                int packedIndex = z * sizeXZ + x;
+                gpuClimatePixels[packedIndex] = new Color((float)wcm.temperatures[sourceIndex], 0f, 0f, 1f);
+            }
+        }
+        gpuTemperatureTexture.SetPixels(gpuClimatePixels);
+        gpuTemperatureTexture.Apply(false, false);
+
+        for (int x = 0; x < sizeXZ; x++)
+        {
+            int xBase = x * sizeXZ;
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                int sourceIndex = xBase + z;
+                int packedIndex = z * sizeXZ + x;
+                gpuClimatePixels[packedIndex] = new Color((float)wcm.rainfall[sourceIndex], 0f, 0f, 1f);
+            }
+        }
+        gpuRainfallTexture.SetPixels(gpuClimatePixels);
+        gpuRainfallTexture.Apply(false, false);
+    }
+
+    /// <summary>
+    /// Precompute the Perlin noise coordinate integer/fractional split for one axis.
+    /// This is the precision-critical part: done in double on CPU, results passed as float arrays.
+    /// permIdx[i] = floor(world) & 0xFF  (exact in float: 0-255)
+    /// frac[i]    = world - floor(world)  (in [0,1), full float precision)
+    /// </summary>
+    private void _PrecomputeNoiseCoords(float[] permIdx, float[] frac, int count,
+                                        double pos, double grid, double coord)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            double world = (pos + (double)i) * grid + coord;
+            double floorVal = System.Math.Floor(world);
+            int intPart;
+            if (floorVal < int.MinValue) intPart = int.MinValue;
+            else if (floorVal > int.MaxValue) intPart = int.MaxValue;
+            else intPart = (int)floorVal;
+            permIdx[i] = (float)(intPart & 255);
+            frac[i] = (float)(world - floorVal);
+        }
+        // Zero remaining slots (shader arrays have fixed size)
+        for (int i = count; i < permIdx.Length; i++)
+        {
+            permIdx[i] = 0f;
+            frac[i] = 0f;
+        }
+    }
+
+    /// <summary>
+    /// Precompute Y-axis coordinates with gradient-cache emulation.
+    /// Minecraft Beta 1.7.3 caches gradient dot products when the Y permutation
+    /// index hasn't changed (consecutive Y samples in the same Perlin cell).
+    /// The cached gradients use relY from the FIRST sample in each cell.
+    /// gradFrac[i] stores that "base" relY for gradient computation;
+    /// frac[i] stores the actual relY for fade() interpolation only.
+    /// </summary>
+    private void _PrecomputeNoiseCoordsY(float[] permIdx, float[] frac, float[] gradFrac,
+                                          int count, double pos, double grid, double coord)
+    {
+        int lastPerm = -1;
+        double baseFrac = 0.0;
+        for (int i = 0; i < count; i++)
+        {
+            double world = (pos + (double)i) * grid + coord;
+            double floorVal = System.Math.Floor(world);
+            int intPart;
+            if (floorVal < int.MinValue) intPart = int.MinValue;
+            else if (floorVal > int.MaxValue) intPart = int.MaxValue;
+            else intPart = (int)floorVal;
+            int perm = intPart & 255;
+            double fracVal = world - floorVal;
+
+            permIdx[i] = (float)perm;
+            frac[i] = (float)fracVal;
+
+            // Replicate CPU caching: reset baseFrac on first sample or when
+            // the permutation index changes (new Perlin cell).
+            if (i == 0 || perm != lastPerm)
+            {
+                lastPerm = perm;
+                baseFrac = fracVal;
+            }
+            gradFrac[i] = (float)baseFrac;
+        }
+        // Zero remaining slots
+        for (int i = count; i < permIdx.Length; i++)
+        {
+            permIdx[i] = 0f;
+            frac[i] = 0f;
+            gradFrac[i] = 0f;
+        }
+    }
+
+    private void _RunGpuNoiseOctaves(NoiseGenerator3dPerlin[] generators, int octaveCount, RenderTexture resultTexture, int xPos, int yPos, int zPos, int xSize, int ySize, int zSize, double gridX, double gridY, double gridZ, bool is2D)
+    {
+        if (!gpuWorldgenReady || generators == null || resultTexture == null) return;
+
+        RenderTexture current = is2D ? gpuNoiseWork2D_A : gpuNoiseWork3D_A;
+        RenderTexture next = is2D ? gpuNoiseWork2D_B : gpuNoiseWork3D_B;
+        VRCGraphics.Blit(gpuClearTexture, current);
+
+        // BATCH UPLOAD: Write ALL octaves' permutation data into a single 256×N texture
+        // so we only call Apply() ONCE before the blit loop. This eliminates the race
+        // condition where Apply() for octave N+1 could overwrite texture data before
+        // the GPU finishes reading octave N's Blit.
+        for (int octave = 0; octave < octaveCount; octave++)
+        {
+            NoiseGenerator3dPerlin generator = generators[octave];
+            if (generator == null) continue;
+            int rowOffset = octave * 256;
+            for (int i = 0; i < 256; i++)
+            {
+                gpuPermutationPixels[rowOffset + i] = new Color(generator.permutations[i] / 255.0f, 0f, 0f, 1f);
+            }
+        }
+        gpuPermTexture.SetPixels(gpuPermutationPixels);
+        gpuPermTexture.Apply(false, false);
+
+        for (int octave = 0; octave < octaveCount; octave++)
+        {
+            NoiseGenerator3dPerlin generator = generators[octave];
+            if (generator == null) continue;
+
+            double octaveFrequency = System.Math.Pow(0.5, octave);
+            float octaveAmplitude = 1.0f / Mathf.Max(0.0001f, (float)octaveFrequency);
+
+            double scaledGridX = gridX * octaveFrequency;
+            double scaledGridY = gridY * octaveFrequency;
+            double scaledGridZ = gridZ * octaveFrequency;
+
+            _PrecomputeNoiseCoords(gpuPrePermX, gpuPreFracX, xSize,
+                                   (double)xPos, scaledGridX, generator.xCoord);
+            if (!is2D)
+            {
+                _PrecomputeNoiseCoordsY(gpuPrePermY, gpuPreFracY, gpuPreGradFracY, ySize,
+                                        (double)yPos, scaledGridY, generator.yCoord);
+            }
+            _PrecomputeNoiseCoords(gpuPrePermZ, gpuPreFracZ, zSize,
+                                   (double)zPos, scaledGridZ, generator.zCoord);
+
+            gpuNoiseOctaveMaterial.SetTexture(gpuPropAccumulationTexId, current);
+            gpuNoiseOctaveMaterial.SetTexture(gpuPropPermTexId, gpuPermTexture);
+            gpuNoiseOctaveMaterial.SetFloat(gpuPropAmplitudeId, octaveAmplitude);
+            gpuNoiseOctaveMaterial.SetInt(gpuPropXSizeId, xSize);
+            gpuNoiseOctaveMaterial.SetInt(gpuPropYSizeId, ySize);
+            gpuNoiseOctaveMaterial.SetInt(gpuPropZSizeId, zSize);
+            gpuNoiseOctaveMaterial.SetInt(gpuPropIs2DId, is2D ? 1 : 0);
+            gpuNoiseOctaveMaterial.SetInt("_OctaveRow", octave);
+
+            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropPermIdxXId, gpuPrePermX);
+            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropFracXId, gpuPreFracX);
+            if (!is2D)
+            {
+                gpuNoiseOctaveMaterial.SetFloatArray(gpuPropPermIdxYId, gpuPrePermY);
+                gpuNoiseOctaveMaterial.SetFloatArray(gpuPropFracYId, gpuPreFracY);
+                gpuNoiseOctaveMaterial.SetFloatArray(gpuPropGradFracYId, gpuPreGradFracY);
+            }
+            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropPermIdxZId, gpuPrePermZ);
+            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropFracZId, gpuPreFracZ);
+
+            VRCGraphics.Blit(current, next, gpuNoiseOctaveMaterial, 1);
+
+            RenderTexture temp = current;
+            current = next;
+            next = temp;
+        }
+
+        VRCGraphics.Blit(current, resultTexture);
+    }
+
+    /// <summary>
+    /// Upload CPU-computed 3D noise to a GPU RenderTexture, packed as (x + z*xSize, y).
+    /// CPU array order: [x][z][y] = array[x * zSize * ySize + z * ySize + y]
+    /// </summary>
+    private void _UploadCpuNoise3D(double[] cpuNoise, int xSize, int ySize, int zSize, RenderTexture target)
+    {
+        int packedWidth = xSize * zSize;
+        for (int nx = 0; nx < xSize; nx++)
+            for (int nz = 0; nz < zSize; nz++)
+                for (int ny = 0; ny < ySize; ny++)
+                {
+                    int cpuIdx = nx * zSize * ySize + nz * ySize + ny;
+                    int xzIdx = nx + nz * xSize;
+                    int texIdx = ny * packedWidth + xzIdx;
+                    gpuNoiseUpload3DPixels[texIdx] = new Color((float)cpuNoise[cpuIdx], 0f, 0f, 1f);
+                }
+        gpuNoiseUpload3D.SetPixels(gpuNoiseUpload3DPixels);
+        gpuNoiseUpload3D.Apply(false, false);
+        VRCGraphics.Blit(gpuNoiseUpload3D, target);
+    }
+
+    /// <summary>
+    /// Upload CPU-computed 2D noise to a GPU RenderTexture.
+    /// CPU array order: [x][z] = array[x * zSize + z]
+    /// Texture layout: pixel(x, z) = pixels[z * xSize + x]
+    /// </summary>
+    private void _UploadCpuNoise2D(double[] cpuNoise, int xSize, int zSize, RenderTexture target)
+    {
+        for (int nx = 0; nx < xSize; nx++)
+            for (int nz = 0; nz < zSize; nz++)
+            {
+                int cpuIdx = nx * zSize + nz;
+                int texIdx = nz * xSize + nx;
+                gpuNoiseUpload2DPixels[texIdx] = new Color((float)cpuNoise[cpuIdx], 0f, 0f, 1f);
+            }
+        gpuNoiseUpload2D.SetPixels(gpuNoiseUpload2DPixels);
+        gpuNoiseUpload2D.Apply(false, false);
+        VRCGraphics.Blit(gpuNoiseUpload2D, target);
+    }
+
+    private bool _StartGpuColumnGeneration()
+    {
+        if (!gpuWorldgenReady) return false;
+
+        _UploadGpuClimateTextures();
+
+        int densityXSize = 5;
+        int densityYSize = gpuWorldHeightBlocks / 8 + 1;
+        int densityZSize = 5;
+        int densityXPos = _GetTerrainNoiseStartX(currentChunkX, 4);
+        int densityZPos = _GetTerrainNoiseStartZ(currentChunkZ, 4);
+        double d0 = 684.412D;
+        double d1 = 684.412D;
+
+        // GPU noise: precompute coordinates on CPU (double precision), run shader per octave.
+        // This eliminates the ~600ms CPU noise bottleneck while maintaining 1:1 accuracy
+        // via CPU-precomputed permutation indices and fractional parts.
+        _RunGpuNoiseOctaves(noiseGen1.generatorCollection, 16, gpuNoise1Texture,
+            densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize,
+            d0, d1, d0, false);
+        _RunGpuNoiseOctaves(noiseGen2.generatorCollection, 16, gpuNoise2Texture,
+            densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize,
+            d0, d1, d0, false);
+        _RunGpuNoiseOctaves(noiseGen3.generatorCollection, 8, gpuNoise3Texture,
+            densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize,
+            d0 / 80.0D, d1 / 160.0D, d0 / 80.0D, false);
+        // 2D noise: generateNoiseArray internally calls generateNoiseOctaves(ad, x, 10.0, z, xSize, 1, zSize, gridX, 1.0, gridZ)
+        _RunGpuNoiseOctaves(noiseGen6.generatorCollection, 10, gpuNoise6Texture,
+            densityXPos, 10, densityZPos, densityXSize, 1, densityZSize,
+            1.121D, 1.0D, 1.121D, true);
+        _RunGpuNoiseOctaves(noiseGen7.generatorCollection, 16, gpuNoise7Texture,
+            densityXPos, 10, densityZPos, densityXSize, 1, densityZSize,
+            200.0D, 1.0D, 200.0D, true);
+
+        // Let's print the CPU's internal variables for the first octave at x=0, z=0
+        if (currentChunkX == 0 && currentChunkZ == 0)
+        {
+            double c_gridX = d0 * 1.0D;
+            double c_gridY = d1 * 1.0D;
+            double c_gridZ = d0 * 1.0D;
+            double cx = (double)densityXPos * c_gridX + noiseGen1.generatorCollection[0].xCoord;
+            double cy = (double)0 * c_gridY + noiseGen1.generatorCollection[0].yCoord; // Will change in loop
+            double cz = (double)densityZPos * c_gridZ + noiseGen1.generatorCollection[0].zCoord;
+            
+            int intX = NoiseGenerator3dPerlin.floor_and_clamp_int(cx);
+            int p1 = intX & 255;
+            double relX = cx - intX;
+            double fx = relX * relX * relX * (relX * (relX * 6D - 15D) + 10D);
+            
+            int intZ = NoiseGenerator3dPerlin.floor_and_clamp_int(cz);
+            int p3 = intZ & 255;
+            double relZ = cz - intZ;
+            
+            int[] perm3d = noiseGen1.generatorCollection[0].permutations;
+            double[] GRAD_X = NoiseGenerator3dPerlin.GRAD_X;
+            double[] GRAD_Y = NoiseGenerator3dPerlin.GRAD_Y;
+            double[] GRAD_Z = NoiseGenerator3dPerlin.GRAD_Z;
+            
+            StringBuilder sb = new StringBuilder();
+            sb.Append("[NOISE MATH DEBUG] CPU Octave 0 at x=0,z=0\n");
+            for (int gy = 7; gy <= 8 && gy < densityYSize; gy++)
+            {
+                double cuy = (double)gy * c_gridY + noiseGen1.generatorCollection[0].yCoord;
+                int intY = NoiseGenerator3dPerlin.floor_and_clamp_int(cuy);
+                int p2 = intY & 255;
+                double relY = cuy - intY;
+                
+                int a1 = perm3d[p1] + p2;
+                int a2 = perm3d[a1] + p3;
+                int h0 = perm3d[a2] & 15;
+                double g0 = GRAD_X[h0] * relX + GRAD_Y[h0] * relY + GRAD_Z[h0] * relZ;
+                
+                sb.Append("  y=").Append(gy).Append(": hash0=").Append(h0)
+                  .Append(" g0=").Append(g0.ToString("F4"))
+                  .Append(" fx=").Append(fx.ToString("F4")).Append("\n");
+            }
+            Debug.Log(sb.ToString());
+        }
+
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise1TexId, gpuNoise1Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise2TexId, gpuNoise2Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise3TexId, gpuNoise3Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise6TexId, gpuNoise6Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise7TexId, gpuNoise7Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropTemperatureTexId, gpuTemperatureTexture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropRainfallTexId, gpuRainfallTexture);
+        gpuNoiseCombineMaterial.SetInt(gpuPropXSizeId, densityXSize);
+        gpuNoiseCombineMaterial.SetInt(gpuPropYSizeId, densityYSize);
+        gpuNoiseCombineMaterial.SetInt(gpuPropZSizeId, densityZSize);
+        gpuNoiseCombineMaterial.SetInt(gpuPropChunkXId, currentChunkX);
+        gpuNoiseCombineMaterial.SetInt(gpuPropChunkZId, currentChunkZ);
+        gpuNoiseCombineMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
+        gpuNoiseCombineMaterial.SetInt(gpuPropBuiltinOffsetXId, BUILTIN_OFFSET_X);
+        gpuNoiseCombineMaterial.SetInt(gpuPropBuiltinOffsetZId, BUILTIN_OFFSET_Z);
+        VRCGraphics.Blit(gpuNoise1Texture, gpuDensityTexture, gpuNoiseCombineMaterial, 1);
+
+        gpuColumnBaseFillMaterial.SetTexture(gpuPropDensityTexId, gpuDensityTexture);
+        gpuColumnBaseFillMaterial.SetTexture(gpuPropTemperatureTexId, gpuTemperatureTexture);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropChunkSizeXZId, world.chunkSizeXZ);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropOceanHeightId, 64);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
+        gpuColumnBaseFillMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropWaterBlockId, waterBlockID);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropIceBlockId, (int)BlockMaterial.ICE);
+        VRCGraphics.Blit(gpuDensityTexture, gpuColumnBaseTexture, gpuColumnBaseFillMaterial);
+
+        gpuColumnReadbackPending = false;
+        gpuColumnReadbackReady = false;
+        gpuColumnReadbackFailed = false;
+        gpuPendingColumnX = currentChunkX;
+        gpuPendingColumnZ = currentChunkZ;
+        gpuColumnSurfaceInfoMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnBaseTexture);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropChunkSizeXZId, world.chunkSizeXZ);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+        VRCGraphics.Blit(gpuColumnBaseTexture, gpuColumnSurfaceInfoTexture, gpuColumnSurfaceInfoMaterial);
+
+        gpuReadbackPhase = GpuWorldgenReadbackPhase.BaseColumn;
+        gpuColumnReadbackPending = true;
+        VRCAsyncGPUReadback.Request(gpuColumnBaseTexture, 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        return true;
+    }
+
+    private void _UploadGpuSurfaceTextures()
+    {
+        if (gpuSurfaceParamsTextureA == null || gpuSurfaceParamsTextureB == null || gpuBedrockMaskTexture == null) return;
+
+        gpuSurfaceParamsTextureA.SetPixels(gpuSurfaceParamPixelsA);
+        gpuSurfaceParamsTextureA.Apply(false, false);
+        gpuSurfaceParamsTextureB.SetPixels(gpuSurfaceParamPixelsB);
+        gpuSurfaceParamsTextureB.Apply(false, false);
+        gpuBedrockMaskTexture.SetPixels(gpuBedrockMaskPixels);
+        gpuBedrockMaskTexture.Apply(false, false);
+    }
+
+    private void _BuildGpuSurfaceParamsFromSurfaceInfo()
+    {
+        if (gpuSurfaceInfoReadbackPixels == null || currentChunkBiomes == null || sandNoise == null || gravelNoise == null || stoneNoise == null) return;
+
+        int sizeXZ = world.chunkSizeXZ;
+        int count = sizeXZ * sizeXZ;
+        int bedrockCount = sizeXZ * 5 * sizeXZ;
+        for (int i = 0; i < count; i++)
+        {
+            gpuSurfaceParamPixelsA[i] = new Color(0f, 0f, 0f, 0f);
+            gpuSurfaceParamPixelsB[i] = new Color(128f / 255f, 0f, 0f, 1f);
+        }
+        for (int i = 0; i < bedrockCount; i++)
+        {
+            gpuBedrockMaskPixels[i] = new Color(0f, 0f, 0f, 1f);
+        }
+
+        initRand(currentChunkX, currentChunkZ);
+        JavaRandom random = rand;
+
+        for (int x = 0; x < sizeXZ; x++)
+        {
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                int finalX = _MapTerrainLocalX(x, sizeXZ);
+                int packedIndex = z * sizeXZ + finalX;
+                int biomeIndex = _GetSurfaceBiomeIndex(x, z, sizeXZ);
+
+                bool sand = sandNoise[biomeIndex] + random.NextDouble() * 0.2D > 0.0D;
+                bool gravel = gravelNoise[biomeIndex] + random.NextDouble() * 0.2D > 3D;
+                int depth = (int)(stoneNoise[biomeIndex] * 0.33333333D + 3D + random.NextDouble() * 0.25D);
+
+                bool hasStone = gpuSurfaceInfoReadbackPixels[packedIndex].a > 127;
+                int surfaceY = hasStone ? gpuSurfaceInfoReadbackPixels[packedIndex].r : 0;
+                BetaBiomeEnum biome = currentChunkBiomes[biomeIndex];
+
+                byte topBlock = BiomeOld.top(biome);
+                byte fillerBlock = BiomeOld.filler(biome);
+                if (depth <= 0)
+                {
+                    topBlock = (byte)BlockMaterial.AIR;
+                    fillerBlock = (byte)BlockMaterial.STONE;
+                }
+                else if (surfaceY >= 60 && surfaceY <= 65)
+                {
+                    topBlock = BiomeOld.top(biome);
+                    fillerBlock = BiomeOld.filler(biome);
+                    if (gravel)
+                    {
+                        topBlock = (byte)BlockMaterial.AIR;
+                        fillerBlock = (byte)BlockMaterial.GRAVEL;
+                    }
+                    if (sand)
+                    {
+                        topBlock = (byte)BlockMaterial.SAND;
+                        fillerBlock = (byte)BlockMaterial.SAND;
+                    }
+                }
+
+                if (surfaceY < 64 && topBlock == (byte)BlockMaterial.AIR)
+                {
+                    topBlock = (byte)BlockMaterial.STATIONARY_WATER;
+                }
+
+                int sandstoneDepth = 0;
+                if (hasStone && fillerBlock == (byte)BlockMaterial.SAND && depth > 0 && surfaceY >= depth)
+                {
+                    sandstoneDepth = random.NextInt(4);
+                }
+
+                int depthEncoded = Mathf.Clamp(depth + 128, 0, 255);
+                gpuSurfaceParamPixelsA[packedIndex] = new Color(surfaceY / 255.0f, topBlock / 255.0f, fillerBlock / 255.0f, hasStone ? 1f : 0f);
+                gpuSurfaceParamPixelsB[packedIndex] = new Color(depthEncoded / 255.0f, sandstoneDepth / 255.0f, 0f, 1f);
+            }
+        }
+
+        for (int y = 0; y < 5; y++)
+        {
+            int packedYBase = y * sizeXZ;
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                int rowBase = (packedYBase + z) * sizeXZ;
+                for (int x = 0; x < sizeXZ; x++)
+                {
+                    if (y <= random.NextInt(5))
+                    {
+                        gpuBedrockMaskPixels[rowBase + x] = new Color(1f, 0f, 0f, 1f);
+                    }
+                }
+            }
+        }
+
+        _UploadGpuSurfaceTextures();
+    }
+
+    private bool _StartGpuColumnFinalize()
+    {
+        if (!gpuColumnReadbackReady || gpuColumnReadbackPixels == null || gpuColumnUploadTexture == null || gpuColumnUploadPixels == null || currentChunkBiomes == null) return false;
+
+        int sizeXZ = world.chunkSizeXZ;
+        int worldHeight = gpuWorldHeightBlocks;
+        byte stoneId = stoneBlockID;
+        byte bedrockId = bedrockBlockID;
+        byte waterId = (byte)BlockMaterial.STATIONARY_WATER;
+        byte sandId = sandBlockID;
+        byte sandstoneId = sandStoneBlockID;
+
+        initRand(currentChunkX, currentChunkZ);
+        JavaRandom random = rand;
+
+        for (int i = 0; i < gpuColumnReadbackPixels.Length; i++)
+        {
+            byte blockId = gpuColumnReadbackPixels[i].r;
+            gpuColumnUploadPixels[i] = new Color(blockId / 255.0f, 0f, 0f, 1f);
+        }
+
+        for (int x = 0; x < sizeXZ; x++)
+        {
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                int finalX = _MapTerrainLocalX(x, sizeXZ);
+                int biomeIndex = _GetSurfaceBiomeIndex(x, z, sizeXZ);
+                BetaBiomeEnum biome = currentChunkBiomes[biomeIndex];
+                bool sand = sandNoise[biomeIndex] + random.NextDouble() * 0.2D > 0.0D;
+                bool gravel = gravelNoise[biomeIndex] + random.NextDouble() * 0.2D > 3D;
+                int depth = (int)(stoneNoise[biomeIndex] * 0.33333333D + 3D + random.NextDouble() * 0.25D);
+
+                int prevDepth = -1;
+                byte fillerBlock = 0;
+
+                for (int globalY = worldHeight - 1; globalY >= 0; globalY--)
+                {
+                    int packedIndex = ((globalY * sizeXZ) + z) * sizeXZ + finalX;
+                    byte blockId = gpuColumnReadbackPixels[packedIndex].r;
+
+                    if (blockId == airBlockID)
+                    {
+                        prevDepth = -1;
+                        continue;
+                    }
+
+                    if (blockId != stoneId)
+                    {
+                        continue;
+                    }
+
+                    if (prevDepth == -1)
+                    {
+                        byte topBlock = BiomeOld.top(biome);
+                        fillerBlock = BiomeOld.filler(biome);
+
+                        if (depth <= 0)
+                        {
+                            topBlock = airBlockID;
+                            fillerBlock = stoneId;
+                        }
+                        else if (globalY >= 60 && globalY <= 65)
+                        {
+                            topBlock = BiomeOld.top(biome);
+                            fillerBlock = BiomeOld.filler(biome);
+                            if (gravel)
+                            {
+                                topBlock = airBlockID;
+                                fillerBlock = (byte)BlockMaterial.GRAVEL;
+                            }
+                            if (sand)
+                            {
+                                topBlock = sandId;
+                                fillerBlock = sandId;
+                            }
+                        }
+
+                        if (globalY < 64 && topBlock == airBlockID)
+                        {
+                            topBlock = waterId;
+                        }
+
+                        prevDepth = depth;
+                        byte finalBlock = globalY >= 63 ? topBlock : fillerBlock;
+                        gpuColumnReadbackPixels[packedIndex].r = finalBlock;
+                        gpuColumnUploadPixels[packedIndex] = new Color(finalBlock / 255.0f, 0f, 0f, 1f);
+                    }
+                    else if (prevDepth > 0)
+                    {
+                        prevDepth--;
+                        gpuColumnReadbackPixels[packedIndex].r = fillerBlock;
+                        gpuColumnUploadPixels[packedIndex] = new Color(fillerBlock / 255.0f, 0f, 0f, 1f);
+
+                        if (prevDepth == 0 && fillerBlock == sandId)
+                        {
+                            prevDepth = random.NextInt(4);
+                            fillerBlock = sandstoneId;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int globalY = 0; globalY < 5; globalY++)
+        {
+            int rowBase = globalY * sizeXZ;
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                int sliceBase = (rowBase + z) * sizeXZ;
+                for (int x = 0; x < sizeXZ; x++)
+                {
+                    if (globalY <= random.NextInt(5))
+                    {
+                        int packedIndex = sliceBase + x;
+                        gpuColumnReadbackPixels[packedIndex].r = bedrockId;
+                        gpuColumnUploadPixels[packedIndex] = new Color(bedrockId / 255.0f, 0f, 0f, 1f);
+                    }
+                }
+            }
+        }
+
+        gpuColumnUploadTexture.SetPixels(gpuColumnUploadPixels);
+        gpuColumnUploadTexture.Apply(false, false);
+        VRCGraphics.Blit(gpuColumnUploadTexture, gpuColumnFinalTexture);
+        gpuColumnSurfaceInfoMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnFinalTexture);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropChunkSizeXZId, world.chunkSizeXZ);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+        VRCGraphics.Blit(gpuColumnFinalTexture, gpuColumnSurfaceInfoTexture, gpuColumnSurfaceInfoMaterial);
+
+        gpuCachedColumnX = gpuPendingColumnX;
+        gpuCachedColumnZ = gpuPendingColumnZ;
+        return true;
+    }
+
+    private void _CopyGpuChunkSliceToWorkingData()
+    {
+        if (!gpuColumnReadbackReady || gpuColumnReadbackPixels == null || workingChunkData == null) return;
+
+        int sizeXZ = world.chunkSizeXZ;
+        int sizeY = world.chunkSizeY;
+        int xyStride = sizeXZ * sizeXZ;
+        int chunkYBase = currentChunkY * sizeY;
+        System.Array.Clear(workingChunkData, 0, workingChunkData.Length);
+        for (int i = 0; i < highestStoneYColumn.Length; i++) highestStoneYColumn[i] = -1;
+
+        for (int localY = 0; localY < sizeY; localY++)
+        {
+            int globalY = chunkYBase + localY;
+            int sourceRowBase = globalY * sizeXZ;
+            int targetYBase = localY * xyStride;
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                int sourceIndex = (sourceRowBase + z) * sizeXZ;
+                int targetIndex = targetYBase + z * sizeXZ;
+                for (int x = 0; x < sizeXZ; x++)
+                {
+                    byte blockID = gpuColumnReadbackPixels[sourceIndex + x].r;
+                    workingChunkData[targetIndex + x] = blockID;
+                    if (blockID == stoneBlockID && localY > highestStoneYColumn[z * sizeXZ + x])
+                    {
+                        highestStoneYColumn[z * sizeXZ + x] = localY;
+                    }
+                }
+            }
+        }
+
+        // DIAGNOSTIC: Compare GPU readback base blocks against CPU-computed terrain
+        // for this chunk slice (only runs once per column, on the topmost chunk)
+        if (currentChunkY == world.worldDimensionY - 1)
+        {
+            _DiagnosticCompareGpuVsCpuBaseColumn();
+        }
+    }
+
+    private void _DiagnosticCompareGpuVsCpuBaseColumn()
+    {
+        // Compute the FULL CPU noise field for this column, then compare block IDs.
+        byte byte0 = 4;
+        int xSize = byte0 + 1;
+        byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
+        int zSize = byte0 + 1;
+        double d0 = 684.412D;
+        double d1 = 684.412D;
+
+        int noiseStartX = match1to1TerrainBaseline ? currentChunkX * byte0 : _GetTerrainNoiseStartX(currentChunkX, byte0);
+        int noiseStartZ = match1to1TerrainBaseline ? currentChunkZ * byte0 : _GetTerrainNoiseStartZ(currentChunkZ, byte0);
+
+        double[] cpuNoise1 = noiseGen1.generateNoiseOctaves(null, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0, d1, d0);
+        double[] cpuNoise2 = noiseGen2.generateNoiseOctaves(null, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0, d1, d0);
+        double[] cpuNoise3 = noiseGen3.generateNoiseOctaves(null, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0 / 80.0D, d1 / 160.0D, d0 / 80.0D);
+        double[] cpuNoise6 = noiseGen6.generateNoiseArray(null, noiseStartX, noiseStartZ, xSize, zSize, 1.121D, 1.121D, 0.5D);
+        double[] cpuNoise7 = noiseGen7.generateNoiseArray(null, noiseStartX, noiseStartZ, xSize, zSize, 200.0D, 200.0D, 0.5D);
+
+        // Run the combine step (same as Prepare_CombineNoise)
+        int i2 = 16 / xSize;
+        double[] temp = wcm.temperatures;
+        double[] rain = wcm.rainfall;
+        double[] cpuDensity = new double[xSize * ySize * zSize];
+        int k1 = 0;
+        int l1 = 0;
+        for (int x = 0; x < xSize; x++)
+        {
+            int k2 = x * i2 + i2 / 2;
+            for (int z = 0; z < zSize; z++)
+            {
+                int i3 = z * i2 + i2 / 2;
+                int tempIndex = k2 * 16 + i3;
+                double d2 = temp[tempIndex];
+                double d3 = rain[tempIndex] * d2;
+                double d4 = 1.0D - d3;
+                d4 *= d4; d4 *= d4; d4 = 1.0D - d4;
+                double d5 = (cpuNoise6[l1] + 256.0D) / 512.0D;
+                d5 *= d4;
+                if (d5 > 1.0D) d5 = 1.0D;
+                double d6 = cpuNoise7[l1] / 8000.0D;
+                if (d6 < 0.0D) d6 = -d6 * 0.3D;
+                d6 = d6 * 3.0D - 2.0D;
+                if (d6 < 0.0D) { d6 *= 0.5D; if (d6 < -1D) d6 = -1D; d6 *= 0.3571428571428571D; d5 = 0.0D; }
+                else { if (d6 > 1.0D) d6 = 1.0D; d6 *= 0.125D; }
+                if (d5 < 0.0D) d5 = 0.0D;
+                d5 += 0.5D;
+                d6 = (d6 * (double)ySize) / 16.0D;
+                double d7 = (double)ySize / 2.0D + d6 * 4.0D;
+
+                for (int y = 0; y < ySize; y++)
+                {
+                    double d9 = (((double)y - d7) * 12D) / d5;
+                    if (d9 < 0.0D) d9 *= 4.0D;
+                    double d10 = cpuNoise1[k1] / 512.0D;
+                    double d11 = cpuNoise2[k1] / 512.0D;
+                    double d12 = (cpuNoise3[k1] * 0.1D + 1.0D) * 0.5D;
+                    double d8;
+                    if (d12 < 0.0D) d8 = d10;
+                    else if (d12 > 1.0D) d8 = d11;
+                    else d8 = d10 + (d11 - d10) * d12;
+                    d8 -= d9;
+                    if (y > ySize - 4)
+                    {
+                        double d13 = (double)((float)(y - (ySize - 4)) * 0.33333334F);
+                        d8 = d8 * (1.0D - d13) - 10.0D * d13;
+                    }
+                    cpuDensity[k1] = d8;
+                    k1++;
+                }
+                l1++;
+            }
+        }
+
+        // Now compare: generate base column blocks from CPU density and compare with GPU readback.
+        int diagSizeXZ = world.chunkSizeXZ;
+        int worldHeight = gpuWorldHeightBlocks;
+        int mismatches = 0;
+        int totalCompared = 0;
+        StringBuilder diagLog = new StringBuilder();
+        diagLog.Append("[GPU vs CPU DIAGNOSTIC] Chunk (").Append(currentChunkX).Append(",").Append(currentChunkZ).Append(")\n");
+
+        // Sample 5 columns at specific (x,z) positions
+        int[] sampleX = new int[] { 0, 4, 8, 12, 7 };
+        int[] sampleZ = new int[] { 0, 4, 8, 12, 7 };
+
+        for (int s = 0; s < 5; s++)
+        {
+            int bx = sampleX[s];
+            int bz = sampleZ[s];
+            int xPiece = bx / 4;
+            int zPiece = bz / 4;
+            int xSub = bx - xPiece * 4;
+            int zSub = bz - zPiece * 4;
+
+            int colMismatches = 0;
+            for (int by = 0; by < worldHeight; by++)
+            {
+                // CPU: trilinear interpolation (density indexed as (x * zSize + z) * ySize + y)
+                int yPiece = by / 8;
+                int ySub = by - yPiece * 8;
+                double yLerp = ySub * 0.125D;
+                double xLerp = xSub * 0.25D;
+                double zLerp = zSub * 0.25D;
+
+                // Inline density indexing: idx = (dx * zSize + dz) * ySize + dy
+                double c00y0 = cpuDensity[(xPiece * zSize + zPiece) * ySize + yPiece];
+                double c00y1 = cpuDensity[(xPiece * zSize + zPiece) * ySize + yPiece + 1];
+                double c01y0 = cpuDensity[(xPiece * zSize + (zPiece + 1)) * ySize + yPiece];
+                double c01y1 = cpuDensity[(xPiece * zSize + (zPiece + 1)) * ySize + yPiece + 1];
+                double c10y0 = cpuDensity[((xPiece + 1) * zSize + zPiece) * ySize + yPiece];
+                double c10y1 = cpuDensity[((xPiece + 1) * zSize + zPiece) * ySize + yPiece + 1];
+                double c11y0 = cpuDensity[((xPiece + 1) * zSize + (zPiece + 1)) * ySize + yPiece];
+                double c11y1 = cpuDensity[((xPiece + 1) * zSize + (zPiece + 1)) * ySize + yPiece + 1];
+
+                double c00 = c00y0 + (c00y1 - c00y0) * yLerp;
+                double c01 = c01y0 + (c01y1 - c01y0) * yLerp;
+                double c10 = c10y0 + (c10y1 - c10y0) * yLerp;
+                double c11 = c11y0 + (c11y1 - c11y0) * yLerp;
+                double dx0 = c00 + (c10 - c00) * xLerp;
+                double dx1 = c01 + (c11 - c01) * xLerp;
+                double density = dx0 + (dx1 - dx0) * zLerp;
+
+                // CPU block assignment (base column: stone/water/air)
+                byte cpuBlock = 0; // air
+                if (by < 64) cpuBlock = (byte)BlockMaterial.STATIONARY_WATER;
+                if (density > 0.0D) cpuBlock = stoneBlockID;
+
+                // GPU readback block (FINALIZED: has surface replacement applied)
+                int gpuX = match1to1TerrainBaseline ? bx : (flipXAxis ? (diagSizeXZ - 1 - bx) : bx);
+                int gpuIdx = ((by * diagSizeXZ) + bz) * diagSizeXZ + gpuX;
+                byte gpuBlock = gpuColumnReadbackPixels[gpuIdx].r;
+
+                // Compare terrain SHAPE (solid vs non-solid), not exact block IDs.
+                // GPU blocks have been surface-replaced (stone → grass/dirt/sand/bedrock),
+                // so exact block comparison is invalid at the surface.
+                bool cpuSolid = density > 0.0D;
+                bool gpuSolid = gpuBlock != 0 && gpuBlock != (byte)BlockMaterial.STATIONARY_WATER && gpuBlock != (byte)BlockMaterial.WATER;
+                
+                totalCompared++;
+                if (cpuSolid != gpuSolid)
+                {
+                    colMismatches++;
+                    mismatches++;
+                    if (colMismatches <= 3)
+                    {
+                        diagLog.Append("  MISMATCH at (").Append(bx).Append(",").Append(by).Append(",").Append(bz).Append("): CPU=").Append(cpuSolid ? "solid" : "air").Append(" GPU=").Append(gpuBlock).Append(" density=").Append(density.ToString("F6")).Append("\n");
+                    }
+                }
+            }
+            diagLog.Append("  Column (").Append(bx).Append(",").Append(bz).Append("): ").Append(colMismatches).Append(" mismatches / ").Append(worldHeight).Append("\n");
+        }
+        diagLog.Append("TOTAL: ").Append(mismatches).Append(" / ").Append(totalCompared).Append(" blocks differ\n");
+
+        // Targeted diagnostic at Y=56-72 for column (0,0) — the terrain surface region
+        diagLog.Append("--- Y=56..72 detail for column (0,0) ---\n");
+        {
+            int bx = 0; int bz = 0;
+            int txPiece = bx / 4; int tzPiece = bz / 4;
+            int txSub = bx - txPiece * 4; int tzSub = bz - tzPiece * 4;
+            int diagSXZ = world.chunkSizeXZ;
+            for (int by = 56; by <= 72 && by < worldHeight; by++)
+            {
+                int tyPiece = by / 8;
+                int tySub = by - tyPiece * 8;
+                double tyLerp = tySub * 0.125D;
+                double txLerp = txSub * 0.25D;
+                double tzLerp = tzSub * 0.25D;
+
+                double tc00y0 = cpuDensity[(txPiece * zSize + tzPiece) * ySize + tyPiece];
+                double tc00y1 = cpuDensity[(txPiece * zSize + tzPiece) * ySize + tyPiece + 1];
+                double tc00 = tc00y0 + (tc00y1 - tc00y0) * tyLerp;
+                double tc10y0 = cpuDensity[((txPiece + 1) * zSize + tzPiece) * ySize + tyPiece];
+                double tc10y1 = cpuDensity[((txPiece + 1) * zSize + tzPiece) * ySize + tyPiece + 1];
+                double tc10 = tc10y0 + (tc10y1 - tc10y0) * tyLerp;
+                double tc01y0 = cpuDensity[(txPiece * zSize + (tzPiece + 1)) * ySize + tyPiece];
+                double tc01y1 = cpuDensity[(txPiece * zSize + (tzPiece + 1)) * ySize + tyPiece + 1];
+                double tc01 = tc01y0 + (tc01y1 - tc01y0) * tyLerp;
+                double tc11y0 = cpuDensity[((txPiece + 1) * zSize + (tzPiece + 1)) * ySize + tyPiece];
+                double tc11y1 = cpuDensity[((txPiece + 1) * zSize + (tzPiece + 1)) * ySize + tyPiece + 1];
+                double tc11 = tc11y0 + (tc11y1 - tc11y0) * tyLerp;
+                double tdx0 = tc00 + (tc10 - tc00) * txLerp;
+                double tdx1 = tc01 + (tc11 - tc01) * txLerp;
+                double tDensity = tdx0 + (tdx1 - tdx0) * tzLerp;
+
+                int tGpuX = match1to1TerrainBaseline ? bx : (flipXAxis ? (diagSXZ - 1 - bx) : bx);
+                int tGpuIdx = ((by * diagSXZ) + bz) * diagSXZ + tGpuX;
+                byte tGpuBlock = gpuColumnReadbackPixels[tGpuIdx].r;
+                byte tCpuBlock = 0;
+                if (by < 64) tCpuBlock = (byte)BlockMaterial.STATIONARY_WATER;
+                if (tDensity > 0.0D) tCpuBlock = stoneBlockID;
+
+                diagLog.Append("  Y=").Append(by).Append(": cpuDensity=").Append(tDensity.ToString("F4"));
+                diagLog.Append(" cpuBlock=").Append(tCpuBlock);
+                diagLog.Append(" gpuBlock=").Append(tGpuBlock);
+                if (tCpuBlock != tGpuBlock) diagLog.Append(" *** MISMATCH");
+                diagLog.Append("\n");
+            }
+        }
+        // Grid-level noise comparison at (x=0, z=0, y=7..9) - the surface grid zone
+        diagLog.Append("--- Grid noise at x=0,z=0 ---\n");
+        {
+            for (int gy = 7; gy <= 9 && gy < ySize; gy++)
+            {
+                int gIdx = 0 * zSize * ySize + 0 * ySize + gy;
+                diagLog.Append("  grid y=").Append(gy);
+                diagLog.Append(": n1=").Append(cpuNoise1[gIdx].ToString("F2"));
+                diagLog.Append(" n2=").Append(cpuNoise2[gIdx].ToString("F2"));
+                diagLog.Append(" n3=").Append(cpuNoise3[gIdx].ToString("F2"));
+                diagLog.Append(" density=").Append(cpuDensity[gIdx].ToString("F2"));
+                diagLog.Append("\n");
+            }
+            int gIdx6 = 0 * zSize + 0;
+            diagLog.Append("  noise6=").Append(cpuNoise6[gIdx6].ToString("F2"));
+            diagLog.Append(" noise7=").Append(cpuNoise7[gIdx6].ToString("F2")).Append("\n");
+        }
+
+        Debug.Log(diagLog.ToString());
+    }
+
+    public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
+    {
+        if (gpuReadbackPhase != GpuWorldgenReadbackPhase.BaseColumn) return;
+
+        gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
+        gpuColumnReadbackPending = false;
+        gpuColumnReadbackReady = false;
+
+        if (request.hasError)
+        {
+            gpuColumnReadbackFailed = true;
+            return;
+        }
+
+        if (!request.TryGetData(gpuColumnReadbackPixels, 0))
+        {
+            gpuColumnReadbackFailed = true;
+            return;
+        }
+
+        gpuColumnReadbackFailed = false;
+        gpuColumnReadbackReady = true;
     }
 
     public void StartChunkGeneration(int chunkX, int chunkY, int chunkZ)
@@ -260,9 +1499,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
         // Check if column is cached and set initial state appropriately
         if (currentChunkX == cacheCoordX && currentChunkZ == cacheCoordZ)
         {
-            // Cached column, skip directly to terrain generation
-            initRand(currentChunkX, currentChunkZ);
-            currentState = GenerationState.GeneratingTerrain;
+            // Cached column, skip directly to terrain generation or GPU copy
+            if (gpuWorldgenReady && gpuColumnReadbackReady && currentChunkX == gpuCachedColumnX && currentChunkZ == gpuCachedColumnZ)
+            {
+                currentState = GenerationState.Copy_GpuChunkSlice;
+            }
+            else if (gpuWorldgenReady && gpuColumnReadbackPending && currentChunkX == gpuPendingColumnX && currentChunkZ == gpuPendingColumnZ)
+            {
+                currentState = GenerationState.Prepare_GpuReadback;
+            }
+            else if (gpuWorldgenReady && gpuColumnReadbackReady && currentChunkX == gpuPendingColumnX && currentChunkZ == gpuPendingColumnZ)
+            {
+                currentState = GenerationState.Prepare_GpuFinalize;
+            }
+            else
+            {
+                initRand(currentChunkX, currentChunkZ);
+                currentState = GenerationState.GeneratingTerrain;
+            }
         }
         else
         {
@@ -366,8 +1620,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         // Compute biomes (expensive but necessary)
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in -15 block offset to align with Minecraft
-                        noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
-                        noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
+                        noiseX = _GetTerrainBlockStartX(currentChunkX);
+                        noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
                         currentChunkBiomes = wcm.getBiomeBlock(currentChunkBiomes, noiseX, noiseZ, 16, 16);
                         
                         // Cache for potential reuse
@@ -398,8 +1652,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
                 // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                 // Apply built-in -15 block offset to align with Minecraft
-                noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
-                noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
+                noiseX = _GetTerrainBlockStartX(currentChunkX);
+                noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
                 this.sandNoise = this.noiseGen4.generateNoiseOctaves(this.sandNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.03125D, 0.03125D, 1.0D);
 #if LOGGING
                 if (enableVerboseLogging) { time_Prep_SandNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
@@ -412,8 +1666,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 t0 = DateTime.UtcNow;
 #endif
                 // Apply built-in -15 block offset to align with Minecraft
-                noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
-                noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
+                noiseX = _GetTerrainBlockStartX(currentChunkX);
+                noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
                 this.gravelNoise = this.noiseGen4.generateNoiseOctaves(this.gravelNoise, noiseX, 109.0134D, noiseZ, 16, 1, 16, 0.03125D, 1.0D, 0.03125D);
 #if LOGGING
                 if (enableVerboseLogging) { time_Prep_GravelNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
@@ -426,15 +1680,83 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 t0 = DateTime.UtcNow;
 #endif
                 // Apply built-in -15 block offset to align with Minecraft
-                noiseX = (flipXAxis ? -currentChunkX * 16 : currentChunkX * 16) + BUILTIN_OFFSET_X;
-                noiseZ = currentChunkZ * 16 + BUILTIN_OFFSET_Z;
+                noiseX = _GetTerrainBlockStartX(currentChunkX);
+                noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
                 this.stoneNoise = this.noiseGen5.generateNoiseOctaves(this.stoneNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.0625D, 0.0625D, 0.0625D);
 #if LOGGING
                 if (enableVerboseLogging) { time_Prep_StoneNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+                if (enableVerboseLogging && gpuWorldgenReady)
+                {
+                    time_Preparation = time_Prep_GetBiomes + time_Prep_SandNoise + time_Prep_GravelNoise + time_Prep_StoneNoise;
+                }
 #endif
-                currentState = GenerationState.Prepare_AllocCache;
+                currentState = gpuWorldgenReady ? GenerationState.Prepare_GpuNoise : GenerationState.Prepare_AllocCache;
                 break;
-                
+
+            case GenerationState.Prepare_GpuNoise:
+                {
+                    if (!_StartGpuColumnGeneration())
+                    {
+                        currentState = GenerationState.Prepare_AllocCache;
+                        break;
+                    }
+
+                    currentState = GenerationState.Prepare_GpuReadback;
+                }
+                break;
+
+            case GenerationState.Prepare_GpuFinalize:
+                {
+                    if (!_StartGpuColumnFinalize())
+                    {
+                        currentState = GenerationState.Prepare_AllocCache;
+                        break;
+                    }
+
+                    currentState = GenerationState.Copy_GpuChunkSlice;
+                }
+                break;
+
+            case GenerationState.Prepare_GpuReadback:
+                {
+                    if (gpuColumnReadbackFailed)
+                    {
+                        currentState = GenerationState.Prepare_AllocCache;
+                        break;
+                    }
+
+                    if (gpuColumnReadbackReady && currentChunkX == gpuPendingColumnX && currentChunkZ == gpuPendingColumnZ)
+                    {
+                        currentState = GenerationState.Prepare_GpuFinalize;
+                    }
+                }
+                break;
+
+            case GenerationState.Copy_GpuChunkSlice:
+                {
+#if LOGGING
+                    DateTime tGpuCopy = DateTime.MinValue;
+                    if (enableVerboseLogging) tGpuCopy = DateTime.UtcNow;
+#endif
+                    _CopyGpuChunkSliceToWorkingData();
+                    terrain_gen_step_count = 1;
+#if LOGGING
+                    if (enableVerboseLogging) time_GeneratingTerrain += (float)(DateTime.UtcNow - tGpuCopy).TotalMilliseconds;
+#endif
+                    if (!match1to1TerrainBaseline && currentChunkY == world.worldDimensionY - 1)
+                    {
+                        decoration_step = 0;
+                        decoration_feature_index = 0;
+                        decoration_feature_count = 0;
+                        currentState = GenerationState.DecoratingTerrain;
+                    }
+                    else
+                    {
+                        currentState = GenerationState.Complete;
+                    }
+                }
+                break;
+
             case GenerationState.Prepare_AllocCache:
                 {
                     byte byte0 = 4;
@@ -507,10 +1829,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         double frequency = System.Math.Pow(0.5, currentOctave);
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
-                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        int noiseOffsetX = BUILTIN_OFFSET_X / 4; // Noise grid is 1/4 resolution
-                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
-                        noiseGen1.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0 + noiseOffsetX, 0, currentChunkZ * byte0 + noiseOffsetZ, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
+                        int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
+                        int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, byte0);
+                        noiseGen1.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
                         currentOctave++;
                         
                         if (currentOctave >= 16) {
@@ -528,10 +1849,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         double frequency = System.Math.Pow(0.5, currentOctave);
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
-                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
-                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
-                        noiseGen2.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0 + noiseOffsetX, 0, currentChunkZ * byte0 + noiseOffsetZ, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
+                        int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
+                        int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, byte0);
+                        noiseGen2.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0 * frequency, d1 * frequency, d0 * frequency, frequency);
                         currentOctave++;
                         
                         if (currentOctave >= 16) {
@@ -549,10 +1869,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         double frequency = System.Math.Pow(0.5, currentOctave);
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
-                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
-                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
-                        noiseGen3.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseChunkX * byte0 + noiseOffsetX, 0, currentChunkZ * byte0 + noiseOffsetZ, xSize, ySize, zSize, (d0 / 80.0D) * frequency, (d1 / 160.0D) * frequency, (d0 / 80.0D) * frequency, frequency);
+                        int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
+                        int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, byte0);
+                        noiseGen3.generatorCollection[currentOctave].generateNoiseArray(currentNoiseOutput, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, (d0 / 80.0D) * frequency, (d1 / 160.0D) * frequency, (d0 / 80.0D) * frequency, frequency);
                         currentOctave++;
                         
                         if (currentOctave >= 8) {
@@ -567,10 +1886,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     {
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
-                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
-                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
-                        noise6 = noiseGen6.generateNoiseArray(noise6, noiseChunkX * byte0 + noiseOffsetX, currentChunkZ * byte0 + noiseOffsetZ, xSize, zSize, 1.121D, 1.121D, 0.5D);
+                        int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
+                        int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, byte0);
+                        noise6 = noiseGen6.generateNoiseArray(noise6, noiseStartX, noiseStartZ, xSize, zSize, 1.121D, 1.121D, 0.5D);
 #if LOGGING
                         if (enableVerboseLogging) { noise6Cells = xSize * zSize; }
 #endif
@@ -580,10 +1898,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     {
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
-                        noiseChunkX = flipXAxis ? -currentChunkX : currentChunkX;
-                        int noiseOffsetX = BUILTIN_OFFSET_X / 4;
-                        int noiseOffsetZ = BUILTIN_OFFSET_Z / 4;
-                        noise7 = noiseGen7.generateNoiseArray(noise7, noiseChunkX * byte0 + noiseOffsetX, currentChunkZ * byte0 + noiseOffsetZ, xSize, zSize, 200.0D, 200.0D, 0.5D);
+                        int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
+                        int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, byte0);
+                        noise7 = noiseGen7.generateNoiseArray(noise7, noiseStartX, noiseStartZ, xSize, zSize, 200.0D, 200.0D, 0.5D);
 #if LOGGING
                         if (enableVerboseLogging) { noise7Cells = xSize * zSize; }
 #endif
@@ -844,7 +2161,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                         if (d15 > 0.0D) block = BlockMaterial.STONE;
 
                                         // CRITICAL: If X-axis is flipped, flip the local X coordinate too
-                                        int finalX = flipXAxis ? (sizeXZ - 1 - xLoc) : xLoc;
+                                        int finalX = _MapTerrainLocalX(xLoc, sizeXZ);
                                         int index = yOffset + currentZ * sizeXZ + finalX;
                                         chunkData[index] = (byte)block;
 #if LOGGING
@@ -889,7 +2206,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 if (terrain_xPiece >= byte0_gt)
                 {
                     // Generate debug pillar if enabled
-                    if (generateDebugPillar)
+                    if (!match1to1TerrainBaseline && generateDebugPillar)
                     {
                         GenerateDebugPillar();
                     }
@@ -931,11 +2248,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         for (int z = 0; z < sizeXZ; z++)
                         {
                             // CRITICAL: If X-axis is flipped, flip local X coordinate
-                            int finalX = flipXAxis ? (sizeXZ - 1 - x) : x;
+                            int finalX = _MapTerrainLocalX(x, sizeXZ);
                             int colIndex = z * sizeXZ + finalX;
-                            
-                            // CRITICAL FIX: Biome array is X-major (x * 16 + z), not Z-major!
-                            int biomeIndex = x * 16 + z;
+
+                            int biomeIndex = _GetSurfaceBiomeIndex(x, z, sizeXZ);
                             BetaBiomeEnum biome = biomes[biomeIndex];
                             bool sand = sandN[biomeIndex] + random.NextDouble() * 0.2D > 0.0D;
                             bool gravel = gravelN[biomeIndex] + random.NextDouble() * 0.2D > 3D;
@@ -1088,7 +2404,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 
                 // CRITICAL: Only decorate the TOP chunk in a column (highest Y chunk)
                 // Beta 1.7.3 decorates per-column, not per-chunk
-                if (currentChunkY == world.worldDimensionY - 1)
+                if (!match1to1TerrainBaseline && currentChunkY == world.worldDimensionY - 1)
                 {
                     decoration_step = 0;
                     decoration_feature_index = 0;
@@ -1243,6 +2559,34 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
             case GenerationState.Complete:
                 completedData = workingChunkData;
+
+                // DIAGNOSTIC: Dump block counts in the completed chunk
+                {
+                    int diagStone = 0, diagAir = 0, diagWater = 0, diagBedrock = 0, diagOther = 0;
+                    for (int di = 0; di < workingChunkData.Length; di++)
+                    {
+                        byte b = workingChunkData[di];
+                        if (b == 0) diagAir++;
+                        else if (b == stoneBlockID) diagStone++;
+                        else if (b == waterBlockID) diagWater++;
+                        else if (b == 7) diagBedrock++;
+                        else diagOther++;
+                    }
+                    StringBuilder diagBuf = new StringBuilder();
+                    diagBuf.Append("[CHUNK BLOCKS] (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(") ");
+                    diagBuf.Append("stone=").Append(diagStone).Append(" air=").Append(diagAir).Append(" water=").Append(diagWater);
+                    diagBuf.Append(" bedrock=").Append(diagBedrock).Append(" other=").Append(diagOther);
+                    diagBuf.Append(" gpu=").Append(gpuWorldgenReady ? "Y" : "N");
+                    
+                    // Dump a cross-section at localY=0 (first layer of this chunk)
+                    int sXZ = world.chunkSizeXZ;
+                    diagBuf.Append("\n  Y=0 row z=0: ");
+                    for (int dx = 0; dx < sXZ; dx++)
+                    {
+                        diagBuf.Append(workingChunkData[0 * sXZ * sXZ + 0 * sXZ + dx]).Append(" ");
+                    }
+                    Debug.Log(diagBuf.ToString());
+                }
 #if LOGGING
                 if (enableVerboseLogging)
                 {
@@ -1567,5 +2911,5 @@ public class McTerrainGenerator : UdonSharpBehaviour
             Debug.Log($"[McTerrainGenerator] Generated debug pillar at ({pillarX}, {pillarZ}) spanning height 0-{worldHeight-1}");
         }
 #endif
-    }
+
 }
