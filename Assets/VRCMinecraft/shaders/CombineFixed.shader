@@ -27,6 +27,9 @@ Shader "VRCM/CombineFixed"
         Pass
         {
             Name "CLEAR"
+            ZTest Always
+            ZWrite Off
+            Cull Off
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
@@ -54,7 +57,7 @@ Shader "VRCM/CombineFixed"
                 return o;
             }
             
-            fixed4 frag (v2f i) : SV_Target
+            float4 frag (v2f i) : SV_Target
             {
                 // Clear to black (0,0,0,1) in fixed-point format
                 return float4(0, 0, 0, 1);
@@ -65,6 +68,9 @@ Shader "VRCM/CombineFixed"
         Pass
         {
             Name "COMBINE"
+            ZTest Always
+            ZWrite Off
+            Cull Off
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
@@ -108,7 +114,7 @@ Shader "VRCM/CombineFixed"
                 return o;
             }
             
-            fixed4 frag (v2f i) : SV_Target
+            float4 frag (v2f i) : SV_Target
             {
                 float2 uv = i.uv;
                 
@@ -121,13 +127,12 @@ Shader "VRCM/CombineFixed"
                 // Recover x and z from the packed index (NOTE: modulo by _XSize, divide by _XSize):
                 int x = xzIndex % _XSize;
                 int z = xzIndex / _XSize;
-                if (_FlipXAxis == 1) x = (_XSize - 1) - x;
                 
                 // UVs into the packed 3D textures (noise1/2/3) use the packed xzIndex + y:
                 float2 uv3D = float2((xzIndex + 0.5) / (float)width,
                                    (y + 0.5)      / (float)_YSize);
                 
-                // UVs into the 2D textures (noise6/7) must use (x,z), NOT (x,y):
+                // UVs into the 2D textures (noise6/7) use (x,z) coordinates:
                 float2 uv2D = float2((x + 0.5) / (float)_XSize,
                                    (z + 0.5) / (float)_ZSize);
                 
@@ -137,9 +142,9 @@ Shader "VRCM/CombineFixed"
                 int i3 = z * i2 + i2 / 2;
                 
                 // Sample temperature and rainfall
-                float2 biomeUV = float2((float)k2 / 16.0, (float)i3 / 16.0);
-                float temp = tex2D(_TemperatureTex, biomeUV).r;
-                float rain = tex2D(_RainfallTex, biomeUV).r;
+                float2 biomeUV = float2(((float)k2 + 0.5) / 16.0, ((float)i3 + 0.5) / 16.0);
+                float temp = tex2Dlod(_TemperatureTex, float4(biomeUV, 0, 0)).r;
+                float rain = tex2Dlod(_RainfallTex, float4(biomeUV, 0, 0)).r;
                 
                 // Calculate biome influence (exact CPU logic)
                 float d3 = rain * temp;
@@ -148,16 +153,16 @@ Shader "VRCM/CombineFixed"
                 d4 *= d4;
                 d4 = 1.0 - d4;
                 
-                // Sample noise6 (2D) - use correct (x,z) coordinates
-                float4 noise6Sample = tex2D(_Noise6Tex, uv2D);
+                // Sample noise6 (3D-packed with ySize=1)
+                float4 noise6Sample = tex2Dlod(_Noise6Tex, float4(uv2D, 0, 0));
                 float noise6Val = noise6Sample.r;
                 
                 float d5 = (noise6Val + 256.0) / 512.0;
                 d5 *= d4;
                 if (d5 > 1.0) d5 = 1.0;
                 
-                // Sample noise7 (2D) - use correct (x,z) coordinates
-                float4 noise7Sample = tex2D(_Noise7Tex, uv2D);
+                // Sample noise7 (3D-packed with ySize=1)
+                float4 noise7Sample = tex2Dlod(_Noise7Tex, float4(uv2D, 0, 0));
                 float noise7Val = noise7Sample.r;
                 
                 float d6 = noise7Val / 8000.0;
@@ -184,9 +189,9 @@ Shader "VRCM/CombineFixed"
                 float d7 = (_YSize * 0.5) + d6 * 4.0;
                 
                 // Sample 3D noise fields using packed coordinates
-                float4 noise1Sample = tex2D(_Noise1Tex, uv3D);
-                float4 noise2Sample = tex2D(_Noise2Tex, uv3D);
-                float4 noise3Sample = tex2D(_Noise3Tex, uv3D);
+                float4 noise1Sample = tex2Dlod(_Noise1Tex, float4(uv3D, 0, 0));
+                float4 noise2Sample = tex2Dlod(_Noise2Tex, float4(uv3D, 0, 0));
+                float4 noise3Sample = tex2Dlod(_Noise3Tex, float4(uv3D, 0, 0));
                 
                 float noise1Val = noise1Sample.r;
                 float noise2Val = noise2Sample.r;

@@ -2,8 +2,12 @@
 
 using UdonSharp;
 using UnityEngine;
+using UnityEngine.UI;
 using VRC.SDKBase;
+using VRC.SDK3.Rendering;
+using VRC.Udon.Common.Interfaces;
 using VRRefAssist;
+using TMPro;
 
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
@@ -37,7 +41,7 @@ public class McWorld : UdonSharpBehaviour
     public McBlockTypeManager blockTypeManager;
     [SerializeField, FindObjectOfType(true)]
     private McCoordinator coordinator;
-    
+
     [Header("Biome Color Textures (Beta 1.7.3)")]
     [Tooltip("grasscolor.png from Beta 1.7.3 (256x256)")]
     public Texture2D grassColorTexture;
@@ -45,11 +49,31 @@ public class McWorld : UdonSharpBehaviour
     public Texture2D foliageColorTexture;
     [Tooltip("watercolor.png from Beta 1.7.3 (256x256)")]
     public Texture2D waterColorTexture;
-    
+
     [Header("Debugging")]
     public bool enableVerboseLogging = false;
     public bool enableGenerationTimings = false;
-    
+
+    [Header("GPU Voxel Backend")]
+    public bool enableGpuVoxelBackend = true;
+    public int gpuChunkSlotCapacity = 1023;
+    public int gpuLightingIterationsPerUpdate = 64;
+    public int gpuLightingTotalIterations = 384;
+    public int gpuResidentRadiusXZ = 6;
+    public int gpuResidentRadiusY = 2;
+    public int gpuResidentSyncsPerFrame = 32;
+    public Material gpuAtlasOverlayMaterial;
+    public Material gpuLightingSeedMaterial;
+    public Material gpuLightingPropagateMaterial;
+    public Material gpuFaceExtractMaterial;
+
+    [Header("GPU Debug HUD")]
+    public bool enableGpuDebugHud = true;
+    public bool showGpuDebugHudOnStart = false;
+    public float gpuDebugHudDistance = 0.85f;
+    public Vector3 gpuDebugHudLocalOffset = new Vector3(0f, -0.08f, 0f);
+    public Vector3 gpuDebugHudEulerOffset = Vector3.zero;
+
     // --- Private World State ---
     private int totalWorldChunks;
     [HideInInspector] public int chunkOffsetX;
@@ -77,22 +101,19 @@ public class McWorld : UdonSharpBehaviour
     // --- Lighting Optimization: Memory Pooling ---
     private readonly System.Collections.Generic.Queue<int[]> bfsQueuePool = new System.Collections.Generic.Queue<int[]>();
     private readonly System.Collections.Generic.Queue<int[]> bfsQueuePoolLarge = new System.Collections.Generic.Queue<int[]>();
+    private readonly System.Collections.Generic.Queue<int[]> lightingQueuePool = new System.Collections.Generic.Queue<int[]>();
     private const int BFS_QUEUE_SIZE = 4096;
     private const int BFS_QUEUE_SIZE_LARGE = 16384; // FIXED: Increased to prevent queue overflow causing pitch black spots
-    
-    // --- OPTIMIZATION: Persistent Decompression Cache ---
-    private readonly System.Collections.Generic.Dictionary<ChunkData, byte[]> decompressionCache = new System.Collections.Generic.Dictionary<ChunkData, byte[]>();
-    private readonly System.Collections.Generic.Dictionary<ChunkData, bool> decompressionCacheValid = new System.Collections.Generic.Dictionary<ChunkData, bool>();
-    
-    // --- OPTIMIZATION: Neighbor Reference Cache ---
-    private readonly System.Collections.Generic.Dictionary<ChunkData, ChunkData[]> neighborCache = new System.Collections.Generic.Dictionary<ChunkData, ChunkData[]>();
-    private readonly System.Collections.Generic.Dictionary<ChunkData, bool> neighborCacheValid = new System.Collections.Generic.Dictionary<ChunkData, bool>();
-    
+    private const int LIGHTING_QUEUE_SIZE = 8192;
+
     // --- OPTIMIZATION: Reusable Arrays ---
     private byte[] reusableByteArray = new byte[4096];
     private bool[] reusableBoolArray = new bool[4096];
     private int[] reusableIntArray = new int[4096];
-    
+    private readonly byte[] greedyMaskBlockIds = new byte[256];
+    private readonly byte[] greedyMaskLightLevels = new byte[256];
+    private readonly int[] greedyMaskPackedColors = new int[256];
+
     // --- OPTIMIZATION: Deferred Reconciliation System ---
     private readonly System.Collections.Generic.Queue<ChunkData> deferredReconciliationQueue = new System.Collections.Generic.Queue<ChunkData>();
     private readonly System.Collections.Generic.HashSet<ChunkData> reconciliationPending = new System.Collections.Generic.HashSet<ChunkData>();
@@ -106,6 +127,79 @@ public class McWorld : UdonSharpBehaviour
     private ChunkData[] activeMeshingChunks;
     private int activeMeshingCount = 0;
     private const int COLLIDER_DEFER_FRAMES = 2;
+    private Material sharedOpaqueChunkMaterial;
+    private Material sharedTransparentChunkMaterial;
+    private Material sharedCutoutChunkMaterial;
+
+    // --- GPU Voxel Backend State ---
+    private bool gpuBackendReady = false;
+    private int gpuAtlasSlotsX = 1;
+    private int gpuAtlasSlotsY = 1;
+    private int gpuTileWidth = 16;
+    private int gpuTileHeight = 256;
+    private int gpuAtlasWidth = 16;
+    private int gpuAtlasHeight = 256;
+    private int[] gpuChunkIndexToSlot;
+    private int[] gpuChunkSyncedDataVersion;
+    private int[] gpuSlotToChunkIndex;
+    private int[] gpuSlotUseStamp;
+    private int gpuSlotUseCounter = 1;
+    private int gpuResidentCenterChunkX = 0;
+    private int gpuResidentCenterChunkY = 0;
+    private int gpuResidentCenterChunkZ = 0;
+    private Texture2D gpuSlotLookupTexture;
+    private Texture2D gpuSlotMetaTexture;
+    private Texture2D gpuBlockPropertyTexture;
+    private Texture2D gpuUploadBlockTexture;
+    private Texture2D gpuClearTexture;
+    private Color32[] gpuSlotLookupPixels;
+    private Color32[] gpuSlotMetaPixels;
+    private Color32[] gpuUploadBlockPixels;
+    private RenderTexture gpuBlockAtlas;
+    private RenderTexture gpuBlockAtlasScratch;
+    private RenderTexture gpuLightAtlas;
+    private RenderTexture gpuLightAtlasScratch;
+    private bool gpuLightingSeedPending = false;
+    private int gpuLightingIterationsRemaining = 0;
+    private int gpuLightingFrameCursor = 0;
+
+    // --- GPU Face Extraction State ---
+    private Texture2D gpuShouldDrawTexture;
+    private RenderTexture gpuFaceAtlas;
+    private int gpuPropDrawTableTexId;
+    private bool gpuFaceReadbackInFlight = false;
+    private bool gpuFaceReadbackReady = false;
+    private ChunkData gpuFaceReadbackChunk = null;
+    private Color32[] gpuFaceReadbackPixels; // full atlas readback
+    private Color32[] gpuFaceChunkPixels; // extracted per-chunk tile
+    private int gpuPropGpuEnabledId;
+    private int gpuPropLightAtlasId;
+    private int gpuPropBlockAtlasGlobalId;
+    private int gpuPropSlotLookupId;
+    private int gpuPropSlotMetaGlobalId;
+    private int gpuPropBlockPropsGlobalId;
+    private int gpuPropAtlasInfoId;
+    private int gpuPropWorldInfoId;
+    private int gpuPropChunkInfoId;
+    private int gpuPropVoxelOffsetId;
+    private int gpuPropBlockAtlasId;
+    private int gpuPropBlockPropsId;
+    private int gpuPropSlotLookupTexId;
+    private int gpuPropSlotMetaId;
+    private int gpuPropOverlayTexId;
+    private int gpuPropOverlayRectId;
+    private int gpuPropTopSkyLightId;
+    private GameObject gpuDebugHudRoot;
+    private RectTransform gpuDebugHudRect;
+    private GameObject gpuDebugPanel;
+    private RawImage gpuDebugTextureA;
+    private RawImage gpuDebugTextureB;
+    private TextMeshProUGUI gpuDebugLabel;
+    private TextMeshProUGUI gpuDebugToggleButtonLabel;
+    private VRCPlayerApi gpuDebugLocalPlayer;
+    private bool gpuDebugHudVisible = false;
+    private int gpuDebugHudPage = 0;
+    private const int GPU_DEBUG_PAGE_COUNT = 4;
 
     // --- Meshing Constants & Buffers (could be pooled) ---
     private const int MAX_VERTS = 12288;
@@ -128,7 +222,7 @@ public class McWorld : UdonSharpBehaviour
     // --- Bitwise Constants for fast coordinate math (chunk size = 16) ---
     private const int CHUNK_SIZE_SHIFT = 4;
     private const int CHUNK_SIZE_MASK = 15; // 16 - 1
-    
+
     // --- Neighbor Offsets ---
     private readonly int[] neighbor_dx_offsets = { 1, -1, 0,  0, 0,  0 };
     private readonly int[] neighbor_dy_offsets = { 0,  0, 1, -1, 0,  0 };
@@ -136,7 +230,7 @@ public class McWorld : UdonSharpBehaviour
 
 #if LOGGING
     private System.Text.StringBuilder logBuilder;
-    
+
     // --- Performance Profiling Configuration ---
     [Header("Performance Profiling")]
     public bool enableFrameLogging = false;
@@ -146,7 +240,7 @@ public class McWorld : UdonSharpBehaviour
     public bool enableMemoryTracking = true;
     public bool enableCacheTracking = true;
     public int aggregateLogInterval = 300; // frames
-    
+
     // --- Frame/Update Stats ---
     private int stats_frameCount = 0;
     private float stats_updateTotalTime = 0f;
@@ -156,14 +250,14 @@ public class McWorld : UdonSharpBehaviour
     private float stats_processActiveChunksTime = 0f;
     private float stats_reconciliationTime = 0f;
     private float stats_aggregateWindowStart = 0f;
-    
+
     // --- Chunk Management Stats ---
     private int stats_chunkCreations = 0;
     private int stats_chunkDestructions = 0;
     private int stats_chunkStateTransitions = 0;
     private int stats_chunk1DLookups = 0;
     private int stats_chunk3DLookups = 0;
-    
+
     // --- Mesh Building Stats (aggregate) ---
     private int stats_meshBuildTotal = 0;
     private float stats_meshBuildTimeTotal = 0f;
@@ -185,7 +279,7 @@ public class McWorld : UdonSharpBehaviour
     private float stats_meshApplyTransparentTime = 0f;
     private float stats_meshApplyCutoutTime = 0f;
     private float stats_meshApplyColliderTime = 0f;
-    
+
     // --- Lighting Stats (aggregate) ---
     private int stats_lightingInitsTotal = 0;
     private float stats_lightingInitTime = 0f;
@@ -198,7 +292,7 @@ public class McWorld : UdonSharpBehaviour
     private int stats_lightingCrossChunkQueries = 0;
     private int stats_lightingPoolAllocations = 0;
     private int stats_lightingPoolReuses = 0;
-    
+
     // --- RLE Stats (aggregate) ---
     private int stats_rleCompressions = 0;
     private int stats_rleDecompressions = 0;
@@ -207,19 +301,19 @@ public class McWorld : UdonSharpBehaviour
     private int stats_rleTotalBytesIn = 0;
     private int stats_rleTotalBytesOut = 0;
     private int stats_rleHomogeneousChunks = 0;
-    
+
     // --- Block Operation Stats ---
     private int stats_getBlockCalls = 0;
     private int stats_setBlockCalls = 0;
     private int stats_blockModifications = 0;
     private int stats_neighborRebuildTriggers = 0;
-    
+
     // --- Cache Stats ---
     private int stats_decompCacheHits = 0;
     private int stats_decompCacheMisses = 0;
     private int stats_neighborCacheHits = 0;
     private int stats_neighborCacheMisses = 0;
-    
+
     // --- Reconciliation Stats ---
     private int stats_reconciliationOps = 0;
     private int stats_reconciliationBlocks = 0;
@@ -227,7 +321,7 @@ public class McWorld : UdonSharpBehaviour
 
     void Start()
     {
-        Debug.Log("[McWorld] ========== MCWORLD START =========="); 
+        Debug.Log("[McWorld] ========== MCWORLD START ==========");
         if (chunkPrefab == null || terrainGenerator == null || blockTypeManager == null || coordinator == null) {
             Debug.LogError("[McWorld] A critical component is not assigned! Aborting.");
             this.enabled = false;
@@ -237,10 +331,11 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         logBuilder = new System.Text.StringBuilder(2048);
 #endif
-        
+
         InitializeWorldParameters();
         InitializeChunkStorage();
-        
+        _CacheSharedChunkMaterials();
+
         blockDataCache = blockTypeManager.finalDataArray;
         uv_allFacesCache = blockTypeManager.uv_allFacesData;
         uv_topFaceCache = blockTypeManager.uv_topFaceData;
@@ -248,16 +343,18 @@ public class McWorld : UdonSharpBehaviour
         uv_sideFacesCache = blockTypeManager.uv_sideFacesData;
         _BuildBlockCaches();
         _BuildLightingTables();
+        _InitializeGpuVoxelBackend();
+        _InitializeGpuDebugHud();
         
         terrainGenerator.init(McUtils.GetMinecraftSeed(worldSeedString));
-        
+
         int[] radialChunkOrder = GenerateRadialChunkOrder();
         coordinator.InitializeAndStartProcessing(this, radialChunkOrder, totalWorldChunks);
-        
+
 #if LOGGING
         stats_aggregateWindowStart = Time.realtimeSinceStartup;
 #endif
-        
+
         // No longer using SendCustomEventDelayedSeconds - Update() will handle processing
     }
 
@@ -276,13 +373,13 @@ public class McWorld : UdonSharpBehaviour
         Debug.Log($"Converted World Seed: {McUtils.GetMinecraftSeed(worldSeedString)}");
         Debug.Log($"Permutation Table: {McUtils.GetPermutationTable(new JavaRandom(McUtils.GetMinecraftSeed(worldSeedString)))}");
         #endif
-        
+
         // --- FIX: Remove vertical (Y-axis) centering ---
         // The world should be centered on XZ, but start at Y=0 and build upwards.
         chunkOffsetX = worldDimensionX / 2;
-        chunkOffsetY = 0; 
+        chunkOffsetY = 0;
         chunkOffsetZ = worldDimensionZ / 2;
-        
+
         globalVoxelOffsetX = (worldDimensionX * chunkSizeXZ) / 2;
         globalVoxelOffsetY = 0;
         globalVoxelOffsetZ = (worldDimensionZ * chunkSizeXZ) / 2;
@@ -294,16 +391,1040 @@ public class McWorld : UdonSharpBehaviour
         activeDataGenChunks = new ChunkData[MAX_ACTIVE_CHUNKS];
         activeMeshingChunks = new ChunkData[MAX_ACTIVE_CHUNKS];
     }
-    
+
+    private void _InitializeGpuVoxelBackend()
+    {
+        gpuBackendReady = false;
+        if (!enableGpuVoxelBackend) return;
+        if (gpuAtlasOverlayMaterial == null || gpuLightingSeedMaterial == null || gpuLightingPropagateMaterial == null) return;
+
+        gpuChunkSlotCapacity = Mathf.Clamp(gpuChunkSlotCapacity, 1, 4095);
+        if (gpuResidentRadiusXZ <= 0) gpuResidentRadiusXZ = 6;
+        if (gpuResidentRadiusY <= 0) gpuResidentRadiusY = 2;
+        if (gpuResidentSyncsPerFrame <= 0) gpuResidentSyncsPerFrame = 32;
+        gpuTileWidth = chunkSizeXZ;
+        gpuTileHeight = chunkSizeY * chunkSizeXZ;
+
+        float pixelAspect = gpuTileHeight / (float)Mathf.Max(1, gpuTileWidth);
+        gpuAtlasSlotsX = Mathf.Clamp(Mathf.CeilToInt(Mathf.Sqrt(gpuChunkSlotCapacity * pixelAspect)), 1, gpuChunkSlotCapacity);
+        gpuAtlasSlotsY = Mathf.Max(1, Mathf.CeilToInt(gpuChunkSlotCapacity / (float)gpuAtlasSlotsX));
+        gpuAtlasWidth = gpuAtlasSlotsX * gpuTileWidth;
+        gpuAtlasHeight = gpuAtlasSlotsY * gpuTileHeight;
+
+        gpuChunkIndexToSlot = new int[totalWorldChunks];
+        gpuChunkSyncedDataVersion = new int[totalWorldChunks];
+        gpuSlotToChunkIndex = new int[gpuChunkSlotCapacity];
+        gpuSlotUseStamp = new int[gpuChunkSlotCapacity];
+        for (int i = 0; i < totalWorldChunks; i++) gpuChunkIndexToSlot[i] = -1;
+        for (int i = 0; i < totalWorldChunks; i++) gpuChunkSyncedDataVersion[i] = -1;
+        for (int i = 0; i < gpuChunkSlotCapacity; i++) gpuSlotToChunkIndex[i] = -1;
+
+        gpuSlotLookupPixels = new Color32[worldDimensionX * worldDimensionY * worldDimensionZ];
+        gpuSlotMetaPixels = new Color32[gpuChunkSlotCapacity];
+        gpuUploadBlockPixels = new Color32[gpuTileWidth * gpuTileHeight];
+
+        gpuSlotLookupTexture = _CreateGpuTexture2D(worldDimensionX, worldDimensionY * worldDimensionZ);
+        gpuSlotMetaTexture = _CreateGpuTexture2D(gpuChunkSlotCapacity, 1);
+        gpuBlockPropertyTexture = _CreateGpuTexture2D(256, 1);
+        gpuUploadBlockTexture = _CreateGpuTexture2D(gpuTileWidth, gpuTileHeight);
+        gpuClearTexture = _CreateGpuTexture2D(1, 1);
+
+        gpuClearTexture.SetPixel(0, 0, new Color(0f, 0f, 0f, 0f));
+        gpuClearTexture.Apply(false, false);
+
+        gpuSlotLookupTexture.SetPixels32(gpuSlotLookupPixels);
+        gpuSlotLookupTexture.Apply(false, false);
+        gpuSlotMetaTexture.SetPixels32(gpuSlotMetaPixels);
+        gpuSlotMetaTexture.Apply(false, false);
+
+        _BuildGpuBlockPropertyTexture();
+
+        gpuBlockAtlas = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_BlockAtlas_A");
+        gpuBlockAtlasScratch = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_BlockAtlas_B");
+        gpuLightAtlas = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_LightAtlas_A");
+        gpuLightAtlasScratch = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_LightAtlas_B");
+
+        VRCGraphics.Blit(gpuClearTexture, gpuBlockAtlas);
+        VRCGraphics.Blit(gpuClearTexture, gpuBlockAtlasScratch);
+        VRCGraphics.Blit(gpuClearTexture, gpuLightAtlas);
+        VRCGraphics.Blit(gpuClearTexture, gpuLightAtlasScratch);
+
+        gpuPropGpuEnabledId = VRCShader.PropertyToID("_UdonVRCM_GpuEnabled");
+        gpuPropLightAtlasId = VRCShader.PropertyToID("_UdonVRCM_GpuLightAtlas");
+        gpuPropBlockAtlasGlobalId = VRCShader.PropertyToID("_UdonVRCM_GpuBlockAtlas");
+        gpuPropSlotLookupId = VRCShader.PropertyToID("_UdonVRCM_GpuSlotLookup");
+        gpuPropSlotMetaGlobalId = VRCShader.PropertyToID("_UdonVRCM_GpuSlotMeta");
+        gpuPropBlockPropsGlobalId = VRCShader.PropertyToID("_UdonVRCM_GpuBlockProps");
+        gpuPropAtlasInfoId = VRCShader.PropertyToID("_UdonVRCM_GpuAtlasInfo");
+        gpuPropWorldInfoId = VRCShader.PropertyToID("_UdonVRCM_GpuWorldInfo");
+        gpuPropChunkInfoId = VRCShader.PropertyToID("_UdonVRCM_GpuChunkInfo");
+        gpuPropVoxelOffsetId = VRCShader.PropertyToID("_UdonVRCM_GpuVoxelOffset");
+        gpuPropBlockAtlasId = VRCShader.PropertyToID("_BlockAtlas");
+        gpuPropBlockPropsId = VRCShader.PropertyToID("_BlockPropsTex");
+        gpuPropSlotLookupTexId = VRCShader.PropertyToID("_SlotLookupTex");
+        gpuPropSlotMetaId = VRCShader.PropertyToID("_SlotMetaTex");
+        gpuPropOverlayTexId = VRCShader.PropertyToID("_OverlayTex");
+        gpuPropOverlayRectId = VRCShader.PropertyToID("_OverlayRect");
+        gpuPropTopSkyLightId = VRCShader.PropertyToID("_TopSkyLight");
+        gpuPropDrawTableTexId = VRCShader.PropertyToID("_DrawTableTex");
+
+        // --- GPU Face Extraction Init ---
+        gpuFaceAtlas = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_FaceAtlas");
+        VRCGraphics.Blit(gpuClearTexture, gpuFaceAtlas);
+
+        // Readback buffers
+        gpuFaceReadbackPixels = new Color32[gpuAtlasWidth * gpuAtlasHeight];
+        gpuFaceChunkPixels = new Color32[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
+
+        gpuBackendReady = true;
+        _GpuBuildShouldDrawTexture();
+        _GpuPublishGlobals();
+    }
+
+    private Texture2D _CreateGpuTexture2D(int width, int height)
+    {
+        Texture2D texture = new Texture2D(width, height, TextureFormat.RGBA32, false, true);
+        texture.filterMode = FilterMode.Point;
+        texture.wrapMode = TextureWrapMode.Clamp;
+        return texture;
+    }
+
+    private RenderTexture _CreateGpuRenderTexture(int width, int height, string textureName)
+    {
+        RenderTexture rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+        rt.name = textureName;
+        rt.filterMode = FilterMode.Point;
+        rt.wrapMode = TextureWrapMode.Clamp;
+        rt.useMipMap = false;
+        rt.autoGenerateMips = false;
+        rt.enableRandomWrite = false;
+        rt.Create();
+        return rt;
+    }
+
+    private void _BuildGpuBlockPropertyTexture()
+    {
+        if (gpuBlockPropertyTexture == null || blockTypeManager == null) return;
+
+        Color32[] pixels = new Color32[256];
+        for (int i = 0; i < 256; i++)
+        {
+            byte blockId = (byte)i;
+            int opacity = blockTypeManager.GetBlockLightOpacity(blockId);
+            int emission = blockTypeManager.GetBlockLightEmission(blockId);
+            int shape = (int)blockTypeManager.GetBlockShapeType(blockId);
+            bool isSolid = blockTypeManager.GetBlockIsSolid(blockId);
+            pixels[i] = new Color32(
+                (byte)Mathf.Clamp(opacity * 17, 0, 255),
+                (byte)Mathf.Clamp(emission * 17, 0, 255),
+                (byte)Mathf.Clamp(shape, 0, 255),
+                (byte)(isSolid ? 255 : 0)
+            );
+        }
+
+        gpuBlockPropertyTexture.SetPixels32(pixels);
+        gpuBlockPropertyTexture.Apply(false, false);
+    }
+
+    private void _GpuPublishGlobals()
+    {
+        if (gpuSlotLookupTexture == null || gpuLightAtlas == null) return;
+
+        VRCShader.SetGlobalFloat(gpuPropGpuEnabledId, enableGpuVoxelBackend && gpuBackendReady ? 1f : 0f);
+        VRCShader.SetGlobalTexture(gpuPropBlockAtlasGlobalId, gpuBlockAtlas);
+        VRCShader.SetGlobalTexture(gpuPropLightAtlasId, gpuLightAtlas);
+        VRCShader.SetGlobalTexture(gpuPropSlotLookupId, gpuSlotLookupTexture);
+        VRCShader.SetGlobalTexture(gpuPropSlotMetaGlobalId, gpuSlotMetaTexture);
+        VRCShader.SetGlobalTexture(gpuPropBlockPropsGlobalId, gpuBlockPropertyTexture);
+        VRCShader.SetGlobalVector(gpuPropAtlasInfoId, new Vector4(gpuAtlasWidth, gpuAtlasHeight, gpuAtlasSlotsX, gpuAtlasSlotsY));
+        VRCShader.SetGlobalVector(gpuPropWorldInfoId, new Vector4(worldDimensionX, worldDimensionY, worldDimensionZ, worldDimensionY * worldDimensionZ));
+        VRCShader.SetGlobalVector(gpuPropChunkInfoId, new Vector4(chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ));
+        VRCShader.SetGlobalVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
+    }
+
+    public Texture GetGpuBlockAtlasDebugTexture()
+    {
+        return gpuBlockAtlas;
+    }
+
+    public Texture GetGpuLightAtlasDebugTexture()
+    {
+        return gpuLightAtlas;
+    }
+
+    public Texture GetGpuSlotLookupDebugTexture()
+    {
+        return gpuSlotLookupTexture;
+    }
+
+    public Texture GetGpuSlotMetaDebugTexture()
+    {
+        return gpuSlotMetaTexture;
+    }
+
+    private void _InitializeGpuDebugHud()
+    {
+        if (!enableGpuDebugHud) return;
+
+        Transform hudRootTransform = transform.Find("GpuDebugHud");
+        if (hudRootTransform == null) return;
+
+        gpuDebugHudRoot = hudRootTransform.gameObject;
+        gpuDebugHudRect = hudRootTransform.GetComponent<RectTransform>();
+
+        Transform panelTransform = hudRootTransform.Find("Panel");
+        Transform textureATransform = hudRootTransform.Find("TextureA");
+        Transform textureBTransform = hudRootTransform.Find("TextureB");
+        Transform labelTransform = hudRootTransform.Find("Label");
+        Transform toggleButtonLabelTransform = hudRootTransform.Find("ToggleButton/Text");
+
+        gpuDebugPanel = panelTransform != null ? panelTransform.gameObject : null;
+        gpuDebugTextureA = textureATransform != null ? textureATransform.GetComponent<RawImage>() : null;
+        gpuDebugTextureB = textureBTransform != null ? textureBTransform.GetComponent<RawImage>() : null;
+        gpuDebugLabel = labelTransform != null ? labelTransform.GetComponent<TextMeshProUGUI>() : null;
+        gpuDebugToggleButtonLabel = toggleButtonLabelTransform != null ? toggleButtonLabelTransform.GetComponent<TextMeshProUGUI>() : null;
+
+        gpuDebugHudVisible = showGpuDebugHudOnStart;
+        gpuDebugHudPage = 0;
+        if (gpuDebugHudRoot != null)
+        {
+            gpuDebugHudRoot.SetActive(true);
+        }
+        _RefreshGpuDebugHud();
+    }
+
+    public void ToggleGpuDebugHud()
+    {
+        if (gpuDebugHudRoot == null) return;
+        gpuDebugHudVisible = !gpuDebugHudVisible;
+        _RefreshGpuDebugHud();
+    }
+
+    public void NextGpuDebugHudPage()
+    {
+        gpuDebugHudPage++;
+        if (gpuDebugHudPage >= GPU_DEBUG_PAGE_COUNT)
+        {
+            gpuDebugHudPage = 0;
+        }
+        _RefreshGpuDebugHud();
+    }
+
+    private Texture _GetGpuDebugTextureA()
+    {
+        switch (gpuDebugHudPage)
+        {
+            case 0:
+                return gpuBlockAtlas;
+            case 1:
+                return gpuSlotLookupTexture;
+            case 2:
+                return terrainGenerator != null ? terrainGenerator.GetGpuDensityDebugTexture() : null;
+            case 3:
+                return terrainGenerator != null ? terrainGenerator.GetGpuColumnSurfaceInfoDebugTexture() : null;
+        }
+        return null;
+    }
+
+    private Texture _GetGpuDebugTextureB()
+    {
+        switch (gpuDebugHudPage)
+        {
+            case 0:
+                return gpuLightAtlas;
+            case 1:
+                return gpuSlotMetaTexture;
+            case 2:
+                return terrainGenerator != null ? terrainGenerator.GetGpuColumnBaseDebugTexture() : null;
+            case 3:
+                return terrainGenerator != null ? terrainGenerator.GetGpuColumnFinalDebugTexture() : null;
+        }
+        return null;
+    }
+
+    private string _GetGpuDebugPageLabel()
+    {
+        switch (gpuDebugHudPage)
+        {
+            case 0:
+                return "GPU Atlas | Block Atlas / Light Atlas";
+            case 1:
+                return "GPU Slots | Lookup / Slot Meta";
+            case 2:
+                return "GPU Worldgen | Density / Base Column";
+            case 3:
+                return "GPU Worldgen | Surface Info / Final Column";
+        }
+        return "GPU Debug";
+    }
+
+    private void _RefreshGpuDebugHud()
+    {
+        if (gpuDebugHudRoot == null) return;
+
+        Texture textureA = _GetGpuDebugTextureA();
+        Texture textureB = _GetGpuDebugTextureB();
+
+        if (gpuDebugPanel != null)
+        {
+            gpuDebugPanel.SetActive(gpuDebugHudVisible);
+        }
+        if (gpuDebugTextureA != null)
+        {
+            gpuDebugTextureA.gameObject.SetActive(gpuDebugHudVisible);
+            gpuDebugTextureA.texture = textureA;
+            gpuDebugTextureA.color = textureA != null ? Color.white : new Color(0.2f, 0.2f, 0.2f, 0.85f);
+        }
+        if (gpuDebugTextureB != null)
+        {
+            gpuDebugTextureB.gameObject.SetActive(gpuDebugHudVisible);
+            gpuDebugTextureB.texture = textureB;
+            gpuDebugTextureB.color = textureB != null ? Color.white : new Color(0.2f, 0.2f, 0.2f, 0.85f);
+        }
+        if (gpuDebugLabel != null)
+        {
+            gpuDebugLabel.gameObject.SetActive(gpuDebugHudVisible);
+            string readyText = gpuBackendReady ? "backend ready" : "backend pending";
+            gpuDebugLabel.text = _GetGpuDebugPageLabel() + "\nClick Show/Hide and Next | " + readyText;
+        }
+        if (gpuDebugToggleButtonLabel != null)
+        {
+            gpuDebugToggleButtonLabel.text = gpuDebugHudVisible ? "Hide Debug" : "Show Debug";
+        }
+    }
+
+    private void _UpdateGpuDebugHud()
+    {
+        if (!enableGpuDebugHud || gpuDebugHudRoot == null) return;
+        if (gpuDebugHudRect == null) return;
+
+        if (gpuDebugLocalPlayer == null)
+        {
+            gpuDebugLocalPlayer = Networking.LocalPlayer;
+        }
+        if (gpuDebugLocalPlayer == null || !gpuDebugLocalPlayer.IsValid()) return;
+
+        VRCPlayerApi.TrackingData headData = gpuDebugLocalPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
+        Vector3 localOffset = gpuDebugHudLocalOffset + new Vector3(0f, 0f, gpuDebugHudDistance);
+        Vector3 hudPosition = headData.position + headData.rotation * localOffset;
+        gpuDebugHudRect.position = hudPosition;
+        gpuDebugHudRect.rotation = Quaternion.LookRotation(headData.position - hudPosition, headData.rotation * Vector3.up) * Quaternion.Euler(gpuDebugHudEulerOffset);
+    }
+
+    private int _GpuGetLookupPixelIndex(int arrayX, int arrayY, int arrayZ)
+    {
+        return (arrayY * worldDimensionZ + arrayZ) * worldDimensionX + arrayX;
+    }
+
+    private void _GpuSetSlotLookupPixel(int arrayX, int arrayY, int arrayZ, int slotIndex, bool isValid)
+    {
+        if (arrayX < 0 || arrayX >= worldDimensionX || arrayY < 0 || arrayY >= worldDimensionY || arrayZ < 0 || arrayZ >= worldDimensionZ) return;
+
+        int lookupIndex = _GpuGetLookupPixelIndex(arrayX, arrayY, arrayZ);
+        if (!isValid)
+            gpuSlotLookupPixels[lookupIndex] = new Color32(0, 0, 0, 0);
+        else
+            gpuSlotLookupPixels[lookupIndex] = new Color32((byte)(slotIndex & 0xFF), (byte)((slotIndex >> 8) & 0xFF), 0, 255);
+    }
+
+    private void _GpuApplyLookupTextures()
+    {
+        if (gpuSlotLookupTexture == null || gpuSlotMetaTexture == null) return;
+        gpuSlotLookupTexture.SetPixels32(gpuSlotLookupPixels);
+        gpuSlotLookupTexture.Apply(false, false);
+        gpuSlotMetaTexture.SetPixels32(gpuSlotMetaPixels);
+        gpuSlotMetaTexture.Apply(false, false);
+        _GpuPublishGlobals();
+    }
+
+    private int _GpuFindOrAssignSlot(ChunkData chunk)
+    {
+        if (!gpuBackendReady || chunk == null) return -1;
+
+        int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        if (chunkIndex < 0 || chunkIndex >= totalWorldChunks) return -1;
+
+        int currentSlot = gpuChunkIndexToSlot[chunkIndex];
+        if (currentSlot >= 0 && currentSlot < gpuChunkSlotCapacity)
+        {
+            gpuSlotUseStamp[currentSlot] = gpuSlotUseCounter++;
+            return currentSlot;
+        }
+
+        int targetSlot = -1;
+        for (int i = 0; i < gpuChunkSlotCapacity; i++)
+        {
+            if (gpuSlotToChunkIndex[i] == -1)
+            {
+                targetSlot = i;
+                break;
+            }
+        }
+
+        if (targetSlot == -1)
+        {
+            int oldestStamp = int.MaxValue;
+            for (int i = 0; i < gpuChunkSlotCapacity; i++)
+            {
+                int residentChunkIndex = gpuSlotToChunkIndex[i];
+                if (residentChunkIndex >= 0 && residentChunkIndex < totalWorldChunks)
+                {
+                    ChunkData residentChunk = chunks_1D[residentChunkIndex];
+                    // Protect ALL chunks with valid data from eviction,
+                    // not just nearby ones. GPU lighting covers the whole world.
+                    if (residentChunk != null && residentChunk.isDataReady) continue;
+                }
+                if (gpuSlotUseStamp[i] < oldestStamp)
+                {
+                    oldestStamp = gpuSlotUseStamp[i];
+                    targetSlot = i;
+                }
+            }
+        }
+
+        if (targetSlot == -1)
+        {
+            int oldestStamp = int.MaxValue;
+            for (int i = 0; i < gpuChunkSlotCapacity; i++)
+            {
+                if (gpuSlotUseStamp[i] < oldestStamp)
+                {
+                    oldestStamp = gpuSlotUseStamp[i];
+                    targetSlot = i;
+                }
+            }
+        }
+
+        int evictedChunkIndex = gpuSlotToChunkIndex[targetSlot];
+        if (evictedChunkIndex >= 0 && evictedChunkIndex < totalWorldChunks)
+        {
+            ChunkData evictedChunk = chunks_1D[evictedChunkIndex];
+            if (evictedChunk != null)
+            {
+                int evictedArrayX = evictedChunk.chunkX_world + chunkOffsetX;
+                int evictedArrayY = evictedChunk.chunkY_world + chunkOffsetY;
+                int evictedArrayZ = evictedChunk.chunkZ_world + chunkOffsetZ;
+                _GpuSetSlotLookupPixel(evictedArrayX, evictedArrayY, evictedArrayZ, 0, false);
+            }
+            gpuChunkIndexToSlot[evictedChunkIndex] = -1;
+            gpuChunkSyncedDataVersion[evictedChunkIndex] = -1;
+        }
+
+        int arrayX = chunk.chunkX_world + chunkOffsetX;
+        int arrayY = chunk.chunkY_world + chunkOffsetY;
+        int arrayZ = chunk.chunkZ_world + chunkOffsetZ;
+
+        gpuChunkIndexToSlot[chunkIndex] = targetSlot;
+        gpuSlotToChunkIndex[targetSlot] = chunkIndex;
+        gpuSlotUseStamp[targetSlot] = gpuSlotUseCounter++;
+        gpuSlotMetaPixels[targetSlot] = new Color32((byte)arrayX, (byte)arrayY, (byte)arrayZ, 255);
+        _GpuSetSlotLookupPixel(arrayX, arrayY, arrayZ, targetSlot, true);
+        _GpuApplyLookupTextures();
+        return targetSlot;
+    }
+
+    private bool _GpuIsChunkProtectedFromEviction(ChunkData chunk)
+    {
+        if (!gpuBackendReady || chunk == null) return false;
+        int dx = Mathf.Abs(chunk.chunkX_world - gpuResidentCenterChunkX);
+        int dy = Mathf.Abs(chunk.chunkY_world - gpuResidentCenterChunkY);
+        int dz = Mathf.Abs(chunk.chunkZ_world - gpuResidentCenterChunkZ);
+        return dx <= gpuResidentRadiusXZ && dy <= gpuResidentRadiusY && dz <= gpuResidentRadiusXZ;
+    }
+
+    private Vector4 _GpuGetSlotRect(int slotIndex)
+    {
+        int tileX = slotIndex % gpuAtlasSlotsX;
+        int tileY = slotIndex / gpuAtlasSlotsX;
+        float minU = (tileX * gpuTileWidth) / (float)gpuAtlasWidth;
+        float minV = (tileY * gpuTileHeight) / (float)gpuAtlasHeight;
+        float sizeU = gpuTileWidth / (float)gpuAtlasWidth;
+        float sizeV = gpuTileHeight / (float)gpuAtlasHeight;
+        return new Vector4(minU, minV, sizeU, sizeV);
+    }
+
+    private void _GpuOverlayTextureIntoAtlas(Texture overlayTexture, ref RenderTexture currentAtlas, ref RenderTexture scratchAtlas)
+    {
+        if (!gpuBackendReady || overlayTexture == null || currentAtlas == null || scratchAtlas == null || gpuAtlasOverlayMaterial == null) return;
+
+        gpuAtlasOverlayMaterial.SetTexture(gpuPropOverlayTexId, overlayTexture);
+        VRCGraphics.Blit(currentAtlas, scratchAtlas, gpuAtlasOverlayMaterial);
+        RenderTexture temp = currentAtlas;
+        currentAtlas = scratchAtlas;
+        scratchAtlas = temp;
+    }
+
+    private void _GpuClearSlotLight(int slotIndex)
+    {
+        if (!gpuBackendReady || slotIndex < 0 || slotIndex >= gpuChunkSlotCapacity) return;
+        gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetSlotRect(slotIndex));
+        _GpuOverlayTextureIntoAtlas(gpuClearTexture, ref gpuLightAtlas, ref gpuLightAtlasScratch);
+    }
+
+    private void _GpuSyncChunkBlocks(ChunkData chunk, byte[] blockData)
+    {
+        if (!gpuBackendReady || chunk == null || blockData == null || gpuUploadBlockTexture == null) return;
+
+        int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        if (chunkIndex < 0 || chunkIndex >= totalWorldChunks) return;
+
+        // Always sync generated chunks to the GPU atlas for correct lighting.
+        // Eviction now protects all chunks with valid data, so distance gating
+        // is unnecessary — atlas slots are only reclaimed from empty/unloaded chunks.
+
+        int slotIndex = _GpuFindOrAssignSlot(chunk);
+        if (slotIndex < 0) return;
+
+        if (gpuChunkSyncedDataVersion[chunkIndex] == chunk._cachedDataVersion)
+        {
+            gpuSlotUseStamp[slotIndex] = gpuSlotUseCounter++;
+            return;
+        }
+
+        // Clear this slot's light data (sets alpha=0).  The seed shader
+        // uses alpha as a dirty flag:  alpha < 0.5 → compute fresh column-scan
+        // seed values;  alpha >= 0.5 → pass through existing propagated values.
+        _GpuClearSlotLight(slotIndex);
+
+        int stride = chunkSizeXZ * chunkSizeXZ;
+        for (int y = 0; y < chunkSizeY; y++)
+        {
+            int yBase = y * stride;
+            for (int z = 0; z < chunkSizeXZ; z++)
+            {
+                int row = y * chunkSizeXZ + z;
+                int rowBase = row * chunkSizeXZ;
+                int zBase = yBase + z * chunkSizeXZ;
+                for (int x = 0; x < chunkSizeXZ; x++)
+                {
+                    byte blockId = blockData[zBase + x];
+                    gpuUploadBlockPixels[rowBase + x] = new Color32(blockId, 0, 0, 255);
+                }
+            }
+        }
+
+        gpuUploadBlockTexture.SetPixels32(gpuUploadBlockPixels);
+        gpuUploadBlockTexture.Apply(false, false);
+
+        gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetSlotRect(slotIndex));
+        _GpuOverlayTextureIntoAtlas(gpuUploadBlockTexture, ref gpuBlockAtlas, ref gpuBlockAtlasScratch);
+        gpuChunkSyncedDataVersion[chunkIndex] = chunk._cachedDataVersion;
+        _GpuRequestLightingRebuild();
+        _GpuPublishGlobals();
+    }
+
+    private void _GpuUpdateResidentCenterFromPlayer()
+    {
+        if (!gpuBackendReady) return;
+
+        VRCPlayerApi localPlayer = Networking.LocalPlayer;
+        if (localPlayer == null) return;
+
+        Vector3 playerPos = localPlayer.GetPosition();
+        gpuResidentCenterChunkX = Mathf.FloorToInt(playerPos.x / chunkSizeXZ);
+        gpuResidentCenterChunkY = Mathf.FloorToInt(playerPos.y / chunkSizeY);
+        gpuResidentCenterChunkZ = Mathf.FloorToInt(playerPos.z / chunkSizeXZ);
+
+        int minChunkX = -chunkOffsetX;
+        int maxChunkX = worldDimensionX - chunkOffsetX - 1;
+        int minChunkY = -chunkOffsetY;
+        int maxChunkY = worldDimensionY - chunkOffsetY - 1;
+        int minChunkZ = -chunkOffsetZ;
+        int maxChunkZ = worldDimensionZ - chunkOffsetZ - 1;
+
+        gpuResidentCenterChunkX = Mathf.Clamp(gpuResidentCenterChunkX, minChunkX, maxChunkX);
+        gpuResidentCenterChunkY = Mathf.Clamp(gpuResidentCenterChunkY, minChunkY, maxChunkY);
+        gpuResidentCenterChunkZ = Mathf.Clamp(gpuResidentCenterChunkZ, minChunkZ, maxChunkZ);
+    }
+
+    private void _GpuMaintainResidentChunks(float frameStart, float frameBudget)
+    {
+        if (!gpuBackendReady) return;
+
+        _GpuUpdateResidentCenterFromPlayer();
+
+        int syncBudget = Mathf.Max(1, gpuResidentSyncsPerFrame);
+        int touched = 0;
+        int maxDistance = Mathf.Max(gpuResidentRadiusXZ, gpuResidentRadiusY);
+
+        for (int distance = 0; distance <= maxDistance; distance++)
+        {
+            for (int dy = -gpuResidentRadiusY; dy <= gpuResidentRadiusY; dy++)
+            {
+                for (int dz = -gpuResidentRadiusXZ; dz <= gpuResidentRadiusXZ; dz++)
+                {
+                    for (int dx = -gpuResidentRadiusXZ; dx <= gpuResidentRadiusXZ; dx++)
+                    {
+                        if (Mathf.Max(Mathf.Abs(dx), Mathf.Abs(dy), Mathf.Abs(dz)) != distance) continue;
+
+                        int chunkX = gpuResidentCenterChunkX + dx;
+                        int chunkY = gpuResidentCenterChunkY + dy;
+                        int chunkZ = gpuResidentCenterChunkZ + dz;
+                        int chunkIndex = ChunkCenteredCoordsTo1D(chunkX, chunkY, chunkZ);
+                        if (chunkIndex == -1) continue;
+
+                        ChunkData chunk = chunks_1D[chunkIndex];
+                        if (chunk == null || !chunk.isDataReady) continue;
+
+                        int slotIndex = gpuChunkIndexToSlot[chunkIndex];
+                        if (slotIndex >= 0 && slotIndex < gpuChunkSlotCapacity)
+                        {
+                            gpuSlotUseStamp[slotIndex] = gpuSlotUseCounter++;
+                            continue;
+                        }
+
+                        if (touched >= syncBudget) return;
+                        if (Time.realtimeSinceStartup - frameStart > frameBudget) return;
+
+                        byte[] blockData = _GetDecompressedData(chunk);
+                        if (blockData == null) continue;
+
+                        _GpuSyncChunkBlocks(chunk, blockData);
+                        touched++;
+                    }
+                }
+            }
+        }
+    }
+
+    private void _GpuRequestLightingRebuild()
+    {
+        if (!gpuBackendReady) return;
+        gpuLightingSeedPending = true;
+        // Additive: give propagation enough budget to converge the new data
+        // without resetting already-accumulated progress from prior chunks.
+        int maxIterationCap = gpuLightingTotalIterations * 2;
+        gpuLightingIterationsRemaining = Mathf.Min(gpuLightingIterationsRemaining + gpuLightingTotalIterations, maxIterationCap);
+    }
+
+    private int gpuLightingKeepAliveCounter = 0;
+
+    private void _ProcessGpuLighting(float frameStart, float frameBudget)
+    {
+        if (!gpuBackendReady) return;
+
+        // Detect RenderTexture content loss (GPU device recovery, alt-tab, etc.)
+        // and trigger a full re-seed so lighting doesn't go permanently black.
+        bool contentLost = false;
+        if (gpuLightAtlas != null && gpuLightAtlasScratch != null &&
+            (!gpuLightAtlas.IsCreated() || !gpuLightAtlasScratch.IsCreated()))
+        {
+            gpuLightAtlas.Create();
+            gpuLightAtlasScratch.Create();
+            contentLost = true;
+        }
+
+        // Periodic keep-alive: Unity can silently zero out RT contents while
+        // IsCreated() still returns true.  Force a full re-seed + propagation
+        // every ~10 seconds so lighting self-heals within a few seconds.
+        // The seed shader's alpha-based dirty flag (alpha=0 → recompute from
+        // column scan) handles zeroed atlas data correctly without needing
+        // to re-upload block data.
+        gpuLightingKeepAliveCounter++;
+        if (contentLost || gpuLightingKeepAliveCounter >= 600)
+        {
+            gpuLightingKeepAliveCounter = 0;
+            gpuLightingSeedPending = true;
+            if (gpuLightingIterationsRemaining < gpuLightingTotalIterations)
+                gpuLightingIterationsRemaining = gpuLightingTotalIterations;
+        }
+        bool runVerticalSeedPass = gpuLightingSeedPending;
+        bool seededThisFrame = false;
+        if (runVerticalSeedPass)
+        {
+            _GpuRunLightingSeedPass();
+            gpuLightingSeedPending = false;
+            seededThisFrame = true;
+            // Ensure at least a minimum propagation budget after seeding
+            if (gpuLightingIterationsRemaining < gpuLightingTotalIterations)
+            {
+                gpuLightingIterationsRemaining = gpuLightingTotalIterations;
+            }
+        }
+
+        int iterations = Mathf.Max(0, gpuLightingIterationsPerUpdate);
+        int guaranteedIterations = seededThisFrame ? 8 : 2;
+        for (int i = 0; i < iterations && gpuLightingIterationsRemaining > 0; i++)
+        {
+            if (i >= guaranteedIterations && Time.realtimeSinceStartup - frameStart > frameBudget) break;
+            _GpuRunLightingPropagationPass();
+            gpuLightingIterationsRemaining--;
+        }
+    }
+
+    private void _GpuRunLightingSeedPass()
+    {
+        if (!gpuBackendReady || gpuLightingSeedMaterial == null) return;
+
+        gpuLightingSeedMaterial.SetTexture(gpuPropBlockAtlasId, gpuBlockAtlas);
+        gpuLightingSeedMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
+        gpuLightingSeedMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
+        gpuLightingSeedMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
+        gpuLightingSeedMaterial.SetVector(gpuPropAtlasInfoId, new Vector4(gpuAtlasWidth, gpuAtlasHeight, gpuAtlasSlotsX, gpuAtlasSlotsY));
+        gpuLightingSeedMaterial.SetVector(gpuPropWorldInfoId, new Vector4(worldDimensionX, worldDimensionY, worldDimensionZ, worldDimensionY * worldDimensionZ));
+        gpuLightingSeedMaterial.SetVector(gpuPropChunkInfoId, new Vector4(chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ));
+        gpuLightingSeedMaterial.SetVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
+        gpuLightingSeedMaterial.SetFloat(gpuPropTopSkyLightId, 15f);
+
+        VRCGraphics.Blit(gpuLightAtlas, gpuLightAtlasScratch, gpuLightingSeedMaterial);
+        RenderTexture temp = gpuLightAtlas;
+        gpuLightAtlas = gpuLightAtlasScratch;
+        gpuLightAtlasScratch = temp;
+        _GpuPublishGlobals();
+    }
+
+    private void _GpuRunLightingPropagationPass()
+    {
+        if (!gpuBackendReady || gpuLightingPropagateMaterial == null) return;
+
+        gpuLightingPropagateMaterial.SetTexture(gpuPropBlockAtlasId, gpuBlockAtlas);
+        gpuLightingPropagateMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
+        gpuLightingPropagateMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
+        gpuLightingPropagateMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
+        gpuLightingPropagateMaterial.SetVector(gpuPropAtlasInfoId, new Vector4(gpuAtlasWidth, gpuAtlasHeight, gpuAtlasSlotsX, gpuAtlasSlotsY));
+        gpuLightingPropagateMaterial.SetVector(gpuPropWorldInfoId, new Vector4(worldDimensionX, worldDimensionY, worldDimensionZ, worldDimensionY * worldDimensionZ));
+        gpuLightingPropagateMaterial.SetVector(gpuPropChunkInfoId, new Vector4(chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ));
+        gpuLightingPropagateMaterial.SetVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
+        gpuLightingPropagateMaterial.SetFloat(gpuPropTopSkyLightId, 15f);
+        gpuLightingPropagateMaterial.SetInt("_FrameJitter", gpuLightingFrameCursor++);
+
+        VRCGraphics.Blit(gpuLightAtlas, gpuLightAtlasScratch, gpuLightingPropagateMaterial);
+        RenderTexture temp = gpuLightAtlas;
+        gpuLightAtlas = gpuLightAtlasScratch;
+        gpuLightAtlasScratch = temp;
+        _GpuPublishGlobals();
+    }
+
+    // ===== GPU FACE EXTRACTION =====
+
+    private void _GpuBuildShouldDrawTexture()
+    {
+        if (shouldDrawTable == null) return;
+        gpuShouldDrawTexture = new Texture2D(256, 256, TextureFormat.RGBA32, false, true);
+        gpuShouldDrawTexture.filterMode = FilterMode.Point;
+        gpuShouldDrawTexture.wrapMode = TextureWrapMode.Clamp;
+        Color32[] pixels = new Color32[256 * 256];
+        for (int selfId = 0; selfId < 256; selfId++)
+        {
+            for (int neighborId = 0; neighborId < 256; neighborId++)
+            {
+                int index = selfId * 256 + neighborId;
+                int tableIndex = (selfId << 8) | neighborId;
+                byte draw = (tableIndex < shouldDrawTable.Length) ? shouldDrawTable[tableIndex] : (byte)0;
+                pixels[index] = new Color32(draw > 0 ? (byte)255 : (byte)0, 0, 0, 255);
+            }
+        }
+        gpuShouldDrawTexture.SetPixels32(pixels);
+        gpuShouldDrawTexture.Apply(false, false);
+    }
+
+    private bool _GpuFaceExtractionReady()
+    {
+        return gpuBackendReady && gpuFaceExtractMaterial != null && gpuShouldDrawTexture != null && gpuFaceAtlas != null;
+    }
+
+    private void _GpuRunFaceExtraction()
+    {
+        if (!_GpuFaceExtractionReady()) return;
+
+        gpuFaceExtractMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
+
+        VRCGraphics.Blit(gpuBlockAtlas, gpuFaceAtlas, gpuFaceExtractMaterial);
+    }
+
+    private bool _GpuRequestChunkFaceReadback(ChunkData chunk)
+    {
+        if (!_GpuFaceExtractionReady() || chunk == null) return false;
+        if (gpuFaceReadbackInFlight) return false; // one at a time
+
+        int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        if (chunkIndex < 0 || chunkIndex >= totalWorldChunks) return false;
+        int slotIndex = gpuChunkIndexToSlot[chunkIndex];
+        if (slotIndex < 0 || slotIndex >= gpuChunkSlotCapacity) return false;
+
+        chunk._gpuFaceSlotIndex = slotIndex;
+
+        // Run face extraction Blit on entire atlas
+        _GpuRunFaceExtraction();
+
+        // Request async readback of the face atlas
+        gpuFaceReadbackChunk = chunk;
+        gpuFaceReadbackInFlight = true;
+        gpuFaceReadbackReady = false;
+
+        VRCAsyncGPUReadback.Request(gpuFaceAtlas, 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        return true;
+    }
+
+    public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
+    {
+        if (!gpuFaceReadbackInFlight) return;
+
+        gpuFaceReadbackInFlight = false;
+
+        if (request.hasError)
+        {
+            gpuFaceReadbackChunk = null;
+            return;
+        }
+
+        if (!request.TryGetData(gpuFaceReadbackPixels, 0))
+        {
+            gpuFaceReadbackChunk = null;
+            return;
+        }
+
+        gpuFaceReadbackReady = true;
+    }
+
+    /// <summary>
+    /// Called from the meshing processing loop to check if face readback is ready
+    /// and trigger mesh building.
+    /// </summary>
+    private void _ProcessGpuFaceReadback()
+    {
+        if (!gpuFaceReadbackReady || gpuFaceReadbackChunk == null) return;
+
+        ChunkData chunk = gpuFaceReadbackChunk;
+        gpuFaceReadbackReady = false;
+        gpuFaceReadbackChunk = null;
+
+        // Extract this chunk's tile from the full atlas readback
+        _GpuExtractChunkTileFromAtlas(chunk._gpuFaceSlotIndex, gpuFaceReadbackPixels, gpuFaceChunkPixels);
+
+        // Build mesh from extracted face data
+        _GpuBuildMeshFromFaceData(chunk, gpuFaceChunkPixels);
+    }
+
+    private void _GpuExtractChunkTileFromAtlas(int slotIndex, Color32[] atlasPixels, Color32[] tilePixels)
+    {
+        int sizeXZ = chunkSizeXZ;
+        int sizeY = chunkSizeY;
+        int tilePixelW = sizeXZ;
+        int tilePixelH = sizeY * sizeXZ; // Y * XZ packed vertically
+
+        int tileAtlasX = (slotIndex % gpuAtlasSlotsX) * tilePixelW;
+        int tileAtlasY = (slotIndex / gpuAtlasSlotsX) * tilePixelH;
+
+        int atlasW = gpuAtlasWidth;
+
+        for (int localY = 0; localY < sizeY; localY++)
+        {
+            for (int localZ = 0; localZ < sizeXZ; localZ++)
+            {
+                int atlasRow = tileAtlasY + localY * sizeXZ + localZ;
+                int atlasBase = atlasRow * atlasW + tileAtlasX;
+
+                int tileBase = localY * sizeXZ * sizeXZ + localZ * sizeXZ;
+
+                for (int localX = 0; localX < sizeXZ; localX++)
+                {
+                    if (atlasBase + localX < atlasPixels.Length && tileBase + localX < tilePixels.Length)
+                    {
+                        tilePixels[tileBase + localX] = atlasPixels[atlasBase + localX];
+                    }
+                }
+            }
+        }
+    }
+
+
+    private void _GpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels)
+    {
+        if (chunk == null || facePixels == null) return;
+
+        _ClearAllMeshBuffers(chunk);
+        _PreComputeBiomeColors(chunk);
+
+        int sizeXZ = chunkSizeXZ;
+        int sizeY = chunkSizeY;
+        int stride = sizeXZ * sizeXZ;
+
+        for (int direction = 0; direction < 6; direction++)
+        {
+            int bit = 1 << direction;
+            int maskWidth, maskHeight, sliceCount;
+
+            if (direction <= 1) { maskWidth = sizeXZ; maskHeight = sizeXZ; sliceCount = sizeY; }
+            else if (direction <= 3) { maskWidth = sizeXZ; maskHeight = sizeY; sliceCount = sizeXZ; }
+            else { maskWidth = sizeXZ; maskHeight = sizeY; sliceCount = sizeXZ; }
+
+            for (int slice = 0; slice < sliceCount; slice++)
+            {
+                int maskCount = maskWidth * maskHeight;
+                System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
+
+                for (int v = 0; v < maskHeight; v++)
+                {
+                    for (int u = 0; u < maskWidth; u++)
+                    {
+                        int x, y, z;
+                        if (direction <= 1) { x = u; y = slice; z = v; }
+                        else if (direction <= 3) { x = u; y = v; z = slice; }
+                        else { x = slice; y = v; z = u; }
+
+                        int pixelIndex = y * stride + z * sizeXZ + x;
+                        if (pixelIndex >= facePixels.Length) continue;
+
+                        Color32 pixel = facePixels[pixelIndex];
+                        if (pixel.a < 128) continue;
+
+                        int faceMask = pixel.r;
+                        int blockID = pixel.g;
+                        int shapeType = pixel.b;
+
+                        if (blockID == 0 || shapeType >= 1) continue;
+                        if ((faceMask & bit) == 0) continue;
+
+                        int maskIndex = v * maskWidth + u;
+                        greedyMaskBlockIds[maskIndex] = (byte)blockID;
+                        greedyMaskLightLevels[maskIndex] = 0;
+                        greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, (byte)blockID, x, z));
+                    }
+                }
+
+                _EmitGreedyMask(chunk, direction, slice, maskWidth, maskHeight);
+            }
+        }
+
+        // Handle cross-shaped blocks
+        for (int y = 0; y < sizeY; y++)
+        {
+            for (int z = 0; z < sizeXZ; z++)
+            {
+                for (int x = 0; x < sizeXZ; x++)
+                {
+                    int pixelIndex = y * stride + z * sizeXZ + x;
+                    if (pixelIndex >= facePixels.Length) continue;
+                    Color32 pixel = facePixels[pixelIndex];
+                    if (pixel.a < 128 || pixel.g == 0 || pixel.b < 1) continue;
+                    _AddCrossBlockQuads(chunk, (byte)pixel.g, x, y, z);
+                }
+            }
+        }
+
+        _ApplyAllMeshData(chunk);
+        _ApplyDataToCollider(chunk);
+        chunk.isBuildingMesh = false;
+    }
+
+    private void _AddCrossBlockQuads(ChunkData chunk, byte blockID, int x, int y, int z)
+    {
+        // Inline texture slice lookup (cross blocks always use AllFacesSame)
+        float textureSlice = (blockID < uv_allFacesCache.Length) ? uv_allFacesCache[blockID] : 0;
+        Color biomeColor = _GetCachedBiomeColor(chunk, blockID, x, z);
+        biomeColor.a = 1.0f;
+
+        long seed = (long)(x + chunk.chunkX_world * chunkSizeXZ) * 3129871L ^ (long)(z + chunk.chunkZ_world * chunkSizeXZ) * 116129781L;
+        seed = seed * seed * 42317861L + seed * 11L;
+        float ox = (float)((seed >> 16) & 15L) / 15f * 0.5f - 0.25f;
+        float oz = (float)((seed >> 24) & 15L) / 15f * 0.5f - 0.25f;
+        float cx = x + 0.5f + ox;
+        float cz = z + 0.5f + oz;
+
+        _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
+            new Vector3(cx - 0.45f, y, cz - 0.45f), new Vector3(cx - 0.45f, y + 1, cz - 0.45f),
+            new Vector3(cx + 0.45f, y + 1, cz + 0.45f), new Vector3(cx + 0.45f, y, cz + 0.45f));
+        _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
+            new Vector3(cx + 0.45f, y, cz + 0.45f), new Vector3(cx + 0.45f, y + 1, cz + 0.45f),
+            new Vector3(cx - 0.45f, y + 1, cz - 0.45f), new Vector3(cx - 0.45f, y, cz - 0.45f));
+        _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
+            new Vector3(cx + 0.45f, y, cz - 0.45f), new Vector3(cx + 0.45f, y + 1, cz - 0.45f),
+            new Vector3(cx - 0.45f, y + 1, cz + 0.45f), new Vector3(cx - 0.45f, y, cz + 0.45f));
+        _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
+            new Vector3(cx - 0.45f, y, cz + 0.45f), new Vector3(cx - 0.45f, y + 1, cz + 0.45f),
+            new Vector3(cx + 0.45f, y + 1, cz - 0.45f), new Vector3(cx + 0.45f, y, cz - 0.45f));
+    }
+
+    private void _EmitCrossQuad(ChunkData chunk, byte blockID, float textureSlice, Color color, Vector3 v0, Vector3 v1, Vector3 v2, Vector3 v3)
+    {
+        BlockVisibilityType visibility = (blockID < visibilityCache.Length) ? visibilityCache[blockID] : BlockVisibilityType.Cutout;
+        Vector3[] targetVertices; int[] targetTriangles; Vector3[] targetUVs; Vector3[] targetNormals; Color[] targetColors;
+        int currentVertexCount; int currentTriangleCount;
+
+        if (visibility == BlockVisibilityType.Cutout)
+        {
+            if (chunk._cutoutVertexCount + 4 > MAX_VERTS) return;
+            targetVertices = chunk._cutoutVertices; targetTriangles = chunk._cutoutTriangles; targetUVs = chunk._cutoutUVs; targetNormals = chunk._cutoutNormals; targetColors = chunk._cutoutColors;
+            currentVertexCount = chunk._cutoutVertexCount; currentTriangleCount = chunk._cutoutTriangleCount;
+        }
+        else
+        {
+            if (chunk._opaqueVertexCount + 4 > MAX_VERTS) return;
+            targetVertices = chunk._opaqueVertices; targetTriangles = chunk._opaqueTriangles; targetUVs = chunk._opaqueUVs; targetNormals = chunk._opaqueNormals; targetColors = chunk._opaqueColors;
+            currentVertexCount = chunk._opaqueVertexCount; currentTriangleCount = chunk._opaqueTriangleCount;
+        }
+
+        targetVertices[currentVertexCount + 0] = v0;
+        targetVertices[currentVertexCount + 1] = v1;
+        targetVertices[currentVertexCount + 2] = v2;
+        targetVertices[currentVertexCount + 3] = v3;
+        Vector3 crossNormal = Vector3.Cross(v1 - v0, v2 - v0).normalized;
+        for (int i = 0; i < 4; i++) targetNormals[currentVertexCount + i] = crossNormal;
+        for (int i = 0; i < 4; i++) targetColors[currentVertexCount + i] = color;
+        targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice);
+        targetUVs[currentVertexCount + 1] = new Vector3(0, 1, textureSlice);
+        targetUVs[currentVertexCount + 2] = new Vector3(1, 1, textureSlice);
+        targetUVs[currentVertexCount + 3] = new Vector3(1, 0, textureSlice);
+        targetTriangles[currentTriangleCount + 0] = currentVertexCount;
+        targetTriangles[currentTriangleCount + 1] = currentVertexCount + 1;
+        targetTriangles[currentTriangleCount + 2] = currentVertexCount + 2;
+        targetTriangles[currentTriangleCount + 3] = currentVertexCount;
+        targetTriangles[currentTriangleCount + 4] = currentVertexCount + 2;
+        targetTriangles[currentTriangleCount + 5] = currentVertexCount + 3;
+
+        if (visibility == BlockVisibilityType.Cutout) { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
+        else { chunk._opaqueVertexCount += 4; chunk._opaqueTriangleCount += 6; }
+    }
+
+    private void _CacheSharedChunkMaterials()
+    {
+        if (chunkPrefab == null) return;
+
+        Transform opaqueTransform = chunkPrefab.transform.Find("Opaque");
+        Transform transparentTransform = chunkPrefab.transform.Find("Transparent");
+        Transform cutoutTransform = chunkPrefab.transform.Find("Cutout");
+
+        MeshRenderer opaqueRenderer = opaqueTransform != null ? opaqueTransform.GetComponent<MeshRenderer>() : null;
+        MeshRenderer transparentRenderer = transparentTransform != null ? transparentTransform.GetComponent<MeshRenderer>() : null;
+        MeshRenderer cutoutRenderer = cutoutTransform != null ? cutoutTransform.GetComponent<MeshRenderer>() : null;
+
+        sharedOpaqueChunkMaterial = opaqueRenderer != null ? opaqueRenderer.sharedMaterial : null;
+        sharedTransparentChunkMaterial = transparentRenderer != null ? transparentRenderer.sharedMaterial : null;
+        sharedCutoutChunkMaterial = cutoutRenderer != null ? cutoutRenderer.sharedMaterial : null;
+
+        _EnableSharedChunkMaterialInstancing(sharedOpaqueChunkMaterial);
+        _EnableSharedChunkMaterialInstancing(sharedTransparentChunkMaterial);
+        _EnableSharedChunkMaterialInstancing(sharedCutoutChunkMaterial);
+    }
+
+    private void _EnableSharedChunkMaterialInstancing(Material material)
+    {
+        if (material == null) return;
+        if (!material.enableInstancing) material.enableInstancing = true;
+    }
+
+    private void _AssignSharedChunkMaterial(Transform childTransform, Material sharedMaterial)
+    {
+        if (childTransform == null || sharedMaterial == null) return;
+
+        MeshRenderer renderer = childTransform.GetComponent<MeshRenderer>();
+        if (renderer == null) return;
+        if (renderer.sharedMaterial != sharedMaterial) renderer.sharedMaterial = sharedMaterial;
+    }
+
     public int InstantiateAndConfigureChunk(int array_cx, int array_cy, int array_cz)
     {
         int centered_dx = array_cx - chunkOffsetX;
-        int centered_dy = array_cy - chunkOffsetY; 
+        int centered_dy = array_cy - chunkOffsetY;
         int centered_dz = array_cz - chunkOffsetZ;
 
         int chunk1DIndex = ChunkCenteredCoordsTo1D(centered_dx, centered_dy, centered_dz);
         if (chunk1DIndex == -1 || chunks_1D[chunk1DIndex] != null) return -1;
-        
+
         GameObject newChunkGO = Instantiate(chunkPrefab);
         newChunkGO.name = $"Chunk_({centered_dx},{centered_dy},{centered_dz})";
         newChunkGO.transform.SetParent(this.transform, false);
@@ -318,28 +1439,38 @@ public class McWorld : UdonSharpBehaviour
         newChunkData.chunkY_world = centered_dy;
         newChunkData.chunkZ_world = centered_dz;
         newChunkData.gameObject = newChunkGO;
-        
+
         // --- Assign Component References ---
         // This is a bit fragile, relies on child object names. A more robust solution
         // would be a simple script on the prefab to hold the references.
-        newChunkData.opaqueMeshFilter = newChunkGO.transform.Find("Opaque").GetComponent<MeshFilter>();
-        newChunkData.transparentMeshFilter = newChunkGO.transform.Find("Transparent").GetComponent<MeshFilter>();
-        newChunkData.cutoutMeshFilter = newChunkGO.transform.Find("Cutout").GetComponent<MeshFilter>();
+        Transform opaqueTransform = newChunkGO.transform.Find("Opaque");
+        Transform transparentTransform = newChunkGO.transform.Find("Transparent");
+        Transform cutoutTransform = newChunkGO.transform.Find("Cutout");
+
+        _AssignSharedChunkMaterial(opaqueTransform, sharedOpaqueChunkMaterial);
+        _AssignSharedChunkMaterial(transparentTransform, sharedTransparentChunkMaterial);
+        _AssignSharedChunkMaterial(cutoutTransform, sharedCutoutChunkMaterial);
+
+        newChunkData.opaqueMeshFilter = opaqueTransform != null ? opaqueTransform.GetComponent<MeshFilter>() : null;
+        newChunkData.transparentMeshFilter = transparentTransform != null ? transparentTransform.GetComponent<MeshFilter>() : null;
+        newChunkData.cutoutMeshFilter = cutoutTransform != null ? cutoutTransform.GetComponent<MeshFilter>() : null;
         newChunkData.meshCollider = newChunkGO.GetComponent<MeshCollider>();
-        
+
         // --- Initialize Buffers & State ---
         newChunkData._chunkDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
-        
+        newChunkData._cachedNeighbors = new ChunkData[6];
+
         newChunkData._opaqueVertices = new Vector3[MAX_VERTS]; newChunkData._opaqueTriangles = new int[MAX_TRIS]; newChunkData._opaqueUVs = new Vector3[MAX_VERTS]; newChunkData._opaqueNormals = new Vector3[MAX_VERTS]; newChunkData._opaqueColors = new Color[MAX_VERTS];
         newChunkData._transparentVertices = new Vector3[MAX_VERTS]; newChunkData._transparentTriangles = new int[MAX_TRIS]; newChunkData._transparentUVs = new Vector3[MAX_VERTS]; newChunkData._transparentNormals = new Vector3[MAX_VERTS]; newChunkData._transparentColors = new Color[MAX_VERTS];
         newChunkData._cutoutVertices = new Vector3[MAX_VERTS]; newChunkData._cutoutTriangles = new int[MAX_TRIS]; newChunkData._cutoutUVs = new Vector3[MAX_VERTS]; newChunkData._cutoutNormals = new Vector3[MAX_VERTS]; newChunkData._cutoutColors = new Color[MAX_VERTS];
         newChunkData._collisionVertices = new Vector3[MAX_VERTS * 3]; newChunkData._collisionTriangles = new int[MAX_TRIS * 3];
-        
+
         // Initialize biome data arrays (16x16 per chunk)
         newChunkData._biomeTemperatures = new double[chunkSizeXZ * chunkSizeXZ];
         newChunkData._biomeRainfall = new double[chunkSizeXZ * chunkSizeXZ];
-        
+
         newChunkGO.SetActive(true);
+        _InvalidateNeighborCache(newChunkData);
 
 #if LOGGING
         if (enableCounters) stats_chunkCreations++;
@@ -352,7 +1483,7 @@ public class McWorld : UdonSharpBehaviour
     {
         // Safety check: Don't process if not initialized
         if (chunks_1D == null || terrainGenerator == null) return;
-        
+
 #if LOGGING
         float updateStartTime = 0f;
         if (enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
@@ -360,9 +1491,10 @@ public class McWorld : UdonSharpBehaviour
             updateStartTime = Time.realtimeSinceStartup;
         }
 #endif
-        
+
         ProcessActiveChunks();
-        
+        _UpdateGpuDebugHud();
+
 #if LOGGING
         if (enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
         {
@@ -372,13 +1504,13 @@ public class McWorld : UdonSharpBehaviour
             if (updateTime > stats_updateTimeMax) stats_updateTimeMax = updateTime;
             if (updateTime > updateTimeBudgetMs) stats_budgetExceededCount++;
             stats_frameCount++;
-            
+
             // Per-frame logging
             if (enableFrameLogging)
             {
                 LogFrameStats(updateTime);
             }
-            
+
             // Aggregate logging
             if (enableAggregateLogging && stats_frameCount % aggregateLogInterval == 0)
             {
@@ -387,21 +1519,34 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
     }
-    
+
     private void ProcessActiveChunks()
     {
         float frameStart = Time.realtimeSinceStartup;
         float frameBudget = updateTimeBudgetMs * 0.001f;
-        
+
 #if LOGGING
         float processStartTime = frameStart;
 #endif
-        
+
+        // Keep nearby chunks resident in the GPU atlases before running lighting.
+        // Otherwise visible chunks can be evicted by distant worldgen and slowly fall
+        // back to stale mesh lighting.
+        _GpuMaintainResidentChunks(frameStart, frameBudget);
+
+        // Run GPU lighting first so atlas propagation still gets time while worldgen and
+        // meshing are busy. Otherwise repeated chunk uploads can keep reseeding lighting
+        // without enough passes to converge.
+        _ProcessGpuLighting(frameStart, frameBudget);
+
+        // Process any completed GPU face readbacks → build meshes
+        _ProcessGpuFaceReadback();
+
         // --- Process Data Generation ---
         for (int i = 0; i < activeDataGenCount; i++)
         {
             if (Time.realtimeSinceStartup - frameStart > frameBudget) break; // Don't exceed budget
-            
+
             ChunkData chunk = activeDataGenChunks[i];
             if (chunk == null || !chunk.isGeneratingData)
             {
@@ -418,7 +1563,7 @@ public class McWorld : UdonSharpBehaviour
         for (int i = 0; i < activeMeshingCount; i++)
         {
             if (Time.realtimeSinceStartup - frameStart > frameBudget) break; // Don't exceed budget
-            
+
             ChunkData chunk = activeMeshingChunks[i];
             if (chunk == null || !chunk.isBuildingMesh)
             {
@@ -430,7 +1575,7 @@ public class McWorld : UdonSharpBehaviour
             }
 
             // OPTIMIZATION: Process multiple mesh steps per frame to reduce overhead
-            int maxMeshStepsPerFrame = 5;
+            int maxMeshStepsPerFrame = 20;
             for (int step = 0; step < maxMeshStepsPerFrame; step++)
             {
                 if (!chunk.isBuildingMesh) break; // Mesh complete
@@ -438,10 +1583,10 @@ public class McWorld : UdonSharpBehaviour
                 _BuildChunkMeshStep(chunk);
             }
         }
-        
+
         // --- FIXED: Process Incremental Lighting (managed by coordinator) ---
         // Note: Lighting is now handled by coordinator's STATE_LIGHTING, not here
-        
+
         // --- OPTIMIZATION: Process Deferred Reconciliation ---
 #if LOGGING
         float reconcilStartTime = Time.realtimeSinceStartup;
@@ -453,26 +1598,37 @@ public class McWorld : UdonSharpBehaviour
             stats_reconciliationTime += (Time.realtimeSinceStartup - reconcilStartTime) * 1000f;
         }
 #endif
-        
+
+        // Chunks can finish generation after the first lighting window in this frame.
+        // Give the GPU lighting backend one more chance to seed/propagate before render
+        // so freshly published atlas slots do not spend a whole frame sampling black.
+        // CRITICAL: When a seed is pending (slot was just cleared), we MUST run the seed
+        // pass before render, even if over time budget — otherwise cleared slots (alpha=0)
+        // cause the shader to fall back to full brightness for one frame.
+        if (gpuLightingSeedPending || gpuLightingIterationsRemaining > 0)
+        {
+            _ProcessGpuLighting(frameStart, frameBudget);
+        }
+
 #if LOGGING
         if (enableDetailedTimings)
         {
             stats_processActiveChunksTime += (Time.realtimeSinceStartup - processStartTime) * 1000f;
         }
 #endif
-        
+
         // No longer need to reschedule - Update() runs every frame automatically!
     }
-    
+
     // Called by Coordinator
     public void StartChunkDataGeneration(int chunkIndex)
     {
         if (chunkIndex == -1) return;
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null || chunk.isGeneratingData) return;
-        
+
         chunk.isGeneratingData = true;
-        
+
         // Pass centered chunk coordinates directly - they ARE the Minecraft chunk coordinates
         // Engine centered coords (e.g., -2,-1,0,1) map to Minecraft chunks (-2,-1,0,1)
         terrainGenerator.StartChunkGeneration(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
@@ -482,62 +1638,76 @@ public class McWorld : UdonSharpBehaviour
             activeDataGenChunks[activeDataGenCount++] = chunk;
         }
     }
-    
-    // Called by ProcessActiveChunks loop
-    private void StepChunkDataGeneration(ChunkData chunk)
+
+    // Called by Coordinator or ProcessActiveChunks loop
+    public void StepChunkDataGeneration(ChunkData chunk)
     {
         if (!chunk.isGeneratingData) return;
-        
-        // OPTIMIZATION: Process 1 step per frame for maximum smoothness (120fps VR ready)
-        // Each step = ~5-8ms, spread across more frames for buttery smooth generation
+
+        bool useGpuWorldgen = terrainGenerator != null && terrainGenerator.enableGpuWorldgen;
         byte[] generatedData = null;
         bool isComplete = false;
         float stepStart = Time.realtimeSinceStartup;
-        float stepBudget = 0.008f; // 8ms budget for 120fps
-        int maxStepsPerFrame = 1; // Process 1 step per frame for smoothest experience
-        
+        float stepBudget = useGpuWorldgen ? 0.016f : 0.008f;
+        int maxStepsPerFrame = useGpuWorldgen ? 20 : 1;
+
         for (int step = 0; step < maxStepsPerFrame; step++)
         {
             isComplete = terrainGenerator.StepChunkGeneration(out generatedData);
             if (isComplete) break;
-            
+
             // Stop if we've used our budget (prevents stutters)
             if (Time.realtimeSinceStartup - stepStart > stepBudget) break;
         }
-        
+
         if (isComplete)
         {
             bool isHomogeneous;
             chunk._chunkData = _CompressChunkColumnRLE(generatedData, out isHomogeneous);
             
-            // OPTIMIZATION: Invalidate decompression cache since we have new data
-            if (decompressionCacheValid.ContainsKey(chunk))
-                decompressionCacheValid[chunk] = false;
-            
+            // OPTIMIZATION: Invalidate chunk-owned caches since we have new data
+            chunk._decompCacheValid = false;
+            chunk._cachedDataVersion++;
+
+            _GpuSyncChunkBlocks(chunk, generatedData);
+
             // OPTIMIZATION: Invalidate neighbor cache since chunk data changed
             _InvalidateNeighborCache(chunk);
-            
+
             chunk.isSingleOpaqueSolid = false;
+            chunk._isAllAir = false;
             if (isHomogeneous) {
                 byte blockID = (byte)chunk._chunkData;
-                if(_IsBlockSolid(blockID) && _GetVisibilityType(blockID) == BlockVisibilityType.Opaque) {
+                if (blockID == 0) {
+                    chunk._isAllAir = true;
+                }
+                else if(_IsBlockSolid(blockID) && _GetVisibilityType(blockID) == BlockVisibilityType.Opaque) {
                     chunk.isSingleOpaqueSolid = true;
                 }
             }
-            
+
             // Store biome data for this chunk from the terrain generator
             // This data will be used during meshing to apply biome tinting
             _StoreBiomeData(chunk);
-            
-            // FIXED: Lighting is now handled by coordinator STATE_LIGHTING
-            // Initialize lighting data structure but don't run BFS yet
-            InitializeChunkLighting(chunk);
-                
+
+            if (!UsesGpuLightingBackend())
+            {
+                InitializeChunkLighting(chunk);
+            }
+            else
+            {
+                chunk.lightData = null;
+                chunk.isProcessingLighting = false;
+                chunk.lightingPhase = 2;
+                chunk.lightingQueueStart = 0;
+                chunk.lightingQueueEnd = 0;
+                chunk.lightingIteration = 0;
+            }
+
             // Mark chunk as ready and data gen complete
             chunk.isDataReady = true;
             chunk.isGeneratingData = false;
-            
-            // Coordinator will now move to STATE_LIGHTING and call StartChunkLighting
+
         }
     }
 
@@ -547,52 +1717,119 @@ public class McWorld : UdonSharpBehaviour
         if (chunkIndex == -1 || chunkIndex >= chunks_1D.Length) return;
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null || !chunk.isDataReady) return;
-        
+
+        if (chunk.lightingQueue != null)
+        {
+            ReturnLightingQueue(chunk.lightingQueue);
+            chunk.lightingQueue = null;
+        }
+
+        if (UsesGpuLightingBackend())
+        {
+            chunk.lightData = null;
+            chunk.isProcessingLighting = false;
+            chunk.lightingPhase = 2;
+            chunk.lightingQueueStart = 0;
+            chunk.lightingQueueEnd = 0;
+            chunk.lightingIteration = 0;
+            return;
+        }
+
+        byte[] chunkData = _GetDecompressedData(chunk);
+        if (chunkData == null) return;
+
+        if (chunk.isSingleOpaqueSolid && !chunk._hasEmissiveBlocks)
+        {
+            int lightDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
+            if (chunk.lightData == null || chunk.lightData.Length != lightDataSize)
+            {
+                chunk.lightData = new byte[lightDataSize];
+            }
+            else
+            {
+                System.Array.Clear(chunk.lightData, 0, chunk.lightData.Length);
+            }
+            chunk.isProcessingLighting = false;
+            chunk.lightingPhase = 2;
+            ImmediateReconciliation(chunk);
+            TriggerNeighborMeshRebuilds(chunk);
+            return;
+        }
+
+        if (chunk._isAllAir && chunk.chunkY_world >= worldDimensionY - 1)
+        {
+            int lightDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
+            if (chunk.lightData == null || chunk.lightData.Length != lightDataSize)
+            {
+                chunk.lightData = new byte[lightDataSize];
+            }
+            for (int i = 0; i < lightDataSize; i++)
+            {
+                chunk.lightData[i] = 0xF0;
+            }
+            chunk.isProcessingLighting = false;
+            chunk.lightingPhase = 2;
+            ImmediateReconciliation(chunk);
+            TriggerNeighborMeshRebuilds(chunk);
+            return;
+        }
+
         // Allocate persistent queue for this chunk
-        chunk.lightingQueue = new int[8192]; // Smaller queue, but we process incrementally
+        chunk.lightingQueue = GetLightingQueue();
         chunk.lightingQueueStart = 0;
         chunk.lightingQueueEnd = 0;
         chunk.lightingPhase = 0; // Start with sky light
         chunk.lightingIteration = 0;
         chunk.isProcessingLighting = true;
-        
+
         // Import light from neighbors first
-        byte[] chunkData = _DecompressChunkColumnRLE(chunk);
-        if (chunkData != null)
-        {
-            _ImportLightFromNeighbors(chunk, chunkData);
-        }
-        
+        _ImportLightFromNeighbors(chunk, chunkData);
+
         // Initialize queue with blocks that need processing
         _InitializeLightingQueue(chunk);
     }
-    
+
     // FIXED: Called by Coordinator Update() to step through lighting incrementally
     public void StepChunkLighting(int chunkIndex)
     {
         if (chunkIndex == -1 || chunkIndex >= chunks_1D.Length) return;
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null || !chunk.isProcessingLighting) return;
-        
-        byte[] chunkData = _DecompressChunkColumnRLE(chunk);
+
+        if (UsesGpuLightingBackend())
+        {
+            chunk.isProcessingLighting = false;
+            chunk.lightingPhase = 2;
+            chunk.lightingQueueStart = 0;
+            chunk.lightingQueueEnd = 0;
+            chunk.lightingIteration = 0;
+            if (chunk.lightingQueue != null)
+            {
+                ReturnLightingQueue(chunk.lightingQueue);
+                chunk.lightingQueue = null;
+            }
+            return;
+        }
+
+        byte[] chunkData = _GetDecompressedData(chunk);
         if (chunkData == null) return;
-        
+
         // Pre-calculate neighbor offsets
         int[] neighborOffsets = { -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1 };
-        
+
         // Process a batch of blocks (small enough to never overflow queue)
         int blocksToProcess = 256; // Process 256 blocks per step
         int processed = 0;
-        
+
         bool isSkyLight = (chunk.lightingPhase == 0);
-        
+
         while (chunk.lightingQueueStart < chunk.lightingQueueEnd && processed < blocksToProcess)
         {
             int packed = chunk.lightingQueue[chunk.lightingQueueStart++];
             int x = (packed >> 16) & 0xFF;
             int y = (packed >> 8) & 0xFF;
             int z = packed & 0xFF;
-            
+
             // Skip opaque blocks
             int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
             byte blockID = chunkData[blockIndex];
@@ -602,18 +1839,18 @@ public class McWorld : UdonSharpBehaviour
                 processed++;
                 continue;
             }
-            
+
             // Process this block (PULL-based update)
             _UpdateBlockLightPULLOptimized(chunk, chunkData, x, y, z, isSkyLight, chunk.lightingQueue, ref chunk.lightingQueueEnd, neighborOffsets);
-            
+
             processed++;
         }
-        
+
         // Check if current phase is complete
         if (chunk.lightingQueueStart >= chunk.lightingQueueEnd)
         {
             chunk.lightingIteration++;
-            
+
             // Check if we've done enough iterations or converged
             if (chunk.lightingIteration >= 16 || chunk.lightingQueueEnd == 0)
             {
@@ -630,12 +1867,13 @@ public class McWorld : UdonSharpBehaviour
                 {
                     // Block light complete, do final cleanup and finish
                     _EnsureNoPitchBlackSpots(chunk, chunkData);
-                    
+
                     // Lighting complete!
                     chunk.isProcessingLighting = false;
                     chunk.lightingPhase = 2; // Mark as complete
-                    chunk.lightingQueue = null; // Free memory
-                    
+                    ReturnLightingQueue(chunk.lightingQueue);
+                    chunk.lightingQueue = null;
+
                     // Now do reconciliation and trigger neighbor mesh rebuilds
                     ImmediateReconciliation(chunk);
                     TriggerNeighborMeshRebuilds(chunk);
@@ -643,15 +1881,15 @@ public class McWorld : UdonSharpBehaviour
             }
         }
     }
-    
+
     // FIXED: Initialize the lighting queue for a chunk
     private void _InitializeLightingQueue(ChunkData chunk)
     {
-        byte[] chunkData = _DecompressChunkColumnRLE(chunk);
+        byte[] chunkData = _GetDecompressedData(chunk);
         if (chunkData == null) return;
-        
+
         chunk.lightingQueueEnd = 0;
-        
+
         // Phase 0: Sky light - add all blocks with skylight < 15
         if (chunk.lightingPhase == 0)
         {
@@ -663,7 +1901,7 @@ public class McWorld : UdonSharpBehaviour
                     {
                         int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
                         int skyLight = (chunk.lightData[blockIndex] >> 4) & 0xF;
-                        
+
                         if (skyLight < 15 && chunk.lightingQueueEnd < chunk.lightingQueue.Length - 6)
                         {
                             chunk.lightingQueue[chunk.lightingQueueEnd++] = (x << 16) | (y << 8) | z;
@@ -684,7 +1922,7 @@ public class McWorld : UdonSharpBehaviour
                         int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
                         int blockLight = chunk.lightData[blockIndex] & 0xF;
                         int skyLight = (chunk.lightData[blockIndex] >> 4) & 0xF;
-                        
+
                         if ((blockLight > 0 || skyLight == 0) && chunk.lightingQueueEnd < chunk.lightingQueue.Length - 6)
                         {
                             chunk.lightingQueue[chunk.lightingQueueEnd++] = (x << 16) | (y << 8) | z;
@@ -694,37 +1932,37 @@ public class McWorld : UdonSharpBehaviour
             }
         }
     }
-    
+
     // Called by Coordinator
     public void RequestChunkMeshUpdate(int chunkIndex)
     {
         if (coordinator != null) coordinator.RequestChunkMeshUpdate(chunkIndex);
     }
-    
+
     public byte GetBlock(int globalX, int globalY, int globalZ)
     {
         // OPTIMIZATION: Use bitwise operations instead of division/modulus
         int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;
         int chunkY = globalY >> CHUNK_SIZE_SHIFT;
         int centeredChunkZ = globalZ >> CHUNK_SIZE_SHIFT;
-        
+
         ChunkData chunk = GetChunkAt(centeredChunkX, chunkY, centeredChunkZ);
         if (chunk == null || !chunk.isDataReady) return 0;
 
         int localX = globalX & CHUNK_SIZE_MASK;
         int localY = globalY & CHUNK_SIZE_MASK;
         int localZ = globalZ & CHUNK_SIZE_MASK;
-        
+
         return _GetBlockLocal(chunk, localX, localY, localZ);
     }
-    
+
     public void SetBlock(int globalX, int globalY, int globalZ, byte blockType)
     {
         // OPTIMIZATION: Use bitwise operations instead of division/modulus
         int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;
         int chunkY = globalY >> CHUNK_SIZE_SHIFT;
         int centeredChunkZ = globalZ >> CHUNK_SIZE_SHIFT;
-        
+
         ChunkData chunk = GetChunkAt(centeredChunkX, chunkY, centeredChunkZ);
         if (chunk == null) return;
 
@@ -734,14 +1972,14 @@ public class McWorld : UdonSharpBehaviour
 
         byte oldBlockType = _GetBlockLocal(chunk, localX, localY, localZ);
         _SetBlockLocal(chunk, localX, localY, localZ, blockType, true);
-        
+
         // Update lighting if block changed
         if (oldBlockType != blockType && chunk.lightData != null)
         {
             _UpdateBlockLighting(chunk, localX, localY, localZ, oldBlockType, blockType);
         }
     }
-    
+
     public void TriggerNeighborMeshRebuilds(ChunkData chunk)
     {
         for (int i = 0; i < 6; i++) {
@@ -749,21 +1987,21 @@ public class McWorld : UdonSharpBehaviour
             int neighborY = chunk.chunkY_world + neighbor_dy_offsets[i];
             int neighborZ = chunk.chunkZ_world + neighbor_dz_offsets[i];
             int neighborIndex = ChunkCenteredCoordsTo1D(neighborX, neighborY, neighborZ);
-            
+
             if (neighborIndex != -1 && GetChunkAt(neighborX, neighborY, neighborZ) != null)
             {
                  RequestChunkMeshUpdate(neighborIndex);
             }
         }
     }
-    
+
     public ChunkData GetChunkAt(int centered_cx, int cy, int centered_cz)
     {
         int index = ChunkCenteredCoordsTo1D(centered_cx, cy, centered_cz);
         if (index == -1 || chunks_1D == null || index >= chunks_1D.Length) return null;
         return chunks_1D[index];
     }
-    
+
     private int ChunkArrayCoordsTo1D(int arrayX, int arrayY, int arrayZ)
     {
         if (arrayX < 0 || arrayX >= worldDimensionX || arrayY < 0 || arrayY >= worldDimensionY || arrayZ < 0 || arrayZ >= worldDimensionZ) return -1;
@@ -775,7 +2013,7 @@ public class McWorld : UdonSharpBehaviour
         // Y is no longer "centered", it's an absolute index.
         return ChunkArrayCoordsTo1D(centeredX + chunkOffsetX, centeredY + chunkOffsetY, centeredZ + chunkOffsetZ);
     }
-    
+
     public void Chunk1DToArrrayCoords(int index, out int x, out int y, out int z)
     {
         z = index / (worldDimensionX * worldDimensionY);
@@ -834,14 +2072,14 @@ public class McWorld : UdonSharpBehaviour
         if (chunkIndex < 0 || chunkIndex >= chunks_1D.Length) return null;
         return chunks_1D[chunkIndex];
     }
-    
+
     public bool IsChunkGeneratingData(int chunkIndex)
     {
         if (chunkIndex == -1) return false;
         ChunkData c = chunks_1D[chunkIndex];
         return c != null && c.isGeneratingData;
     }
-    
+
     public bool IsChunkBuildingMesh(int chunkIndex)
     {
         if (chunkIndex == -1) return false;
@@ -849,12 +2087,17 @@ public class McWorld : UdonSharpBehaviour
         return c != null && c.isBuildingMesh;
     }
 
+    public bool UsesGpuLightingBackend()
+    {
+        return enableGpuVoxelBackend && gpuBackendReady;
+    }
+
     public bool AreAllNeighborsReady(int chunkIndex)
     {
         if (chunkIndex == -1) return false;
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null) return false;
-        
+
         for (int i = 0; i < 6; i++)
         {
             int n_cx = chunk.chunkX_world + neighbor_dx_offsets[i];
@@ -862,7 +2105,7 @@ public class McWorld : UdonSharpBehaviour
             int n_cz = chunk.chunkZ_world + neighbor_dz_offsets[i];
 
             int neighbor_1D_index = ChunkCenteredCoordsTo1D(n_cx, n_cy, n_cz);
-            if (neighbor_1D_index == -1) continue; 
+            if (neighbor_1D_index == -1) continue;
 
             ChunkData neighborChunk = GetChunkAt(n_cx, n_cy, n_cz);
 
@@ -874,7 +2117,7 @@ public class McWorld : UdonSharpBehaviour
     public bool IsChunkSingleOpaqueSolid(int centered_cx, int cy, int centered_cz)
     {
         ChunkData chunk = GetChunkAt(centered_cx, cy, centered_cz);
-        if (chunk == null) return false; 
+        if (chunk == null) return false;
         return chunk.isSingleOpaqueSolid;
     }
 
@@ -887,14 +2130,14 @@ public class McWorld : UdonSharpBehaviour
         if (chunkIndex == -1) return;
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null || chunk.isBuildingMesh || chunk._chunkData == null) return;
-        
+
         chunk.isBuildingMesh = true;
 
 #if LOGGING
         chunk.meshBuildStartTime = Time.realtimeSinceStartup;
         if (enableCounters) stats_meshBuildTotal++;
         if (enableCounters) stats_chunkStateTransitions++;
-        
+
         if (enableVerboseLogging)
         {
             logBuilder.Clear();
@@ -931,6 +2174,38 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
             if (isFullyOccluded) { _ApplyEmptyMesh(chunk); chunk.isBuildingMesh = false; return; }
+        }
+
+        // OPTIMIZATION: Skip all-air chunks that are fully surrounded by air or out-of-bounds
+        // These chunks have zero blocks and all neighbors are also empty, so zero faces
+        if (chunk._isAllAir)
+        {
+            bool hasNonAirNeighbor = false;
+            for (int i = 0; i < 6; i++)
+            {
+                ChunkData neighbor = GetChunkAt(chunk.chunkX_world + neighbor_dx_offsets[i], chunk.chunkY_world + neighbor_dy_offsets[i], chunk.chunkZ_world + neighbor_dz_offsets[i]);
+                if (neighbor != null && neighbor.isDataReady && !neighbor._isAllAir)
+                {
+                    hasNonAirNeighbor = true; break;
+                }
+            }
+            if (!hasNonAirNeighbor) { _ApplyEmptyMesh(chunk); chunk.isBuildingMesh = false; return; }
+        }
+
+        // GPU face extraction path: trigger Blit + async readback, mesh will be built in _ProcessGpuFaceReadback
+        if (_GpuFaceExtractionReady())
+        {
+            if (!gpuFaceReadbackInFlight)
+            {
+                _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+                _PreComputeBiomeColors(chunk);
+                if (_GpuRequestChunkFaceReadback(chunk))
+                {
+                    return; // Mesh will be built when readback completes
+                }
+            }
+            // GPU is busy or request failed — mark for GPU retry in _BuildChunkMeshStep
+            chunk._gpuMeshPending = true;
         }
 
         // --- OPTIMIZATION: Use cached neighbor references ---
@@ -977,18 +2252,32 @@ public class McWorld : UdonSharpBehaviour
             chunk.time_DataPrep = chunk.time_DecompressNeighbors;
         }
 #endif
-        
+
+        bool useGpuLighting = UsesGpuLightingBackend();
+
         // OPTIMIZATION Phase 3 & 6: Pre-compute brightness and biome colors
-        // This eliminates 10,000+ lighting and biome texture lookups during meshing
-        _PreComputeChunkBrightness(chunk);
+        // This eliminates 10,000+ lighting and biome texture lookups during meshing.
+        // Skip CPU brightness preparation when the GPU light atlas is authoritative.
+        if (!useGpuLighting)
+        {
+            _PreComputeChunkBrightness(chunk);
+        }
+        else
+        {
+            chunk._cachedBrightness = null;
+        }
         _PreComputeBiomeColors(chunk);
-        if (chunk.neighborPX != null && chunk.neighborPX.isDataReady) _PreComputeChunkBrightness(chunk.neighborPX);
-        if (chunk.neighborNX != null && chunk.neighborNX.isDataReady) _PreComputeChunkBrightness(chunk.neighborNX);
-        if (chunk.neighborPY != null && chunk.neighborPY.isDataReady) _PreComputeChunkBrightness(chunk.neighborPY);
-        if (chunk.neighborNY != null && chunk.neighborNY.isDataReady) _PreComputeChunkBrightness(chunk.neighborNY);
-        if (chunk.neighborPZ != null && chunk.neighborPZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborPZ);
-        if (chunk.neighborNZ != null && chunk.neighborNZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborNZ);
-        
+        if (!useGpuLighting)
+        {
+            if (chunk.neighborPX != null && chunk.neighborPX.isDataReady) _PreComputeChunkBrightness(chunk.neighborPX);
+            if (chunk.neighborNX != null && chunk.neighborNX.isDataReady) _PreComputeChunkBrightness(chunk.neighborNX);
+            if (chunk.neighborPY != null && chunk.neighborPY.isDataReady) _PreComputeChunkBrightness(chunk.neighborPY);
+            if (chunk.neighborNY != null && chunk.neighborNY.isDataReady) _PreComputeChunkBrightness(chunk.neighborNY);
+            if (chunk.neighborPZ != null && chunk.neighborPZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborPZ);
+            if (chunk.neighborNZ != null && chunk.neighborNZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborNZ);
+        }
+        _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+
         if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
         {
             activeMeshingChunks[activeMeshingCount++] = chunk;
@@ -998,6 +2287,27 @@ public class McWorld : UdonSharpBehaviour
     private void _BuildChunkMeshStep(ChunkData chunk)
     {
         if (!chunk.isBuildingMesh) return;
+
+        // OPTIMIZATION: GPU face extraction retry — chunk was deferred because GPU was busy
+        if (chunk._gpuMeshPending)
+        {
+            if (_GpuFaceExtractionReady() && !gpuFaceReadbackInFlight)
+            {
+                chunk._gpuMeshPending = false;
+                _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+                _PreComputeBiomeColors(chunk);
+                if (_GpuRequestChunkFaceReadback(chunk))
+                {
+                    return; // Mesh will be built when readback completes
+                }
+                // If request failed, fall through to CPU path below
+            }
+            else
+            {
+                return; // GPU still busy, retry next frame
+            }
+        }
+
         chunk._lastMeshStepFrame = Time.frameCount;
 
 #if LOGGING
@@ -1013,15 +2323,13 @@ public class McWorld : UdonSharpBehaviour
         float budgetStart = Time.realtimeSinceStartup;
         float budgetSec = meshStepTimeBudgetMs * 0.001f;
 
-        // OPTIMIZATION: Cache arrays locally for maximum performance
         byte[] selfData = chunk._decompSelf;
-        byte[] drawTable = shouldDrawTable;
-        int drawTableLen = drawTable != null ? drawTable.Length : 0;
-        BlockCullingType[] cullCache = cullingCache;
-        int cullCacheLen = cullCache != null ? cullCache.Length : 0;
-        McBlockShapeType[] shapeCache = shapeTypeCache;
-        int shapeCacheLen = shapeCache != null ? shapeCache.Length : 0;
-        
+        if (selfData == null)
+        {
+            chunk.isBuildingMesh = false;
+            return;
+        }
+
         // Cache neighbor decompressed data for boundary checks
         byte[] dataPX = chunk._decompPX;
         byte[] dataNX = chunk._decompNX;
@@ -1029,267 +2337,108 @@ public class McWorld : UdonSharpBehaviour
         byte[] dataNY = chunk._decompNY;
         byte[] dataPZ = chunk._decompPZ;
         byte[] dataNZ = chunk._decompNZ;
-        
+
         // Pre-calculate strides for direct indexing
         int chunkStride = chunkSizeXZ * chunkSizeXZ;
 
-        while (chunk._greedyAxis <= 2)
+        // OPTIMIZATION: Pre-fetch chunk-global bounds for slice skipping
+        int gMinY = chunk._chunkGlobalMinY, gMaxY = chunk._chunkGlobalMaxY;
+        int gMinX = chunk._chunkGlobalMinX, gMaxX = chunk._chunkGlobalMaxX;
+        int gMinZ = chunk._chunkGlobalMinZ, gMaxZ = chunk._chunkGlobalMaxZ;
+        bool isAllAir = chunk._isAllAir;
+
+        while (chunk._greedyAxis <= 5)
         {
             if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
 
-            if (chunk._greedyAxis == 0)
+            int direction = chunk._greedyAxis;
+            int maxSlices = direction <= 1 ? chunkSizeY : chunkSizeXZ;
+            if (chunk._greedyU >= maxSlices)
             {
-#if LOGGING
-                float axisStart = 0f; if (enableVerboseLogging) axisStart = Time.realtimeSinceStartup;
-#endif
-                // OPTIMIZATION Phase 1: Y-axis faces using direct data access
-                int lx = chunk._greedyU; // 0..chunkSizeXZ-1
-                int lz = chunk._greedyV; // 0..chunkSizeXZ-1
+                chunk._greedyU = 0;
+                chunk._greedyAxis++;
+                continue;
+            }
 
-                // Process all Y boundaries for this (x,z) column
-                for (int y = 0; y <= chunkSizeY; y++)
+            // OPTIMIZATION: Skip slices that lie entirely outside the chunk's occupied region
+            // _BuildGreedySliceMask skips selfID==0 cells, so slices with no self blocks produce zero faces.
+            // For Y-axis (directions 0,1): slice is Y, skip if outside [gMinY, gMaxY]
+            // For Z-axis (directions 2,3): slice is Z, skip if outside [gMinZ, gMaxZ]
+            // For X-axis (directions 4,5): slice is X, skip if outside [gMinX, gMaxX]
+            if (!isAllAir)
+            {
+                int slice = chunk._greedyU;
+                bool canSkip = false;
+                if (direction <= 1) canSkip = (gMinY > gMaxY) || slice < gMinY || slice > gMaxY;
+                else if (direction <= 3) canSkip = (gMinZ > gMaxZ) || slice < gMinZ || slice > gMaxZ;
+                else canSkip = (gMinX > gMaxX) || slice < gMinX || slice > gMaxX;
+
+                // OPTIMIZATION: For single-opaque-solid chunks, only boundary slices facing
+                // neighbor chunks can produce faces. Interior slices always have selfID == neighborID.
+                // Dir 0(Y+) → only slice=maxY; Dir 1(Y-) → only slice=0
+                // Dir 2(Z+) → only slice=maxZ; Dir 3(Z-) → only slice=0
+                // Dir 4(X+) → only slice=maxX; Dir 5(X-) → only slice=0
+                if (!canSkip && chunk.isSingleOpaqueSolid)
                 {
-                    byte idBelow = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, lx, y - 1, lz, chunkSizeXZ, chunkSizeY, chunkStride);
-                    byte idAbove = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, lx, y, lz, chunkSizeXZ, chunkSizeY, chunkStride);
-#if LOGGING
-                    if (enableVerboseLogging) chunk.boundaryChecksY++;
-#endif
-                    // Skip if same block, unless it's a NoCull block (e.g. leaves)
-                    if (idBelow == idAbove && !(idBelow < cullCacheLen && cullCache[idBelow] == BlockCullingType.NoCull)) continue;
-
-                    // Check if both are same NoCull type (to avoid z-fighting with double faces)
-                    bool bothSameNoCull = idBelow == idAbove && idBelow < cullCacheLen && cullCache[idBelow] == BlockCullingType.NoCull;
-                    
-                    // Up face of below cell (only if below is not air and within bounds)
-                    if (idBelow != 0 && y > 0 && y <= chunkSizeY)
-                    {
-                        // OPTIMIZATION: Skip cross-type blocks - they have their own mesh generation
-                        bool isCrossBlock = idBelow < shapeCacheLen && shapeCache[idBelow] == McBlockShapeType.Cross;
-                        if (!isCrossBlock)
-                        {
-                            // OPTIMIZATION: Fully inlined _ShouldDrawFace for performance
-                            int idx = (idBelow << 8) | idAbove;
-                            bool drawTest = idx < drawTableLen && drawTable[idx] != 0;
-#if LOGGING
-                            if (enableVerboseLogging) { chunk.shouldDrawTests++; if (drawTest) chunk.shouldDrawTrue++; }
-#endif
-                            if (drawTest)
-                            {
-                                _AddFaceOptimized(chunk, FaceVertices_Up, Normal_Up, lx, y - 1, lz, idBelow, FACE_INDEX_TOP);
-                            }
-                        }
-                    }
-                    // Down face of above cell (only if above is not air and within bounds)
-                    // Skip this face if both blocks are the same NoCull type (prevent z-fighting)
-                    if (idAbove != 0 && y >= 0 && y < chunkSizeY && !bothSameNoCull)
-                    {
-                        // OPTIMIZATION: Skip cross-type blocks - they have their own mesh generation
-                        bool isCrossBlock = idAbove < shapeCacheLen && shapeCache[idAbove] == McBlockShapeType.Cross;
-                        if (!isCrossBlock)
-                        {
-                            // OPTIMIZATION: Fully inlined _ShouldDrawFace for performance
-                            int idx2 = (idAbove << 8) | idBelow;
-                            bool drawTest2 = idx2 < drawTableLen && drawTable[idx2] != 0;
-#if LOGGING
-                            if (enableVerboseLogging) { chunk.shouldDrawTests++; if (drawTest2) chunk.shouldDrawTrue++; }
-#endif
-                            if (drawTest2)
-                            {
-                                _AddFaceOptimized(chunk, FaceVertices_Down, Normal_Down, lx, y, lz, idAbove, FACE_INDEX_BOTTOM);
-                            }
-                        }
-                    }
+                    int boundarySlice;
+                    if (direction == 0) boundarySlice = chunkSizeY - 1;
+                    else if (direction == 1) boundarySlice = 0;
+                    else if (direction == 2) boundarySlice = chunkSizeXZ - 1;
+                    else if (direction == 3) boundarySlice = 0;
+                    else if (direction == 4) boundarySlice = chunkSizeXZ - 1;
+                    else boundarySlice = 0;
+                    canSkip = (slice != boundarySlice);
                 }
 
-                // advance (u,v)
-                chunk._greedyU++;
-                if (chunk._greedyU >= chunkSizeXZ)
+                if (canSkip)
                 {
-                    chunk._greedyU = 0;
-                    chunk._greedyV++;
-                    if (chunk._greedyV >= chunkSizeXZ)
+                    chunk._greedyU++;
+                    if (chunk._greedyU >= maxSlices)
                     {
-                        chunk._greedyV = 0;
+                        chunk._greedyU = 0;
                         chunk._greedyAxis++;
                     }
+                    continue;
                 }
-#if LOGGING
-                if (enableVerboseLogging) chunk.time_AxisY += (Time.realtimeSinceStartup - axisStart) * 1000f;
-#endif
             }
-            else if (chunk._greedyAxis == 1)
+
+#if LOGGING
+            float axisStart = 0f; if (enableVerboseLogging) axisStart = Time.realtimeSinceStartup;
+#endif
+
+            int maskWidth, maskHeight;
+            _BuildGreedySliceMask(chunk, direction, chunk._greedyU, selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, chunkStride, out maskWidth, out maskHeight);
+            _EmitGreedyMask(chunk, direction, chunk._greedyU, maskWidth, maskHeight);
+
+            chunk._greedyU++;
+            if (chunk._greedyU >= maxSlices)
             {
-#if LOGGING
-                float axisStart = 0f; if (enableVerboseLogging) axisStart = Time.realtimeSinceStartup;
-#endif
-                // OPTIMIZATION Phase 1: Z-axis faces using direct data access
-                int lx = chunk._greedyU; // 0..chunkSizeXZ-1
-                int ly = chunk._greedyV; // 0..chunkSizeY-1
-
-                // Process all Z boundaries for this (x,y) line
-                for (int z = 0; z <= chunkSizeXZ; z++)
-                {
-                    byte idBack = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, lx, ly, z - 1, chunkSizeXZ, chunkSizeY, chunkStride);
-                    byte idFront = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, lx, ly, z, chunkSizeXZ, chunkSizeY, chunkStride);
-#if LOGGING
-                    if (enableVerboseLogging) chunk.boundaryChecksZ++;
-#endif
-                    // Skip if same block, unless it's a NoCull block (e.g. leaves)
-                    if (idBack == idFront && !(idBack < cullCacheLen && cullCache[idBack] == BlockCullingType.NoCull)) continue;
-
-                    // Check if both are same NoCull type (to avoid z-fighting with double faces)
-                    bool bothSameNoCull = idBack == idFront && idBack < cullCacheLen && cullCache[idBack] == BlockCullingType.NoCull;
-                    
-                    // North face (positive Z) of back cell
-                    if (idBack != 0 && z > 0 && z <= chunkSizeXZ)
-                    {
-                        // OPTIMIZATION: Skip cross-type blocks - they have their own mesh generation
-                        bool isCrossBlock = idBack < shapeCacheLen && shapeCache[idBack] == McBlockShapeType.Cross;
-                        if (!isCrossBlock)
-                        {
-                            // OPTIMIZATION: Fully inlined _ShouldDrawFace for performance
-                            int idx = (idBack << 8) | idFront;
-                            bool drawTest = idx < drawTableLen && drawTable[idx] != 0;
-#if LOGGING
-                            if (enableVerboseLogging) { chunk.shouldDrawTests++; if (drawTest) chunk.shouldDrawTrue++; }
-#endif
-                            if (drawTest)
-                            {
-                                _AddFaceOptimized(chunk, FaceVertices_North, Normal_North, lx, ly, z - 1, idBack, FACE_INDEX_SIDE);
-                            }
-                        }
-                    }
-                    // South face (negative Z) of front cell
-                    // Skip this face if both blocks are the same NoCull type (prevent z-fighting)
-                    if (idFront != 0 && z >= 0 && z < chunkSizeXZ && !bothSameNoCull)
-                    {
-                        // OPTIMIZATION: Skip cross-type blocks - they have their own mesh generation
-                        bool isCrossBlock = idFront < shapeCacheLen && shapeCache[idFront] == McBlockShapeType.Cross;
-                        if (!isCrossBlock)
-                        {
-                            // OPTIMIZATION: Fully inlined _ShouldDrawFace for performance
-                            int idx2 = (idFront << 8) | idBack;
-                            bool drawTest2 = idx2 < drawTableLen && drawTable[idx2] != 0;
-#if LOGGING
-                            if (enableVerboseLogging) { chunk.shouldDrawTests++; if (drawTest2) chunk.shouldDrawTrue++; }
-#endif
-                            if (drawTest2)
-                            {
-                                _AddFaceOptimized(chunk, FaceVertices_South, Normal_South, lx, ly, z, idFront, FACE_INDEX_SIDE);
-                            }
-                        }
-                    }
-                }
-
-                // advance (u,v)
-                chunk._greedyU++;
-                if (chunk._greedyU >= chunkSizeXZ)
-                {
-                    chunk._greedyU = 0;
-                    chunk._greedyV++;
-                    if (chunk._greedyV >= chunkSizeY)
-                    {
-                        chunk._greedyV = 0;
-                        chunk._greedyAxis++;
-                    }
-                }
-#if LOGGING
-                if (enableVerboseLogging) chunk.time_AxisZ += (Time.realtimeSinceStartup - axisStart) * 1000f;
-#endif
+                chunk._greedyU = 0;
+                chunk._greedyAxis++;
             }
-            else // X-axis
+
+#if LOGGING
+            if (enableVerboseLogging)
             {
-#if LOGGING
-                float axisStart = 0f; if (enableVerboseLogging) axisStart = Time.realtimeSinceStartup;
-#endif
-                // OPTIMIZATION Phase 1: X-axis faces using direct data access
-                int ly = chunk._greedyU; // 0..chunkSizeY-1
-                int lz = chunk._greedyV; // 0..chunkSizeXZ-1
-
-                // Process all X boundaries for this (y,z) line
-                for (int x = 0; x <= chunkSizeXZ; x++)
-                {
-                    byte idLeft = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, x - 1, ly, lz, chunkSizeXZ, chunkSizeY, chunkStride);
-                    byte idRight = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, x, ly, lz, chunkSizeXZ, chunkSizeY, chunkStride);
-#if LOGGING
-                    if (enableVerboseLogging) chunk.boundaryChecksX++;
-#endif
-                    // Skip if same block, unless it's a NoCull block (e.g. leaves)
-                    if (idLeft == idRight && !(idLeft < cullCacheLen && cullCache[idLeft] == BlockCullingType.NoCull)) continue;
-
-                    // Check if both are same NoCull type (to avoid z-fighting with double faces)
-                    bool bothSameNoCull = idLeft == idRight && idLeft < cullCacheLen && cullCache[idLeft] == BlockCullingType.NoCull;
-                    
-                    // East face (positive X) of left cell
-                    if (idLeft != 0 && x > 0 && x <= chunkSizeXZ)
-                    {
-                        // OPTIMIZATION: Skip cross-type blocks - they have their own mesh generation
-                        bool isCrossBlock = idLeft < shapeCacheLen && shapeCache[idLeft] == McBlockShapeType.Cross;
-                        if (!isCrossBlock)
-                        {
-                            // OPTIMIZATION: Fully inlined _ShouldDrawFace for performance
-                            int idx = (idLeft << 8) | idRight;
-                            bool drawTest = idx < drawTableLen && drawTable[idx] != 0;
-#if LOGGING
-                            if (enableVerboseLogging) { chunk.shouldDrawTests++; if (drawTest) chunk.shouldDrawTrue++; }
-#endif
-                            if (drawTest)
-                            {
-                                _AddFaceOptimized(chunk, FaceVertices_East, Normal_East, x - 1, ly, lz, idLeft, FACE_INDEX_SIDE);
-                            }
-                        }
-                    }
-                    // West face (negative X) of right cell
-                    // Skip this face if both blocks are the same NoCull type (prevent z-fighting)
-                    if (idRight != 0 && x >= 0 && x < chunkSizeXZ && !bothSameNoCull)
-                    {
-                        // OPTIMIZATION: Skip cross-type blocks - they have their own mesh generation
-                        bool isCrossBlock = idRight < shapeCacheLen && shapeCache[idRight] == McBlockShapeType.Cross;
-                        if (!isCrossBlock)
-                        {
-                            // OPTIMIZATION: Fully inlined _ShouldDrawFace for performance
-                            int idx2 = (idRight << 8) | idLeft;
-                            bool drawTest2 = idx2 < drawTableLen && drawTable[idx2] != 0;
-#if LOGGING
-                            if (enableVerboseLogging) { chunk.shouldDrawTests++; if (drawTest2) chunk.shouldDrawTrue++; }
-#endif
-                            if (drawTest2)
-                            {
-                                _AddFaceOptimized(chunk, FaceVertices_West, Normal_West, x, ly, lz, idRight, FACE_INDEX_SIDE);
-                            }
-                        }
-                    }
-                }
-
-                // advance (u,v)
-                chunk._greedyU++;
-                if (chunk._greedyU >= chunkSizeY)
-                {
-                    chunk._greedyU = 0;
-                    chunk._greedyV++;
-                    if (chunk._greedyV >= chunkSizeXZ)
-                    {
-                        chunk._greedyV = 0;
-                        chunk._greedyAxis++;
-                    }
-                }
-#if LOGGING
-                if (enableVerboseLogging) chunk.time_AxisX += (Time.realtimeSinceStartup - axisStart) * 1000f;
-#endif
+                float axisElapsed = (Time.realtimeSinceStartup - axisStart) * 1000f;
+                if (direction <= 1) chunk.time_AxisY += axisElapsed;
+                else if (direction <= 3) chunk.time_AxisZ += axisElapsed;
+                else chunk.time_AxisX += axisElapsed;
             }
+#endif
         }
 
 #if LOGGING
         if (enableVerboseLogging) chunk.time_MainLoop += (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
 #endif
 
-        if (chunk._greedyAxis > 2)
+        if (chunk._greedyAxis > 5)
         {
             // After all boundary processing, add cross-shaped blocks
             _AddCrossShapedBlocks(chunk);
-            
+
             _ApplyAllMeshData(chunk);
-            
+
 #if LOGGING
             // Track aggregate mesh building stats
             if (enableDetailedTimings)
@@ -1319,9 +2468,9 @@ public class McWorld : UdonSharpBehaviour
                 stats_verticesCutout += chunk._cutoutVertexCount;
             }
 #endif
-            
+
             chunk.isBuildingMesh = false;
-            
+
             // Null out neighbor references to free memory
             chunk.neighborPX = null; chunk.neighborNX = null;
             chunk.neighborPY = null; chunk.neighborNY = null;
@@ -1331,11 +2480,11 @@ public class McWorld : UdonSharpBehaviour
             chunk._decompNX = null; chunk._decompPX = null;
             chunk._decompNY = null; chunk._decompPY = null;
             chunk._decompNZ = null; chunk._decompPZ = null;
-            
+
             // Can't use SendCustomEventDelayedFrames here easily without more state,
             // so we'll just apply the collider directly after a few frames in the main loop.
             // A more robust solution might involve another queue. For now, this is simpler.
-            _ApplyDataToCollider(chunk); 
+            _ApplyDataToCollider(chunk);
 
 #if LOGGING
             if (enableVerboseLogging)
@@ -1572,9 +2721,9 @@ public class McWorld : UdonSharpBehaviour
         // If within bounds, use the optimized getter on the current chunk's compressed data
         return _GetBlockLocal(chunk, x, y, z);
     }
-    
+
     // OPTIMIZATION Phase 1: Direct block access helper (replaces lambda for Udon compatibility)
-    private byte _GetBlockDirectMeshing(byte[] selfData, byte[] dataNX, byte[] dataPX, byte[] dataNY, byte[] dataPY, byte[] dataNZ, byte[] dataPZ, 
+    private byte _GetBlockDirectMeshing(byte[] selfData, byte[] dataNX, byte[] dataPX, byte[] dataNY, byte[] dataPY, byte[] dataNZ, byte[] dataPZ,
                                         int x, int y, int z, int chunkSizeXZ, int chunkSizeY, int chunkStride)
     {
         if (x >= 0 && x < chunkSizeXZ && y >= 0 && y < chunkSizeY && z >= 0 && z < chunkSizeXZ)
@@ -1590,7 +2739,421 @@ public class McWorld : UdonSharpBehaviour
         if (z >= chunkSizeXZ && dataPZ != null) return dataPZ[y * chunkStride + 0 * chunkSizeXZ + x];
         return 0; // Air/empty
     }
-    
+
+    private int _PackColorRGB(Color color)
+    {
+        Color32 color32 = (Color32)color;
+        return color32.r | (color32.g << 8) | (color32.b << 16);
+    }
+
+    private Color _UnpackColorRGB(int packedColor, float alpha)
+    {
+        return new Color(
+            (packedColor & 0xFF) / 255f,
+            ((packedColor >> 8) & 0xFF) / 255f,
+            ((packedColor >> 16) & 0xFF) / 255f,
+            alpha
+        );
+    }
+
+    private byte _GetCachedLightLevelAtBlockRaw(ChunkData chunk, int localX, int localY, int localZ)
+    {
+        if (chunk == null || chunk._cachedBrightness == null) return 15;
+        if (localX < 0 || localX >= chunkSizeXZ || localY < 0 || localY >= chunkSizeY || localZ < 0 || localZ >= chunkSizeXZ) return 15;
+        int idx = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
+        return chunk._cachedBrightness[idx];
+    }
+
+    private byte _GetCachedLightLevelForDirection(ChunkData chunk, int direction, int localX, int localY, int localZ)
+    {
+        int neighborX = localX;
+        int neighborY = localY;
+        int neighborZ = localZ;
+
+        if (direction == 0) neighborY++;
+        else if (direction == 1) neighborY--;
+        else if (direction == 2) neighborZ++;
+        else if (direction == 3) neighborZ--;
+        else if (direction == 4) neighborX++;
+        else neighborX--;
+
+        if (neighborX >= 0 && neighborX < chunkSizeXZ &&
+            neighborY >= 0 && neighborY < chunkSizeY &&
+            neighborZ >= 0 && neighborZ < chunkSizeXZ)
+        {
+            // GPU lighting: shader handles brightness, use uniform placeholder
+            if (chunk._cachedBrightness == null) return 15;
+            return _GetCachedLightLevelAtBlockRaw(chunk, neighborX, neighborY, neighborZ);
+        }
+
+        ChunkData neighborChunk = null;
+        int neighborLocalX = neighborX;
+        int neighborLocalY = neighborY;
+        int neighborLocalZ = neighborZ;
+
+        if (neighborX < 0)
+        {
+            neighborChunk = chunk.neighborNX;
+            neighborLocalX = chunkSizeXZ - 1;
+        }
+        else if (neighborX >= chunkSizeXZ)
+        {
+            neighborChunk = chunk.neighborPX;
+            neighborLocalX = 0;
+        }
+        else if (neighborY < 0)
+        {
+            neighborChunk = chunk.neighborNY;
+            neighborLocalY = chunkSizeY - 1;
+        }
+        else if (neighborY >= chunkSizeY)
+        {
+            neighborChunk = chunk.neighborPY;
+            neighborLocalY = 0;
+        }
+        else if (neighborZ < 0)
+        {
+            neighborChunk = chunk.neighborNZ;
+            neighborLocalZ = chunkSizeXZ - 1;
+        }
+        else if (neighborZ >= chunkSizeXZ)
+        {
+            neighborChunk = chunk.neighborPZ;
+            neighborLocalZ = 0;
+        }
+
+        if (neighborChunk != null && neighborChunk.isDataReady && neighborChunk._cachedBrightness != null)
+        {
+            return _GetCachedLightLevelAtBlockRaw(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
+        }
+
+        // GPU lighting: shader handles brightness, use uniform placeholder
+        if (UsesGpuLightingBackend()) return 15;
+
+        return 0;
+    }
+
+    private int _GetTextureSliceCached(byte blockID, int faceIndex)
+    {
+        if (blockDataCache != null && blockID < blockDataCache.Length)
+        {
+            McBlockTextureMappingType mappingType = (McBlockTextureMappingType)((blockDataCache[blockID] >> 8) & 0x3);
+            if (mappingType == McBlockTextureMappingType.AllFacesSame)
+                return uv_allFacesCache[blockID];
+            if (mappingType == McBlockTextureMappingType.TopBottomSides)
+            {
+                if (faceIndex == FACE_INDEX_TOP) return uv_topFaceCache[blockID];
+                if (faceIndex == FACE_INDEX_BOTTOM) return uv_bottomFaceCache[blockID];
+                return uv_sideFacesCache[blockID];
+            }
+            return uv_allFacesCache[blockID];
+        }
+        return 0;
+    }
+
+    private void _AddGreedyQuad(ChunkData chunk, int direction, int slice, int u, int v, int width, int height, byte blockID, byte lightLevel, int packedColor)
+    {
+        BlockVisibilityType visibility = (blockID < visibilityCache.Length) ? visibilityCache[blockID] : BlockVisibilityType.Opaque;
+
+        Vector3[] targetVertices;
+        int[] targetTriangles;
+        Vector3[] targetUVs;
+        Vector3[] targetNormals;
+        Color[] targetColors;
+        int currentVertexCount;
+        int currentTriangleCount;
+
+        if (visibility == BlockVisibilityType.Opaque)
+        {
+            if (chunk._opaqueVertexCount + 4 > MAX_VERTS) return;
+            targetVertices = chunk._opaqueVertices; targetTriangles = chunk._opaqueTriangles; targetUVs = chunk._opaqueUVs; targetNormals = chunk._opaqueNormals; targetColors = chunk._opaqueColors;
+            currentVertexCount = chunk._opaqueVertexCount; currentTriangleCount = chunk._opaqueTriangleCount;
+        }
+        else if (visibility == BlockVisibilityType.Transparent)
+        {
+            if (chunk._transparentVertexCount + 4 > MAX_VERTS) return;
+            targetVertices = chunk._transparentVertices; targetTriangles = chunk._transparentTriangles; targetUVs = chunk._transparentUVs; targetNormals = chunk._transparentNormals; targetColors = chunk._transparentColors;
+            currentVertexCount = chunk._transparentVertexCount; currentTriangleCount = chunk._transparentTriangleCount;
+        }
+        else
+        {
+            if (chunk._cutoutVertexCount + 4 > MAX_VERTS) return;
+            targetVertices = chunk._cutoutVertices; targetTriangles = chunk._cutoutTriangles; targetUVs = chunk._cutoutUVs; targetNormals = chunk._cutoutNormals; targetColors = chunk._cutoutColors;
+            currentVertexCount = chunk._cutoutVertexCount; currentTriangleCount = chunk._cutoutTriangleCount;
+        }
+
+        Vector3 faceNormal = Normal_Up;
+        int faceIndex = FACE_INDEX_SIDE;
+        float plane = slice;
+        float u0 = u;
+        float v0 = v;
+        float u1 = u + width;
+        float v1 = v + height;
+
+        if (direction == 0) // Up
+        {
+            plane = slice + 1;
+            faceNormal = Normal_Up;
+            faceIndex = FACE_INDEX_TOP;
+            targetVertices[currentVertexCount + 0] = new Vector3(u0, plane, v0);
+            targetVertices[currentVertexCount + 1] = new Vector3(u0, plane, v1);
+            targetVertices[currentVertexCount + 2] = new Vector3(u1, plane, v1);
+            targetVertices[currentVertexCount + 3] = new Vector3(u1, plane, v0);
+        }
+        else if (direction == 1) // Down
+        {
+            plane = slice;
+            faceNormal = Normal_Down;
+            faceIndex = FACE_INDEX_BOTTOM;
+            targetVertices[currentVertexCount + 0] = new Vector3(u1, plane, v0);
+            targetVertices[currentVertexCount + 1] = new Vector3(u1, plane, v1);
+            targetVertices[currentVertexCount + 2] = new Vector3(u0, plane, v1);
+            targetVertices[currentVertexCount + 3] = new Vector3(u0, plane, v0);
+        }
+        else if (direction == 2) // North
+        {
+            plane = slice + 1;
+            faceNormal = Normal_North;
+            faceIndex = FACE_INDEX_SIDE;
+            targetVertices[currentVertexCount + 0] = new Vector3(u1, v0, plane);
+            targetVertices[currentVertexCount + 1] = new Vector3(u1, v1, plane);
+            targetVertices[currentVertexCount + 2] = new Vector3(u0, v1, plane);
+            targetVertices[currentVertexCount + 3] = new Vector3(u0, v0, plane);
+        }
+        else if (direction == 3) // South
+        {
+            plane = slice;
+            faceNormal = Normal_South;
+            faceIndex = FACE_INDEX_SIDE;
+            targetVertices[currentVertexCount + 0] = new Vector3(u0, v0, plane);
+            targetVertices[currentVertexCount + 1] = new Vector3(u0, v1, plane);
+            targetVertices[currentVertexCount + 2] = new Vector3(u1, v1, plane);
+            targetVertices[currentVertexCount + 3] = new Vector3(u1, v0, plane);
+        }
+        else if (direction == 4) // East
+        {
+            plane = slice + 1;
+            faceNormal = Normal_East;
+            faceIndex = FACE_INDEX_SIDE;
+            targetVertices[currentVertexCount + 0] = new Vector3(plane, v0, u0);
+            targetVertices[currentVertexCount + 1] = new Vector3(plane, v1, u0);
+            targetVertices[currentVertexCount + 2] = new Vector3(plane, v1, u1);
+            targetVertices[currentVertexCount + 3] = new Vector3(plane, v0, u1);
+        }
+        else // West
+        {
+            plane = slice;
+            faceNormal = Normal_West;
+            faceIndex = FACE_INDEX_SIDE;
+            targetVertices[currentVertexCount + 0] = new Vector3(plane, v0, u1);
+            targetVertices[currentVertexCount + 1] = new Vector3(plane, v1, u1);
+            targetVertices[currentVertexCount + 2] = new Vector3(plane, v1, u0);
+            targetVertices[currentVertexCount + 3] = new Vector3(plane, v0, u0);
+        }
+
+        for (int i = 0; i < 4; i++) targetNormals[currentVertexCount + i] = faceNormal;
+
+        float brightness = (lightLevel >= 0 && lightLevel < lightBrightnessTable.Length) ? lightBrightnessTable[lightLevel] : 1f;
+        Color biomeColor = _UnpackColorRGB(packedColor, brightness);
+        for (int i = 0; i < 4; i++) targetColors[currentVertexCount + i] = biomeColor;
+
+        float textureSlice = _GetTextureSliceCached(blockID, faceIndex);
+        targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice);
+        targetUVs[currentVertexCount + 1] = new Vector3(0, height, textureSlice);
+        targetUVs[currentVertexCount + 2] = new Vector3(width, height, textureSlice);
+        targetUVs[currentVertexCount + 3] = new Vector3(width, 0, textureSlice);
+
+        targetTriangles[currentTriangleCount + 0] = currentVertexCount;
+        targetTriangles[currentTriangleCount + 1] = currentVertexCount + 1;
+        targetTriangles[currentTriangleCount + 2] = currentVertexCount + 2;
+        targetTriangles[currentTriangleCount + 3] = currentVertexCount;
+        targetTriangles[currentTriangleCount + 4] = currentVertexCount + 2;
+        targetTriangles[currentTriangleCount + 5] = currentVertexCount + 3;
+
+        if (visibility == BlockVisibilityType.Opaque) { chunk._opaqueVertexCount += 4; chunk._opaqueTriangleCount += 6; }
+        else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
+        else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
+
+        if (visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4)
+        {
+            chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
+            chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
+            chunk._collisionVertices[chunk._collisionVertexCount + 2] = targetVertices[currentVertexCount + 2];
+            chunk._collisionVertices[chunk._collisionVertexCount + 3] = targetVertices[currentVertexCount + 3];
+            chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount;
+            chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 1;
+            chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 2;
+            chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount;
+            chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 2;
+            chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 3;
+            chunk._collisionVertexCount += 4;
+        }
+
+#if LOGGING
+        if (enableVerboseLogging)
+        {
+            chunk.facesTotal++;
+            if (visibility == BlockVisibilityType.Opaque) chunk.facesOpaque++;
+            else if (visibility == BlockVisibilityType.Transparent) chunk.facesTransparent++;
+            else chunk.facesCutout++;
+        }
+#endif
+    }
+
+    private void _BuildGreedySliceMask(ChunkData chunk, int direction, int slice, byte[] selfData, byte[] dataNX, byte[] dataPX, byte[] dataNY, byte[] dataPY, byte[] dataNZ, byte[] dataPZ, int chunkStride, out int width, out int height)
+    {
+        width = (direction <= 3) ? chunkSizeXZ : chunkSizeXZ;
+        height = (direction <= 1) ? chunkSizeXZ : chunkSizeY;
+        int maskCount = width * height;
+        System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
+
+        byte[] drawTable = shouldDrawTable;
+        int drawTableLen = drawTable != null ? drawTable.Length : 0;
+        BlockCullingType[] cullCache = cullingCache;
+        int cullCacheLen = cullCache != null ? cullCache.Length : 0;
+        McBlockShapeType[] shapeCache = shapeTypeCache;
+        int shapeCacheLen = shapeCache != null ? shapeCache.Length : 0;
+
+        for (int v = 0; v < height; v++)
+        {
+            for (int u = 0; u < width; u++)
+            {
+                int x = 0, y = 0, z = 0;
+                if (direction <= 1)
+                {
+                    x = u; y = slice; z = v;
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY != null && chunk._columnMaxY != null)
+                    {
+                        byte minY = chunk._columnMinY[columnIndex];
+                        byte maxY = chunk._columnMaxY[columnIndex];
+                        if (minY == 255 || slice < minY || slice > maxY) continue;
+                    }
+                }
+                else if (direction <= 3)
+                {
+                    x = u; y = v; z = slice;
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY != null && chunk._columnMaxY != null)
+                    {
+                        byte minY = chunk._columnMinY[columnIndex];
+                        byte maxY = chunk._columnMaxY[columnIndex];
+                        if (minY == 255 || y < minY || y > maxY) continue;
+                    }
+                }
+                else
+                {
+                    x = slice; y = v; z = u;
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY != null && chunk._columnMaxY != null)
+                    {
+                        byte minY = chunk._columnMinY[columnIndex];
+                        byte maxY = chunk._columnMaxY[columnIndex];
+                        if (minY == 255 || y < minY || y > maxY) continue;
+                    }
+                }
+
+                int selfIndex = y * chunkStride + z * chunkSizeXZ + x;
+                byte selfID = selfData[selfIndex];
+                if (selfID == 0) continue;
+                if (selfID < shapeCacheLen && shapeCache[selfID] == McBlockShapeType.Cross) continue;
+
+                int neighborX = x;
+                int neighborY = y;
+                int neighborZ = z;
+                bool suppressSameNoCull = false;
+
+                if (direction == 0) neighborY++;
+                else if (direction == 1) { neighborY--; suppressSameNoCull = true; }
+                else if (direction == 2) neighborZ++;
+                else if (direction == 3) { neighborZ--; suppressSameNoCull = true; }
+                else if (direction == 4) neighborX++;
+                else { neighborX--; suppressSameNoCull = true; }
+
+                byte neighborID = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, neighborX, neighborY, neighborZ, chunkSizeXZ, chunkSizeY, chunkStride);
+                if (suppressSameNoCull && selfID == neighborID && selfID < cullCacheLen && cullCache[selfID] == BlockCullingType.NoCull) continue;
+
+                int drawIndex = (selfID << 8) | neighborID;
+                bool drawFace = drawIndex < drawTableLen && drawTable[drawIndex] != 0;
+#if LOGGING
+                if (enableVerboseLogging)
+                {
+                    chunk.shouldDrawTests++;
+                    if (drawFace) chunk.shouldDrawTrue++;
+                    if (direction <= 1) chunk.boundaryChecksY++;
+                    else if (direction <= 3) chunk.boundaryChecksZ++;
+                    else chunk.boundaryChecksX++;
+                }
+#endif
+                if (!drawFace) continue;
+
+                int maskIndex = v * width + u;
+                greedyMaskBlockIds[maskIndex] = selfID;
+                greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
+                greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, x, z));
+            }
+        }
+    }
+
+    private void _EmitGreedyMask(ChunkData chunk, int direction, int slice, int width, int height)
+    {
+        for (int v = 0; v < height; v++)
+        {
+            int rowOffset = v * width;
+            for (int u = 0; u < width; )
+            {
+                int maskIndex = rowOffset + u;
+                byte blockID = greedyMaskBlockIds[maskIndex];
+                if (blockID == 0)
+                {
+                    u++;
+                    continue;
+                }
+
+                byte lightLevel = greedyMaskLightLevels[maskIndex];
+                int packedColor = greedyMaskPackedColors[maskIndex];
+
+                int quadWidth = 1;
+                while (u + quadWidth < width)
+                {
+                    int nextIndex = rowOffset + u + quadWidth;
+                    if (greedyMaskBlockIds[nextIndex] != blockID || greedyMaskLightLevels[nextIndex] != lightLevel || greedyMaskPackedColors[nextIndex] != packedColor) break;
+                    quadWidth++;
+                }
+
+                int quadHeight = 1;
+                bool canGrow = true;
+                while (v + quadHeight < height && canGrow)
+                {
+                    int nextRowOffset = (v + quadHeight) * width;
+                    for (int checkU = 0; checkU < quadWidth; checkU++)
+                    {
+                        int nextIndex = nextRowOffset + u + checkU;
+                        if (greedyMaskBlockIds[nextIndex] != blockID || greedyMaskLightLevels[nextIndex] != lightLevel || greedyMaskPackedColors[nextIndex] != packedColor)
+                        {
+                            canGrow = false;
+                            break;
+                        }
+                    }
+                    if (canGrow) quadHeight++;
+                }
+
+                _AddGreedyQuad(chunk, direction, slice, u, v, quadWidth, quadHeight, blockID, lightLevel, packedColor);
+
+                for (int clearV = 0; clearV < quadHeight; clearV++)
+                {
+                    int clearRowOffset = (v + clearV) * width;
+                    for (int clearU = 0; clearU < quadWidth; clearU++)
+                    {
+                        greedyMaskBlockIds[clearRowOffset + u + clearU] = 0;
+                    }
+                }
+
+                u += quadWidth;
+            }
+        }
+    }
+
     // OPTIMIZATION Phase 2: Batch face collection helper (replaces lambda for Udon compatibility)
     // OPTIMIZATION: Optimized face adding that avoids Vector3 allocations
     private void _AddFaceOptimized(ChunkData chunk, Vector3[] faceVertices, Vector3 faceNormal, int bx, int by, int bz, byte blockID, int faceIndex)
@@ -1613,23 +3176,23 @@ public class McWorld : UdonSharpBehaviour
             targetVertices = chunk._cutoutVertices; targetTriangles = chunk._cutoutTriangles; targetUVs = chunk._cutoutUVs; targetNormals = chunk._cutoutNormals; targetColors = chunk._cutoutColors;
             currentVertexCount = chunk._cutoutVertexCount; currentTriangleCount = chunk._cutoutTriangleCount;
         }
-        
+
         // OPTIMIZATION: Avoid Vector3 constructor calls
         targetVertices[currentVertexCount + 0] = new Vector3(bx + faceVertices[0].x, by + faceVertices[0].y, bz + faceVertices[0].z);
         targetVertices[currentVertexCount + 1] = new Vector3(bx + faceVertices[1].x, by + faceVertices[1].y, bz + faceVertices[1].z);
         targetVertices[currentVertexCount + 2] = new Vector3(bx + faceVertices[2].x, by + faceVertices[2].y, bz + faceVertices[2].z);
         targetVertices[currentVertexCount + 3] = new Vector3(bx + faceVertices[3].x, by + faceVertices[3].y, bz + faceVertices[3].z);
         for (int i=0; i<4; i++) targetNormals[currentVertexCount + i] = faceNormal;
-        
+
         // OPTIMIZATION Phase 6: Use pre-computed cached biome color (eliminates texture lookups)
         Color biomeColor = _GetCachedBiomeColor(chunk, blockID, bx, bz);
-        
+
         // OPTIMIZATION Phase 3: Use pre-computed cached brightness (eliminates method call overhead)
         float brightness = _GetCachedBrightnessForFace(chunk, faceNormal, bx, by, bz);
         biomeColor.a = brightness;
-        
+
         for (int i=0; i<4; i++) targetColors[currentVertexCount + i] = biomeColor;
-        
+
         // OPTIMIZATION Phase 5: Inline _GetTextureSlice (eliminates method call)
         float textureSlice = 0;
         if (blockDataCache != null && blockID < blockDataCache.Length)
@@ -1648,15 +3211,15 @@ public class McWorld : UdonSharpBehaviour
         }
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice); targetUVs[currentVertexCount + 1] = new Vector3(0, 1, textureSlice);
         targetUVs[currentVertexCount + 2] = new Vector3(1, 1, textureSlice); targetUVs[currentVertexCount + 3] = new Vector3(1, 0, textureSlice);
-        
+
         targetTriangles[currentTriangleCount + 0] = currentVertexCount; targetTriangles[currentTriangleCount + 1] = currentVertexCount + 1;
         targetTriangles[currentTriangleCount + 2] = currentVertexCount + 2; targetTriangles[currentTriangleCount + 3] = currentVertexCount;
         targetTriangles[currentTriangleCount + 4] = currentVertexCount + 2; targetTriangles[currentTriangleCount + 5] = currentVertexCount + 3;
-        
+
         if (visibility == BlockVisibilityType.Opaque) { chunk._opaqueVertexCount += 4; chunk._opaqueTriangleCount += 6; }
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
         else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
-        
+
         if (visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4) {
             chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
             chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
@@ -1677,7 +3240,7 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
     }
-    
+
     // OPTIMIZATION Phase 2: Bulk process collected faces (better cache locality, reduces method overhead)
     private void _AddFace(ChunkData chunk, Vector3[] faceVertices, Vector3 faceNormal, Vector3 blockPos, byte blockID, BlockVisibilityType visibility, int faceIndex)
     {
@@ -1697,36 +3260,36 @@ public class McWorld : UdonSharpBehaviour
             targetVertices = chunk._cutoutVertices; targetTriangles = chunk._cutoutTriangles; targetUVs = chunk._cutoutUVs; targetNormals = chunk._cutoutNormals; targetColors = chunk._cutoutColors;
             currentVertexCount = chunk._cutoutVertexCount; currentTriangleCount = chunk._cutoutTriangleCount;
         }
-        
+
         float bx = blockPos.x, by = blockPos.y, bz = blockPos.z;
         targetVertices[currentVertexCount + 0] = new Vector3(bx + faceVertices[0].x, by + faceVertices[0].y, bz + faceVertices[0].z);
         targetVertices[currentVertexCount + 1] = new Vector3(bx + faceVertices[1].x, by + faceVertices[1].y, bz + faceVertices[1].z);
         targetVertices[currentVertexCount + 2] = new Vector3(bx + faceVertices[2].x, by + faceVertices[2].y, bz + faceVertices[2].z);
         targetVertices[currentVertexCount + 3] = new Vector3(bx + faceVertices[3].x, by + faceVertices[3].y, bz + faceVertices[3].z);
         for (int i=0; i<4; i++) targetNormals[currentVertexCount + i] = faceNormal;
-        
+
         // Calculate biome color for this block position
         Color biomeColor = _GetBiomeColorForBlock(chunk, blockID, (int)bx, (int)bz);
-        
+
         // FIXED: Apply lighting to vertex colors (alpha channel = brightness)
         // Sample light from the neighbor block that this face is against, not the block itself
         float brightness = _GetLightBrightnessForFace(chunk, faceNormal, (int)bx, (int)by, (int)bz);
         biomeColor.a = brightness;
-        
+
         for (int i=0; i<4; i++) targetColors[currentVertexCount + i] = biomeColor;
-        
+
         float textureSlice = _GetTextureSlice(blockID, faceIndex);
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice); targetUVs[currentVertexCount + 1] = new Vector3(0, 1, textureSlice);
         targetUVs[currentVertexCount + 2] = new Vector3(1, 1, textureSlice); targetUVs[currentVertexCount + 3] = new Vector3(1, 0, textureSlice);
-        
+
         targetTriangles[currentTriangleCount + 0] = currentVertexCount; targetTriangles[currentTriangleCount + 1] = currentVertexCount + 1;
         targetTriangles[currentTriangleCount + 2] = currentVertexCount + 2; targetTriangles[currentTriangleCount + 3] = currentVertexCount;
         targetTriangles[currentTriangleCount + 4] = currentVertexCount + 2; targetTriangles[currentTriangleCount + 5] = currentVertexCount + 3;
-        
+
         if (visibility == BlockVisibilityType.Opaque) { chunk._opaqueVertexCount += 4; chunk._opaqueTriangleCount += 6; }
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
         else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
-        
+
         if (visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4) {
             chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
             chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
@@ -1747,45 +3310,35 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
     }
-    
+
     // ===== CROSS-SHAPED BLOCK RENDERING =====
     // Cross-shaped blocks (like tall grass and flowers) use two intersecting perpendicular quads
     // with seeded random offsets based on block position (matching Beta 1.7.3)
-    
+
     private void _AddCrossShapedBlocks(ChunkData chunk)
     {
-        // Iterate through all blocks in the chunk and add cross geometry for cross-shaped blocks
         byte[] decompressed = chunk._decompSelf;
-        if (decompressed == null) return;
-        
-        int columnStride = chunkSizeXZ * chunkSizeXZ;
-        for (int y = 0; y < chunkSizeY; y++)
+        if (decompressed == null || chunk._crossBlockPackedPositions == null || chunk._crossBlockCount == 0) return;
+
+        for (int i = 0; i < chunk._crossBlockCount; i++)
         {
-            int yBase = y * columnStride;
-            for (int z = 0; z < chunkSizeXZ; z++)
-            {
-                int zBase = yBase + z * chunkSizeXZ;
-                for (int x = 0; x < chunkSizeXZ; x++)
-                {
-                    byte blockID = decompressed[zBase + x];
-                    if (blockID == 0) continue;
-                    
-                    McBlockShapeType shapeType = blockTypeManager.GetBlockShapeType(blockID);
-                    if (shapeType == McBlockShapeType.Cross)
-                    {
-                        BlockVisibilityType visibility = _GetVisibilityType(blockID);
-                        _AddCrossShapedBlock(chunk, new Vector3(x, y, z), blockID, visibility);
-                    }
-                }
-            }
+            int packed = chunk._crossBlockPackedPositions[i];
+            int x = (packed >> 16) & 0xFF;
+            int y = (packed >> 8) & 0xFF;
+            int z = packed & 0xFF;
+            int idx = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
+            byte blockID = decompressed[idx];
+            if (blockID == 0 || blockID >= shapeTypeCache.Length || shapeTypeCache[blockID] != McBlockShapeType.Cross) continue;
+            BlockVisibilityType visibility = blockID < visibilityCache.Length ? visibilityCache[blockID] : BlockVisibilityType.Opaque;
+            _AddCrossShapedBlock(chunk, new Vector3(x, y, z), blockID, visibility);
         }
     }
-    
+
     private void _AddCrossShapedBlock(ChunkData chunk, Vector3 blockPos, byte blockID, BlockVisibilityType visibility)
     {
         // Cross-shaped blocks use 2 perpendicular quads forming an X shape when viewed from above
         // The quads extend from corner to corner: (0,0,0)→(1,1,1) and (1,0,0)→(0,1,1)
-        
+
         Vector3[] targetVertices; int[] targetTriangles; Vector3[] targetUVs; Vector3[] targetNormals; Color[] targetColors;
         int currentVertexCount; int currentTriangleCount;
 
@@ -1802,41 +3355,41 @@ public class McWorld : UdonSharpBehaviour
             targetVertices = chunk._cutoutVertices; targetTriangles = chunk._cutoutTriangles; targetUVs = chunk._cutoutUVs; targetNormals = chunk._cutoutNormals; targetColors = chunk._cutoutColors;
             currentVertexCount = chunk._cutoutVertexCount; currentTriangleCount = chunk._cutoutTriangleCount;
         }
-        
+
         float bx = blockPos.x, by = blockPos.y, bz = blockPos.z;
         float textureSlice = _GetTextureSlice(blockID, FACE_INDEX_SIDE);
-        
+
         // Calculate biome color for this block (grass blocks like tall grass should be tinted)
-        Color biomeColor = _GetBiomeColorForBlock(chunk, blockID, (int)bx, (int)bz);
-        
+        Color biomeColor = _GetCachedBiomeColor(chunk, blockID, (int)bx, (int)bz);
+
         // FIXED: Apply lighting to vertex colors (alpha channel = brightness)
         // For cross-shaped blocks, sample light from the block itself (no face direction)
-        float brightness = _GetLightBrightnessAtBlock(chunk, (int)bx, (int)by, (int)bz);
+        float brightness = _GetCachedBrightnessAtBlock(chunk, (int)bx, (int)by, (int)bz);
         biomeColor.a = brightness;
-        
+
         // Seeded random offset (matching Beta 1.7.3 BlockTallGrass colorMultiplier logic)
         // Calculate global position for seeding
         int globalX = (int)(bx + chunk.chunkX_world * chunkSizeXZ);
         int globalY = (int)(by + chunk.chunkY_world * chunkSizeY);
         int globalZ = (int)(bz + chunk.chunkZ_world * chunkSizeXZ);
-        
+
         // BETA 1.7.3 EXACT: Seeded random offset calculation (RenderBlocks.java line 1316-1320)
         // Reference: renderBlockReed() method for tall grass randomization
         long seed = (long)(globalX * 3129871) ^ (long)globalZ * 116129781L ^ (long)globalY;
         seed = seed * seed * 42317861L + seed * 11L;
-        
+
         // Extract random values from different bit ranges (Minecraft's approach)
         float randX = (float)((seed >> 16 & 15L) / 15.0f); // 0-1 from bits 16-19
         float randY = (float)((seed >> 20 & 15L) / 15.0f); // 0-1 from bits 20-23
         float randZ = (float)((seed >> 24 & 15L) / 15.0f); // 0-1 from bits 24-27
-        
+
         // Convert to Minecraft's offset ranges:
         // X and Z: ±0.25 blocks (makes plants wobble left/right)
         // Y: -0.2 to 0 blocks (slightly sunk into ground for natural look)
         float offsetX = (randX - 0.5f) * 0.5f; // -0.25 to +0.25
         float offsetY = (randY - 1.0f) * 0.2f; // -0.2 to 0
         float offsetZ = (randZ - 0.5f) * 0.5f; // -0.25 to +0.25
-        
+
         // QUAD 1: Southwest to Northeast diagonal
         // Vertices: (0,0,0), (0,1,0), (1,1,1), (1,0,1)
         // Apply randomization to make each plant look unique (Minecraft behavior)
@@ -1844,20 +3397,20 @@ public class McWorld : UdonSharpBehaviour
         targetVertices[currentVertexCount + 1] = new Vector3(bx + 0 + offsetX, by + 1 + offsetY, bz + 0 + offsetZ);
         targetVertices[currentVertexCount + 2] = new Vector3(bx + 1 + offsetX, by + 1 + offsetY, bz + 1 + offsetZ);
         targetVertices[currentVertexCount + 3] = new Vector3(bx + 1 + offsetX, by + 0 + offsetY, bz + 1 + offsetZ);
-        
+
         // Normals: Use a diagonal normal for lighting (average of X and Z)
         Vector3 normal1 = new Vector3(0.7071f, 0, 0.7071f).normalized;
         for (int i=0; i<4; i++) targetNormals[currentVertexCount + i] = normal1;
-        
+
         // Colors: Apply biome tint to all vertices
         for (int i=0; i<4; i++) targetColors[currentVertexCount + i] = biomeColor;
-        
+
         // UVs: Standard quad UV mapping
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice);
         targetUVs[currentVertexCount + 1] = new Vector3(0, 1, textureSlice);
         targetUVs[currentVertexCount + 2] = new Vector3(1, 1, textureSlice);
         targetUVs[currentVertexCount + 3] = new Vector3(1, 0, textureSlice);
-        
+
         // Triangles for first quad
         targetTriangles[currentTriangleCount + 0] = currentVertexCount + 0;
         targetTriangles[currentTriangleCount + 1] = currentVertexCount + 1;
@@ -1865,7 +3418,7 @@ public class McWorld : UdonSharpBehaviour
         targetTriangles[currentTriangleCount + 3] = currentVertexCount + 0;
         targetTriangles[currentTriangleCount + 4] = currentVertexCount + 2;
         targetTriangles[currentTriangleCount + 5] = currentVertexCount + 3;
-        
+
         // QUAD 2: Southeast to Northwest diagonal
         // Vertices: (1,0,0), (1,1,0), (0,1,1), (0,0,1)
         // Apply same randomization to maintain consistent plant offset
@@ -1873,20 +3426,20 @@ public class McWorld : UdonSharpBehaviour
         targetVertices[currentVertexCount + 5] = new Vector3(bx + 1 + offsetX, by + 1 + offsetY, bz + 0 + offsetZ);
         targetVertices[currentVertexCount + 6] = new Vector3(bx + 0 + offsetX, by + 1 + offsetY, bz + 1 + offsetZ);
         targetVertices[currentVertexCount + 7] = new Vector3(bx + 0 + offsetX, by + 0 + offsetY, bz + 1 + offsetZ);
-        
+
         // Normals: Use opposite diagonal normal
         Vector3 normal2 = new Vector3(-0.7071f, 0, 0.7071f).normalized;
         for (int i=4; i<8; i++) targetNormals[currentVertexCount + i] = normal2;
-        
+
         // Colors: Apply biome tint to all vertices
         for (int i=4; i<8; i++) targetColors[currentVertexCount + i] = biomeColor;
-        
+
         // UVs: Standard quad UV mapping
         targetUVs[currentVertexCount + 4] = new Vector3(0, 0, textureSlice);
         targetUVs[currentVertexCount + 5] = new Vector3(0, 1, textureSlice);
         targetUVs[currentVertexCount + 6] = new Vector3(1, 1, textureSlice);
         targetUVs[currentVertexCount + 7] = new Vector3(1, 0, textureSlice);
-        
+
         // Triangles for second quad
         targetTriangles[currentTriangleCount + 6] = currentVertexCount + 4;
         targetTriangles[currentTriangleCount + 7] = currentVertexCount + 5;
@@ -1894,14 +3447,14 @@ public class McWorld : UdonSharpBehaviour
         targetTriangles[currentTriangleCount + 9] = currentVertexCount + 4;
         targetTriangles[currentTriangleCount + 10] = currentVertexCount + 6;
         targetTriangles[currentTriangleCount + 11] = currentVertexCount + 7;
-        
+
         // Update counts
         if (visibility == BlockVisibilityType.Opaque) { chunk._opaqueVertexCount += 8; chunk._opaqueTriangleCount += 12; }
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 8; chunk._transparentTriangleCount += 12; }
         else { chunk._cutoutVertexCount += 8; chunk._cutoutTriangleCount += 12; }
-        
+
         // NOTE: Cross-shaped blocks have no collision in Minecraft Beta 1.7.3
-        
+
 #if LOGGING
         if (enableVerboseLogging)
         {
@@ -1912,7 +3465,7 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
     }
-    
+
     private void _ApplyEmptyMesh(ChunkData chunk)
     {
         _ApplyDataToMesh(chunk.opaqueMeshFilter, chunk._opaqueVertices, chunk._opaqueTriangles, chunk._opaqueUVs, chunk._opaqueNormals, chunk._opaqueColors, 0, 0);
@@ -1920,28 +3473,30 @@ public class McWorld : UdonSharpBehaviour
         _ApplyDataToMesh(chunk.cutoutMeshFilter, chunk._cutoutVertices, chunk._cutoutTriangles, chunk._cutoutUVs, chunk._cutoutNormals, chunk._cutoutColors, 0, 0);
         _ApplyDataToCollider(chunk);
     }
-    
+
     private byte[] _GetDecompressedData(ChunkData chunk)
     {
-        // OPTIMIZED: Use global persistent cache to avoid repeated decompression
-        if (decompressionCacheValid.ContainsKey(chunk) && decompressionCacheValid[chunk] && decompressionCache.ContainsKey(chunk))
+        if (chunk == null) return null;
+
+        if (chunk._decompCacheValid && chunk._cachedDecompressedData != null)
         {
 #if LOGGING
             if (enableCacheTracking) stats_decompCacheHits++;
 #endif
-            return decompressionCache[chunk];
+            return chunk._cachedDecompressedData;
         }
-        
+
 #if LOGGING
         if (enableCacheTracking) stats_decompCacheMisses++;
 #endif
-        
+
         byte[] decompressed = _DecompressChunkColumnRLE(chunk);
-        decompressionCache[chunk] = decompressed;
-        decompressionCacheValid[chunk] = true;
+        chunk._cachedDecompressedData = decompressed;
+        chunk._decompCacheValid = true;
+        _RefreshChunkDerivedData(chunk, decompressed);
         return decompressed;
     }
-    
+
     private void _ClearAllMeshBuffers(ChunkData chunk)
     {
         chunk._opaqueVertexCount = 0; chunk._opaqueTriangleCount = 0;
@@ -1949,13 +3504,13 @@ public class McWorld : UdonSharpBehaviour
         chunk._cutoutVertexCount = 0; chunk._cutoutTriangleCount = 0;
         chunk._collisionVertexCount = 0; chunk._collisionTriangleCount = 0;
     }
-    
+
     private bool _ShouldDrawFace(byte selfID, byte neighborID)
     {
         int idx = (selfID << 8) | neighborID;
         return shouldDrawTable != null && idx >= 0 && idx < shouldDrawTable.Length && shouldDrawTable[idx] != 0;
     }
-    
+
     private void _ApplyAllMeshData(ChunkData chunk)
     {
 #if LOGGING
@@ -1984,22 +3539,16 @@ public class McWorld : UdonSharpBehaviour
     {
         if (mf == null) return;
         Mesh m = mf.sharedMesh;
-        if (m == null) { m = new Mesh(); m.name = $"ChunkMesh_{mf.gameObject.name}"; mf.sharedMesh = m; }
+        if (m == null) { m = new Mesh(); m.name = $"ChunkMesh_{mf.gameObject.name}"; m.MarkDynamic(); mf.sharedMesh = m; }
         m.Clear();
         if (vertexCount == 0) { mf.gameObject.SetActive(false); return; }
-        
+
         mf.gameObject.SetActive(true);
-        Vector3[] finalVertices = new Vector3[vertexCount]; System.Array.Copy(vertices, finalVertices, vertexCount);
-        int[] finalTriangles = new int[triangleCount]; System.Array.Copy(triangles, finalTriangles, triangleCount);
-        Vector3[] finalNormals = new Vector3[vertexCount]; System.Array.Copy(normals, finalNormals, vertexCount);
-        Vector3[] finalUVs = new Vector3[vertexCount]; System.Array.Copy(uvs, finalUVs, vertexCount);
-        Color[] finalColors = new Color[vertexCount]; System.Array.Copy(colors, finalColors, vertexCount);
-        
-        m.vertices = finalVertices; 
-        m.triangles = finalTriangles; 
-        m.normals = finalNormals;
-        m.SetUVs(0, finalUVs);
-        m.colors = finalColors; // Apply vertex colors for biome tinting
+        m.SetVertices(vertices, 0, vertexCount);
+        m.SetNormals(normals, 0, vertexCount);
+        m.SetUVs(0, uvs, 0, vertexCount);
+        m.SetColors(colors, 0, vertexCount);
+        m.SetTriangles(triangles, 0, triangleCount, 0, true);
         m.RecalculateBounds();
     }
 
@@ -2012,17 +3561,14 @@ public class McWorld : UdonSharpBehaviour
 
         if (chunk.meshCollider == null) return;
         Mesh colMesh = chunk.meshCollider.sharedMesh;
-        if (colMesh == null) { colMesh = new Mesh(); colMesh.name = $"ChunkCollisionMesh_{chunk.gameObject.name}"; }
-        
+        if (colMesh == null) { colMesh = new Mesh(); colMesh.name = $"ChunkCollisionMesh_{chunk.gameObject.name}"; colMesh.MarkDynamic(); }
+
         colMesh.Clear();
         if (chunk._collisionVertexCount == 0) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; return; }
-        
+
         chunk.meshCollider.enabled = true;
-        Vector3[] finalVertices = new Vector3[chunk._collisionVertexCount]; System.Array.Copy(chunk._collisionVertices, finalVertices, chunk._collisionVertexCount);
-        int[] finalTriangles = new int[chunk._collisionTriangleCount]; System.Array.Copy(chunk._collisionTriangles, finalTriangles, chunk._collisionTriangleCount);
-        
-        colMesh.vertices = finalVertices; 
-        colMesh.triangles = finalTriangles;
+        colMesh.SetVertices(chunk._collisionVertices, 0, chunk._collisionVertexCount);
+        colMesh.SetTriangles(chunk._collisionTriangles, 0, chunk._collisionTriangleCount, 0, true);
         chunk.meshCollider.sharedMesh = colMesh;
 
 #if LOGGING
@@ -2039,9 +3585,16 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         if (enableCounters) stats_getBlockCalls++;
 #endif
-        
+
         if (chunk._chunkData == null || !chunk.isDataReady) return 0;
-        
+        if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ) return 0;
+
+        if (chunk._decompCacheValid && chunk._cachedDecompressedData != null)
+        {
+            int directIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
+            return chunk._cachedDecompressedData[directIndex];
+        }
+
         System.Type dataType = chunk._chunkData.GetType();
 
         // Case 1: Homogeneous chunk, data is a single ushort
@@ -2086,7 +3639,7 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
         return 0; // Fallback for out of bounds Y or error
     }
 
@@ -2095,14 +3648,14 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         if (enableCounters) stats_setBlockCalls++;
 #endif
-        
+
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ) return;
         // Safety check: ensure chunk exists
         if (chunk == null) return;
-        
+
         // Safety check: ensure chunk data exists
         if (chunk._chunkData == null) return;
-        
+
         // Optimization: check if the block is actually changing before doing any work.
         if (blockType == _GetBlockLocal(chunk, x, y, z)) return;
 
@@ -2110,10 +3663,10 @@ public class McWorld : UdonSharpBehaviour
         if (enableCounters) stats_blockModifications++;
 #endif
 
-        // OPTIMIZATION: Invalidate decompression cache since data is changing
-        if (decompressionCacheValid.ContainsKey(chunk))
-            decompressionCacheValid[chunk] = false;
-        
+        // OPTIMIZATION: Invalidate chunk-owned caches since data is changing
+        chunk._decompCacheValid = false;
+        chunk._cachedDataVersion++;
+
         // OPTIMIZATION: Invalidate neighbor cache since chunk data changed
         _InvalidateNeighborCache(chunk);
 
@@ -2135,8 +3688,8 @@ public class McWorld : UdonSharpBehaviour
         else if (chunk._chunkData.GetType() == typeof(byte)) // Case 2: Homogeneous chunk being modified
         {
             // The chunk is no longer homogeneous. Decompress the whole thing once.
-            byte[] fullData = _DecompressChunkColumnRLE(chunk);
-            if (fullData == null) return; 
+            byte[] fullData = _GetDecompressedData(chunk);
+            if (fullData == null) return;
 
             // Modify the block
             int localIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
@@ -2148,17 +3701,22 @@ public class McWorld : UdonSharpBehaviour
             chunk.isSingleOpaqueSolid = false;
         }
 
+        chunk._cachedDecompressedData = null;
+        chunk._decompCacheValid = false;
+        _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+        _GpuRequestLightingRebuild();
+
         if (!updateMesh) return;
 
         int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
         RequestChunkMeshUpdate(chunkIndex);
-        
+
         if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
         {
             TriggerNeighborMeshRebuilds(chunk);
         }
     }
-    
+
     private byte[] _DecompressSingleColumn(ushort[] rlePairs)
     {
         byte[] columnData = new byte[chunkSizeY];
@@ -2207,7 +3765,7 @@ public class McWorld : UdonSharpBehaviour
         if (enableCounters) stats_rleCompressions++;
         int bytesIn = fullChunkData != null ? fullChunkData.Length : 0;
 #endif
-        
+
         isHomogeneous = true;
         byte firstBlock = fullChunkData[0];
         for (int i = 1; i < fullChunkData.Length; i++) {
@@ -2232,14 +3790,14 @@ public class McWorld : UdonSharpBehaviour
 
         int columnCount = chunkSizeXZ * chunkSizeXZ;
         ushort[][] columnRLEData = new ushort[columnCount][];
-        
+
         for (int x = 0; x < chunkSizeXZ; x++) {
             for (int z = 0; z < chunkSizeXZ; z++) {
                 int columnIndex = z * chunkSizeXZ + x;
-                
+
                 // Using a list here because we don't know the final size. This is fine as it's a one-off operation.
                 var columnRuns = new System.Collections.Generic.List<ushort>();
-                
+
                 for (int y = 0; y < chunkSizeY; ) {
                     byte currentBlock = fullChunkData[y * columnCount + columnIndex];
                     ushort runLength = 1;
@@ -2253,7 +3811,7 @@ public class McWorld : UdonSharpBehaviour
                 columnRLEData[columnIndex] = columnRuns.ToArray();
             }
         }
-        
+
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -2268,10 +3826,10 @@ public class McWorld : UdonSharpBehaviour
             stats_rleTotalBytesOut += bytesOut;
         }
 #endif
-        
+
         return columnRLEData;
     }
-    
+
     private byte[] _DecompressChunkColumnRLE(ChunkData chunk)
     {
 #if LOGGING
@@ -2279,10 +3837,10 @@ public class McWorld : UdonSharpBehaviour
         if (enableDetailedTimings) decompressStartTime = Time.realtimeSinceStartup;
         if (enableCounters) stats_rleDecompressions++;
 #endif
-        
+
         byte[] fullData = new byte[chunk._chunkDataSize];
         if (chunk._chunkData == null) return fullData;
-        
+
         System.Type dataType = chunk._chunkData.GetType();
 
         // Case 1: Homogeneous chunk (optimized with Array.Fill equivalent)
@@ -2292,7 +3850,7 @@ public class McWorld : UdonSharpBehaviour
             int size = chunk._chunkDataSize;
             int i = 0;
             int limit = size - 15;
-            
+
             // Process 16 at a time
             for (; i < limit; i += 16) {
                 fullData[i] = blockValue;
@@ -2331,13 +3889,13 @@ public class McWorld : UdonSharpBehaviour
 
                 int currentY = 0;
                 int pairCount = rlePairs.Length;
-                
+
                 for (int p = 0; p < pairCount; p += 2) {
                     byte blockID = (byte)rlePairs[p];
                     int runLength = rlePairs[p+1];
                     int endY = currentY + runLength;
                     if (endY > maxY) endY = maxY;
-                    
+
                     // OPTIMIZED: Direct calculation without nested loop when possible
                     int baseIdx = currentY * columnCount + col;
                     for (int y = currentY; y < endY; y++) {
@@ -2348,19 +3906,19 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
 #if LOGGING
         if (enableDetailedTimings)
         {
             stats_rleDecompressionTime += (Time.realtimeSinceStartup - decompressStartTime) * 1000f;
         }
 #endif
-        
+
         return fullData;
     }
 
     #endregion
-    
+
     #region Local Block Data Getters
 
     private bool _IsBlockSolid(byte blockID)
@@ -2439,7 +3997,7 @@ public class McWorld : UdonSharpBehaviour
             float darkness = 1.0f - lightLevel;
             lightBrightnessTable[i] = (1.0f - darkness) / (darkness * 3.0f + 1.0f) * 0.95f + 0.05f;
         }
-        
+
         // Build light opacity and emission caches
         int maxId = blockTypeManager.finalDataArray != null ? blockTypeManager.finalDataArray.Length : 256;
         lightOpacityCache = new int[256];
@@ -2457,10 +4015,10 @@ public class McWorld : UdonSharpBehaviour
                 lightEmissionCache[i] = 0;  // Default to no emission
             }
         }
-        
+
         Debug.Log("[McWorld] Light brightness table and caches built successfully.");
     }
-    
+
     // --- Lighting Optimization: Memory Pooling ---
     private int[] GetBFSQueue()
     {
@@ -2468,14 +4026,14 @@ public class McWorld : UdonSharpBehaviour
             return bfsQueuePool.Dequeue();
         return new int[BFS_QUEUE_SIZE];
     }
-    
+
     private int[] GetBFSQueueLarge()
     {
         if (bfsQueuePoolLarge.Count > 0)
             return bfsQueuePoolLarge.Dequeue();
         return new int[BFS_QUEUE_SIZE_LARGE];
     }
-    
+
     private void ReturnBFSQueue(int[] queue)
     {
         if (queue.Length == BFS_QUEUE_SIZE && bfsQueuePool.Count < 10)
@@ -2483,50 +4041,68 @@ public class McWorld : UdonSharpBehaviour
         else if (queue.Length == BFS_QUEUE_SIZE_LARGE && bfsQueuePoolLarge.Count < 5)
             bfsQueuePoolLarge.Enqueue(queue);
     }
-    
+
+    private int[] GetLightingQueue()
+    {
+        if (lightingQueuePool.Count > 0)
+            return lightingQueuePool.Dequeue();
+        return new int[LIGHTING_QUEUE_SIZE];
+    }
+
+    private void ReturnLightingQueue(int[] queue)
+    {
+        if (queue == null || queue.Length != LIGHTING_QUEUE_SIZE) return;
+        if (lightingQueuePool.Count < 8) lightingQueuePool.Enqueue(queue);
+    }
+
     // OPTIMIZATION: Cache neighbor references to avoid repeated lookups
     private ChunkData[] _GetCachedNeighbors(ChunkData chunk)
     {
-        if (neighborCacheValid.ContainsKey(chunk) && neighborCacheValid[chunk] && neighborCache.ContainsKey(chunk))
+        if (chunk == null) return null;
+        if (chunk._cachedNeighbors == null || chunk._cachedNeighbors.Length != 6)
+        {
+            chunk._cachedNeighbors = new ChunkData[6];
+        }
+
+        if (chunk._neighborCacheValid)
         {
 #if LOGGING
             if (enableCacheTracking) stats_neighborCacheHits++;
 #endif
-            return neighborCache[chunk];
+            return chunk._cachedNeighbors;
         }
-        
+
 #if LOGGING
         if (enableCacheTracking) stats_neighborCacheMisses++;
 #endif
-        
-        ChunkData[] neighbors = new ChunkData[6];
+
+        ChunkData[] neighbors = chunk._cachedNeighbors;
         neighbors[0] = GetChunkAt(chunk.chunkX_world + 1, chunk.chunkY_world, chunk.chunkZ_world); // PX
         neighbors[1] = GetChunkAt(chunk.chunkX_world - 1, chunk.chunkY_world, chunk.chunkZ_world); // NX
         neighbors[2] = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world + 1, chunk.chunkZ_world); // PY
         neighbors[3] = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world - 1, chunk.chunkZ_world); // NY
         neighbors[4] = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world + 1); // PZ
         neighbors[5] = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world - 1); // NZ
-        
-        neighborCache[chunk] = neighbors;
-        neighborCacheValid[chunk] = true;
+        chunk._neighborCacheValid = true;
         return neighbors;
     }
-    
+
     // OPTIMIZATION: Invalidate neighbor cache when chunks change
     private void _InvalidateNeighborCache(ChunkData chunk)
     {
-        if (neighborCacheValid.ContainsKey(chunk))
-            neighborCacheValid[chunk] = false;
-            
-        // Also invalidate neighbors' caches since they reference this chunk
-        ChunkData[] neighbors = _GetCachedNeighbors(chunk);
+        if (chunk == null) return;
+        chunk._neighborCacheValid = false;
+
         for (int i = 0; i < 6; i++)
         {
-            if (neighbors[i] != null && neighborCacheValid.ContainsKey(neighbors[i]))
-                neighborCacheValid[neighbors[i]] = false;
+            ChunkData neighbor = GetChunkAt(chunk.chunkX_world + neighbor_dx_offsets[i], chunk.chunkY_world + neighbor_dy_offsets[i], chunk.chunkZ_world + neighbor_dz_offsets[i]);
+            if (neighbor != null)
+            {
+                neighbor._neighborCacheValid = false;
+            }
         }
     }
-    
+
     // OPTIMIZATION: Defer reconciliation to prevent lag spikes
     private void DeferReconciliation(ChunkData chunk)
     {
@@ -2536,18 +4112,18 @@ public class McWorld : UdonSharpBehaviour
             reconciliationPending.Add(chunk);
         }
     }
-    
+
     // FIXED: Immediate reconciliation for critical cases (e.g., emissive blocks near boundaries)
     private void ImmediateReconciliation(ChunkData chunk)
     {
         if (chunk == null || !chunk.isDataReady) return;
-        
+
         // Check if chunk has emissive blocks near boundaries that need immediate propagation
-        byte[] chunkData = _DecompressChunkColumnRLE(chunk);
+        byte[] chunkData = _GetDecompressedData(chunk);
         if (chunkData == null) return;
-        
+
         bool hasEmissiveNearBoundary = false;
-        
+
         // Check boundary blocks for emissive blocks
         for (int y = 0; y < chunkSizeY && !hasEmissiveNearBoundary; y++)
         {
@@ -2556,17 +4132,17 @@ public class McWorld : UdonSharpBehaviour
                 // Check X boundaries
                 int leftIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + 0;
                 int rightIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + (chunkSizeXZ - 1);
-                
+
                 if (lightEmissionCache[chunkData[leftIndex]] > 0 || lightEmissionCache[chunkData[rightIndex]] > 0)
                 {
                     hasEmissiveNearBoundary = true;
                     break;
                 }
-                
+
                 // Check Z boundaries
                 int frontIndex = y * (chunkSizeXZ * chunkSizeXZ) + 0 * chunkSizeXZ + z;
                 int backIndex = y * (chunkSizeXZ * chunkSizeXZ) + (chunkSizeXZ - 1) * chunkSizeXZ + z;
-                
+
                 if (lightEmissionCache[chunkData[frontIndex]] > 0 || lightEmissionCache[chunkData[backIndex]] > 0)
                 {
                     hasEmissiveNearBoundary = true;
@@ -2574,7 +4150,7 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
         // If emissive blocks near boundary, do immediate reconciliation
         if (hasEmissiveNearBoundary)
         {
@@ -2586,20 +4162,20 @@ public class McWorld : UdonSharpBehaviour
             DeferReconciliation(chunk);
         }
     }
-    
+
     // OPTIMIZATION: Process deferred reconciliation with time budget
     private void ProcessDeferredReconciliation(float frameStart, float frameBudget)
     {
         float reconciliationBudget = RECONCILIATION_TIME_BUDGET_MS * 0.001f;
         int processedCount = 0;
-        
-        while (deferredReconciliationQueue.Count > 0 && 
+
+        while (deferredReconciliationQueue.Count > 0 &&
                processedCount < MAX_RECONCILIATION_PER_FRAME &&
                Time.realtimeSinceStartup - frameStart < frameBudget - reconciliationBudget)
         {
             ChunkData chunk = deferredReconciliationQueue.Dequeue();
             reconciliationPending.Remove(chunk);
-            
+
             if (chunk != null && chunk.isDataReady)
             {
                 _ReconcileLightingWithNeighbors(chunk);
@@ -2607,35 +4183,35 @@ public class McWorld : UdonSharpBehaviour
             }
         }
     }
-    
+
     // OPTIMIZATION: Batch process multiple chunks for new columns
     private void BatchProcessNewColumnChunks(ChunkData[] chunks)
     {
         // OPTIMIZATION: Process chunks in batches to reduce overhead
         // This is called when a new multi-chunk column is being initialized
-        
+
         // OPTIMIZATION: UdonSharp compatibility - avoid array length access
         int batchSize = 4; // Process max 4 chunks at once
-        
+
         for (int i = 0; i < batchSize; i++)
         {
             // OPTIMIZATION: UdonSharp compatibility - check bounds manually
             if (i >= chunks.Length) break;
-            
+
             ChunkData chunk = chunks[i];
             if (chunk != null && chunk.isDataReady)
             {
                 // OPTIMIZATION: Skip expensive reconciliation for isolated chunks
                 ChunkData[] neighbors = _GetCachedNeighbors(chunk);
                 int readyNeighbors = 0;
-                
+
                 for (int j = 0; j < 6; j++)
                 {
                     ChunkData neighbor = neighbors[j];
                     if (neighbor != null && neighbor.isDataReady)
                         readyNeighbors++;
                 }
-                
+
                 // Only do lightweight reconciliation for chunks with neighbors
                 if (readyNeighbors > 0)
                 {
@@ -2644,19 +4220,19 @@ public class McWorld : UdonSharpBehaviour
             }
         }
     }
-    
+
     // OPTIMIZATION: Optimized PULL-based lighting with pre-calculated offsets
     private bool _UpdateBlockLightPULLOptimized(ChunkData chunk, byte[] fullData, int x, int y, int z, bool isSkyLight, int[] queue, ref int queueEnd, int[] neighborOffsets)
     {
         int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         byte blockID = fullData[blockIndex];
-        
+
         // OPTIMIZATION: Skip fully opaque blocks (opacity >= 15)
         int opacity = lightOpacityCache[blockID];
         if (opacity >= 15) {
             return false; // Skip opaque blocks
         }
-        
+
         // OPTIMIZATION: Use pre-calculated offsets for neighbor queries
         int maxNeighborLight = 0;
         for (int i = 0; i < 6; i++)
@@ -2664,21 +4240,21 @@ public class McWorld : UdonSharpBehaviour
             int nx = x + neighborOffsets[i * 3];
             int ny = y + neighborOffsets[i * 3 + 1];
             int nz = z + neighborOffsets[i * 3 + 2];
-            
+
             int neighborLight = _GetNeighborLightOptimized(chunk, nx, ny, nz, isSkyLight);
             if (neighborLight > maxNeighborLight) maxNeighborLight = neighborLight;
         }
-        
+
         // Get current light FIRST
         byte currentLightByte = chunk.lightData[blockIndex];
         int currentLight = isSkyLight ? ((currentLightByte >> 4) & 0xF) : (currentLightByte & 0xF);
-        
+
         // Apply opacity (air has opacity 0, treated as 1)
         if (opacity == 0) opacity = 1;
-        
+
         int newLight = maxNeighborLight - opacity;
         if (newLight < 0) newLight = 0;
-        
+
         // For skylight: max with sky visibility (15 if can see sky)
         if (isSkyLight) {
             // MINECRAFT BEHAVIOR: Check if this block can see the sky
@@ -2688,7 +4264,7 @@ public class McWorld : UdonSharpBehaviour
             } else if (currentLight == 15) {
                 canSeeSky = true; // Already has full skylight
             }
-            
+
             if (canSeeSky && newLight < 15) {
                 newLight = 15;
             }
@@ -2698,12 +4274,12 @@ public class McWorld : UdonSharpBehaviour
             int emission = lightEmissionCache[blockID];
             if (emission > newLight) newLight = emission;
         }
-        
+
         if (newLight != currentLight) {
             // Set new light value
             if (isSkyLight) {
                 int blockLight = currentLightByte & 0xF;
-                
+
                 // MINECRAFT BEHAVIOR: When skylight is reduced by semi-transparent block,
                 // it creates block light to prevent areas from going too dark
                 if (opacity > 1 && opacity < 15 && newLight < maxNeighborLight) {
@@ -2712,13 +4288,13 @@ public class McWorld : UdonSharpBehaviour
                         blockLight = convertedBlockLight;
                     }
                 }
-                
+
                 chunk.lightData[blockIndex] = (byte)((newLight << 4) | blockLight);
             } else {
                 int skyLight = (currentLightByte >> 4) & 0xF;
                 chunk.lightData[blockIndex] = (byte)((skyLight << 4) | newLight);
             }
-            
+
             // OPTIMIZATION: Schedule neighbors using pre-calculated offsets
             for (int i = 0; i < 6; i++)
             {
@@ -2727,20 +4303,20 @@ public class McWorld : UdonSharpBehaviour
                 int nz = z + neighborOffsets[i * 3 + 2];
                 _ScheduleNeighborUpdate(chunk, nx, ny, nz, queue, ref queueEnd);
             }
-            
+
             // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
             // This ensures neighbors update their meshes when lighting changes at chunk boundaries
             if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
             {
                 TriggerNeighborMeshRebuilds(chunk);
             }
-            
+
             return true; // Light was updated
         }
-        
+
         return false; // No change
     }
-    
+
     // OPTIMIZATION: Optimized neighbor light query with bounds checking
     private int _GetNeighborLightOptimized(ChunkData chunk, int x, int y, int z, bool isSkyLight)
     {
@@ -2750,7 +4326,7 @@ public class McWorld : UdonSharpBehaviour
             // Within same chunk
             int neighborIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
             byte neighborLightByte = chunk.lightData[neighborIndex];
-            
+
             if (isSkyLight)
                 return (neighborLightByte >> 4) & 0xF;
             else
@@ -2763,7 +4339,7 @@ public class McWorld : UdonSharpBehaviour
             int neighborLocalX = x;
             int neighborLocalY = y;
             int neighborLocalZ = z;
-            
+
             // Determine which neighbor chunk and adjust local coordinates
             if (x < 0)
             {
@@ -2795,34 +4371,40 @@ public class McWorld : UdonSharpBehaviour
                 neighborChunk = chunk.neighborPZ;
                 neighborLocalZ = 0;
             }
-            
+
             // Get light from neighbor chunk if available
             if (neighborChunk != null && neighborChunk.isDataReady && neighborChunk.lightData != null)
             {
                 int neighborIndex = neighborLocalY * (chunkSizeXZ * chunkSizeXZ) + neighborLocalZ * chunkSizeXZ + neighborLocalX;
                 byte neighborLightByte = neighborChunk.lightData[neighborIndex];
-                
+
                 if (isSkyLight)
                     return (neighborLightByte >> 4) & 0xF;
                 else
                     return neighborLightByte & 0xF;
             }
-            
+
             // No neighbor chunk data = fully dark (Minecraft behavior)
             return 0;
         }
     }
-    
+
     private void InitializeChunkLighting(ChunkData chunk)
     {
+        if (UsesGpuLightingBackend())
+        {
+            chunk.lightData = null;
+            return;
+        }
+
 #if LOGGING
         float startTime = Time.realtimeSinceStartup * 1000f;
 #endif
-        
+
         // Initialize lighting data array for this chunk
         int lightDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ; // 16x16x16 = 4096
         chunk.lightData = new byte[lightDataSize];
-        
+
         // CRITICAL: Use cached neighbor references for cross-chunk lighting queries
         ChunkData[] neighbors = _GetCachedNeighbors(chunk);
         chunk.neighborPX = neighbors[0];
@@ -2831,7 +4413,7 @@ public class McWorld : UdonSharpBehaviour
         chunk.neighborNY = neighbors[3];
         chunk.neighborPZ = neighbors[4];
         chunk.neighborNZ = neighbors[5];
-        
+
 #if LOGGING
         // Debug neighbor availability
         if (enableVerboseLogging)
@@ -2846,16 +4428,16 @@ public class McWorld : UdonSharpBehaviour
             Debug.Log($"[McWorld] Chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) has {readyNeighbors}/6 ready neighbors");
         }
 #endif
-        
+
         // Get full decompressed chunk data
-        byte[] fullData = _DecompressChunkColumnRLE(chunk);
+        byte[] fullData = _GetDecompressedData(chunk);
         if (fullData == null) return;
-        
+
 #if LOGGING
         chunk.time_LightingInit = Time.realtimeSinceStartup * 1000f - startTime;
         startTime = Time.realtimeSinceStartup * 1000f;
 #endif
-        
+
         // Stage 1: Calculate initial sky light (vertical propagation)
         // OPTIMIZATION: Use reusable arrays to avoid allocations
         if (reusableBoolArray.Length < lightDataSize)
@@ -2866,13 +4448,13 @@ public class McWorld : UdonSharpBehaviour
         bool[] skylightZeroBlocks = new bool[lightDataSize];
         int skylightReachedCount = 0;
         int skylightZeroCount = 0;
-        
+
         for (int x = 0; x < chunkSizeXZ; x++)
         {
             for (int z = 0; z < chunkSizeXZ; z++)
             {
                 int skyLight = 15; // Start with full brightness at world top
-                
+
                 // OPTIMIZATION: Check if this is a top chunk to avoid expensive neighbor queries
                 if (chunk.chunkY_world >= worldDimensionY - 1)
                 {
@@ -2891,20 +4473,20 @@ public class McWorld : UdonSharpBehaviour
                         skyLight = 15; // Default to full light if chunk above not ready
                     }
                 }
-                
+
                 // Propagate downward from top (Y = chunkSizeY-1) to bottom (Y = 0)
                 for (int y = chunkSizeY - 1; y >= 0; y--)
                 {
                     int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
                     byte blockID = fullData[blockIndex];
-                    
+
                     // Get block opacity
                     int opacity = lightOpacityCache[blockID];
-                    
+
                     // CORRECTED: Current block sky light = above block sky light - current block opacity
                     int currentBlockSkyLight = skyLight - opacity;
                     if (currentBlockSkyLight < 0) currentBlockSkyLight = 0;
-                    
+
                     // MINECRAFT BEHAVIOR: When sky light is reduced by semi-transparent block,
                     // it also creates block light to prevent it going completely dark
                     int currentBlockLight = 0;
@@ -2913,10 +4495,10 @@ public class McWorld : UdonSharpBehaviour
                         // Sky light was reduced by semi-transparent block -> convert to block light
                         currentBlockLight = currentBlockSkyLight;
                     }
-                    
+
                     // Set lighting for this block
                     chunk.lightData[blockIndex] = (byte)((currentBlockSkyLight << 4) | currentBlockLight);
-                    
+
                     // OPTIMIZATION: Track blocks that got full skylight (no BFS needed)
                     if (currentBlockSkyLight == 15)
                     {
@@ -2929,13 +4511,13 @@ public class McWorld : UdonSharpBehaviour
                         skylightZeroBlocks[blockIndex] = true;
                         skylightZeroCount++;
                     }
-                    
+
                     // Use current block's light for next block down
                     skyLight = currentBlockSkyLight;
                 }
             }
         }
-        
+
         // Stage 2: Set block light for emissive blocks
         for (int i = 0; i < lightDataSize; i++)
         {
@@ -2948,15 +4530,15 @@ public class McWorld : UdonSharpBehaviour
                 chunk.lightData[i] = (byte)((skyLight << 4) | emission);
             }
         }
-        
+
 #if LOGGING
         chunk.lightingSkylightReachedBlocks = skylightReachedCount;
         chunk.lightingSkylightZeroBlocks = skylightZeroCount;
 #endif
-        
+
         // Stage 3: Propagate block light horizontally (sky light is vertical-only)
         _PropagateChunkLightingOptimized(chunk, fullData, skylightReachedBlocks, skylightZeroBlocks);
-        
+
 #if LOGGING
         // Log detailed lighting performance metrics with Y-layer visualization
         if (enableVerboseLogging)
@@ -2974,7 +4556,7 @@ public class McWorld : UdonSharpBehaviour
             sb.AppendLine($"  Neighbor Queries: {chunk.lightingNeighborQueries_Sky + chunk.lightingNeighborQueries_Block}");
             sb.AppendLine($"  Cross-Chunk Ops: {chunk.lightingCrossChunkOps_Sky + chunk.lightingCrossChunkOps_Block}");
             sb.AppendLine($"  Queue Ops: {chunk.lightingQueueOps_Sky + chunk.lightingQueueOps_Block}");
-            
+
             // DETAILED: Print Y-layer visualization
             sb.AppendLine($"--- Y-Layer Analysis ---");
             for (int y = chunkSizeY - 1; y >= 0; y--)
@@ -2982,7 +4564,7 @@ public class McWorld : UdonSharpBehaviour
                 int skylight15 = 0, skylight0 = 0, skylightOther = 0;
                 int blocklight0 = 0, blocklightOther = 0;
                 int airCount = 0, solidCount = 0;
-                
+
                 for (int z = 0; z < chunkSizeXZ; z++)
                 {
                     for (int x = 0; x < chunkSizeXZ; x++)
@@ -2992,19 +4574,19 @@ public class McWorld : UdonSharpBehaviour
                         int skyLight = (lightByte >> 4) & 0xF;
                         int blockLight = lightByte & 0xF;
                         byte blockID = fullData[blockIndex];
-                        
+
                         if (skyLight == 15) skylight15++;
                         else if (skyLight == 0) skylight0++;
                         else skylightOther++;
-                        
+
                         if (blockLight == 0) blocklight0++;
                         else blocklightOther++;
-                        
+
                         if (blockID == 0) airCount++;
                         else solidCount++;
                     }
                 }
-                
+
                 // Only print layers with interesting data
                 if (skylightOther > 0 || blocklightOther > 0 || (skylight0 > 0 && skylight0 < 256))
                 {
@@ -3013,38 +4595,38 @@ public class McWorld : UdonSharpBehaviour
                         $"Blocks[air:{airCount:D3} solid:{solidCount:D3}]");
                 }
             }
-            
+
             Debug.Log(sb.ToString());
         }
 #endif
     }
-    
+
     // NEW: Optimized PULL-based lighting propagation (Minecraft Beta 1.7.3 algorithm)
     private void _PropagateChunkLightingOptimized(ChunkData chunk, byte[] fullData, bool[] skylightReachedBlocks, bool[] skylightZeroBlocks)
     {
         // CRITICAL: Prevent infinite recursion during cross-chunk BFS
         if (chunk.isPropagatingLight) return;
-        
+
         chunk.isPropagatingLight = true;
-        
+
 #if LOGGING
         float startTime = Time.realtimeSinceStartup * 1000f;
 #endif
-        
+
         // STEP 0: Import light from all neighbor chunks into our boundary blocks
         // This ensures we don't miss light coming from already-generated neighbors
         _ImportLightFromNeighbors(chunk, fullData);
-        
+
 #if LOGGING
         chunk.time_LightingImport = Time.realtimeSinceStartup * 1000f - startTime;
         startTime = Time.realtimeSinceStartup * 1000f;
 #endif
-        
+
         // OPTIMIZATION: Use pooled queue to avoid GC pressure
         int[] lightQueue = GetBFSQueueLarge();
         int queueStart = 0;
         int queueEnd = 0;
-        
+
         // OPTIMIZATION: Pre-calculate neighbor offsets to avoid repeated calculations
         int[] neighborOffsets = {
             -1, 0, 0,  // X-
@@ -3054,11 +4636,11 @@ public class McWorld : UdonSharpBehaviour
             0, 0, -1, // Z-
             0, 0, 1   // Z+
         };
-        
+
         // MINECRAFT BETA 1.7.3 ALGORITHM:
         // Skylight has BOTH vertical initialization AND horizontal propagation via BFS
         // Vertical pass sets initial values, horizontal BFS spreads light between chunks
-        
+
         // First pass: Sky light horizontal propagation (PULL-based BFS)
         // CRITICAL: Add ALL blocks with skylight < 15
         // skylight=15: already at max, skip
@@ -3070,7 +4652,7 @@ public class McWorld : UdonSharpBehaviour
                 for (int x = 0; x < chunkSizeXZ; x++)
                 {
                     int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
-                    
+
                     // Add ALL blocks with skylight < 15 (including 0)
                     // These blocks can potentially receive light from neighbors
                     int skyLight = (chunk.lightData[blockIndex] >> 4) & 0xF;
@@ -3084,42 +4666,42 @@ public class McWorld : UdonSharpBehaviour
             }
             if (queueEnd >= lightQueue.Length - 6) break;
         }
-        
+
         // FIXED: Process sky light queue with multi-pass convergence algorithm
         int skylightIterations = 0;
         int skylightInitialQueue = queueEnd;
         int skylightMaxQueue = queueEnd;
         int maxSkylightIterations = 16; // Increased limit for better convergence
-        
+
         while (queueStart < queueEnd && skylightIterations < maxSkylightIterations)
         {
             int iterationStart = queueStart;
             int iterationEnd = queueEnd;
             int blocksProcessedThisIteration = 0;
-            
+
             while (queueStart < iterationEnd)
             {
                 int packed = lightQueue[queueStart++];
                 int x = (packed >> 16) & 0xFF;
                 int y = (packed >> 8) & 0xFF;
                 int z = packed & 0xFF;
-                
+
                 // OPTIMIZATION: Skip fully opaque blocks early
                 int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
                 byte blockID = fullData[blockIndex];
                 int opacity = lightOpacityCache[blockID];
                 if (opacity >= 15) continue;
-                
+
                 // PULL from ALL 6 neighbors and take MAX
                 bool updated = _UpdateBlockLightPULLOptimized(chunk, fullData, x, y, z, true, lightQueue, ref queueEnd, neighborOffsets);
-                
+
 #if LOGGING
                 if (updated) chunk.lightingUpdatesApplied_Sky++;
                 chunk.lightingBlocksProcessed_Sky++;
 #endif
-                
+
                 blocksProcessedThisIteration++;
-                
+
                 // FIXED: Handle queue overflow gracefully - expand queue instead of breaking
                 if (queueEnd >= lightQueue.Length - 6)
                 {
@@ -3133,14 +4715,14 @@ public class McWorld : UdonSharpBehaviour
                     break;
                 }
             }
-            
+
             skylightIterations++;
             if (queueEnd > skylightMaxQueue) skylightMaxQueue = queueEnd;
-            
+
             // If no blocks were processed this iteration, we've converged
             if (blocksProcessedThisIteration == 0) break;
         }
-        
+
 #if LOGGING
         chunk.time_LightingBFS_Sky = Time.realtimeSinceStartup * 1000f - startTime;
         if (enableVerboseLogging && skylightIterations > 0)
@@ -3151,11 +4733,11 @@ public class McWorld : UdonSharpBehaviour
         }
         startTime = Time.realtimeSinceStartup * 1000f;
 #endif
-        
+
         // Second pass: Block light propagation
         queueStart = 0;
         queueEnd = 0;
-        
+
         // OPTIMIZATION: Only add blocks that need BFS processing
         // 1. Emissive blocks (torches, glowstone, etc.)
         // 2. Blocks with skylight=0 (underground areas that need light from neighbors)
@@ -3166,7 +4748,7 @@ public class McWorld : UdonSharpBehaviour
                 for (int x = 0; x < chunkSizeXZ; x++)
                 {
                     int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
-                    
+
                     // Add emissive blocks (they emit light)
                     int blockLight = chunk.lightData[blockIndex] & 0xF;
                     if (blockLight > 0)
@@ -3185,42 +4767,42 @@ public class McWorld : UdonSharpBehaviour
             }
             if (queueEnd >= lightQueue.Length - 6) break;
         }
-        
+
         // FIXED: Process block light queue with multi-pass convergence algorithm
         int iterations = 0;
         int initialQueueSize = queueEnd;
         int maxQueueSize = queueEnd;
         int maxBlocklightIterations = 16; // Increased limit for better convergence
-        
+
         while (queueStart < queueEnd && iterations < maxBlocklightIterations)
         {
             int iterationStart = queueStart;
             int iterationEnd = queueEnd;
             int blocksProcessedThisIteration = 0;
-            
+
             while (queueStart < iterationEnd)
             {
                 int packed = lightQueue[queueStart++];
                 int x = (packed >> 16) & 0xFF;
                 int y = (packed >> 8) & 0xFF;
                 int z = packed & 0xFF;
-                
+
                 // OPTIMIZATION: Skip fully opaque blocks early
                 int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
                 byte blockID = fullData[blockIndex];
                 int opacity = lightOpacityCache[blockID];
                 if (opacity >= 15) continue;
-                
+
                 // PULL from ALL 6 neighbors and take MAX
                 bool updated = _UpdateBlockLightPULLOptimized(chunk, fullData, x, y, z, false, lightQueue, ref queueEnd, neighborOffsets);
-                
+
 #if LOGGING
                 if (updated) chunk.lightingUpdatesApplied_Block++;
                 chunk.lightingBlocksProcessed_Block++;
 #endif
-                
+
                 blocksProcessedThisIteration++;
-                
+
                 // FIXED: Handle queue overflow gracefully - expand queue instead of breaking
                 if (queueEnd >= lightQueue.Length - 6)
                 {
@@ -3234,14 +4816,14 @@ public class McWorld : UdonSharpBehaviour
                     break;
                 }
             }
-            
+
             iterations++;
             if (queueEnd > maxQueueSize) maxQueueSize = queueEnd;
-            
+
             // If no blocks were processed this iteration, we've converged
             if (blocksProcessedThisIteration == 0) break;
         }
-        
+
 #if LOGGING
         // Log BFS iteration details for debugging
         if (enableVerboseLogging && iterations > 0)
@@ -3251,22 +4833,22 @@ public class McWorld : UdonSharpBehaviour
                 $"Updates: {chunk.lightingUpdatesApplied_Block}");
         }
 #endif
-        
+
 #if LOGGING
         chunk.time_LightingBFS_Block = Time.realtimeSinceStartup * 1000f - startTime;
 #endif
-        
+
         // FIXED: Final fallback - ensure no blocks remain completely dark
         // This catches any remaining pitch black spots that BFS might have missed
         _EnsureNoPitchBlackSpots(chunk, fullData);
-        
+
         // Return queue to pool
         ReturnBFSQueue(lightQueue);
-        
+
         // Clear the flag to allow future BFS calls
         chunk.isPropagatingLight = false;
     }
-    
+
     // FIXED: Final fallback to ensure no pitch black spots remain
     private void _EnsureNoPitchBlackSpots(ChunkData chunk, byte[] fullData)
     {
@@ -3274,77 +4856,75 @@ public class McWorld : UdonSharpBehaviour
         // and try to fix them by finding the nearest light source
         int lightDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
         bool foundDarkSpots = false;
-        
-        for (int i = 0; i < lightDataSize; i++)
+        int stride = chunkSizeXZ * chunkSizeXZ;
+
+        for (int z = 0; z < chunkSizeXZ; z++)
         {
-            byte lightByte = chunk.lightData[i];
-            int skyLight = (lightByte >> 4) & 0xF;
-            int blockLight = lightByte & 0xF;
-            
-            // If both lights are 0, this is a pitch black spot
-            if (skyLight == 0 && blockLight == 0)
+            for (int x = 0; x < chunkSizeXZ; x++)
             {
-                byte blockID = fullData[i];
-                int opacity = lightOpacityCache[blockID];
-                
-                // Skip opaque blocks (they should be dark)
-                if (opacity >= 15) continue;
-                
-                // Try to find light from nearby blocks
-                int x = i % chunkSizeXZ;
-                int y = (i / (chunkSizeXZ * chunkSizeXZ)) % chunkSizeY;
-                int z = (i / chunkSizeXZ) % chunkSizeXZ;
-                
-                int bestLight = 0;
-                
-                // Check all 6 neighbors for light
-                for (int dir = 0; dir < 6; dir++)
+                int columnIndex = z * chunkSizeXZ + x;
+                int minY = 0;
+                int maxY = chunkSizeY - 1;
+
+                if (!chunk._isAllAir && chunk._columnMinY != null && chunk._columnMaxY != null)
                 {
-                    int nx = x + neighbor_dx_offsets[dir];
-                    int ny = y + neighbor_dy_offsets[dir];
-                    int nz = z + neighbor_dz_offsets[dir];
-                    
-                    if (nx >= 0 && nx < chunkSizeXZ && ny >= 0 && ny < chunkSizeY && nz >= 0 && nz < chunkSizeXZ)
+                    byte rawMin = chunk._columnMinY[columnIndex];
+                    byte rawMax = chunk._columnMaxY[columnIndex];
+                    if (rawMin == 255 || rawMax == 255) continue;
+                    minY = rawMin > 0 ? rawMin - 1 : 0;
+                    maxY = rawMax < chunkSizeY - 1 ? rawMax + 1 : chunkSizeY - 1;
+                }
+
+                for (int y = minY; y <= maxY; y++)
+                {
+                    int i = y * stride + z * chunkSizeXZ + x;
+                    byte lightByte = chunk.lightData[i];
+                    int skyLight = (lightByte >> 4) & 0xF;
+                    int blockLight = lightByte & 0xF;
+
+                    if (skyLight != 0 || blockLight != 0) continue;
+
+                    byte blockID = fullData[i];
+                    int opacity = lightOpacityCache[blockID];
+                    if (opacity >= 15) continue;
+
+                    int bestLight = 0;
+                    for (int dir = 0; dir < 6; dir++)
                     {
-                        int neighborIndex = ny * (chunkSizeXZ * chunkSizeXZ) + nz * chunkSizeXZ + nx;
-                        byte neighborLightByte = chunk.lightData[neighborIndex];
-                        int neighborSkyLight = (neighborLightByte >> 4) & 0xF;
-                        int neighborBlockLight = neighborLightByte & 0xF;
-                        int neighborMaxLight = Mathf.Max(neighborSkyLight, neighborBlockLight);
-                        
-                        if (neighborMaxLight > bestLight)
+                        int nx = x + neighbor_dx_offsets[dir];
+                        int ny = y + neighbor_dy_offsets[dir];
+                        int nz = z + neighbor_dz_offsets[dir];
+
+                        if (nx >= 0 && nx < chunkSizeXZ && ny >= 0 && ny < chunkSizeY && nz >= 0 && nz < chunkSizeXZ)
                         {
-                            bestLight = neighborMaxLight;
+                            int neighborIndex = ny * stride + nz * chunkSizeXZ + nx;
+                            byte neighborLightByte = chunk.lightData[neighborIndex];
+                            int neighborSkyLight = (neighborLightByte >> 4) & 0xF;
+                            int neighborBlockLight = neighborLightByte & 0xF;
+                            int neighborMaxLight = neighborSkyLight > neighborBlockLight ? neighborSkyLight : neighborBlockLight;
+                            if (neighborMaxLight > bestLight) bestLight = neighborMaxLight;
                         }
                     }
-                }
-                
-                // If we found light nearby, propagate it to this block
-                if (bestLight > 0)
-                {
-                    int propagatedLight = bestLight - opacity;
-                    if (propagatedLight > 0)
+
+                    if (bestLight > 0)
                     {
-                        // Use the higher of sky or block light for propagation
-                        if (bestLight >= 8) // Assume sky light if bright enough
+                        int propagatedLight = bestLight - opacity;
+                        if (propagatedLight > 0)
                         {
-                            chunk.lightData[i] = (byte)((propagatedLight << 4) | 0);
+                            if (bestLight >= 8) chunk.lightData[i] = (byte)(propagatedLight << 4);
+                            else chunk.lightData[i] = (byte)propagatedLight;
+                            foundDarkSpots = true;
                         }
-                        else // Assume block light
-                        {
-                            chunk.lightData[i] = (byte)((0 << 4) | propagatedLight);
-                        }
-                        foundDarkSpots = true;
                     }
                 }
             }
         }
-        
+
         if (foundDarkSpots && enableVerboseLogging)
         {
             Debug.Log($"[McWorld] Fixed pitch black spots in chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world})");
         }
-        
+
         // Debug: Count remaining dark spots for monitoring
         int remainingDarkSpots = 0;
         for (int i = 0; i < lightDataSize; i++)
@@ -3352,7 +4932,7 @@ public class McWorld : UdonSharpBehaviour
             byte lightByte = chunk.lightData[i];
             int skyLight = (lightByte >> 4) & 0xF;
             int blockLight = lightByte & 0xF;
-            
+
             if (skyLight == 0 && blockLight == 0)
             {
                 byte blockID = fullData[i];
@@ -3363,33 +4943,33 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
         if (remainingDarkSpots > 0 && enableVerboseLogging)
         {
             Debug.LogWarning($"[McWorld] Chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) still has {remainingDarkSpots} dark spots after BFS");
         }
     }
-    
+
     // OLD: Legacy PUSH-based method (kept for reference/compatibility)
     private void _PropagateChunkLighting(ChunkData chunk, byte[] fullData)
     {
         // CRITICAL: Prevent infinite recursion during cross-chunk BFS
         if (chunk.isPropagatingLight) return;
-        
+
         chunk.isPropagatingLight = true;
-        
+
         // Minecraft Beta 1.7.3 style flood-fill lighting propagation
         // CRITICAL: First import light from neighbor chunks, THEN propagate
-        
+
         // STEP 0: Import light from all neighbor chunks into our boundary blocks
         // This ensures we don't miss light coming from already-generated neighbors
         _ImportLightFromNeighbors(chunk, fullData);
-        
+
         // Queue for light propagation: stores packed position (x, y, z)
         int[] lightQueue = new int[4096 * 2]; // Oversized to handle cascading
         int queueStart = 0;
         int queueEnd = 0;
-        
+
         // First pass: Propagate sky light horizontally
         // Add all lit blocks to the queue
         for (int y = 0; y < chunkSizeY; y++)
@@ -3411,7 +4991,7 @@ public class McWorld : UdonSharpBehaviour
             }
             if (queueEnd >= lightQueue.Length) break;
         }
-        
+
         // Process sky light queue
         while (queueStart < queueEnd)
         {
@@ -3419,10 +4999,10 @@ public class McWorld : UdonSharpBehaviour
             int x = (packed >> 16) & 0xFF;
             int y = (packed >> 8) & 0xFF;
             int z = packed & 0xFF;
-            
+
             int centerIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
             int centerLight = (chunk.lightData[centerIndex] >> 4) & 0xF;
-            
+
             // Propagate to 6 neighbors
             _PropagateLightToNeighbor(chunk, fullData, x - 1, y, z, centerLight, true, lightQueue, ref queueEnd);
             _PropagateLightToNeighbor(chunk, fullData, x + 1, y, z, centerLight, true, lightQueue, ref queueEnd);
@@ -3430,14 +5010,14 @@ public class McWorld : UdonSharpBehaviour
             _PropagateLightToNeighbor(chunk, fullData, x, y + 1, z, centerLight, true, lightQueue, ref queueEnd);
             _PropagateLightToNeighbor(chunk, fullData, x, y, z - 1, centerLight, true, lightQueue, ref queueEnd);
             _PropagateLightToNeighbor(chunk, fullData, x, y, z + 1, centerLight, true, lightQueue, ref queueEnd);
-            
+
             if (queueEnd >= lightQueue.Length - 6) break; // Safety: leave room for 6 neighbors
         }
-        
+
         // Second pass: Propagate block light horizontally
         queueStart = 0;
         queueEnd = 0;
-        
+
         // Add all emissive blocks to the queue
         for (int y = 0; y < chunkSizeY; y++)
         {
@@ -3457,7 +5037,7 @@ public class McWorld : UdonSharpBehaviour
             }
             if (queueEnd >= lightQueue.Length) break;
         }
-        
+
         // Process block light queue
         while (queueStart < queueEnd)
         {
@@ -3465,10 +5045,10 @@ public class McWorld : UdonSharpBehaviour
             int x = (packed >> 16) & 0xFF;
             int y = (packed >> 8) & 0xFF;
             int z = packed & 0xFF;
-            
+
             int centerIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
             int centerLight = chunk.lightData[centerIndex] & 0xF;
-            
+
             // Propagate to 6 neighbors
             _PropagateLightToNeighbor(chunk, fullData, x - 1, y, z, centerLight, false, lightQueue, ref queueEnd);
             _PropagateLightToNeighbor(chunk, fullData, x + 1, y, z, centerLight, false, lightQueue, ref queueEnd);
@@ -3476,27 +5056,27 @@ public class McWorld : UdonSharpBehaviour
             _PropagateLightToNeighbor(chunk, fullData, x, y + 1, z, centerLight, false, lightQueue, ref queueEnd);
             _PropagateLightToNeighbor(chunk, fullData, x, y, z - 1, centerLight, false, lightQueue, ref queueEnd);
             _PropagateLightToNeighbor(chunk, fullData, x, y, z + 1, centerLight, false, lightQueue, ref queueEnd);
-            
+
             if (queueEnd >= lightQueue.Length - 6) break;
         }
-        
+
         // Clear the flag to allow future BFS calls
         chunk.isPropagatingLight = false;
     }
-    
+
     // NEW: PULL-based block light update (Minecraft Beta 1.7.3 algorithm)
     private bool _UpdateBlockLightPULL(ChunkData chunk, byte[] fullData, int x, int y, int z, bool isSkyLight, int[] queue, ref int queueEnd)
     {
         int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         byte blockID = fullData[blockIndex];
-        
+
         // OPTIMIZATION: Skip fully opaque blocks (opacity >= 15)
         // Light cannot penetrate these blocks, so no point processing them
         int opacity = lightOpacityCache[blockID];
         if (opacity >= 15) {
             return false; // Skip opaque blocks
         }
-        
+
         // Get light from ALL 6 neighbors and find MAXIMUM
         int light_X_minus = _GetNeighborLight(chunk, fullData, x-1, y, z, isSkyLight);
         int light_X_plus  = _GetNeighborLight(chunk, fullData, x+1, y, z, isSkyLight);
@@ -3504,14 +5084,14 @@ public class McWorld : UdonSharpBehaviour
         int light_Y_plus  = _GetNeighborLight(chunk, fullData, x, y+1, z, isSkyLight);
         int light_Z_minus = _GetNeighborLight(chunk, fullData, x, y, z-1, isSkyLight);
         int light_Z_plus  = _GetNeighborLight(chunk, fullData, x, y, z+1, isSkyLight);
-        
+
 #if LOGGING
         if (isSkyLight)
             chunk.lightingNeighborQueries_Sky += 6;
         else
             chunk.lightingNeighborQueries_Block += 6;
 #endif
-        
+
         // Find MAX of all neighbors
         int maxNeighborLight = light_X_minus;
         if (light_X_plus > maxNeighborLight) maxNeighborLight = light_X_plus;
@@ -3519,17 +5099,17 @@ public class McWorld : UdonSharpBehaviour
         if (light_Y_plus > maxNeighborLight) maxNeighborLight = light_Y_plus;
         if (light_Z_minus > maxNeighborLight) maxNeighborLight = light_Z_minus;
         if (light_Z_plus > maxNeighborLight) maxNeighborLight = light_Z_plus;
-        
+
         // Get current light FIRST
         byte currentLightByte = chunk.lightData[blockIndex];
         int currentLight = isSkyLight ? ((currentLightByte >> 4) & 0xF) : (currentLightByte & 0xF);
-        
+
         // Apply opacity (air has opacity 0, treated as 1)
         if (opacity == 0) opacity = 1;
-        
+
         int newLight = maxNeighborLight - opacity;
         if (newLight < 0) newLight = 0;
-        
+
         // For skylight: max with sky visibility (15 if can see sky)
         if (isSkyLight) {
             // MINECRAFT BEHAVIOR: Check if this block can see the sky
@@ -3540,7 +5120,7 @@ public class McWorld : UdonSharpBehaviour
             } else if (currentLight == 15) {
                 canSeeSky = true; // Already has full skylight
             }
-            
+
             if (canSeeSky && newLight < 15) {
                 newLight = 15;
             }
@@ -3550,11 +5130,11 @@ public class McWorld : UdonSharpBehaviour
             int emission = lightEmissionCache[blockID];
             if (emission > newLight) newLight = emission;
         }
-        
+
         // MINECRAFT BETA 1.7.3 BEHAVIOR: Update skylight whenever newLight != currentLight
         // Skylight can both increase AND decrease during horizontal propagation
         // This is essential for proper light propagation across chunk boundaries
-        
+
         if (newLight != currentLight) {
 #if LOGGING
             // Debug boundary lighting updates
@@ -3564,11 +5144,11 @@ public class McWorld : UdonSharpBehaviour
                     $"{currentLight} -> {newLight}, maxNeighbor={maxNeighborLight}, opacity={opacity}");
             }
 #endif
-            
+
             // Set new light value
             if (isSkyLight) {
                 int blockLight = currentLightByte & 0xF;
-                
+
                 // MINECRAFT BEHAVIOR: When skylight is reduced by semi-transparent block,
                 // it creates block light to prevent areas from going too dark
                 // This happens during HORIZONTAL propagation when opacity reduces light
@@ -3580,13 +5160,13 @@ public class McWorld : UdonSharpBehaviour
                         blockLight = convertedBlockLight;
                     }
                 }
-                
+
                 chunk.lightData[blockIndex] = (byte)((newLight << 4) | blockLight);
             } else {
                 int skyLight = (currentLightByte >> 4) & 0xF;
                 chunk.lightData[blockIndex] = (byte)((skyLight << 4) | newLight);
             }
-            
+
             // MINECRAFT BETA 1.7.3 PROPAGATION:
             // Schedule ALL 6 neighbors for re-evaluation (symmetric propagation)
             // The light value decrease (newLight < currentLight) naturally prevents infinite propagation
@@ -3596,27 +5176,27 @@ public class McWorld : UdonSharpBehaviour
             _ScheduleNeighborUpdate(chunk, x, y+1, z, queue, ref queueEnd);  // Y+
             _ScheduleNeighborUpdate(chunk, x, y, z-1, queue, ref queueEnd);  // Z-
             _ScheduleNeighborUpdate(chunk, x, y, z+1, queue, ref queueEnd);  // Z+
-            
+
             // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
             // This ensures neighbors update their meshes when lighting changes at chunk boundaries
             if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
             {
                 TriggerNeighborMeshRebuilds(chunk);
             }
-            
+
 #if LOGGING
             if (isSkyLight)
                 chunk.lightingQueueOps_Sky += 6;
             else
                 chunk.lightingQueueOps_Block += 6;
 #endif
-            
+
             return true; // Light was updated
         }
-        
+
         return false; // No change
     }
-    
+
     // Helper: Get light value from a neighbor (handles cross-chunk boundaries)
     private int _GetNeighborLight(ChunkData chunk, byte[] fullData, int x, int y, int z, bool isSkyLight)
     {
@@ -3626,7 +5206,7 @@ public class McWorld : UdonSharpBehaviour
             // Within same chunk
             int neighborIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
             byte neighborLightByte = chunk.lightData[neighborIndex];
-            
+
             if (isSkyLight)
                 return (neighborLightByte >> 4) & 0xF;
             else
@@ -3639,7 +5219,7 @@ public class McWorld : UdonSharpBehaviour
             int neighborLocalX = x;
             int neighborLocalY = y;
             int neighborLocalZ = z;
-            
+
             // Determine which neighbor chunk and adjust local coordinates
             if (x < 0)
             {
@@ -3671,20 +5251,20 @@ public class McWorld : UdonSharpBehaviour
                 neighborChunk = chunk.neighborPZ;
                 neighborLocalZ = 0;
             }
-            
+
             // Get light from neighbor chunk if available
             if (neighborChunk != null && neighborChunk.isDataReady && neighborChunk.lightData != null)
             {
                 int neighborIndex = neighborLocalY * (chunkSizeXZ * chunkSizeXZ) + neighborLocalZ * chunkSizeXZ + neighborLocalX;
                 byte neighborLightByte = neighborChunk.lightData[neighborIndex];
-                
+
 #if LOGGING
                 if (isSkyLight)
                     chunk.lightingCrossChunkOps_Sky++;
                 else
                     chunk.lightingCrossChunkOps_Block++;
 #endif
-                
+
                 if (isSkyLight)
                     return (neighborLightByte >> 4) & 0xF;
                 else
@@ -3701,12 +5281,12 @@ public class McWorld : UdonSharpBehaviour
                 Debug.Log($"[McWorld] Cross-chunk query failed: neighbor exists but {reason}");
             }
 #endif
-            
+
             // No neighbor chunk data = fully dark (Minecraft behavior)
             return 0;
         }
     }
-    
+
     // Helper: Schedule a neighbor for update (add to queue)
     private void _ScheduleNeighborUpdate(ChunkData chunk, int x, int y, int z, int[] queue, ref int queueEnd)
     {
@@ -3722,7 +5302,7 @@ public class McWorld : UdonSharpBehaviour
         // NOTE: Cross-chunk updates are handled by _ReconcileLightingWithNeighbors
         // Don't try to schedule them during BFS to prevent recursion/queue overflow
     }
-    
+
     // OLD: Legacy PUSH-based method (kept for reference/compatibility)
     private void _PropagateLightToNeighbor(ChunkData chunk, byte[] fullData, int x, int y, int z, int sourceLight, bool isSkyLight, int[] queue, ref int queueEnd)
     {
@@ -3732,18 +5312,18 @@ public class McWorld : UdonSharpBehaviour
             // Within same chunk - process directly
         int neighborIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         byte blockID = fullData[neighborIndex];
-        
+
         // Get block opacity (CRITICAL: treat 0 as 1)
         int opacity = lightOpacityCache[blockID];
         if (opacity == 0) opacity = 1;
-        
+
         // If opacity >= 15, light can't pass through
         if (opacity >= 15) return;
-        
+
         // Calculate propagated light value
         int newLight = sourceLight - opacity;
         if (newLight <= 0) return;
-        
+
         // Get current light value at neighbor
         byte currentLightByte = chunk.lightData[neighborIndex];
         int currentLight;
@@ -3751,10 +5331,10 @@ public class McWorld : UdonSharpBehaviour
             currentLight = (currentLightByte >> 4) & 0xF;
         else
             currentLight = currentLightByte & 0xF;
-        
+
         // Only update if new light is brighter
         if (newLight <= currentLight) return;
-        
+
         // Update light value
         if (isSkyLight)
         {
@@ -3768,7 +5348,7 @@ public class McWorld : UdonSharpBehaviour
             int skyLight = (currentLightByte >> 4) & 0xF;
             chunk.lightData[neighborIndex] = (byte)((skyLight << 4) | newLight);
         }
-        
+
         // Add to queue for further propagation
             queue[queueEnd++] = (x << 16) | (y << 8) | z;
         }
@@ -3778,18 +5358,18 @@ public class McWorld : UdonSharpBehaviour
             _PropagateToNeighborChunk(chunk, x, y, z, sourceLight, isSkyLight);
         }
     }
-    
+
     private void _PropagateToNeighborChunk(ChunkData chunk, int x, int y, int z, int sourceLight, bool isSkyLight)
     {
         // MINECRAFT BETA 1.7.3 APPROACH: Update the boundary block, then trigger full BFS in neighbor
         // This ensures light propagates through the neighbor to its neighbors
-        
+
         // Determine which neighbor chunk and adjust coordinates
         ChunkData neighborChunk = null;
         int neighborLocalX = x;
         int neighborLocalY = y;
         int neighborLocalZ = z;
-        
+
         if (x < 0)
         {
             neighborChunk = chunk.neighborNX;
@@ -3820,29 +5400,29 @@ public class McWorld : UdonSharpBehaviour
             neighborChunk = chunk.neighborPZ;
             neighborLocalZ = 0;
         }
-        
+
         // If neighbor chunk not ready, can't propagate
         if (neighborChunk == null || !neighborChunk.isDataReady || neighborChunk.lightData == null)
             return;
-        
+
         // Get neighbor block data
         byte[] neighborData = _DecompressChunkColumnRLE(neighborChunk);
         if (neighborData == null) return;
-        
+
         int neighborIndex = neighborLocalY * (chunkSizeXZ * chunkSizeXZ) + neighborLocalZ * chunkSizeXZ + neighborLocalX;
         byte blockID = neighborData[neighborIndex];
-        
+
         // Get block opacity (CRITICAL: treat 0 as 1)
         int opacity = lightOpacityCache[blockID];
         if (opacity == 0) opacity = 1;
-        
+
         // If opacity >= 15, light can't pass through
         if (opacity >= 15) return;
-        
+
         // Calculate propagated light value
         int newLight = sourceLight - opacity;
         if (newLight <= 0) return;
-        
+
         // Get current light value at neighbor
         byte currentLightByte = neighborChunk.lightData[neighborIndex];
         int currentLight;
@@ -3850,10 +5430,10 @@ public class McWorld : UdonSharpBehaviour
             currentLight = (currentLightByte >> 4) & 0xF;
         else
             currentLight = currentLightByte & 0xF;
-        
+
         // Only update if new light is brighter
         if (newLight <= currentLight) return;
-        
+
         // Update light value in neighbor chunk
         if (isSkyLight)
         {
@@ -3865,37 +5445,37 @@ public class McWorld : UdonSharpBehaviour
             int skyLight = (currentLightByte >> 4) & 0xF;
             neighborChunk.lightData[neighborIndex] = (byte)((skyLight << 4) | newLight);
         }
-        
+
         // FIXED: Trigger lightweight boundary BFS instead of full chunk BFS
         // This allows the light we just added to spread through the neighbor efficiently
         _PropagateBoundaryLighting(neighborChunk, neighborData);
-        
+
         // FIXED: Trigger neighbor mesh rebuilds for cross-chunk lighting updates
         // This ensures the neighbor chunk updates its mesh when light propagates across boundaries
         TriggerNeighborMeshRebuilds(neighborChunk);
     }
-    
+
     private void _UpdateBlockLighting(ChunkData chunk, int x, int y, int z, byte oldBlockID, byte newBlockID)
     {
         // Minecraft Beta 1.7.3 style lighting update for a single block change
         // This is a simplified version that handles the most common cases
-        
+
         int lightIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
-        byte[] fullData = _DecompressChunkColumnRLE(chunk);
+        byte[] fullData = _GetDecompressedData(chunk);
         if (fullData == null) return;
-        
+
         int oldOpacity = lightOpacityCache[oldBlockID];
         int newOpacity = lightOpacityCache[newBlockID];
         int oldEmission = lightEmissionCache[oldBlockID];
         int newEmission = lightEmissionCache[newBlockID];
-        
+
         // If opacity or emission changed, we need to recalculate lighting
         bool needsUpdate = (oldOpacity != newOpacity) || (oldEmission != newEmission);
         if (!needsUpdate) return;
-        
+
         // Recalculate lighting at this position and propagate
         _RecalculateLightAtPosition(chunk, fullData, x, y, z);
-        
+
         // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
         // This ensures neighbors update their meshes when lighting changes at chunk boundaries
         if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
@@ -3903,16 +5483,16 @@ public class McWorld : UdonSharpBehaviour
             TriggerNeighborMeshRebuilds(chunk);
         }
     }
-    
+
     private void _RecalculateLightAtPosition(ChunkData chunk, byte[] fullData, int x, int y, int z)
     {
         // Recalculate light value at a single position following Minecraft Beta 1.7.3 logic
         int lightIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         byte blockID = fullData[lightIndex];
-        
+
         int opacity = lightOpacityCache[blockID];
         if (opacity == 0) opacity = 1; // CRITICAL: treat air as opacity 1
-        
+
         // Calculate sky light
         int newSkyLight = 0;
         if (y == chunkSizeY - 1)
@@ -3934,15 +5514,15 @@ public class McWorld : UdonSharpBehaviour
             if (neighborLight > maxNeighborSky) maxNeighborSky = neighborLight;
             neighborLight = _GetSkyLightAt(chunk, x, y, z + 1);
             if (neighborLight > maxNeighborSky) maxNeighborSky = neighborLight;
-            
+
             newSkyLight = maxNeighborSky - opacity;
             if (newSkyLight < 0) newSkyLight = 0;
         }
-        
+
         // Calculate block light
         int emission = lightEmissionCache[blockID];
         int newBlockLight = emission;
-        
+
         // Check 6 neighbors and take maximum propagated value
         int maxNeighborBlock = _GetBlockLightAt(chunk, x - 1, y, z);
         int neighborBlockLight = _GetBlockLightAt(chunk, x + 1, y, z);
@@ -3955,18 +5535,18 @@ public class McWorld : UdonSharpBehaviour
         if (neighborBlockLight > maxNeighborBlock) maxNeighborBlock = neighborBlockLight;
         neighborBlockLight = _GetBlockLightAt(chunk, x, y, z + 1);
         if (neighborBlockLight > maxNeighborBlock) maxNeighborBlock = neighborBlockLight;
-        
+
         int propagatedBlockLight = maxNeighborBlock - opacity;
         if (propagatedBlockLight < 0) propagatedBlockLight = 0;
         if (propagatedBlockLight > newBlockLight) newBlockLight = propagatedBlockLight;
-        
+
         // Update the light value
         chunk.lightData[lightIndex] = (byte)((newSkyLight << 4) | newBlockLight);
-        
+
         // Propagate changes to neighbors (simplified flood-fill)
         _PropagateChangedLight(chunk, fullData, x, y, z, newSkyLight, newBlockLight);
     }
-    
+
     private void _PropagateChangedLight(ChunkData chunk, byte[] fullData, int x, int y, int z, int skyLight, int blockLight)
     {
         // Simple recursive propagation (limited depth to avoid stack overflow)
@@ -3978,46 +5558,46 @@ public class McWorld : UdonSharpBehaviour
         _PropagateToNeighborIfBrighter(chunk, fullData, x, y, z - 1, skyLight, blockLight, 1);
         _PropagateToNeighborIfBrighter(chunk, fullData, x, y, z + 1, skyLight, blockLight, 1);
     }
-    
+
     private void _PropagateToNeighborIfBrighter(ChunkData chunk, byte[] fullData, int x, int y, int z, int sourceSkyLight, int sourceBlockLight, int depth)
     {
         // Limit recursion depth to prevent stack overflow
         if (depth > 15) return;
-        
+
         // Bounds check
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ)
             return;
-        
+
         int neighborIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         byte blockID = fullData[neighborIndex];
-        
+
         int opacity = lightOpacityCache[blockID];
         if (opacity == 0) opacity = 1;
         if (opacity >= 15) return; // Can't propagate through opaque blocks
-        
+
         // Calculate propagated light values
         int newSkyLight = sourceSkyLight - opacity;
         int newBlockLight = sourceBlockLight - opacity;
         if (newSkyLight < 0) newSkyLight = 0;
         if (newBlockLight < 0) newBlockLight = 0;
-        
+
         // Get current light at neighbor
         byte currentByte = chunk.lightData[neighborIndex];
         int currentSkyLight = (currentByte >> 4) & 0xF;
         int currentBlockLight = currentByte & 0xF;
-        
+
         // Check if update is needed
         bool skyBrighter = newSkyLight > currentSkyLight + 1; // +1 threshold to reduce updates
         bool blockBrighter = newBlockLight > currentBlockLight + 1;
-        
+
         if (!skyBrighter && !blockBrighter) return;
-        
+
         // Update light values
         if (skyBrighter) currentSkyLight = newSkyLight;
         if (blockBrighter) currentBlockLight = newBlockLight;
-        
+
         chunk.lightData[neighborIndex] = (byte)((currentSkyLight << 4) | currentBlockLight);
-        
+
         // Continue propagation
         _PropagateToNeighborIfBrighter(chunk, fullData, x - 1, y, z, currentSkyLight, currentBlockLight, depth + 1);
         _PropagateToNeighborIfBrighter(chunk, fullData, x + 1, y, z, currentSkyLight, currentBlockLight, depth + 1);
@@ -4026,25 +5606,25 @@ public class McWorld : UdonSharpBehaviour
         _PropagateToNeighborIfBrighter(chunk, fullData, x, y, z - 1, currentSkyLight, currentBlockLight, depth + 1);
         _PropagateToNeighborIfBrighter(chunk, fullData, x, y, z + 1, currentSkyLight, currentBlockLight, depth + 1);
     }
-    
+
     private int _GetSkyLightAt(ChunkData chunk, int x, int y, int z)
     {
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ)
             return 0;
-        
+
         int lightIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         return (chunk.lightData[lightIndex] >> 4) & 0xF;
     }
-    
+
     private int _GetBlockLightAt(ChunkData chunk, int x, int y, int z)
     {
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ)
             return 0;
-        
+
         int lightIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
         return chunk.lightData[lightIndex] & 0xF;
     }
-    
+
     private float _GetLightBrightnessAtBlock(ChunkData chunk, int localX, int localY, int localZ)
     {
         // Check if chunk has light data
@@ -4052,36 +5632,36 @@ public class McWorld : UdonSharpBehaviour
         {
             return 1.0f; // Default to full brightness if no lighting data
         }
-        
+
         // Bounds check
         if (localX < 0 || localX >= chunkSizeXZ || localY < 0 || localY >= chunkSizeY || localZ < 0 || localZ >= chunkSizeXZ)
         {
             return 1.0f; // Default to full brightness if out of bounds
         }
-        
+
         // Sample light data at this position
         int lightIndex = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
         byte lightByte = chunk.lightData[lightIndex];
-        
+
         // Extract sky light (high 4 bits) and block light (low 4 bits)
         int skyLight = (lightByte >> 4) & 0xF;
         int blockLight = lightByte & 0xF;
-        
+
         // Apply time-of-day adjustment to sky light
         skyLight -= skylightSubtracted;
         if (skyLight < 0) skyLight = 0;
-        
+
         // Take maximum of sky light and block light (Minecraft behavior)
         int finalLight = skyLight > blockLight ? skyLight : blockLight;
-        
+
         // Clamp to valid range
         if (finalLight < 0) finalLight = 0;
         if (finalLight > 15) finalLight = 15;
-        
+
         // Look up brightness from table
         return lightBrightnessTable[finalLight];
     }
-    
+
     // FIXED: Sample light from the neighbor block that the face is against
     private float _GetLightBrightnessForFace(ChunkData chunk, Vector3 faceNormal, int localX, int localY, int localZ)
     {
@@ -4089,22 +5669,22 @@ public class McWorld : UdonSharpBehaviour
         int neighborX = localX + Mathf.RoundToInt(faceNormal.x);
         int neighborY = localY + Mathf.RoundToInt(faceNormal.y);
         int neighborZ = localZ + Mathf.RoundToInt(faceNormal.z);
-        
+
         // Check if neighbor is in the same chunk
-        if (neighborX >= 0 && neighborX < chunkSizeXZ && 
-            neighborY >= 0 && neighborY < chunkSizeY && 
+        if (neighborX >= 0 && neighborX < chunkSizeXZ &&
+            neighborY >= 0 && neighborY < chunkSizeY &&
             neighborZ >= 0 && neighborZ < chunkSizeXZ)
         {
             // Sample light from neighbor block in same chunk
             return _GetLightBrightnessAtBlock(chunk, neighborX, neighborY, neighborZ);
         }
-        
+
         // Neighbor is in a different chunk - sample from neighbor chunk
         ChunkData neighborChunk = null;
         int neighborLocalX = neighborX;
         int neighborLocalY = neighborY;
         int neighborLocalZ = neighborZ;
-        
+
         // Determine which neighbor chunk and adjust local coordinates
         if (neighborX < 0)
         {
@@ -4136,18 +5716,23 @@ public class McWorld : UdonSharpBehaviour
             neighborChunk = chunk.neighborPZ;
             neighborLocalZ = 0;
         }
-        
+
         // Sample from neighbor chunk if available
         if (neighborChunk != null && neighborChunk.isDataReady && neighborChunk.lightData != null)
         {
             return _GetLightBrightnessAtBlock(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
         }
-        
+
+        if (UsesGpuLightingBackend())
+        {
+            return 1.0f;
+        }
+
         // No neighbor chunk data = fully dark (Minecraft behavior)
         return lightBrightnessTable[0]; // 0 light level = darkest
     }
-    
-    
+
+
     private int _GetSkyLightFromChunkAbove(int chunkX, int chunkY, int chunkZ, int localX, int localZ)
     {
         // Get the chunk above
@@ -4166,7 +5751,7 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
         // Fallback: assume full light from above
         return 15;
     }
@@ -4190,49 +5775,118 @@ public class McWorld : UdonSharpBehaviour
         }
         return 0;
     }
-    
+
     private void _StoreBiomeData(ChunkData chunk)
     {
         // Get biome temperature and rainfall data from the terrain generator
         // This needs to be called right after chunk generation completes
         if (terrainGenerator == null) return;
-        
+
         // Request the current biome data from terrain generator
         // The terrain generator should have this cached for the current chunk
         terrainGenerator.GetBiomeDataForChunk(chunk.chunkX_world, chunk.chunkZ_world, chunk._biomeTemperatures, chunk._biomeRainfall);
+        chunk._cachedBiomeColorsValid = false;
     }
-    
+
+    private void _RefreshChunkDerivedData(ChunkData chunk, byte[] fullData)
+    {
+        if (chunk == null || fullData == null) return;
+
+        int columnCount = chunkSizeXZ * chunkSizeXZ;
+        if (chunk._columnMinY == null || chunk._columnMinY.Length != columnCount)
+        {
+            chunk._columnMinY = new byte[columnCount];
+            chunk._columnMaxY = new byte[columnCount];
+        }
+        if (chunk._crossBlockPackedPositions == null || chunk._crossBlockPackedPositions.Length != fullData.Length)
+        {
+            chunk._crossBlockPackedPositions = new int[fullData.Length];
+        }
+
+        chunk._crossBlockCount = 0;
+        chunk._isAllAir = true;
+        chunk._hasEmissiveBlocks = false;
+        chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
+        chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
+        chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
+
+        for (int i = 0; i < columnCount; i++)
+        {
+            chunk._columnMinY[i] = 255;
+            chunk._columnMaxY[i] = 255;
+        }
+
+        int stride = chunkSizeXZ * chunkSizeXZ;
+        for (int y = 0; y < chunkSizeY; y++)
+        {
+            int yBase = y * stride;
+            for (int z = 0; z < chunkSizeXZ; z++)
+            {
+                int zBase = yBase + z * chunkSizeXZ;
+                for (int x = 0; x < chunkSizeXZ; x++)
+                {
+                    int idx = zBase + x;
+                    byte blockID = fullData[idx];
+                    if (blockID == 0) continue;
+
+                    chunk._isAllAir = false;
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY[columnIndex] == 255) chunk._columnMinY[columnIndex] = (byte)y;
+                    chunk._columnMaxY[columnIndex] = (byte)y;
+
+                    // OPTIMIZATION: Track chunk-global spatial bounds
+                    if (y < chunk._chunkGlobalMinY) chunk._chunkGlobalMinY = (byte)y;
+                    if (y > chunk._chunkGlobalMaxY) chunk._chunkGlobalMaxY = (byte)y;
+                    if (x < chunk._chunkGlobalMinX) chunk._chunkGlobalMinX = (byte)x;
+                    if (x > chunk._chunkGlobalMaxX) chunk._chunkGlobalMaxX = (byte)x;
+                    if (z < chunk._chunkGlobalMinZ) chunk._chunkGlobalMinZ = (byte)z;
+                    if (z > chunk._chunkGlobalMaxZ) chunk._chunkGlobalMaxZ = (byte)z;
+
+                    if (!chunk._hasEmissiveBlocks && blockID < lightEmissionCache.Length && lightEmissionCache[blockID] > 0)
+                    {
+                        chunk._hasEmissiveBlocks = true;
+                    }
+
+                    if (blockID < shapeTypeCache.Length && shapeTypeCache[blockID] == McBlockShapeType.Cross)
+                    {
+                        chunk._crossBlockPackedPositions[chunk._crossBlockCount++] = (x << 16) | (y << 8) | z;
+                    }
+                }
+            }
+        }
+    }
+
     // OPTIMIZATION: Optimized biome color calculation that avoids allocations
     private Color _GetBiomeColorForBlockOptimized(ChunkData chunk, byte blockID, int localX, int localZ)
     {
         // Default white color (no tint) with full AO
         Color defaultColor = new Color(1f, 1f, 1f, 1f);
-        
+
         // OPTIMIZATION: Early exit for non-tinted blocks
         if (!BetaBiome.IsGrassTintedBlock(blockID) && !BetaBiome.IsFoliageTintedBlock(blockID) && !BetaBiome.IsWaterTintedBlock(blockID))
         {
             return defaultColor; // No tinting needed
         }
-        
+
         // Get biome data for this block's XZ position
         if (chunk._biomeTemperatures == null || chunk._biomeRainfall == null)
         {
             return defaultColor; // Biome data not available
         }
-        
+
         // Calculate biome data index (16x16 grid)
         int biomeIndex = localZ * chunkSizeXZ + localX;
-        
+
         // Bounds check
         if (biomeIndex < 0 || biomeIndex >= chunk._biomeTemperatures.Length)
         {
             return defaultColor;
         }
-        
+
         // Get temperature and rainfall for this block's position
         double temperature = chunk._biomeTemperatures[biomeIndex];
         double rainfall = chunk._biomeRainfall[biomeIndex];
-        
+
         // OPTIMIZATION: Calculate biome color based on block type using actual Beta 1.7.3 textures
         Color biomeColor;
         if (BetaBiome.IsGrassTintedBlock(blockID))
@@ -4247,13 +5901,13 @@ public class McWorld : UdonSharpBehaviour
         {
             biomeColor = BetaBiome.GetWaterColor(temperature, rainfall, waterColorTexture);
         }
-        
+
         // Keep full alpha for AO (alpha channel is used for vertex AO in the shader)
         biomeColor.a = 1f;
-        
+
         return biomeColor;
     }
-    
+
     // OPTIMIZATION: Optimized lighting calculation that avoids Vector3 allocations
     private float _GetLightBrightnessForFaceOptimized(ChunkData chunk, Vector3 faceNormal, int localX, int localY, int localZ)
     {
@@ -4261,22 +5915,22 @@ public class McWorld : UdonSharpBehaviour
         int neighborX = localX + Mathf.RoundToInt(faceNormal.x);
         int neighborY = localY + Mathf.RoundToInt(faceNormal.y);
         int neighborZ = localZ + Mathf.RoundToInt(faceNormal.z);
-        
+
         // Check if neighbor is in the same chunk
-        if (neighborX >= 0 && neighborX < chunkSizeXZ && 
-            neighborY >= 0 && neighborY < chunkSizeY && 
+        if (neighborX >= 0 && neighborX < chunkSizeXZ &&
+            neighborY >= 0 && neighborY < chunkSizeY &&
             neighborZ >= 0 && neighborZ < chunkSizeXZ)
         {
             // Sample light from neighbor block in same chunk
             return _GetLightBrightnessAtBlockOptimized(chunk, neighborX, neighborY, neighborZ);
         }
-        
+
         // Neighbor is in a different chunk - sample from neighbor chunk
         ChunkData neighborChunk = null;
         int neighborLocalX = neighborX;
         int neighborLocalY = neighborY;
         int neighborLocalZ = neighborZ;
-        
+
         // Determine which neighbor chunk and adjust local coordinates
         if (neighborX < 0)
         {
@@ -4308,17 +5962,22 @@ public class McWorld : UdonSharpBehaviour
             neighborChunk = chunk.neighborPZ;
             neighborLocalZ = 0;
         }
-        
+
         // Sample from neighbor chunk if available
         if (neighborChunk != null && neighborChunk.isDataReady && neighborChunk.lightData != null)
         {
             return _GetLightBrightnessAtBlockOptimized(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
         }
-        
+
+        if (UsesGpuLightingBackend())
+        {
+            return 1.0f;
+        }
+
         // No neighbor chunk data = fully dark (Minecraft behavior)
         return lightBrightnessTable[0]; // 0 light level = darkest
     }
-    
+
     // OPTIMIZATION: Optimized block lighting calculation
     private float _GetLightBrightnessAtBlockOptimized(ChunkData chunk, int localX, int localY, int localZ)
     {
@@ -4327,70 +5986,70 @@ public class McWorld : UdonSharpBehaviour
         {
             return 1.0f; // Default to full brightness if no lighting data
         }
-        
+
         // Bounds check
         if (localX < 0 || localX >= chunkSizeXZ || localY < 0 || localY >= chunkSizeY || localZ < 0 || localZ >= chunkSizeXZ)
         {
             return 1.0f; // Default to full brightness if out of bounds
         }
-        
+
         // Sample light data at this position
         int lightIndex = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
         byte lightByte = chunk.lightData[lightIndex];
-        
+
         // Extract sky light (high 4 bits) and block light (low 4 bits)
         int skyLight = (lightByte >> 4) & 0xF;
         int blockLight = lightByte & 0xF;
-        
+
         // Apply time-of-day adjustment to sky light
         skyLight -= skylightSubtracted;
         if (skyLight < 0) skyLight = 0;
-        
+
         // Take maximum of sky light and block light (Minecraft behavior)
         int finalLight = skyLight > blockLight ? skyLight : blockLight;
-        
+
         // Clamp to valid range
         if (finalLight < 0) finalLight = 0;
         if (finalLight > 15) finalLight = 15;
-        
+
         // Look up brightness from table
         return lightBrightnessTable[finalLight];
     }
-    
+
     private Color _GetBiomeColorForBlock(ChunkData chunk, byte blockID, int localX, int localZ)
     {
         // Default white color (no tint) with full AO
         Color defaultColor = new Color(1f, 1f, 1f, 1f);
-        
+
         // Check if this block type should be biome tinted
         bool isGrassTinted = BetaBiome.IsGrassTintedBlock(blockID);
         bool isFoliageTinted = BetaBiome.IsFoliageTintedBlock(blockID);
         bool isWaterTinted = BetaBiome.IsWaterTintedBlock(blockID);
-        
+
         if (!isGrassTinted && !isFoliageTinted && !isWaterTinted)
         {
             return defaultColor; // No tinting needed
         }
-        
+
         // Get biome data for this block's XZ position
         if (chunk._biomeTemperatures == null || chunk._biomeRainfall == null)
         {
             return defaultColor; // Biome data not available
         }
-        
+
         // Calculate biome data index (16x16 grid)
         int biomeIndex = localZ * chunkSizeXZ + localX;
-        
+
         // Bounds check
         if (biomeIndex < 0 || biomeIndex >= chunk._biomeTemperatures.Length)
         {
             return defaultColor;
         }
-        
+
         // Get temperature and rainfall for this block's position
         double temperature = chunk._biomeTemperatures[biomeIndex];
         double rainfall = chunk._biomeRainfall[biomeIndex];
-        
+
         // Calculate biome color based on block type using actual Beta 1.7.3 textures
         Color biomeColor;
         if (isGrassTinted)
@@ -4405,23 +6064,29 @@ public class McWorld : UdonSharpBehaviour
         {
             biomeColor = BetaBiome.GetWaterColor(temperature, rainfall, waterColorTexture);
         }
-        
+
         // Keep full alpha for AO (alpha channel is used for vertex AO in the shader)
         biomeColor.a = 1f;
-        
+
         return biomeColor;
     }
-    
+
     // OPTIMIZATION Phase 3: Pre-compute brightness for all blocks in chunk
     // This eliminates 10,000+ method calls during meshing
     private void _PreComputeChunkBrightness(ChunkData chunk)
     {
+        if (UsesGpuLightingBackend())
+        {
+            chunk._cachedBrightness = null;
+            return;
+        }
+
         // Allocate brightness cache if needed (4096 bytes for 16x16x16)
         if (chunk._cachedBrightness == null || chunk._cachedBrightness.Length != chunkSizeXZ * chunkSizeY * chunkSizeXZ)
         {
             chunk._cachedBrightness = new byte[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
         }
-        
+
         // Check if we have light data
         if (chunk.lightData == null)
         {
@@ -4432,7 +6097,7 @@ public class McWorld : UdonSharpBehaviour
             }
             return;
         }
-        
+
         // Pre-compute brightness for all blocks in this chunk
         int stride = chunkSizeXZ * chunkSizeXZ;
         for (int y = 0; y < chunkSizeY; y++)
@@ -4445,29 +6110,29 @@ public class McWorld : UdonSharpBehaviour
                 {
                     int idx = zBase + x;
                     byte lightByte = chunk.lightData[idx];
-                    
+
                     // Extract sky light (high 4 bits) and block light (low 4 bits)
                     int skyLight = (lightByte >> 4) & 0xF;
                     int blockLight = lightByte & 0xF;
-                    
+
                     // Apply time-of-day adjustment to sky light
                     skyLight -= skylightSubtracted;
                     if (skyLight < 0) skyLight = 0;
-                    
+
                     // Take maximum of sky light and block light (Minecraft behavior)
                     int finalLight = skyLight > blockLight ? skyLight : blockLight;
-                    
+
                     // Clamp to valid range (0-15)
                     if (finalLight < 0) finalLight = 0;
                     if (finalLight > 15) finalLight = 15;
-                    
+
                     // Store light level (0-15) directly
                     chunk._cachedBrightness[idx] = (byte)finalLight;
                 }
             }
         }
     }
-    
+
     // OPTIMIZATION Phase 3: Fast brightness lookup from pre-computed cache
     private float _GetCachedBrightnessAtBlock(ChunkData chunk, int localX, int localY, int localZ)
     {
@@ -4476,21 +6141,21 @@ public class McWorld : UdonSharpBehaviour
         {
             return 1.0f; // Default to full brightness if out of bounds
         }
-        
+
         // Check if cache exists
         if (chunk._cachedBrightness == null)
         {
             return 1.0f; // Default to full brightness
         }
-        
+
         // Direct lookup from cache
         int idx = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
         int lightLevel = chunk._cachedBrightness[idx];
-        
+
         // Look up brightness from table
         return lightBrightnessTable[lightLevel];
     }
-    
+
     // OPTIMIZATION Phase 3: Fast brightness lookup for faces (uses cached data)
     private float _GetCachedBrightnessForFace(ChunkData chunk, Vector3 faceNormal, int localX, int localY, int localZ)
     {
@@ -4498,22 +6163,22 @@ public class McWorld : UdonSharpBehaviour
         int neighborX = localX + Mathf.RoundToInt(faceNormal.x);
         int neighborY = localY + Mathf.RoundToInt(faceNormal.y);
         int neighborZ = localZ + Mathf.RoundToInt(faceNormal.z);
-        
+
         // Check if neighbor is in the same chunk
-        if (neighborX >= 0 && neighborX < chunkSizeXZ && 
-            neighborY >= 0 && neighborY < chunkSizeY && 
+        if (neighborX >= 0 && neighborX < chunkSizeXZ &&
+            neighborY >= 0 && neighborY < chunkSizeY &&
             neighborZ >= 0 && neighborZ < chunkSizeXZ)
         {
             // Use cached brightness from same chunk
             return _GetCachedBrightnessAtBlock(chunk, neighborX, neighborY, neighborZ);
         }
-        
+
         // Neighbor is in a different chunk - determine which neighbor
         ChunkData neighborChunk = null;
         int neighborLocalX = neighborX;
         int neighborLocalY = neighborY;
         int neighborLocalZ = neighborZ;
-        
+
         if (neighborX < 0)
         {
             neighborChunk = chunk.neighborNX;
@@ -4544,17 +6209,22 @@ public class McWorld : UdonSharpBehaviour
             neighborChunk = chunk.neighborPZ;
             neighborLocalZ = 0;
         }
-        
+
         // Sample from neighbor chunk if available
         if (neighborChunk != null && neighborChunk.isDataReady && neighborChunk._cachedBrightness != null)
         {
             return _GetCachedBrightnessAtBlock(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
         }
-        
+
+        if (UsesGpuLightingBackend())
+        {
+            return 1.0f;
+        }
+
         // No neighbor chunk data = fully dark (Minecraft behavior)
         return lightBrightnessTable[0]; // 0 light level = darkest
     }
-    
+
     // OPTIMIZATION Phase 6: Pre-compute biome colors for all XZ columns in chunk
     // This eliminates ~10,000 biome texture lookups, reducing to just 256
     private void _PreComputeBiomeColors(ChunkData chunk)
@@ -4563,8 +6233,11 @@ public class McWorld : UdonSharpBehaviour
         if (chunk._cachedBiomeColors == null || chunk._cachedBiomeColors.Length != chunkSizeXZ * chunkSizeXZ)
         {
             chunk._cachedBiomeColors = new Color[chunkSizeXZ * chunkSizeXZ];
+            chunk._cachedBiomeColorsValid = false;
         }
-        
+
+        if (chunk._cachedBiomeColorsValid) return;
+
         // Check if biome data is available
         if (chunk._biomeTemperatures == null || chunk._biomeRainfall == null)
         {
@@ -4574,79 +6247,82 @@ public class McWorld : UdonSharpBehaviour
             {
                 chunk._cachedBiomeColors[i] = defaultColor;
             }
+            chunk._cachedBiomeColorsValid = true;
             return;
         }
-        
+
         // Pre-compute biome colors for each XZ column
         for (int z = 0; z < chunkSizeXZ; z++)
         {
             for (int x = 0; x < chunkSizeXZ; x++)
             {
                 int idx = z * chunkSizeXZ + x;
-                
+
                 // Get temperature and rainfall for this column
                 double temperature = chunk._biomeTemperatures[idx];
                 double rainfall = chunk._biomeRainfall[idx];
-                
+
                 // Calculate grass color for this biome (most common tinted block type)
                 // We use grass color as default since it's the most common
                 // Individual blocks will check if they need different tinting
                 Color grassColor = BetaBiome.GetGrassColor(temperature, rainfall, grassColorTexture);
                 grassColor.a = 1f; // Keep full alpha
-                
+
                 chunk._cachedBiomeColors[idx] = grassColor;
             }
         }
+
+        chunk._cachedBiomeColorsValid = true;
     }
-    
+
     // OPTIMIZATION Phase 6: Get cached biome color with block-specific tinting
     // This uses the pre-computed cache but applies proper tinting based on block type
     private Color _GetCachedBiomeColor(ChunkData chunk, byte blockID, int localX, int localZ)
     {
         // Default white color (no tint)
         Color defaultColor = new Color(1f, 1f, 1f, 1f);
-        
+
         // Check if cache exists
         if (chunk._cachedBiomeColors == null)
         {
             return defaultColor;
         }
-        
+
         // Bounds check
         if (localX < 0 || localX >= chunkSizeXZ || localZ < 0 || localZ >= chunkSizeXZ)
         {
             return defaultColor;
         }
-        
+
         // OPTIMIZATION: Early exit for non-tinted blocks
         bool isGrassTinted = BetaBiome.IsGrassTintedBlock(blockID);
         bool isFoliageTinted = BetaBiome.IsFoliageTintedBlock(blockID);
         bool isWaterTinted = BetaBiome.IsWaterTintedBlock(blockID);
-        
+
         if (!isGrassTinted && !isFoliageTinted && !isWaterTinted)
         {
             return defaultColor; // No tinting needed
         }
-        
+
         // Get index for this XZ position
         int idx = localZ * chunkSizeXZ + localX;
-        
+
         // If it's grass-tinted, we can use the cached value directly
         if (isGrassTinted)
         {
             return chunk._cachedBiomeColors[idx];
         }
-        
+
         // For foliage or water, we need to recalculate with correct tint type
         // But we can still use the cached biome data
         if (chunk._biomeTemperatures == null || chunk._biomeRainfall == null)
         {
             return defaultColor;
         }
-        
+
         double temperature = chunk._biomeTemperatures[idx];
         double rainfall = chunk._biomeRainfall[idx];
-        
+
         Color biomeColor;
         if (isFoliageTinted)
         {
@@ -4656,11 +6332,11 @@ public class McWorld : UdonSharpBehaviour
         {
             biomeColor = BetaBiome.GetWaterColor(temperature, rainfall, waterColorTexture);
         }
-        
+
         biomeColor.a = 1f;
         return biomeColor;
     }
-    
+
     #endregion
 
     // OPTIMIZATION: Simplified reconciliation to prevent lag spikes
@@ -4670,17 +6346,17 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         float startTime = Time.realtimeSinceStartup * 1000f;
 #endif
-        
+
         // OPTIMIZATION: Lightweight reconciliation - only update immediate boundaries
         // This prevents cascading updates that cause lag spikes on new columns
-        
-        byte[] chunkData = _DecompressChunkColumnRLE(chunk);
+
+        byte[] chunkData = _GetDecompressedData(chunk);
         if (chunkData == null) return;
-        
+
         // OPTIMIZATION: Only reconcile with ready neighbors to avoid cascading
         ChunkData[] neighbors = _GetCachedNeighbors(chunk);
         int readyNeighbors = 0;
-        
+
         for (int dir = 0; dir < 6; dir++)
         {
             ChunkData neighbor = neighbors[dir];
@@ -4690,33 +6366,33 @@ public class McWorld : UdonSharpBehaviour
                 _UpdateNeighborBoundaryLighting(chunk, neighbor, dir, chunkData);
             }
         }
-        
+
         // FIXED: Always do boundary BFS if we have any ready neighbors
         // This ensures light propagates even for isolated chunks
         if (readyNeighbors > 0)
         {
             _PerformLightweightBFS(chunk, chunkData);
-            
+
             // FIXED: Trigger neighbor mesh rebuilds after lighting reconciliation
             // This ensures neighbors update their meshes when lighting changes
             TriggerNeighborMeshRebuilds(chunk);
         }
-        
+
 #if LOGGING
         chunk.time_LightingReconcile = Time.realtimeSinceStartup * 1000f - startTime;
 #endif
     }
-    
+
     // OPTIMIZATION: Update only the boundary lighting between two chunks
     private void _UpdateNeighborBoundaryLighting(ChunkData chunk, ChunkData neighbor, int direction, byte[] chunkData)
     {
         // Only update the boundary face between the two chunks
         // This is much cheaper than full BFS
-        
+
         int faceSize = chunkSizeXZ * chunkSizeY; // Size of one face
         int[] boundaryOffsets = new int[faceSize];
         int boundaryCount = 0;
-        
+
         // Calculate boundary block indices based on direction
         for (int y = 0; y < chunkSizeY; y++)
         {
@@ -4733,34 +6409,34 @@ public class McWorld : UdonSharpBehaviour
                     case 5: x = i; z = i; break; // NY face (simplified)
                     default: continue;
                 }
-                
+
                 if (x >= 0 && x < chunkSizeXZ && z >= 0 && z < chunkSizeXZ)
                 {
                     boundaryOffsets[boundaryCount++] = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
                 }
             }
         }
-        
+
         // Update lighting for boundary blocks only
         for (int i = 0; i < boundaryCount; i++)
         {
             int blockIndex = boundaryOffsets[i];
             byte blockID = chunkData[blockIndex];
             int opacity = lightOpacityCache[blockID];
-            
+
             if (opacity < 15) // Skip fully opaque blocks
             {
                 _UpdateSingleBlockLighting(chunk, blockIndex, blockID);
             }
         }
     }
-    
+
     // OPTIMIZATION: Lightweight BFS with limited scope
     private void _PerformLightweightBFS(ChunkData chunk, byte[] chunkData)
     {
         int[] lightQueue = GetBFSQueue();
         int queueEnd = 0;
-        
+
         // OPTIMIZATION: Only add boundary blocks to queue
         for (int y = 1; y < chunkSizeY - 1; y++)
         {
@@ -4769,20 +6445,20 @@ public class McWorld : UdonSharpBehaviour
                 // X faces
                 lightQueue[queueEnd++] = (0 << 16) | (y << 8) | z;
                 lightQueue[queueEnd++] = ((chunkSizeXZ - 1) << 16) | (y << 8) | z;
-                
+
                 // Z faces
                 lightQueue[queueEnd++] = (z << 16) | (y << 8) | 0;
                 lightQueue[queueEnd++] = (z << 16) | (y << 8) | (chunkSizeXZ - 1);
-                
+
                 if (queueEnd >= lightQueue.Length - 10) break;
             }
             if (queueEnd >= lightQueue.Length - 10) break;
         }
-        
+
         // OPTIMIZATION: Limited BFS iterations
         int queueStart = 0;
         int[] neighborOffsets = { -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1 };
-        
+
         for (int iteration = 0; iteration < 2 && queueStart < queueEnd; iteration++)
         {
             int iterationEnd = queueEnd;
@@ -4792,54 +6468,54 @@ public class McWorld : UdonSharpBehaviour
                 int x = (packed >> 16) & 0xFF;
                 int y = (packed >> 8) & 0xFF;
                 int z = packed & 0xFF;
-                
+
                 _UpdateBlockLightPULLOptimized(chunk, chunkData, x, y, z, true, lightQueue, ref queueEnd, neighborOffsets);
             }
         }
-        
+
         // FIXED: Trigger neighbor mesh rebuilds after lightweight BFS
         // This ensures neighbors update their meshes when boundary lighting changes
         TriggerNeighborMeshRebuilds(chunk);
-        
+
         ReturnBFSQueue(lightQueue);
     }
-    
+
     // OPTIMIZATION: Update lighting for a single block
     private void _UpdateSingleBlockLighting(ChunkData chunk, int blockIndex, byte blockID)
     {
         int y = blockIndex / (chunkSizeXZ * chunkSizeXZ);
         int z = (blockIndex / chunkSizeXZ) % chunkSizeXZ;
         int x = blockIndex % chunkSizeXZ;
-        
+
         int opacity = lightOpacityCache[blockID];
         if (opacity == 0) opacity = 1;
-        
+
         // Calculate new lighting based on neighbors
         int maxNeighborLight = 0;
         int[] neighborOffsets = { -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1 };
-        
+
         for (int i = 0; i < 6; i++)
         {
             int nx = x + neighborOffsets[i * 3];
             int ny = y + neighborOffsets[i * 3 + 1];
             int nz = z + neighborOffsets[i * 3 + 2];
-            
+
             int neighborLight = _GetNeighborLightOptimized(chunk, nx, ny, nz, true);
             if (neighborLight > maxNeighborLight) maxNeighborLight = neighborLight;
         }
-        
+
         int newLight = maxNeighborLight - opacity;
         if (newLight < 0) newLight = 0;
-        
+
         // Update if different
         byte currentByte = chunk.lightData[blockIndex];
         int currentLight = (currentByte >> 4) & 0xF;
-        
+
         if (newLight != currentLight)
         {
             int blockLight = currentByte & 0xF;
             chunk.lightData[blockIndex] = (byte)((newLight << 4) | blockLight);
-            
+
             // FIXED: Trigger neighbor mesh rebuilds for boundary blocks
             // This ensures neighbors update their meshes when lighting changes at chunk boundaries
             if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
@@ -4848,17 +6524,17 @@ public class McWorld : UdonSharpBehaviour
             }
         }
     }
-    
+
     // Add all boundary blocks of a chunk to the reconciliation queue
     private void _AddBoundaryBlocksToQueue(ChunkData chunk, int[] queue, ref int queueEnd)
     {
         // Pack: chunkX(8bits) | chunkY(4bits) | chunkZ(4bits) | localX(4bits) | localY(4bits) | localZ(4bits) = 28 bits
         // This allows us to track blocks across multiple chunks in the same queue
-        
+
         int chunkXPacked = (chunk.chunkX_world & 0xFF) << 24;
         int chunkYPacked = (chunk.chunkY_world & 0xF) << 20;
         int chunkZPacked = (chunk.chunkZ_world & 0xF) << 16;
-        
+
         // Add boundary faces (not edges/corners to keep queue size reasonable)
         // X faces
         for (int y = 1; y < chunkSizeY - 1 && queueEnd < queue.Length - 1; y++)
@@ -4870,7 +6546,7 @@ public class McWorld : UdonSharpBehaviour
                     queue[queueEnd++] = chunkXPacked | chunkYPacked | chunkZPacked | ((chunkSizeXZ-1) << 12) | (y << 8) | (z << 4);
             }
         }
-        
+
         // Z faces
         for (int y = 1; y < chunkSizeY - 1 && queueEnd < queue.Length - 1; y++)
         {
@@ -4882,17 +6558,17 @@ public class McWorld : UdonSharpBehaviour
             }
         }
     }
-    
+
     // Add a neighbor chunk's boundary face to the reconciliation queue
     private void _AddNeighborBoundaryToQueue(ChunkData neighborChunk, int faceDir, int[] queue, ref int queueEnd)
     {
         int chunkXPacked = (neighborChunk.chunkX_world & 0xFF) << 24;
         int chunkYPacked = (neighborChunk.chunkY_world & 0xF) << 20;
         int chunkZPacked = (neighborChunk.chunkZ_world & 0xF) << 16;
-        
+
         // Add boundary face based on direction
         // 0=NZ, 1=PZ, 2=NX, 3=PX, 4=NY, 5=PY
-        
+
         switch(faceDir)
         {
             case 0: // -Z face (z=0)
@@ -4917,7 +6593,7 @@ public class McWorld : UdonSharpBehaviour
                 break;
         }
     }
-    
+
     // OLD: Run a limited BFS that only propagates from boundary blocks inward
     // This is much cheaper than a full chunk BFS and sufficient for reconciliation
     private void _PropagateBoundaryLighting(ChunkData chunk, byte[] fullData)
@@ -4925,7 +6601,7 @@ public class McWorld : UdonSharpBehaviour
         // Get a BFS queue
         int[] lightQueue = GetBFSQueue();
         int queueEnd = 0;
-        
+
         // Add all boundary blocks to the queue (faces only, not edges/corners)
         // X faces
         bool queueFull = false;
@@ -4942,7 +6618,7 @@ public class McWorld : UdonSharpBehaviour
                     queueFull = true;
                     break;
                 }
-                
+
                 if (queueEnd < lightQueue.Length - 1)
                 {
                     lightQueue[queueEnd++] = ((chunkSizeXZ - 1) << 16) | (y << 8) | z; // X = 15
@@ -4954,7 +6630,7 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
         // Z faces
         if (!queueFull)
         {
@@ -4971,7 +6647,7 @@ public class McWorld : UdonSharpBehaviour
                         queueFull = true;
                         break;
                     }
-                    
+
                     if (queueEnd < lightQueue.Length - 1)
                     {
                         lightQueue[queueEnd++] = (x << 16) | (y << 8) | (chunkSizeXZ - 1); // Z = 15
@@ -4984,7 +6660,7 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
         // Y faces (less important but include for completeness)
         if (!queueFull)
         {
@@ -5005,7 +6681,7 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
-        
+
         // FIXED: Process skylight with convergence-based iterations
         // Continue until no more updates occur (proper convergence)
         int queueStart = 0;
@@ -5025,11 +6701,11 @@ public class McWorld : UdonSharpBehaviour
                 _UpdateBlockLightPULL(chunk, fullData, x, y, z, true, lightQueue, ref queueEnd);
             }
             skylightIterations++;
-            
+
             // If no new blocks were added to queue, we've converged
             if (queueStart == queueEnd) break;
         }
-        
+
         // FIXED: Process block light with convergence-based iterations
         queueStart = 0;
         queueEnd = initialQueueSize; // Reset to boundary blocks only
@@ -5048,23 +6724,23 @@ public class McWorld : UdonSharpBehaviour
                 _UpdateBlockLightPULL(chunk, fullData, x, y, z, false, lightQueue, ref queueEnd);
             }
             blocklightIterations++;
-            
+
             // If no new blocks were added to queue, we've converged
             if (queueStart == queueEnd) break;
         }
-        
+
         // FIXED: Trigger neighbor mesh rebuilds after boundary lighting propagation
         // This ensures neighbors update their meshes when boundary lighting changes
         TriggerNeighborMeshRebuilds(chunk);
-        
+
         ReturnBFSQueue(lightQueue);
     }
-    
+
     // OLD: Per-block lighting update (REMOVED - too expensive, caused lag and darkening)
     // Previously: Scheduled individual BFS updates for 1000+ boundary blocks
     // Problem: Way too slow, and caused darkening by pulling from all neighbors
     // Solution: Use simplified reconciliation that just re-imports boundaries
-    
+
     // Import light from all neighbor chunks into this chunk's boundary blocks
     // This ensures BFS starts with light from already-generated neighbors
     private void _ImportLightFromNeighbors(ChunkData chunk, byte[] fullData)
@@ -5075,36 +6751,36 @@ public class McWorld : UdonSharpBehaviour
             int neighborChunkX = chunk.chunkX_world + neighbor_dx_offsets[dir];
             int neighborChunkY = chunk.chunkY_world + neighbor_dy_offsets[dir];
             int neighborChunkZ = chunk.chunkZ_world + neighbor_dz_offsets[dir];
-            
+
             ChunkData neighborChunk = GetChunkAt(neighborChunkX, neighborChunkY, neighborChunkZ);
-            
+
             // Skip if neighbor doesn't exist or isn't ready
             if (neighborChunk == null || !neighborChunk.isDataReady || neighborChunk.lightData == null)
                 continue;
-            
+
             // Get neighbor's data
             byte[] neighborData = _DecompressChunkColumnRLE(neighborChunk);
             if (neighborData == null) continue;
-            
+
             // Import light from neighbor's boundary to our boundary
             _ImportFromNeighborBoundary(chunk, fullData, neighborChunk, neighborData, dir);
         }
     }
-    
+
     // Import light from a specific neighbor chunk's boundary
     private void _ImportFromNeighborBoundary(ChunkData chunk, byte[] chunkData, ChunkData neighborChunk, byte[] neighborData, int direction)
     {
         // Iterate over all blocks on the boundary face
         int size1 = (direction == 4 || direction == 5) ? chunkSizeXZ : chunkSizeXZ;
         int size2 = (direction == 4 || direction == 5) ? chunkSizeXZ : chunkSizeY;
-        
+
         for (int i = 0; i < size1; i++)
         {
             for (int j = 0; j < size2; j++)
             {
                 int chunkX = 0, chunkY = 0, chunkZ = 0;
                 int neighborX = 0, neighborY = 0, neighborZ = 0;
-                
+
                 // Determine coordinates based on direction (reversed from export)
                 switch (direction)
                 {
@@ -5133,52 +6809,52 @@ public class McWorld : UdonSharpBehaviour
                         neighborX = i; neighborY = 0; neighborZ = j;
                         break;
                 }
-                
+
                 // Get neighbor's light
                 int neighborIndex = neighborY * (chunkSizeXZ * chunkSizeXZ) + neighborZ * chunkSizeXZ + neighborX;
                 byte neighborLightByte = neighborChunk.lightData[neighborIndex];
                 int neighborSkyLight = (neighborLightByte >> 4) & 0xF;
                 int neighborBlockLight = neighborLightByte & 0xF;
-                
+
                 // Get our boundary block
                 int chunkIndex = chunkY * (chunkSizeXZ * chunkSizeXZ) + chunkZ * chunkSizeXZ + chunkX;
                 byte ourBlockID = chunkData[chunkIndex];
-                
+
                 // Get our block opacity
                 int opacity = lightOpacityCache[ourBlockID];
                 if (opacity == 0) opacity = 1;
-                
+
                 // Skip if we're fully opaque
                 if (opacity >= 15) continue;
-                
+
                 // Calculate propagated light from neighbor into us
                 int propagatedSkyLight = neighborSkyLight - opacity;
                 int propagatedBlockLight = neighborBlockLight - opacity;
                 if (propagatedSkyLight < 0) propagatedSkyLight = 0;
                 if (propagatedBlockLight < 0) propagatedBlockLight = 0;
-                
+
                 // Get our current light
                 byte ourLightByte = chunk.lightData[chunkIndex];
                 int ourSkyLight = (ourLightByte >> 4) & 0xF;
                 int ourBlockLight = ourLightByte & 0xF;
-                
+
                 // Update if neighbor's propagated light is brighter
                 if (propagatedSkyLight > ourSkyLight) ourSkyLight = propagatedSkyLight;
                 if (propagatedBlockLight > ourBlockLight) ourBlockLight = propagatedBlockLight;
-                
+
                 // Apply update
                 chunk.lightData[chunkIndex] = (byte)((ourSkyLight << 4) | ourBlockLight);
             }
         }
-        
+
         // FIXED: Trigger neighbor mesh rebuilds after importing light from neighbors
         // This ensures neighbors update their meshes when light is imported across boundaries
         TriggerNeighborMeshRebuilds(chunk);
     }
-    
+
 #if LOGGING
     // --- Performance Logging Methods ---
-    
+
     private void LogFrameStats(float updateTime)
     {
         logBuilder.Clear();
@@ -5187,7 +6863,7 @@ public class McWorld : UdonSharpBehaviour
         logBuilder.AppendLine($"  DataGen: {activeDataGenCount} chunks active");
         logBuilder.AppendLine($"  Meshing: {activeMeshingCount} chunks active");
         logBuilder.AppendLine($"  Reconciliation Queue: {deferredReconciliationQueue.Count}");
-        
+
         if (enableCacheTracking)
         {
             int totalDecomp = stats_decompCacheHits + stats_decompCacheMisses;
@@ -5196,17 +6872,17 @@ public class McWorld : UdonSharpBehaviour
             float neighborHitRate = totalNeighbor > 0 ? (stats_neighborCacheHits / (float)totalNeighbor * 100f) : 0f;
             logBuilder.AppendLine($"Cache: Decomp {decompHitRate:F0}% hit ({stats_decompCacheHits}/{totalDecomp}), Neighbor {neighborHitRate:F0}% hit ({stats_neighborCacheHits}/{totalNeighbor})");
         }
-        
+
         Debug.Log(logBuilder.ToString());
     }
-    
+
     private void LogAggregateStats()
     {
         float windowDuration = Time.realtimeSinceStartup - stats_aggregateWindowStart;
-        
+
         logBuilder.Clear();
         logBuilder.AppendLine($"=== Performance Summary (last {aggregateLogInterval} frames, {windowDuration:F1} seconds) ===");
-        
+
         // Update stats
         if (stats_frameCount > 0)
         {
@@ -5214,7 +6890,7 @@ public class McWorld : UdonSharpBehaviour
             logBuilder.AppendLine($"Update: avg {avgUpdateTime:F2}ms, min {stats_updateTimeMin:F2}ms, max {stats_updateTimeMax:F2}ms");
             logBuilder.AppendLine($"  Budget exceeded: {stats_budgetExceededCount} times ({(stats_budgetExceededCount / (float)stats_frameCount * 100f):F1}%)");
         }
-        
+
         // Mesh building stats
         if (stats_meshBuildTotal > 0)
         {
@@ -5222,7 +6898,7 @@ public class McWorld : UdonSharpBehaviour
             float avgStepsPerChunk = stats_meshStepsTotal / (float)stats_meshBuildTotal;
             logBuilder.AppendLine($"Mesh Building: {stats_meshBuildTotal} chunks, avg {avgMeshTime:F2}ms (min {stats_meshBuildTimeMin:F2}ms, max {stats_meshBuildTimeMax:F2}ms)");
             logBuilder.AppendLine($"  Steps: avg {avgStepsPerChunk:F1} per chunk");
-            
+
             if (enableDetailedTimings)
             {
                 float totalGreedy = stats_greedyAxisYTime + stats_greedyAxisZTime + stats_greedyAxisXTime;
@@ -5231,7 +6907,7 @@ public class McWorld : UdonSharpBehaviour
                     logBuilder.AppendLine($"  Greedy Meshing: Y={stats_greedyAxisYTime / totalGreedy * 100f:F0}% ({stats_greedyAxisYTime:F1}ms), Z={stats_greedyAxisZTime / totalGreedy * 100f:F0}% ({stats_greedyAxisZTime:F1}ms), X={stats_greedyAxisXTime / totalGreedy * 100f:F0}% ({stats_greedyAxisXTime:F1}ms)");
                 }
             }
-            
+
             if (enableCounters && stats_faceCullingTests > 0)
             {
                 float cullRate = stats_facesCulled / (float)stats_faceCullingTests * 100f;
@@ -5239,13 +6915,13 @@ public class McWorld : UdonSharpBehaviour
                 logBuilder.AppendLine($"  Vertices: {stats_verticesOpaque} opaque, {stats_verticesTransparent} transparent, {stats_verticesCutout} cutout");
             }
         }
-        
+
         // RLE stats
         if (stats_rleCompressions > 0 || stats_rleDecompressions > 0)
         {
             float compressionRatio = stats_rleTotalBytesIn > 0 ? (stats_rleTotalBytesOut / (float)stats_rleTotalBytesIn) : 0f;
             logBuilder.AppendLine($"RLE: {compressionRatio * 100f:F0}% compression ratio ({stats_rleTotalBytesIn / 1024f:F1}KB→{stats_rleTotalBytesOut / 1024f:F1}KB)");
-            
+
             if (enableDetailedTimings)
             {
                 float avgCompTime = stats_rleCompressions > 0 ? stats_rleCompressionTime / stats_rleCompressions : 0f;
@@ -5253,7 +6929,7 @@ public class McWorld : UdonSharpBehaviour
                 logBuilder.AppendLine($"  Compressions: {stats_rleCompressions} (avg {avgCompTime:F2}ms), Decompressions: {stats_rleDecompressions} (avg {avgDecompTime:F2}ms)");
                 logBuilder.AppendLine($"  Homogeneous chunks: {stats_rleHomogeneousChunks}");
             }
-            
+
             if (enableCacheTracking)
             {
                 int totalDecomp = stats_decompCacheHits + stats_decompCacheMisses;
@@ -5261,7 +6937,7 @@ public class McWorld : UdonSharpBehaviour
                 logBuilder.AppendLine($"  Cache hit rate: {decompHitRate:F1}% ({stats_decompCacheHits}/{totalDecomp})");
             }
         }
-        
+
         // Block operation stats
         if (enableCounters && stats_getBlockCalls > 0)
         {
@@ -5271,7 +6947,7 @@ public class McWorld : UdonSharpBehaviour
                 logBuilder.AppendLine($"  Neighbor rebuilds triggered: {stats_neighborRebuildTriggers}");
             }
         }
-        
+
         // Cache stats
         if (enableCacheTracking)
         {
@@ -5281,22 +6957,22 @@ public class McWorld : UdonSharpBehaviour
             float neighborHitRate = totalNeighbor > 0 ? (stats_neighborCacheHits / (float)totalNeighbor * 100f) : 0f;
             logBuilder.AppendLine($"Cache: Decomp {decompHitRate:F1}% ({stats_decompCacheHits}/{totalDecomp}), Neighbor {neighborHitRate:F1}% ({stats_neighborCacheHits}/{totalNeighbor})");
         }
-        
+
         // Reconciliation stats
         if (stats_reconciliationOps > 0)
         {
             float avgReconcilTime = stats_reconciliationTime / stats_reconciliationOps;
             logBuilder.AppendLine($"Reconciliation: {stats_reconciliationOps} ops, {stats_reconciliationBlocks} blocks, avg {avgReconcilTime:F2}ms");
         }
-        
+
         // Chunk management stats
         if (enableCounters)
         {
             logBuilder.AppendLine($"Chunks: {stats_chunkCreations} created, {stats_chunkStateTransitions} state transitions");
         }
-        
+
         Debug.Log(logBuilder.ToString());
-        
+
         // Reset aggregate stats for next window
         stats_aggregateWindowStart = Time.realtimeSinceStartup;
         stats_frameCount = 0;

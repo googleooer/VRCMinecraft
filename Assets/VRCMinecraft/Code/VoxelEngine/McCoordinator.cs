@@ -1,4 +1,4 @@
-﻿#define LOGGING
+#define LOGGING
 
 using UdonSharp;
 using UnityEngine;
@@ -29,7 +29,7 @@ public class McCoordinator : UdonSharpBehaviour
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
     public float updateTimeBudgetMs = 8.0f;
     [Tooltip("Skip N state checks per worker to reduce overhead (higher = less responsive but faster)")]
-    public int skipCheckCycles = 1;
+    public int skipCheckCycles = 0;
 
     [Header("Workload Per Step")]
     [Tooltip("How many Z-columns of voxels to generate per step inside a chunk. Higher values generate chunks faster but may cause lag spikes.")]
@@ -56,6 +56,7 @@ public class McCoordinator : UdonSharpBehaviour
     private int totalWorldChunks;
     private int chunksCompletedCount = 0;
     private bool isGeneratorBusy = false;
+    private float benchmarkStartTime = 0f;
     
     // --- Player-Initiated Rebuild Queue ---
     private int[] chunkRebuildQueue;
@@ -96,6 +97,7 @@ public class McCoordinator : UdonSharpBehaviour
         this.totalWorldChunks = worldTotalChunks;
         this.nextChunkIndexToAssign = 0;
         this.chunksCompletedCount = 0;
+        this.benchmarkStartTime = Time.realtimeSinceStartup;
 #if LOGGING
         this.lastLoggedPercent = -1;
 #endif
@@ -163,14 +165,6 @@ public class McCoordinator : UdonSharpBehaviour
                 continue;
             }
 
-            // OPTIMIZATION: Skip state checks for a few cycles to reduce overhead
-            int skipCount = worker_skipCheckCounter[i];
-            if (skipCount > 0)
-            {
-                worker_skipCheckCounter[i] = skipCount - 1;
-                continue;
-            }
-
             // Direct chunk access (already validated index)
             ChunkData chunk = chunks[chunkIndex];
             if (chunk == null)
@@ -180,88 +174,120 @@ public class McCoordinator : UdonSharpBehaviour
                 continue;
             }
 
-            // OPTIMIZATION: Use if-else instead of switch for better performance in UdonSharp
-            if (state == STATE_DATA_GEN)
+            // OPTIMIZATION: Re-evaluation loop — cascade state transitions within a single frame.
+            // When a worker finishes data gen, it can immediately check neighbors, start meshing, etc.
+            // without waiting for the next Update() call. Critical for cached Y-chunks that complete in <1ms.
+            bool recheck = true;
+            while (recheck)
             {
-                // Check if data generation is complete
-                if (!chunk.isGeneratingData)
-                {
-                    // Data generation is complete, move to lighting
-                    worker_state[i] = STATE_LIGHTING;
-                    worker_skipCheckCounter[i] = 0; // Start lighting immediately
-                    isGeneratorBusy = false;
-                    
-                    // FIXED: Start incremental lighting processing
-                    world.StartChunkLighting(chunkIndex);
-#if LOGGING
-                    if (enableDetailedTimings) workers_DataGenCompleted++;
-#endif
-                }
-                else
-                {
-                    // Data gen takes multiple cycles, skip checking for a bit
-                    worker_skipCheckCounter[i] = skipCheckCycles;
-                }
-            }
-            else if (state == STATE_LIGHTING)
-            {
-                // FIXED: Step through lighting incrementally
-                world.StepChunkLighting(chunkIndex);
+                recheck = false;
+                if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break;
                 
-                // Check if lighting is complete
-                if (!chunk.isProcessingLighting)
+                state = worker_state[i];
+
+                if (state == STATE_DATA_GEN)
                 {
-                    // Lighting is complete, move to waiting for mesh
-                    worker_state[i] = STATE_WAITING_FOR_MESH;
-                    worker_skipCheckCounter[i] = 0; // Check immediately for neighbors
-                }
-                else
-                {
-                    // Continue processing lighting (don't skip, process every frame)
-                    worker_skipCheckCounter[i] = 0;
-                }
-            }
-            else if (state == STATE_WAITING_FOR_MESH)
-            {
-                // OPTIMIZATION: Only check if not already building mesh
-                if (!chunk.isBuildingMesh)
-                {
-                    // Check if neighbors are ready (expensive, but only when needed)
-                    if (world.AreAllNeighborsReady(chunkIndex))
+                    // OPTIMIZATION: Actively drive data gen forward instead of passively waiting.
+                    // This eliminates the cross-Update handoff delay between McWorld and coordinator.
+                    if (chunk.isGeneratingData)
                     {
-                        world.BuildChunkMesh(chunkIndex); 
-                        worker_state[i] = STATE_MESHING;
-                        worker_skipCheckCounter[i] = 1; // Skip 1 cycle for mesh to start
+                        world.StepChunkDataGeneration(chunk);
                     }
-                    else
+
+                    // Check if data generation is complete
+                    if (!chunk.isGeneratingData)
                     {
-                        // Neighbors not ready, check again in a few cycles
-                        worker_skipCheckCounter[i] = skipCheckCycles * 2; // Wait longer for neighbors
-                    }
-                }
-            }
-            else if (state == STATE_MESHING)
-            {
-                // Check if mesh building is complete
-                if (!chunk.isBuildingMesh)
-                {
-                    // Mesh building is complete
-                    worker_targetChunkIndex[i] = -1;
-                    worker_state[i] = STATE_IDLE;
-                    worker_skipCheckCounter[i] = 0;
-                    
-                    if(chunksCompletedCount < totalWorldChunks)
-                    {
-                       chunksCompletedCount++;
-                    }
+                        isGeneratorBusy = false;
+
+                        if (world.UsesGpuLightingBackend())
+                        {
+                            worker_state[i] = STATE_WAITING_FOR_MESH;
+                            worker_skipCheckCounter[i] = 0;
+                            // Trigger neighbor re-meshing so already-meshed neighbors
+                            // update their boundary faces with this chunk's data
+                            world.TriggerNeighborMeshRebuilds(chunk);
+                        }
+                        else
+                        {
+                            // Data generation is complete, move to lighting
+                            worker_state[i] = STATE_LIGHTING;
+                            worker_skipCheckCounter[i] = 0; // Start lighting immediately
+                            world.StartChunkLighting(chunkIndex);
+                        }
+                        recheck = true; // Re-evaluate the new state immediately
 #if LOGGING
-                    if (enableDetailedTimings) workers_MeshCompleted++;
+                        if (enableDetailedTimings) workers_DataGenCompleted++;
 #endif
+                    }
                 }
-                else
+                else if (state == STATE_LIGHTING)
                 {
-                    // Meshing takes multiple cycles, skip checking for a bit
-                    worker_skipCheckCounter[i] = skipCheckCycles;
+                    if (world.UsesGpuLightingBackend())
+                    {
+                        worker_state[i] = STATE_WAITING_FOR_MESH;
+                        worker_skipCheckCounter[i] = 0;
+                        recheck = true;
+                        continue;
+                    }
+
+                    // FIXED: Step through lighting incrementally
+                    world.StepChunkLighting(chunkIndex);
+                    
+                    // Check if lighting is complete
+                    if (!chunk.isProcessingLighting)
+                    {
+                        // Lighting is complete, move to waiting for mesh
+                        worker_state[i] = STATE_WAITING_FOR_MESH;
+                        worker_skipCheckCounter[i] = 0; // Check immediately for neighbors
+                        recheck = true;
+                    }
+                }
+                else if (state == STATE_WAITING_FOR_MESH)
+                {
+                    // OPTIMIZATION: Only check if not already building mesh
+                    if (!chunk.isBuildingMesh)
+                    {
+                        // Check if neighbors are ready (expensive, but only when needed)
+                        if (world.AreAllNeighborsReady(chunkIndex))
+                        {
+                            world.BuildChunkMesh(chunkIndex); 
+                            worker_state[i] = STATE_MESHING;
+                            worker_skipCheckCounter[i] = 0;
+                            // Don't recheck — meshing takes multiple frames
+                        }
+                    }
+                }
+                else if (state == STATE_MESHING)
+                {
+                    // Check if mesh building is complete
+                    if (!chunk.isBuildingMesh)
+                    {
+                        // Mesh building is complete
+                        worker_targetChunkIndex[i] = -1;
+                        worker_state[i] = STATE_IDLE;
+                        worker_skipCheckCounter[i] = 0;
+                        
+                        if(chunksCompletedCount < totalWorldChunks)
+                        {
+                           chunksCompletedCount++;
+                        }
+
+                        // Benchmark: log time at 50% and 100% completion
+                        if (chunksCompletedCount == (totalWorldChunks + 1) / 2)
+                        {
+                            float elapsed = Time.realtimeSinceStartup - benchmarkStartTime;
+                            Debug.Log($"[BENCHMARK] 50% world gen at {elapsed:F3}s — chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) #{chunksCompletedCount}/{totalWorldChunks}");
+                        }
+                        else if (chunksCompletedCount == totalWorldChunks)
+                        {
+                            float elapsed = Time.realtimeSinceStartup - benchmarkStartTime;
+                            Debug.Log($"[BENCHMARK] 100% world gen at {elapsed:F3}s — last chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) #{chunksCompletedCount}/{totalWorldChunks}");
+                        }
+#if LOGGING
+                        if (enableDetailedTimings) workers_MeshCompleted++;
+#endif
+                        // Don't recheck — worker is now IDLE
+                    }
                 }
             }
         }
@@ -331,8 +357,8 @@ public class McCoordinator : UdonSharpBehaviour
                 }
             }
             
-            // Stop if we've assigned enough work this cycle (prevent overwhelming the system)
-            if (assignedThisCycle >= 2) break;
+            // Keep filling idle workers until the frame budget says stop.
+            if (assignedThisCycle >= maxConcurrentWorkers) break;
         }
 
 #if LOGGING
