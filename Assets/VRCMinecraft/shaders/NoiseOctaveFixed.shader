@@ -5,6 +5,13 @@ Shader "VRCM/NoiseOctaveFixed"
         _PermTex ("Permutation Texture", 2D) = "white" {}
         _GradTex ("Gradient Texture", 2D) = "white" {}
         _AccumulationTex ("Accumulation Texture", 2D) = "black" {}
+        _ClimatePermTex0 ("Climate Perm 0", 2D) = "white" {}
+        _ClimatePermTex1 ("Climate Perm 1", 2D) = "white" {}
+        _ClimatePermTex2 ("Climate Perm 2", 2D) = "white" {}
+        _ClimateOffsetTex0 ("Climate Offset 0", 2D) = "white" {}
+        _ClimateOffsetTex1 ("Climate Offset 1", 2D) = "white" {}
+        _ClimateOffsetTex2 ("Climate Offset 2", 2D) = "white" {}
+        _ClimateBiomeLookupTex ("Climate Biome Lookup", 2D) = "white" {}
         _Amplitude ("Amplitude", Float) = 1.0
         _XSize ("X Size", Int) = 5
         _YSize ("Y Size", Int) = 33
@@ -12,6 +19,11 @@ Shader "VRCM/NoiseOctaveFixed"
         _Is2D ("Is 2D", Int) = 0
         _OctaveCount ("Octave Count", Int) = 16
         _OctaveRow ("Octave Row", Int) = 0
+        _ChunkX ("Chunk X", Int) = 0
+        _ChunkZ ("Chunk Z", Int) = 0
+        _ClimateOctaveCount0 ("Climate Octave Count 0", Int) = 4
+        _ClimateOctaveCount1 ("Climate Octave Count 1", Int) = 4
+        _ClimateOctaveCount2 ("Climate Octave Count 2", Int) = 2
     }
     
     SubShader
@@ -107,7 +119,7 @@ Shader "VRCM/NoiseOctaveFixed"
             float4 sampleCoordX(int octave, int index)
             {
                 float rowV = ((float)octave + 0.5) / 16.0;
-                return tex2Dlod(_CoordXTex, float4(((float)index + 0.5) / 5.0, rowV, 0, 0));
+                return tex2Dlod(_CoordXTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0));
             }
 
             float4 sampleCoordY(int octave, int index)
@@ -119,7 +131,7 @@ Shader "VRCM/NoiseOctaveFixed"
             float4 sampleCoordZ(int octave, int index)
             {
                 float rowV = ((float)octave + 0.5) / 16.0;
-                return tex2Dlod(_CoordZTex, float4(((float)index + 0.5) / 5.0, rowV, 0, 0));
+                return tex2Dlod(_CoordZTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0));
             }
 
             static const float3 GRADIENTS[16] = {
@@ -278,6 +290,171 @@ Shader "VRCM/NoiseOctaveFixed"
 
                     return float4(value, 0, 0, 1);
                 }
+            }
+            ENDCG
+        }
+
+        Pass
+        {
+            Name "CLIMATE"
+            ZTest Always
+            ZWrite Off
+            Cull Off
+            CGPROGRAM
+            #pragma vertex vert
+            #pragma fragment fragClimate
+            #pragma target 3.0
+
+            #include "UnityCG.cginc"
+
+            struct appdata
+            {
+                float4 vertex : POSITION;
+                float2 uv : TEXCOORD0;
+            };
+
+            struct v2f
+            {
+                float2 uv : TEXCOORD0;
+                float4 vertex : SV_POSITION;
+            };
+
+            sampler2D _ClimatePermTex0;
+            sampler2D _ClimatePermTex1;
+            sampler2D _ClimatePermTex2;
+            sampler2D _ClimateOffsetTex0;
+            sampler2D _ClimateOffsetTex1;
+            sampler2D _ClimateOffsetTex2;
+            sampler2D _ClimateBiomeLookupTex;
+            int _ChunkX;
+            int _ChunkZ;
+            int _XSize;
+            int _ZSize;
+            int _ClimateOctaveCount0;
+            int _ClimateOctaveCount1;
+            int _ClimateOctaveCount2;
+
+            static const float SIMPLEX_F2 = 0.3660254037844386;
+            static const float SIMPLEX_G2 = 0.2113248654051871;
+
+            static const float2 SIMPLEX_GRADS[12] = {
+                float2(1, 1), float2(-1, 1), float2(1, -1), float2(-1, -1),
+                float2(1, 0), float2(-1, 0), float2(1, 0), float2(-1, 0),
+                float2(0, 1), float2(0, -1), float2(0, 1), float2(0, -1)
+            };
+
+            v2f vert (appdata v)
+            {
+                v2f o;
+                o.vertex = UnityObjectToClipPos(v.vertex);
+                o.uv = v.uv;
+                return o;
+            }
+
+            int sampleClimatePerm(sampler2D tex, int octave, int index)
+            {
+                float rowV = ((float)octave + 0.5) / 4.0;
+                return (int)round(tex2Dlod(tex, float4(((float)index + 0.5) / 512.0, rowV, 0, 0)).r * 255.0);
+            }
+
+            float2 sampleClimateOffset(sampler2D tex, int octave)
+            {
+                return tex2Dlod(tex, float4(((float)octave + 0.5) / 4.0, 0.5, 0, 0)).rg;
+            }
+
+            float simplexContribution(float2 grad, float x, float y)
+            {
+                float t = 0.5 - x * x - y * y;
+                if (t < 0.0) return 0.0;
+                t *= t;
+                return t * t * dot(grad, float2(x, y));
+            }
+
+            int wrapLikeCpu(float v)
+            {
+                int truncated = (int)v;
+                return v > 0.0 ? truncated : (truncated - 1);
+            }
+
+            float simplexNoise2D(sampler2D permTex, sampler2D offsetTex, int octave, float worldX, float worldZ, float gridX, float gridZ)
+            {
+                float2 randomOffset = sampleClimateOffset(offsetTex, octave);
+                float cx = worldX * gridX + randomOffset.x;
+                float cz = worldZ * gridZ + randomOffset.y;
+
+                float skew = (cx + cz) * SIMPLEX_F2;
+                int cellX = wrapLikeCpu(cx + skew);
+                int cellZ = wrapLikeCpu(cz + skew);
+                float unskew = (cellX + cellZ) * SIMPLEX_G2;
+                float originX = cellX - unskew;
+                float originZ = cellZ - unskew;
+                float relX = cx - originX;
+                float relZ = cz - originZ;
+
+                int stepX = relX > relZ ? 1 : 0;
+                int stepZ = relX > relZ ? 0 : 1;
+
+                float relX1 = relX - stepX + SIMPLEX_G2;
+                float relZ1 = relZ - stepZ + SIMPLEX_G2;
+                float relX2 = relX - 1.0 + 2.0 * SIMPLEX_G2;
+                float relZ2 = relZ - 1.0 + 2.0 * SIMPLEX_G2;
+
+                int permX = cellX & 255;
+                int permZ = cellZ & 255;
+                int grad0 = sampleClimatePerm(permTex, octave, permX + sampleClimatePerm(permTex, octave, permZ)) % 12;
+                int grad1 = sampleClimatePerm(permTex, octave, permX + stepX + sampleClimatePerm(permTex, octave, permZ + stepZ)) % 12;
+                int grad2 = sampleClimatePerm(permTex, octave, permX + 1 + sampleClimatePerm(permTex, octave, permZ + 1)) % 12;
+
+                float n0 = simplexContribution(SIMPLEX_GRADS[grad0], relX, relZ);
+                float n1 = simplexContribution(SIMPLEX_GRADS[grad1], relX1, relZ1);
+                float n2 = simplexContribution(SIMPLEX_GRADS[grad2], relX2, relZ2);
+                return 70.0 * (n0 + n1 + n2);
+            }
+
+            float generateClimateField(sampler2D permTex, sampler2D offsetTex, int octaveCount, float worldX, float worldZ, float baseGridX, float baseGridZ, float fq, float persistence)
+            {
+                float gridXDiv = baseGridX / 1.5;
+                float gridZDiv = baseGridZ / 1.5;
+                float frequency = 1.0;
+                float amplitude = 1.0;
+                float value = 0.0;
+
+                [loop]
+                for (int octave = 0; octave < 4; octave++)
+                {
+                    if (octave >= octaveCount) break;
+                    float contrib = simplexNoise2D(permTex, offsetTex, octave, worldX, worldZ, gridXDiv * frequency, gridZDiv * frequency);
+                    value += contrib * (0.55 / amplitude);
+                    frequency *= fq;
+                    amplitude *= persistence;
+                }
+
+                return value;
+            }
+
+            float4 fragClimate(v2f i) : SV_Target
+            {
+                int x = clamp((int)floor(i.vertex.x), 0, _XSize - 1);
+                int z = clamp((int)floor(i.vertex.y), 0, _ZSize - 1);
+                float worldX = (float)(_ChunkX + x);
+                float worldZ = (float)(_ChunkZ + z);
+
+                float tempNoise = generateClimateField(_ClimatePermTex0, _ClimateOffsetTex0, _ClimateOctaveCount0, worldX, worldZ, 0.02500000037252903, 0.02500000037252903, 0.25, 0.5);
+                float rainNoise = generateClimateField(_ClimatePermTex1, _ClimateOffsetTex1, _ClimateOctaveCount1, worldX, worldZ, 0.05000000074505806, 0.05000000074505806, 0.33333333333333331, 0.5);
+                float modifierNoise = generateClimateField(_ClimatePermTex2, _ClimateOffsetTex2, _ClimateOctaveCount2, worldX, worldZ, 0.25, 0.25, 0.58823529411764708, 0.5);
+
+                float modifier = modifierNoise * 1.1 + 0.5;
+                float finalTemp = (tempNoise * 0.15 + 0.7) * 0.99 + modifier * 0.01;
+                float finalRain = (rainNoise * 0.15 + 0.5) * 0.998 + modifier * 0.002;
+                finalTemp = 1.0 - (1.0 - finalTemp) * (1.0 - finalTemp);
+                finalTemp = clamp(finalTemp, 0.0, 1.0);
+                finalRain = clamp(finalRain, 0.0, 1.0);
+
+                int biomeTempIndex = clamp((int)(finalTemp * 63.0), 0, 63);
+                int biomeRainIndex = clamp((int)(finalRain * 63.0), 0, 63);
+                float2 biomeLookupUv = float2(((float)biomeTempIndex + 0.5) / 64.0, ((float)biomeRainIndex + 0.5) / 64.0);
+                int biomeId = (int)round(tex2Dlod(_ClimateBiomeLookupTex, float4(biomeLookupUv, 0, 0)).r * 255.0);
+                return float4(finalTemp, finalRain, biomeId / 255.0, 1.0);
             }
             ENDCG
         }

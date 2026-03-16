@@ -15702,6 +15702,11 @@ MonoBehaviour:
   deferredInteriorMeshRequestsPerFrame: 1
   deferredInteriorMeshScanCountPerFrame: 64
   deferFarChunkSecondaryWork: 1
+  nearOnlyChunkColliders: 1
+  colliderPriorityRadiusXZ: 2
+  colliderPriorityRadiusY: 1
+  colliderPriorityBelowRadiusY: 3
+  nearColliderUpdatesPerFrame: 8
   deferredSecondaryWorkTasksPerFrame: 2
   deferredSecondaryWorkScanCountPerFrame: 64
   enableAdaptiveBudgets: 1

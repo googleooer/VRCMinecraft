@@ -55,6 +55,16 @@ public class McWorld : UdonSharpBehaviour
     public int deferredInteriorMeshScanCountPerFrame = 64;
     [Tooltip("Defer collider application, lighting finalize, and neighbor mesh rebuilds for far chunks until there is frame headroom.")]
     public bool deferFarChunkSecondaryWork = true;
+    [Tooltip("Only keep chunk colliders enabled near the player. Far chunks keep render meshes but disable collision until the player approaches.")]
+    public bool nearOnlyChunkColliders = true;
+    [Tooltip("Chunks within this XZ radius keep their colliders active.")]
+    public int colliderPriorityRadiusXZ = 2;
+    [Tooltip("Chunks within this many chunk layers above the player keep their colliders active.")]
+    public int colliderPriorityRadiusY = 1;
+    [Tooltip("Chunks within this many chunk layers below the player keep their colliders active so the ground does not disappear underfoot.")]
+    public int colliderPriorityBelowRadiusY = 3;
+    [Tooltip("Maximum nearby chunk colliders to enable per frame before the general deferred-work scan runs.")]
+    public int nearColliderUpdatesPerFrame = 8;
     [Tooltip("How many deferred secondary tasks to finish per frame when there is headroom.")]
     public int deferredSecondaryWorkTasksPerFrame = 2;
     [Tooltip("How many chunk slots to scan per frame for deferred secondary work.")]
@@ -126,6 +136,7 @@ public class McWorld : UdonSharpBehaviour
     private BlockVisibilityType[] visibilityCache; // per blockID
     private BlockCullingType[] cullingCache; // per blockID
     private McBlockShapeType[] shapeTypeCache; // per blockID - NEW: cache for block shape types
+    private byte[] biomeTintModeCache; // 0=none, 1=grass, 2=foliage, 3=water
     private byte[] shouldDrawTable; // 256x256 lookup: self<<8 | neighbor => 0/1
 
     // --- Lighting System (Minecraft Beta 1.7.3 style) ---
@@ -1540,10 +1551,11 @@ public class McWorld : UdonSharpBehaviour
         chunk._gpuFacePixels = facePixels;
         chunk._gpuFaceReadbackQueueSlot = bufferIndex;
         chunk._gpuFaceBuildActive = true;
-        chunk._gpuFaceBuildStage = 0;
+        chunk._gpuFaceBuildStage = -1;
         chunk._gpuFaceDirection = 0;
         chunk._gpuFaceSlice = 0;
         chunk._gpuFaceCrossIndex = 0;
+        chunk._gpuFaceSummaryIndex = 0;
 
         if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
         {
@@ -1575,6 +1587,73 @@ public class McWorld : UdonSharpBehaviour
         chunk._gpuFacePixels = null;
         chunk._gpuFaceReadbackQueueSlot = -1;
         chunk._gpuFaceBuildActive = false;
+    }
+
+    private int _GetGpuFaceSliceSummaryIndex(int direction, int slice)
+    {
+        return direction * chunkSizeY + slice;
+    }
+
+    private void _ResetGpuFaceSliceSummary(ChunkData chunk)
+    {
+        if (chunk == null) return;
+
+        int summaryLength = 6 * chunkSizeY;
+        if (chunk._gpuFaceSliceActive == null || chunk._gpuFaceSliceActive.Length != summaryLength)
+        {
+            chunk._gpuFaceSliceActive = new byte[summaryLength];
+            chunk._gpuFaceSliceMinU = new byte[summaryLength];
+            chunk._gpuFaceSliceMaxU = new byte[summaryLength];
+            chunk._gpuFaceSliceMinV = new byte[summaryLength];
+            chunk._gpuFaceSliceMaxV = new byte[summaryLength];
+        }
+
+        for (int i = 0; i < summaryLength; i++)
+        {
+            chunk._gpuFaceSliceActive[i] = 0;
+            chunk._gpuFaceSliceMinU[i] = 255;
+            chunk._gpuFaceSliceMaxU[i] = 0;
+            chunk._gpuFaceSliceMinV[i] = 255;
+            chunk._gpuFaceSliceMaxV[i] = 0;
+        }
+    }
+
+    private void _MarkGpuFaceSliceBounds(ChunkData chunk, int direction, int slice, int u, int v)
+    {
+        int summaryIndex = _GetGpuFaceSliceSummaryIndex(direction, slice);
+        if (chunk._gpuFaceSliceActive[summaryIndex] == 0)
+        {
+            chunk._gpuFaceSliceActive[summaryIndex] = 1;
+            chunk._gpuFaceSliceMinU[summaryIndex] = (byte)u;
+            chunk._gpuFaceSliceMaxU[summaryIndex] = (byte)u;
+            chunk._gpuFaceSliceMinV[summaryIndex] = (byte)v;
+            chunk._gpuFaceSliceMaxV[summaryIndex] = (byte)v;
+            return;
+        }
+
+        if (u < chunk._gpuFaceSliceMinU[summaryIndex]) chunk._gpuFaceSliceMinU[summaryIndex] = (byte)u;
+        if (u > chunk._gpuFaceSliceMaxU[summaryIndex]) chunk._gpuFaceSliceMaxU[summaryIndex] = (byte)u;
+        if (v < chunk._gpuFaceSliceMinV[summaryIndex]) chunk._gpuFaceSliceMinV[summaryIndex] = (byte)v;
+        if (v > chunk._gpuFaceSliceMaxV[summaryIndex]) chunk._gpuFaceSliceMaxV[summaryIndex] = (byte)v;
+    }
+
+    private bool _TryGetGpuFaceSliceBounds(ChunkData chunk, int direction, int slice, out int minU, out int maxU, out int minV, out int maxV)
+    {
+        minU = 0;
+        maxU = -1;
+        minV = 0;
+        maxV = -1;
+
+        if (chunk == null || chunk._gpuFaceSliceActive == null) return false;
+        int summaryIndex = _GetGpuFaceSliceSummaryIndex(direction, slice);
+        if (summaryIndex < 0 || summaryIndex >= chunk._gpuFaceSliceActive.Length) return false;
+        if (chunk._gpuFaceSliceActive[summaryIndex] == 0) return false;
+
+        minU = chunk._gpuFaceSliceMinU[summaryIndex];
+        maxU = chunk._gpuFaceSliceMaxU[summaryIndex];
+        minV = chunk._gpuFaceSliceMinV[summaryIndex];
+        maxV = chunk._gpuFaceSliceMaxV[summaryIndex];
+        return true;
     }
 
     private void _GpuBuildMeshFromFaceDataStep(ChunkData chunk)
@@ -1612,9 +1691,74 @@ public class McWorld : UdonSharpBehaviour
         float budgetStart = Time.realtimeSinceStartup;
         float budgetSec = Mathf.Max(0.25f, adaptiveGpuMeshDecodeStepBudgetMs) * 0.001f;
         Color32[] facePixels = chunk._gpuFacePixels;
+        int totalPixels = sizeY * stride;
+        int summaryBudgetCountdown = 64;
+        int crossBudgetCountdown = 16;
 
         while (Time.realtimeSinceStartup - budgetStart <= budgetSec)
         {
+            if (chunk._gpuFaceBuildStage == -1)
+            {
+                if (chunk._gpuFaceSummaryIndex == 0)
+                {
+                    _ResetGpuFaceSliceSummary(chunk);
+                }
+
+                while (chunk._gpuFaceSummaryIndex < totalPixels)
+                {
+                    int pixelIndex = chunk._gpuFaceSummaryIndex++;
+                    if (pixelIndex >= facePixels.Length) break;
+
+                    Color32 pixel = facePixels[pixelIndex];
+                    if (pixel.a < 128 || pixel.g == 0 || pixel.b >= 1)
+                    {
+                        if (--summaryBudgetCountdown <= 0)
+                        {
+                            summaryBudgetCountdown = 64;
+                            if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
+                        }
+                        continue;
+                    }
+
+                    int faceMask = pixel.r;
+                    if (faceMask == 0)
+                    {
+                        if (--summaryBudgetCountdown <= 0)
+                        {
+                            summaryBudgetCountdown = 64;
+                            if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
+                        }
+                        continue;
+                    }
+
+                    int y = pixelIndex / stride;
+                    int z = (pixelIndex / sizeXZ) % sizeXZ;
+                    int x = pixelIndex % sizeXZ;
+
+                    if ((faceMask & 1) != 0) _MarkGpuFaceSliceBounds(chunk, 0, y, x, z);
+                    if ((faceMask & 2) != 0) _MarkGpuFaceSliceBounds(chunk, 1, y, x, z);
+                    if ((faceMask & 4) != 0) _MarkGpuFaceSliceBounds(chunk, 2, z, x, y);
+                    if ((faceMask & 8) != 0) _MarkGpuFaceSliceBounds(chunk, 3, z, x, y);
+                    if ((faceMask & 16) != 0) _MarkGpuFaceSliceBounds(chunk, 4, x, z, y);
+                    if ((faceMask & 32) != 0) _MarkGpuFaceSliceBounds(chunk, 5, x, z, y);
+
+                    if (--summaryBudgetCountdown <= 0)
+                    {
+                        summaryBudgetCountdown = 64;
+                        if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
+                    }
+                }
+
+                if (chunk._gpuFaceSummaryIndex >= totalPixels)
+                {
+                    chunk._gpuFaceBuildStage = 0;
+                    chunk._gpuFaceDirection = 0;
+                    chunk._gpuFaceSlice = 0;
+                    chunk._gpuFaceCrossIndex = 0;
+                }
+                continue;
+            }
+
             if (chunk._gpuFaceBuildStage == 0)
             {
                 if (chunk._gpuFaceDirection >= 6)
@@ -1638,12 +1782,22 @@ public class McWorld : UdonSharpBehaviour
                 }
 
                 int slice = chunk._gpuFaceSlice;
+                int minU;
+                int maxU;
+                int minV;
+                int maxV;
+                if (!_TryGetGpuFaceSliceBounds(chunk, direction, slice, out minU, out maxU, out minV, out maxV))
+                {
+                    chunk._gpuFaceSlice++;
+                    continue;
+                }
+
                 int maskCount = maskWidth * maskHeight;
                 System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
 
-                for (int v = 0; v < maskHeight; v++)
+                for (int v = minV; v <= maxV; v++)
                 {
-                    for (int u = 0; u < maskWidth; u++)
+                    for (int u = minU; u <= maxU; u++)
                     {
                         int x, y, z;
                         if (direction <= 1) { x = u; y = slice; z = v; }
@@ -1670,31 +1824,38 @@ public class McWorld : UdonSharpBehaviour
                     }
                 }
 
-                _EmitGreedyMask(chunk, direction, slice, maskWidth, maskHeight);
+                _EmitGreedyMaskRegion(chunk, direction, slice, maskWidth, maskHeight, minU, maxU, minV, maxV);
                 chunk._gpuFaceSlice++;
                 continue;
             }
 
             if (chunk._gpuFaceBuildStage == 1)
             {
-                int totalPixels = sizeY * stride;
-                while (chunk._gpuFaceCrossIndex < totalPixels)
+                int crossCount = chunk._crossBlockPackedPositions != null ? chunk._crossBlockCount : 0;
+                while (chunk._gpuFaceCrossIndex < crossCount)
                 {
-                    int pixelIndex = chunk._gpuFaceCrossIndex++;
-                    if (pixelIndex >= facePixels.Length) break;
+                    int packed = chunk._crossBlockPackedPositions[chunk._gpuFaceCrossIndex++];
+                    int x = (packed >> 16) & 0xFF;
+                    int y = (packed >> 8) & 0xFF;
+                    int z = packed & 0xFF;
+                    int pixelIndex = y * stride + z * sizeXZ + x;
+                    if (pixelIndex >= 0 && pixelIndex < facePixels.Length)
+                    {
+                        Color32 pixel = facePixels[pixelIndex];
+                        if (pixel.a >= 128 && pixel.g != 0)
+                        {
+                            _AddCrossBlockQuads(chunk, (byte)pixel.g, x, y, z);
+                        }
+                    }
 
-                    Color32 pixel = facePixels[pixelIndex];
-                    if (pixel.a < 128 || pixel.g == 0 || pixel.b < 1) continue;
-
-                    int y = pixelIndex / stride;
-                    int z = (pixelIndex / sizeXZ) % sizeXZ;
-                    int x = pixelIndex % sizeXZ;
-                    _AddCrossBlockQuads(chunk, (byte)pixel.g, x, y, z);
-
-                    if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
+                    if (--crossBudgetCountdown <= 0)
+                    {
+                        crossBudgetCountdown = 16;
+                        if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
+                    }
                 }
 
-                if (chunk._gpuFaceCrossIndex >= totalPixels)
+                if (chunk._gpuFaceCrossIndex >= crossCount)
                 {
                     chunk._gpuFaceBuildStage = 2;
                 }
@@ -1704,7 +1865,9 @@ public class McWorld : UdonSharpBehaviour
             if (chunk._gpuFaceBuildStage == 2)
             {
                 _ApplyAllMeshData(chunk);
-                if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
+                if (chunk._collisionVertexCount == 0) _DisableChunkCollider(chunk, false);
+                else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
+                else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
                 else _ApplyDataToCollider(chunk);
 #if LOGGING
                 _RecordMeshBuildCompletion(chunk, true, false);
@@ -2116,6 +2279,29 @@ public class McWorld : UdonSharpBehaviour
         return !_ShouldPrioritizeChunkSecondaryWork(chunk);
     }
 
+    private bool _ShouldEnableChunkCollider(ChunkData chunk)
+    {
+        if (chunk == null) return false;
+        if (!nearOnlyChunkColliders) return true;
+        if (!_TryGetPlayerChunkCoords(out int playerChunkX, out int playerChunkY, out int playerChunkZ)) return true;
+
+        int dx = Mathf.Abs(chunk.chunkX_world - playerChunkX);
+        int dz = Mathf.Abs(chunk.chunkZ_world - playerChunkZ);
+        int relativeY = chunk.chunkY_world - playerChunkY;
+        return dx <= colliderPriorityRadiusXZ
+            && dz <= colliderPriorityRadiusXZ
+            && relativeY <= colliderPriorityRadiusY
+            && relativeY >= -colliderPriorityBelowRadiusY;
+    }
+
+    private void _DisableChunkCollider(ChunkData chunk, bool keepPending)
+    {
+        if (chunk == null || chunk.meshCollider == null) return;
+        chunk.meshCollider.sharedMesh = null;
+        chunk.meshCollider.enabled = false;
+        chunk.pendingColliderApply = keepPending && chunk._collisionVertexCount > 0;
+    }
+
     private void _QueueDeferredColliderApply(ChunkData chunk)
     {
         if (chunk == null) return;
@@ -2140,16 +2326,52 @@ public class McWorld : UdonSharpBehaviour
         TriggerNeighborMeshRebuilds(chunk);
     }
 
+    private int _ProcessNearbyChunkColliderUpdates()
+    {
+        if (!nearOnlyChunkColliders || chunks_1D == null || chunks_1D.Length == 0) return 0;
+        if (!_TryGetPlayerChunkCoords(out int playerChunkX, out int playerChunkY, out int playerChunkZ)) return 0;
+
+        int completedTasks = 0;
+        int taskLimit = Mathf.Max(1, nearColliderUpdatesPerFrame);
+        int minY = playerChunkY - colliderPriorityBelowRadiusY;
+        int maxY = playerChunkY + colliderPriorityRadiusY;
+
+        for (int y = minY; y <= maxY; y++)
+        {
+            for (int z = playerChunkZ - colliderPriorityRadiusXZ; z <= playerChunkZ + colliderPriorityRadiusXZ; z++)
+            {
+                for (int x = playerChunkX - colliderPriorityRadiusXZ; x <= playerChunkX + colliderPriorityRadiusXZ; x++)
+                {
+                    int chunkIndex = ChunkCenteredCoordsTo1D(x, y, z);
+                    if (chunkIndex == -1) continue;
+
+                    ChunkData chunk = chunks_1D[chunkIndex];
+                    if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh || !chunk.pendingColliderApply) continue;
+                    if (!_ShouldEnableChunkCollider(chunk)) continue;
+
+                    chunk.pendingColliderApply = false;
+                    _ApplyDataToCollider(chunk);
+                    completedTasks++;
+                    if (completedTasks >= taskLimit) return completedTasks;
+                }
+            }
+        }
+
+        return completedTasks;
+    }
+
     private void _ProcessDeferredChunkSecondaryWork(float frameStart, float frameBudget)
     {
-        if (!deferFarChunkSecondaryWork || chunks_1D == null || chunks_1D.Length == 0) return;
-        if (Time.realtimeSinceStartup - frameStart > frameBudget * 0.75f) return;
+        if ((!deferFarChunkSecondaryWork && !nearOnlyChunkColliders) || chunks_1D == null || chunks_1D.Length == 0) return;
 
         bool hasHeadroom = !enableAdaptiveBudgets || lastUpdateDurationMs < Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
         int taskLimit = Mathf.Max(1, deferredSecondaryWorkTasksPerFrame);
         int scansRemaining = Mathf.Max(1, deferredSecondaryWorkScanCountPerFrame);
         int totalChunks = chunks_1D.Length;
-        int completedTasks = 0;
+        int completedTasks = _ProcessNearbyChunkColliderUpdates();
+
+        if (completedTasks >= Mathf.Max(1, nearColliderUpdatesPerFrame)) return;
+        if (Time.realtimeSinceStartup - frameStart > frameBudget * 0.75f) return;
 
         while (scansRemaining-- > 0)
         {
@@ -2159,6 +2381,14 @@ public class McWorld : UdonSharpBehaviour
 
             ChunkData chunk = chunks_1D[chunkIndex];
             if (chunk == null || !chunk.isDataReady) continue;
+
+            if (nearOnlyChunkColliders && !chunk.isBuildingMesh && chunk.meshCollider != null && chunk.meshCollider.enabled && !_ShouldEnableChunkCollider(chunk))
+            {
+                _DisableChunkCollider(chunk, true);
+                completedTasks++;
+                if (completedTasks >= taskLimit) break;
+                continue;
+            }
 
             bool shouldRunNow = _ShouldPrioritizeChunkSecondaryWork(chunk) || hasHeadroom;
             if (!shouldRunNow) continue;
@@ -2182,6 +2412,7 @@ public class McWorld : UdonSharpBehaviour
             }
             else if (chunk.pendingColliderApply && !chunk.isBuildingMesh)
             {
+                if (!_ShouldEnableChunkCollider(chunk)) continue;
                 chunk.pendingColliderApply = false;
                 _ApplyDataToCollider(chunk);
                 completedTasks++;
@@ -3172,7 +3403,9 @@ public class McWorld : UdonSharpBehaviour
             // Can't use SendCustomEventDelayedFrames here easily without more state,
             // so we'll just apply the collider directly after a few frames in the main loop.
             // A more robust solution might involve another queue. For now, this is simpler.
-            if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
+            if (chunk._collisionVertexCount == 0) _DisableChunkCollider(chunk, false);
+            else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
+            else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
             else _ApplyDataToCollider(chunk);
 
         }
@@ -3806,10 +4039,21 @@ public class McWorld : UdonSharpBehaviour
 
     private void _EmitGreedyMask(ChunkData chunk, int direction, int slice, int width, int height)
     {
-        for (int v = 0; v < height; v++)
+        _EmitGreedyMaskRegion(chunk, direction, slice, width, height, 0, width - 1, 0, height - 1);
+    }
+
+    private void _EmitGreedyMaskRegion(ChunkData chunk, int direction, int slice, int width, int height, int minU, int maxU, int minV, int maxV)
+    {
+        if (minU < 0) minU = 0;
+        if (minV < 0) minV = 0;
+        if (maxU >= width) maxU = width - 1;
+        if (maxV >= height) maxV = height - 1;
+        if (maxU < minU || maxV < minV) return;
+
+        for (int v = minV; v <= maxV; v++)
         {
             int rowOffset = v * width;
-            for (int u = 0; u < width; )
+            for (int u = minU; u <= maxU; )
             {
                 int maskIndex = rowOffset + u;
                 byte blockID = greedyMaskBlockIds[maskIndex];
@@ -3823,7 +4067,7 @@ public class McWorld : UdonSharpBehaviour
                 int packedColor = greedyMaskPackedColors[maskIndex];
 
                 int quadWidth = 1;
-                while (u + quadWidth < width)
+                while (u + quadWidth <= maxU)
                 {
                     int nextIndex = rowOffset + u + quadWidth;
                     if (greedyMaskBlockIds[nextIndex] != blockID || greedyMaskLightLevels[nextIndex] != lightLevel || greedyMaskPackedColors[nextIndex] != packedColor) break;
@@ -3832,7 +4076,7 @@ public class McWorld : UdonSharpBehaviour
 
                 int quadHeight = 1;
                 bool canGrow = true;
-                while (v + quadHeight < height && canGrow)
+                while (v + quadHeight <= maxV && canGrow)
                 {
                     int nextRowOffset = (v + quadHeight) * width;
                     for (int checkU = 0; checkU < quadWidth; checkU++)
@@ -4180,8 +4424,7 @@ public class McWorld : UdonSharpBehaviour
         _ApplyDataToMesh(chunk.opaqueMeshFilter, chunk._opaqueVertices, chunk._opaqueTriangles, chunk._opaqueUVs, chunk._opaqueNormals, chunk._opaqueColors, 0, 0);
         _ApplyDataToMesh(chunk.transparentMeshFilter, chunk._transparentVertices, chunk._transparentTriangles, chunk._transparentUVs, chunk._transparentNormals, chunk._transparentColors, 0, 0);
         _ApplyDataToMesh(chunk.cutoutMeshFilter, chunk._cutoutVertices, chunk._cutoutTriangles, chunk._cutoutUVs, chunk._cutoutNormals, chunk._cutoutColors, 0, 0);
-        if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
-        else _ApplyDataToCollider(chunk);
+        _DisableChunkCollider(chunk, false);
     }
 
     private byte[] _GetDecompressedData(ChunkData chunk)
@@ -4658,11 +4901,16 @@ public class McWorld : UdonSharpBehaviour
         visibilityCache = new BlockVisibilityType[maxId];
         cullingCache = new BlockCullingType[maxId];
         shapeTypeCache = new McBlockShapeType[maxId]; // NEW: Initialize shape type cache
+        biomeTintModeCache = new byte[maxId];
         for (int i = 0; i < maxId; i++)
         {
             visibilityCache[i] = (BlockVisibilityType)((blockDataCache[i] >> 1) & 0x3);
             cullingCache[i] = (BlockCullingType)((blockDataCache[i] >> 3) & 0x7);
             shapeTypeCache[i] = (McBlockShapeType)((blockDataCache[i] >> 6) & 0x3); // NEW: Cache shape type (bits 6-7)
+            if (i == 2 || i == 31) biomeTintModeCache[i] = 1;
+            else if (i == 18) biomeTintModeCache[i] = 2;
+            else if (i == 8 || i == 9) biomeTintModeCache[i] = 3;
+            else biomeTintModeCache[i] = 0;
         }
         // Precompute should-draw table for all pairs
         int tableSize = 256 * 256; // supports up to 256 block IDs
@@ -6528,8 +6776,8 @@ public class McWorld : UdonSharpBehaviour
         // Default white color (no tint) with full AO
         Color defaultColor = new Color(1f, 1f, 1f, 1f);
 
-        // OPTIMIZATION: Early exit for non-tinted blocks
-        if (!BetaBiome.IsGrassTintedBlock(blockID) && !BetaBiome.IsFoliageTintedBlock(blockID) && !BetaBiome.IsWaterTintedBlock(blockID))
+        byte tintMode = (biomeTintModeCache != null && blockID < biomeTintModeCache.Length) ? biomeTintModeCache[blockID] : (byte)0;
+        if (tintMode == 0)
         {
             return defaultColor; // No tinting needed
         }
@@ -6555,11 +6803,11 @@ public class McWorld : UdonSharpBehaviour
 
         // OPTIMIZATION: Calculate biome color based on block type using actual Beta 1.7.3 textures
         Color biomeColor;
-        if (BetaBiome.IsGrassTintedBlock(blockID))
+        if (tintMode == 1)
         {
             biomeColor = BetaBiome.GetGrassColor(temperature, rainfall, grassColorTexture);
         }
-        else if (BetaBiome.IsFoliageTintedBlock(blockID))
+        else if (tintMode == 2)
         {
             biomeColor = BetaBiome.GetFoliageColor(temperature, rainfall, foliageColorTexture);
         }
@@ -6687,12 +6935,8 @@ public class McWorld : UdonSharpBehaviour
         // Default white color (no tint) with full AO
         Color defaultColor = new Color(1f, 1f, 1f, 1f);
 
-        // Check if this block type should be biome tinted
-        bool isGrassTinted = BetaBiome.IsGrassTintedBlock(blockID);
-        bool isFoliageTinted = BetaBiome.IsFoliageTintedBlock(blockID);
-        bool isWaterTinted = BetaBiome.IsWaterTintedBlock(blockID);
-
-        if (!isGrassTinted && !isFoliageTinted && !isWaterTinted)
+        byte tintMode = (biomeTintModeCache != null && blockID < biomeTintModeCache.Length) ? biomeTintModeCache[blockID] : (byte)0;
+        if (tintMode == 0)
         {
             return defaultColor; // No tinting needed
         }
@@ -6718,11 +6962,11 @@ public class McWorld : UdonSharpBehaviour
 
         // Calculate biome color based on block type using actual Beta 1.7.3 textures
         Color biomeColor;
-        if (isGrassTinted)
+        if (tintMode == 1)
         {
             biomeColor = BetaBiome.GetGrassColor(temperature, rainfall, grassColorTexture);
         }
-        else if (isFoliageTinted)
+        else if (tintMode == 2)
         {
             biomeColor = BetaBiome.GetFoliageColor(temperature, rainfall, foliageColorTexture);
         }
@@ -6956,16 +7200,14 @@ public class McWorld : UdonSharpBehaviour
             return PACKED_WHITE_RGB;
         }
 
-        bool isGrassTinted = BetaBiome.IsGrassTintedBlock(blockID);
-        bool isFoliageTinted = BetaBiome.IsFoliageTintedBlock(blockID);
-        bool isWaterTinted = BetaBiome.IsWaterTintedBlock(blockID);
-        if (!isGrassTinted && !isFoliageTinted && !isWaterTinted)
+        byte tintMode = (biomeTintModeCache != null && blockID < biomeTintModeCache.Length) ? biomeTintModeCache[blockID] : (byte)0;
+        if (tintMode == 0)
         {
             return PACKED_WHITE_RGB;
         }
 
         int idx = localZ * chunkSizeXZ + localX;
-        if (isGrassTinted && chunk._cachedPackedGrassBiomeColors != null && idx < chunk._cachedPackedGrassBiomeColors.Length)
+        if (tintMode == 1 && chunk._cachedPackedGrassBiomeColors != null && idx < chunk._cachedPackedGrassBiomeColors.Length)
         {
             return chunk._cachedPackedGrassBiomeColors[idx];
         }
@@ -6993,11 +7235,9 @@ public class McWorld : UdonSharpBehaviour
         }
 
         // OPTIMIZATION: Early exit for non-tinted blocks
-        bool isGrassTinted = BetaBiome.IsGrassTintedBlock(blockID);
-        bool isFoliageTinted = BetaBiome.IsFoliageTintedBlock(blockID);
-        bool isWaterTinted = BetaBiome.IsWaterTintedBlock(blockID);
+        byte tintMode = (biomeTintModeCache != null && blockID < biomeTintModeCache.Length) ? biomeTintModeCache[blockID] : (byte)0;
 
-        if (!isGrassTinted && !isFoliageTinted && !isWaterTinted)
+        if (tintMode == 0)
         {
             return defaultColor; // No tinting needed
         }
@@ -7006,7 +7246,7 @@ public class McWorld : UdonSharpBehaviour
         int idx = localZ * chunkSizeXZ + localX;
 
         // If it's grass-tinted, we can use the cached value directly
-        if (isGrassTinted)
+        if (tintMode == 1)
         {
             return chunk._cachedBiomeColors[idx];
         }
@@ -7022,7 +7262,7 @@ public class McWorld : UdonSharpBehaviour
         double rainfall = chunk._biomeRainfall[idx];
 
         Color biomeColor;
-        if (isFoliageTinted)
+        if (tintMode == 2)
         {
             biomeColor = BetaBiome.GetFoliageColor(temperature, rainfall, foliageColorTexture);
         }
