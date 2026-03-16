@@ -4804,8 +4804,8 @@ MonoBehaviour:
     type: 2}
   gpuColumnSurfaceReplaceMaterial: {fileID: 2100000, guid: 9acee80b4e0949dbb16aa48e5dd64dfd,
     type: 2}
-  enableGpuNoiseDiagnostics: 1
-  gpuNoiseDiagnosticDumpAllCells: 1
+  enableGpuNoiseDiagnostics: 0
+  gpuNoiseDiagnosticDumpAllCells: 0
   gpuNoiseDiagnosticChunkX: 0
   gpuNoiseDiagnosticChunkZ: 0
   gpuNoiseDiagnosticRunOncePerChunk: 1
@@ -15691,6 +15691,11 @@ MonoBehaviour:
   voxelsPerMeshStep: 32768
   meshStepTimeBudgetMs: 11
   updateTimeBudgetMs: 11
+  gpuMeshDecodeStepBudgetMs: 2.5
+  gpuMeshDecodeStepsPerFrame: 2
+  gpuMeshDecodeFrameBudgetMs: 3.5
+  gpuWorldgenStepBudgetMs: 3
+  gpuWorldgenStepsPerFrame: 4
   terrainGenerator: {fileID: 660800870}
   blockTypeManager: {fileID: 1410233257}
   coordinator: {fileID: 1156113852}

@@ -254,6 +254,10 @@ public class McCoordinator : UdonSharpBehaviour
                         // Check if neighbors are ready (expensive, but only when needed)
                         if (world.AreAllNeighborsReady(chunkIndex))
                         {
+                            if (!world.HasAvailableGpuMeshReadbackSlot())
+                            {
+                                continue;
+                            }
                             world.BuildChunkMesh(chunkIndex); 
                             worker_state[i] = STATE_MESHING;
                             worker_skipCheckCounter[i] = 0;
