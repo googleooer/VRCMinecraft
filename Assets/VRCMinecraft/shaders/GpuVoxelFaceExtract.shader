@@ -147,8 +147,12 @@ Shader "VRCM/GpuVoxelFaceExtract"
                     float4 slotMeta = tex2D(_SlotMetaTex, slotMetaUv);
                     if (slotMeta.a < 0.5) return 0;
 
-                    float slice = floor(i.uv.x * _UdonVRCM_GpuChunkInfo.y);
-                    float direction = floor(i.uv.y * 6.0);
+                    float compactWidth = max(1.0, floor(_UdonVRCM_GpuChunkInfo.x * 0.5 + 0.5));
+                    float compactHeight = 6.0 * _UdonVRCM_GpuChunkInfo.y;
+                    float pixelX = floor(i.uv.x * compactWidth);
+                    float pixelY = floor(i.uv.y * compactHeight);
+                    float direction = floor(pixelY / _UdonVRCM_GpuChunkInfo.y);
+                    float slice = pixelY - direction * _UdonVRCM_GpuChunkInfo.y;
                     if (direction < 0.0 || direction > 5.0) return 0;
 
                     float width = _UdonVRCM_GpuChunkInfo.x;
@@ -181,67 +185,91 @@ Shader "VRCM/GpuVoxelFaceExtract"
                     float chunkX = floor(slotMeta.r * 255.0 + 0.5);
                     float chunkY = floor(slotMeta.g * 255.0 + 0.5);
                     float chunkZ = floor(slotMeta.b * 255.0 + 0.5);
-
-                    float minU = 255.0;
-                    float maxU = -1.0;
-                    float minV = 255.0;
-                    float maxV = -1.0;
+                    float rowMask0 = 0.0;
+                    float rowMask1 = 0.0;
+                    float v0 = pixelX * 2.0;
+                    float v1 = v0 + 1.0;
 
                     [loop]
-                    for (int vInt = 0; vInt < 64; vInt++)
+                    for (int uInt = 0; uInt < 16; uInt++)
                     {
-                        float v = (float)vInt;
-                        if (v >= maskHeight) break;
+                        float u = (float)uInt;
+                        if (u >= maskWidth) break;
 
-                        [loop]
-                        for (int uInt = 0; uInt < 16; uInt++)
+                        float localX = 0.0;
+                        float localY = 0.0;
+                        float localZ = 0.0;
+                        float offsetX = 0.0;
+                        float offsetY = 0.0;
+                        float offsetZ = 0.0;
+
+                        if (direction <= 1.0)
                         {
-                            float u = (float)uInt;
-                            if (u >= maskWidth) break;
+                            localX = u; localY = slice; localZ = v0;
+                            offsetY = (direction < 0.5) ? 1.0 : -1.0;
+                        }
+                        else if (direction <= 3.0)
+                        {
+                            localX = u; localY = v0; localZ = slice;
+                            offsetZ = (direction < 2.5) ? 1.0 : -1.0;
+                        }
+                        else
+                        {
+                            localX = slice; localY = v0; localZ = u;
+                            offsetX = (direction < 4.5) ? 1.0 : -1.0;
+                        }
 
-                            float localX = 0.0;
-                            float localY = 0.0;
-                            float localZ = 0.0;
-                            float offsetX = 0.0;
-                            float offsetY = 0.0;
-                            float offsetZ = 0.0;
+                        if (v0 < maskHeight)
+                        {
+                            float selfId = SampleBlockId(slotIndex, localX, localY, localZ);
+                            if (selfId >= 0.5)
+                            {
+                                float2 propUv = float2((selfId + 0.5) / 256.0, 0.5);
+                                float4 blockProps = tex2D(_BlockPropsTex, propUv);
+                                float shapeType = floor(blockProps.b * 255.0 + 0.5);
+                                if (shapeType < 1.0)
+                                {
+                                    float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ);
+                                    if (ShouldDrawFace(selfId, neighborId) > 0.5) rowMask0 += exp2(u);
+                                }
+                            }
+                        }
 
+                        if (v1 < maskHeight)
+                        {
                             if (direction <= 1.0)
                             {
-                                localX = u; localY = slice; localZ = v;
-                                offsetY = (direction < 0.5) ? 1.0 : -1.0;
+                                localX = u; localY = slice; localZ = v1;
                             }
                             else if (direction <= 3.0)
                             {
-                                localX = u; localY = v; localZ = slice;
-                                offsetZ = (direction < 2.5) ? 1.0 : -1.0;
+                                localX = u; localY = v1; localZ = slice;
                             }
                             else
                             {
-                                localX = slice; localY = v; localZ = u;
-                                offsetX = (direction < 4.5) ? 1.0 : -1.0;
+                                localX = slice; localY = v1; localZ = u;
                             }
 
                             float selfId = SampleBlockId(slotIndex, localX, localY, localZ);
-                            if (selfId < 0.5) continue;
-
-                            float2 propUv = float2((selfId + 0.5) / 256.0, 0.5);
-                            float4 blockProps = tex2D(_BlockPropsTex, propUv);
-                            float shapeType = floor(blockProps.b * 255.0 + 0.5);
-                            if (shapeType >= 1.0) continue;
-
-                            float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ);
-                            if (ShouldDrawFace(selfId, neighborId) <= 0.5) continue;
-
-                            if (u < minU) minU = u;
-                            if (u > maxU) maxU = u;
-                            if (v < minV) minV = v;
-                            if (v > maxV) maxV = v;
+                            if (selfId >= 0.5)
+                            {
+                                float2 propUv = float2((selfId + 0.5) / 256.0, 0.5);
+                                float4 blockProps = tex2D(_BlockPropsTex, propUv);
+                                float shapeType = floor(blockProps.b * 255.0 + 0.5);
+                                if (shapeType < 1.0)
+                                {
+                                    float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ);
+                                    if (ShouldDrawFace(selfId, neighborId) > 0.5) rowMask1 += exp2(u);
+                                }
+                            }
                         }
                     }
 
-                    if (maxU < minU || maxV < minV) return 0;
-                    return float4(minU / 255.0, maxU / 255.0, minV / 255.0, (maxV + 1.0) / 255.0);
+                    float row0Lo = floor(fmod(rowMask0, 256.0));
+                    float row0Hi = floor(rowMask0 / 256.0);
+                    float row1Lo = floor(fmod(rowMask1, 256.0));
+                    float row1Hi = floor(rowMask1 / 256.0);
+                    return float4(row0Lo / 255.0, row0Hi / 255.0, row1Lo / 255.0, row1Hi / 255.0);
                 }
 
                 if (_Mode > 0.5)
