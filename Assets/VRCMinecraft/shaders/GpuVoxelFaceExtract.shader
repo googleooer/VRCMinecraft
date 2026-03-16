@@ -138,6 +138,112 @@ Shader "VRCM/GpuVoxelFaceExtract"
 
             float4 frag(v2f i) : SV_Target
             {
+                if (_Mode > 1.5)
+                {
+                    float slotIndex = floor(_ReadSlotIndex + 0.5);
+                    if (slotIndex < 0.0 || slotIndex >= _UdonVRCM_GpuVoxelOffset.w) return 0;
+
+                    float2 slotMetaUv = float2((slotIndex + 0.5) / _UdonVRCM_GpuVoxelOffset.w, 0.5);
+                    float4 slotMeta = tex2D(_SlotMetaTex, slotMetaUv);
+                    if (slotMeta.a < 0.5) return 0;
+
+                    float slice = floor(i.uv.x * _UdonVRCM_GpuChunkInfo.y);
+                    float direction = floor(i.uv.y * 6.0);
+                    if (direction < 0.0 || direction > 5.0) return 0;
+
+                    float width = _UdonVRCM_GpuChunkInfo.x;
+                    float height = _UdonVRCM_GpuChunkInfo.y;
+                    float sliceCount = 0.0;
+                    float maskWidth = 0.0;
+                    float maskHeight = 0.0;
+
+                    if (direction <= 1.0)
+                    {
+                        sliceCount = height;
+                        maskWidth = width;
+                        maskHeight = width;
+                    }
+                    else if (direction <= 3.0)
+                    {
+                        sliceCount = width;
+                        maskWidth = width;
+                        maskHeight = height;
+                    }
+                    else
+                    {
+                        sliceCount = width;
+                        maskWidth = width;
+                        maskHeight = height;
+                    }
+
+                    if (slice < 0.0 || slice >= sliceCount) return 0;
+
+                    float chunkX = floor(slotMeta.r * 255.0 + 0.5);
+                    float chunkY = floor(slotMeta.g * 255.0 + 0.5);
+                    float chunkZ = floor(slotMeta.b * 255.0 + 0.5);
+
+                    float minU = 255.0;
+                    float maxU = -1.0;
+                    float minV = 255.0;
+                    float maxV = -1.0;
+
+                    [loop]
+                    for (int vInt = 0; vInt < 64; vInt++)
+                    {
+                        float v = (float)vInt;
+                        if (v >= maskHeight) break;
+
+                        [loop]
+                        for (int uInt = 0; uInt < 16; uInt++)
+                        {
+                            float u = (float)uInt;
+                            if (u >= maskWidth) break;
+
+                            float localX = 0.0;
+                            float localY = 0.0;
+                            float localZ = 0.0;
+                            float offsetX = 0.0;
+                            float offsetY = 0.0;
+                            float offsetZ = 0.0;
+
+                            if (direction <= 1.0)
+                            {
+                                localX = u; localY = slice; localZ = v;
+                                offsetY = (direction < 0.5) ? 1.0 : -1.0;
+                            }
+                            else if (direction <= 3.0)
+                            {
+                                localX = u; localY = v; localZ = slice;
+                                offsetZ = (direction < 2.5) ? 1.0 : -1.0;
+                            }
+                            else
+                            {
+                                localX = slice; localY = v; localZ = u;
+                                offsetX = (direction < 4.5) ? 1.0 : -1.0;
+                            }
+
+                            float selfId = SampleBlockId(slotIndex, localX, localY, localZ);
+                            if (selfId < 0.5) continue;
+
+                            float2 propUv = float2((selfId + 0.5) / 256.0, 0.5);
+                            float4 blockProps = tex2D(_BlockPropsTex, propUv);
+                            float shapeType = floor(blockProps.b * 255.0 + 0.5);
+                            if (shapeType >= 1.0) continue;
+
+                            float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ);
+                            if (ShouldDrawFace(selfId, neighborId) <= 0.5) continue;
+
+                            if (u < minU) minU = u;
+                            if (u > maxU) maxU = u;
+                            if (v < minV) minV = v;
+                            if (v > maxV) maxV = v;
+                        }
+                    }
+
+                    if (maxU < minU || maxV < minV) return 0;
+                    return float4(minU / 255.0, maxU / 255.0, minV / 255.0, (maxV + 1.0) / 255.0);
+                }
+
                 if (_Mode > 0.5)
                 {
                     float slotIndex = floor(_ReadSlotIndex + 0.5);

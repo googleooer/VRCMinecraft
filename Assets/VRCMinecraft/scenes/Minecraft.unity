@@ -15729,6 +15729,7 @@ MonoBehaviour:
   gpuResidentRadiusXZ: 6
   gpuResidentRadiusY: 2
   gpuResidentSyncsPerFrame: 32
+  useCompactGpuFaceExport: 1
   gpuAtlasOverlayMaterial: {fileID: 2100000, guid: 6ffd481a607465347b4812e0d2d77d4d,
     type: 2}
   gpuLightingSeedMaterial: {fileID: 2100000, guid: 80cf6f210528e0644a644435bad9f839,

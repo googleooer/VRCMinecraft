@@ -108,6 +108,8 @@ public class McWorld : UdonSharpBehaviour
     public int gpuResidentRadiusXZ = 6;
     public int gpuResidentRadiusY = 2;
     public int gpuResidentSyncsPerFrame = 32;
+    [Tooltip("Experimental: export per-slice face bounds instead of dense face pixels for GPU meshing. Disabled by default until validated.")]
+    public bool useCompactGpuFaceExport = false;
     public Material gpuAtlasOverlayMaterial;
     public Material gpuLightingSeedMaterial;
     public Material gpuLightingPropagateMaterial;
@@ -213,12 +215,14 @@ public class McWorld : UdonSharpBehaviour
     // --- GPU Face Extraction State ---
     private const int GPU_FACE_READBACK_BUFFER_COUNT = 2;
     private const int GPU_FACE_READBACKS_PER_FRAME = 1;
+    private const int GPU_FACE_SUMMARY_HEIGHT = 6;
     private Texture2D gpuShouldDrawTexture;
     private RenderTexture gpuFaceAtlas;
     private RenderTexture[] gpuFaceReadbackTextures;
     private int gpuPropDrawTableTexId;
     private int gpuPropFaceModeId;
     private int gpuPropFaceReadSlotId;
+    private int gpuFaceSummaryWidth = 64;
     private Color32[][] gpuFaceReadbackPixels; // per-buffer, per-chunk face readback
     private ChunkData[] gpuFaceReadbackChunks;
     private int[] gpuFaceReadbackSlots;
@@ -409,6 +413,8 @@ public class McWorld : UdonSharpBehaviour
     private float stats_gpuFaceExtractBlitTime = 0f;
     private int stats_gpuFaceExportBlits = 0;
     private float stats_gpuFaceExportBlitTime = 0f;
+    private int stats_gpuFaceCompactBuilds = 0;
+    private int stats_gpuFaceCompactActiveSlices = 0;
     private int stats_gpuChunkUploads = 0;
     private float stats_gpuChunkUploadTime = 0f;
     private int stats_gpuChunkUploadBytes = 0;
@@ -572,6 +578,7 @@ public class McWorld : UdonSharpBehaviour
         if (gpuResidentSyncsPerFrame <= 0) gpuResidentSyncsPerFrame = 32;
         gpuTileWidth = chunkSizeXZ;
         gpuTileHeight = chunkSizeY * chunkSizeXZ;
+        gpuFaceSummaryWidth = chunkSizeY;
 
         float pixelAspect = gpuTileHeight / (float)Mathf.Max(1, gpuTileWidth);
         gpuAtlasSlotsX = Mathf.Clamp(Mathf.CeilToInt(Mathf.Sqrt(gpuChunkSlotCapacity * pixelAspect)), 1, gpuChunkSlotCapacity);
@@ -651,9 +658,11 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceReadbackReadyOrder = new int[GPU_FACE_READBACK_BUFFER_COUNT];
         for (int i = 0; i < GPU_FACE_READBACK_BUFFER_COUNT; i++)
         {
-            gpuFaceReadbackTextures[i] = _CreateGpuRenderTexture(gpuTileWidth, gpuTileHeight, "GPU_FaceReadback_" + i);
+            int readbackWidth = useCompactGpuFaceExport ? gpuFaceSummaryWidth : gpuTileWidth;
+            int readbackHeight = useCompactGpuFaceExport ? GPU_FACE_SUMMARY_HEIGHT : gpuTileHeight;
+            gpuFaceReadbackTextures[i] = _CreateGpuRenderTexture(readbackWidth, readbackHeight, "GPU_FaceReadback_" + i);
             VRCGraphics.Blit(gpuClearTexture, gpuFaceReadbackTextures[i]);
-            gpuFaceReadbackPixels[i] = new Color32[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
+            gpuFaceReadbackPixels[i] = new Color32[readbackWidth * readbackHeight];
             gpuFaceReadbackSlots[i] = -1;
             gpuFaceReadbackStartMs[i] = -1f;
         }
@@ -1387,6 +1396,30 @@ public class McWorld : UdonSharpBehaviour
 #endif
     }
 
+    private void _GpuRunFaceSummaryExportDirect(int bufferIndex, int slotIndex)
+    {
+        if (!_GpuFaceExtractionReady() || bufferIndex < 0 || bufferIndex >= gpuFaceReadbackTextures.Length) return;
+
+        gpuFaceExtractMaterial.SetFloat(gpuPropFaceModeId, 2f);
+        gpuFaceExtractMaterial.SetFloat(gpuPropFaceReadSlotId, slotIndex);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
+        float blitStart = 0f;
+#if LOGGING
+        if (enableDetailedTimings) blitStart = Time.realtimeSinceStartup;
+#endif
+        VRCGraphics.Blit(gpuBlockAtlas, gpuFaceReadbackTextures[bufferIndex], gpuFaceExtractMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceExportBlits++;
+            stats_gpuFaceExportBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
+    }
+
     private bool _GpuRequestChunkFaceReadback(ChunkData chunk)
     {
         if (!_GpuFaceExtractionReady() || chunk == null) return false;
@@ -1415,7 +1448,8 @@ public class McWorld : UdonSharpBehaviour
             gpuFaceReadbackStartMs[bufferIndex] = requestStartMs;
         }
 #endif
-        _GpuRunFaceExtractionDirect(bufferIndex, slotIndex);
+        if (useCompactGpuFaceExport) _GpuRunFaceSummaryExportDirect(bufferIndex, slotIndex);
+        else _GpuRunFaceExtractionDirect(bufferIndex, slotIndex);
         VRCAsyncGPUReadback.Request(gpuFaceReadbackTextures[bufferIndex], 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
         return true;
     }
@@ -1541,6 +1575,50 @@ public class McWorld : UdonSharpBehaviour
 #endif
     }
 
+    private void _DecodeGpuFaceSummary(ChunkData chunk, Color32[] summaryPixels)
+    {
+        if (chunk == null || summaryPixels == null) return;
+
+        _ResetGpuFaceSliceSummary(chunk);
+        int activeSliceCount = 0;
+        int summaryWidth = gpuFaceSummaryWidth > 0 ? gpuFaceSummaryWidth : chunkSizeY;
+
+        for (int direction = 0; direction < GPU_FACE_SUMMARY_HEIGHT; direction++)
+        {
+            int sliceCount = direction <= 1 ? chunkSizeY : chunkSizeXZ;
+            int rowBase = direction * summaryWidth;
+            for (int slice = 0; slice < sliceCount; slice++)
+            {
+                int pixelIndex = rowBase + slice;
+                if (pixelIndex < 0 || pixelIndex >= summaryPixels.Length) continue;
+
+                Color32 pixel = summaryPixels[pixelIndex];
+                if (pixel.a == 0) continue;
+
+                int maxV = pixel.a - 1;
+                if (maxV < 0) continue;
+
+                int summaryIndex = _GetGpuFaceSliceSummaryIndex(direction, slice);
+                if (summaryIndex < 0 || summaryIndex >= chunk._gpuFaceSliceActive.Length) continue;
+
+                chunk._gpuFaceSliceActive[summaryIndex] = 1;
+                chunk._gpuFaceSliceMinU[summaryIndex] = pixel.r;
+                chunk._gpuFaceSliceMaxU[summaryIndex] = pixel.g;
+                chunk._gpuFaceSliceMinV[summaryIndex] = pixel.b;
+                chunk._gpuFaceSliceMaxV[summaryIndex] = (byte)maxV;
+                activeSliceCount++;
+            }
+        }
+
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceCompactBuilds++;
+            stats_gpuFaceCompactActiveSlices += activeSliceCount;
+        }
+#endif
+    }
+
 
     private void _StartGpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels, int bufferIndex)
     {
@@ -1548,14 +1626,53 @@ public class McWorld : UdonSharpBehaviour
 
         _ClearAllMeshBuffers(chunk);
         _PreComputeBiomeColors(chunk);
-        chunk._gpuFacePixels = facePixels;
-        chunk._gpuFaceReadbackQueueSlot = bufferIndex;
-        chunk._gpuFaceBuildActive = true;
-        chunk._gpuFaceBuildStage = -1;
-        chunk._gpuFaceDirection = 0;
-        chunk._gpuFaceSlice = 0;
-        chunk._gpuFaceCrossIndex = 0;
-        chunk._gpuFaceSummaryIndex = 0;
+        if (useCompactGpuFaceExport)
+        {
+            ChunkData[] neighbors = _GetCachedNeighbors(chunk);
+            chunk.neighborPX = neighbors[0];
+            chunk.neighborNX = neighbors[1];
+            chunk.neighborPY = neighbors[2];
+            chunk.neighborNY = neighbors[3];
+            chunk.neighborPZ = neighbors[4];
+            chunk.neighborNZ = neighbors[5];
+            _DecompressNeighborsOnce(chunk);
+            if (!UsesGpuLightingBackend())
+            {
+                _PreComputeChunkBrightness(chunk);
+                if (chunk.neighborPX != null && chunk.neighborPX.isDataReady) _PreComputeChunkBrightness(chunk.neighborPX);
+                if (chunk.neighborNX != null && chunk.neighborNX.isDataReady) _PreComputeChunkBrightness(chunk.neighborNX);
+                if (chunk.neighborPY != null && chunk.neighborPY.isDataReady) _PreComputeChunkBrightness(chunk.neighborPY);
+                if (chunk.neighborNY != null && chunk.neighborNY.isDataReady) _PreComputeChunkBrightness(chunk.neighborNY);
+                if (chunk.neighborPZ != null && chunk.neighborPZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborPZ);
+                if (chunk.neighborNZ != null && chunk.neighborNZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborNZ);
+            }
+
+            _DecodeGpuFaceSummary(chunk, facePixels);
+            gpuFaceReadbackChunks[bufferIndex] = null;
+            gpuFaceReadbackSlots[bufferIndex] = -1;
+            gpuFaceReadbackState[bufferIndex] = 0;
+            chunk._gpuFacePixels = null;
+            chunk._gpuFaceReadbackQueueSlot = -1;
+            chunk._gpuFaceBuildUsesSummary = true;
+            chunk._gpuFaceBuildActive = true;
+            chunk._gpuFaceBuildStage = 0;
+            chunk._gpuFaceDirection = 0;
+            chunk._gpuFaceSlice = 0;
+            chunk._gpuFaceCrossIndex = 0;
+            chunk._gpuFaceSummaryIndex = 0;
+        }
+        else
+        {
+            chunk._gpuFacePixels = facePixels;
+            chunk._gpuFaceReadbackQueueSlot = bufferIndex;
+            chunk._gpuFaceBuildUsesSummary = false;
+            chunk._gpuFaceBuildActive = true;
+            chunk._gpuFaceBuildStage = -1;
+            chunk._gpuFaceDirection = 0;
+            chunk._gpuFaceSlice = 0;
+            chunk._gpuFaceCrossIndex = 0;
+            chunk._gpuFaceSummaryIndex = 0;
+        }
 
         if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
         {
@@ -1586,6 +1703,7 @@ public class McWorld : UdonSharpBehaviour
 
         chunk._gpuFacePixels = null;
         chunk._gpuFaceReadbackQueueSlot = -1;
+        chunk._gpuFaceBuildUsesSummary = false;
         chunk._gpuFaceBuildActive = false;
     }
 
@@ -1666,7 +1784,8 @@ public class McWorld : UdonSharpBehaviour
             stats_gpuFaceDecodeSteps++;
         }
 #endif
-        if (chunk == null || chunk._gpuFacePixels == null)
+        bool useSummary = chunk != null && chunk._gpuFaceBuildUsesSummary;
+        if (chunk == null || (useSummary ? chunk._decompSelf == null : chunk._gpuFacePixels == null))
         {
             if (chunk != null)
             {
@@ -1694,11 +1813,27 @@ public class McWorld : UdonSharpBehaviour
         int totalPixels = sizeY * stride;
         int summaryBudgetCountdown = 64;
         int crossBudgetCountdown = 16;
+        byte[] selfData = chunk._decompSelf;
+        byte[] dataPX = chunk._decompPX;
+        byte[] dataNX = chunk._decompNX;
+        byte[] dataPY = chunk._decompPY;
+        byte[] dataNY = chunk._decompNY;
+        byte[] dataPZ = chunk._decompPZ;
+        byte[] dataNZ = chunk._decompNZ;
 
         while (Time.realtimeSinceStartup - budgetStart <= budgetSec)
         {
             if (chunk._gpuFaceBuildStage == -1)
             {
+                if (useSummary)
+                {
+                    chunk._gpuFaceBuildStage = 0;
+                    chunk._gpuFaceDirection = 0;
+                    chunk._gpuFaceSlice = 0;
+                    chunk._gpuFaceCrossIndex = 0;
+                    continue;
+                }
+
                 if (chunk._gpuFaceSummaryIndex == 0)
                 {
                     _ResetGpuFaceSliceSummary(chunk);
@@ -1792,35 +1927,64 @@ public class McWorld : UdonSharpBehaviour
                     continue;
                 }
 
-                int maskCount = maskWidth * maskHeight;
-                System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
-
-                for (int v = minV; v <= maxV; v++)
+                if (useSummary)
                 {
-                    for (int u = minU; u <= maxU; u++)
+                    _BuildGreedySliceMaskRegion(chunk, direction, slice, selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, stride, minU, maxU, minV, maxV, out maskWidth, out maskHeight);
+                }
+                else
+                {
+                    int clearWidth = maxU - minU + 1;
+                    for (int clearV = minV; clearV <= maxV; clearV++)
                     {
-                        int x, y, z;
-                        if (direction <= 1) { x = u; y = slice; z = v; }
-                        else if (direction <= 3) { x = u; y = v; z = slice; }
-                        else { x = slice; y = v; z = u; }
+                        System.Array.Clear(greedyMaskBlockIds, clearV * maskWidth + minU, clearWidth);
+                    }
+                    int[] packedGrassColors = chunk._cachedPackedGrassBiomeColors;
+                    byte[] tintModes = biomeTintModeCache;
 
-                        int pixelIndex = y * stride + z * sizeXZ + x;
-                        if (pixelIndex >= facePixels.Length) continue;
+                    for (int v = minV; v <= maxV; v++)
+                    {
+                        int maskRowOffset = v * maskWidth;
+                        for (int u = minU; u <= maxU; u++)
+                        {
+                            int x, y, z;
+                            if (direction <= 1) { x = u; y = slice; z = v; }
+                            else if (direction <= 3) { x = u; y = v; z = slice; }
+                            else { x = slice; y = v; z = u; }
 
-                        Color32 pixel = facePixels[pixelIndex];
-                        if (pixel.a < 128) continue;
+                            int pixelIndex = y * stride + z * sizeXZ + x;
+                            if (pixelIndex >= facePixels.Length) continue;
 
-                        int faceMask = pixel.r;
-                        int blockID = pixel.g;
-                        int shapeType = pixel.b;
+                            Color32 pixel = facePixels[pixelIndex];
+                            if (pixel.a < 128) continue;
 
-                        if (blockID == 0 || shapeType >= 1) continue;
-                        if ((faceMask & bit) == 0) continue;
+                            int faceMask = pixel.r;
+                            int blockID = pixel.g;
+                            int shapeType = pixel.b;
 
-                        int maskIndex = v * maskWidth + u;
-                        greedyMaskBlockIds[maskIndex] = (byte)blockID;
-                        greedyMaskLightLevels[maskIndex] = 0;
-                        greedyMaskPackedColors[maskIndex] = _GetPackedBiomeColor(chunk, (byte)blockID, x, z);
+                            if (blockID == 0 || shapeType >= 1) continue;
+                            if ((faceMask & bit) == 0) continue;
+
+                            int maskIndex = maskRowOffset + u;
+                            greedyMaskBlockIds[maskIndex] = (byte)blockID;
+                            greedyMaskLightLevels[maskIndex] = 0;
+                            byte tintMode = (tintModes != null && blockID < tintModes.Length) ? tintModes[blockID] : (byte)0;
+                            if (tintMode == 0)
+                            {
+                                greedyMaskPackedColors[maskIndex] = PACKED_WHITE_RGB;
+                            }
+                            else
+                            {
+                                int biomeIndex = z * sizeXZ + x;
+                                if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                                {
+                                    greedyMaskPackedColors[maskIndex] = packedGrassColors[biomeIndex];
+                                }
+                                else
+                                {
+                                    greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, (byte)blockID, x, z));
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1838,13 +2002,28 @@ public class McWorld : UdonSharpBehaviour
                     int x = (packed >> 16) & 0xFF;
                     int y = (packed >> 8) & 0xFF;
                     int z = packed & 0xFF;
-                    int pixelIndex = y * stride + z * sizeXZ + x;
-                    if (pixelIndex >= 0 && pixelIndex < facePixels.Length)
+                    if (useSummary)
                     {
-                        Color32 pixel = facePixels[pixelIndex];
-                        if (pixel.a >= 128 && pixel.g != 0)
+                        int blockIndex = y * stride + z * sizeXZ + x;
+                        if (blockIndex >= 0 && blockIndex < selfData.Length)
                         {
-                            _AddCrossBlockQuads(chunk, (byte)pixel.g, x, y, z);
+                            byte blockID = selfData[blockIndex];
+                            if (blockID != 0)
+                            {
+                                _AddCrossBlockQuads(chunk, blockID, x, y, z);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        int pixelIndex = y * stride + z * sizeXZ + x;
+                        if (pixelIndex >= 0 && pixelIndex < facePixels.Length)
+                        {
+                            Color32 pixel = facePixels[pixelIndex];
+                            if (pixel.a >= 128 && pixel.g != 0)
+                            {
+                                _AddCrossBlockQuads(chunk, (byte)pixel.g, x, y, z);
+                            }
                         }
                     }
 
@@ -1874,6 +2053,16 @@ public class McWorld : UdonSharpBehaviour
 #endif
                 _ReleaseGpuFaceBuildBuffer(chunk);
                 chunk.isBuildingMesh = false;
+                if (useSummary)
+                {
+                    chunk.neighborPX = null; chunk.neighborNX = null;
+                    chunk.neighborPY = null; chunk.neighborNY = null;
+                    chunk.neighborPZ = null; chunk.neighborNZ = null;
+                    chunk._decompSelf = null;
+                    chunk._decompNX = null; chunk._decompPX = null;
+                    chunk._decompNY = null; chunk._decompPY = null;
+                    chunk._decompNZ = null; chunk._decompPZ = null;
+                }
 #if LOGGING
                 if (enableDetailedTimings)
                 {
@@ -4030,6 +4219,97 @@ public class McWorld : UdonSharpBehaviour
                 if (!drawFace) continue;
 
                 int maskIndex = v * width + u;
+                greedyMaskBlockIds[maskIndex] = selfID;
+                greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
+                greedyMaskPackedColors[maskIndex] = _GetPackedBiomeColor(chunk, selfID, x, z);
+            }
+        }
+    }
+
+    private void _BuildGreedySliceMaskRegion(ChunkData chunk, int direction, int slice, byte[] selfData, byte[] dataNX, byte[] dataPX, byte[] dataNY, byte[] dataPY, byte[] dataNZ, byte[] dataPZ, int chunkStride, int minU, int maxU, int minV, int maxV, out int width, out int height)
+    {
+        width = (direction <= 3) ? chunkSizeXZ : chunkSizeXZ;
+        height = (direction <= 1) ? chunkSizeXZ : chunkSizeY;
+
+        if (minU < 0) minU = 0;
+        if (minV < 0) minV = 0;
+        if (maxU >= width) maxU = width - 1;
+        if (maxV >= height) maxV = height - 1;
+        if (maxU < minU || maxV < minV) return;
+
+        byte[] drawTable = shouldDrawTable;
+        int drawTableLen = drawTable != null ? drawTable.Length : 0;
+        BlockCullingType[] cullCache = cullingCache;
+        int cullCacheLen = cullCache != null ? cullCache.Length : 0;
+        McBlockShapeType[] shapeCache = shapeTypeCache;
+        int shapeCacheLen = shapeCache != null ? shapeCache.Length : 0;
+
+        for (int v = minV; v <= maxV; v++)
+        {
+            int rowOffset = v * width;
+            System.Array.Clear(greedyMaskBlockIds, rowOffset + minU, maxU - minU + 1);
+
+            for (int u = minU; u <= maxU; u++)
+            {
+                int x = 0, y = 0, z = 0;
+                if (direction <= 1)
+                {
+                    x = u; y = slice; z = v;
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY != null && chunk._columnMaxY != null)
+                    {
+                        byte minY = chunk._columnMinY[columnIndex];
+                        byte maxY = chunk._columnMaxY[columnIndex];
+                        if (minY == 255 || slice < minY || slice > maxY) continue;
+                    }
+                }
+                else if (direction <= 3)
+                {
+                    x = u; y = v; z = slice;
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY != null && chunk._columnMaxY != null)
+                    {
+                        byte minY = chunk._columnMinY[columnIndex];
+                        byte maxY = chunk._columnMaxY[columnIndex];
+                        if (minY == 255 || y < minY || y > maxY) continue;
+                    }
+                }
+                else
+                {
+                    x = slice; y = v; z = u;
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY != null && chunk._columnMaxY != null)
+                    {
+                        byte minY = chunk._columnMinY[columnIndex];
+                        byte maxY = chunk._columnMaxY[columnIndex];
+                        if (minY == 255 || y < minY || y > maxY) continue;
+                    }
+                }
+
+                int selfIndex = y * chunkStride + z * chunkSizeXZ + x;
+                byte selfID = selfData[selfIndex];
+                if (selfID == 0) continue;
+                if (selfID < shapeCacheLen && shapeCache[selfID] == McBlockShapeType.Cross) continue;
+
+                int neighborX = x;
+                int neighborY = y;
+                int neighborZ = z;
+                bool suppressSameNoCull = false;
+
+                if (direction == 0) neighborY++;
+                else if (direction == 1) { neighborY--; suppressSameNoCull = true; }
+                else if (direction == 2) neighborZ++;
+                else if (direction == 3) { neighborZ--; suppressSameNoCull = true; }
+                else if (direction == 4) neighborX++;
+                else { neighborX--; suppressSameNoCull = true; }
+
+                byte neighborID = _GetBlockDirectMeshing(selfData, dataNX, dataPX, dataNY, dataPY, dataNZ, dataPZ, neighborX, neighborY, neighborZ, chunkSizeXZ, chunkSizeY, chunkStride);
+                if (suppressSameNoCull && selfID == neighborID && selfID < cullCacheLen && cullCache[selfID] == BlockCullingType.NoCull) continue;
+
+                int drawIndex = (selfID << 8) | neighborID;
+                if (drawIndex >= drawTableLen || drawTable[drawIndex] == 0) continue;
+
+                int maskIndex = rowOffset + u;
                 greedyMaskBlockIds[maskIndex] = selfID;
                 greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
                 greedyMaskPackedColors[maskIndex] = _GetPackedBiomeColor(chunk, selfID, x, z);
