@@ -2749,13 +2749,29 @@ public class McTerrainGenerator : UdonSharpBehaviour
             return;
         }
 
-        if (gpuColumnReadbackBlocks == null || gpuColumnReadbackBlocks.Length != gpuColumnReadbackPixels.Length)
+        Color32[] readbackPixels = gpuColumnReadbackPixels;
+        if (gpuColumnReadbackBlocks == null || gpuColumnReadbackBlocks.Length != readbackPixels.Length)
         {
-            gpuColumnReadbackBlocks = new byte[gpuColumnReadbackPixels.Length];
+            gpuColumnReadbackBlocks = new byte[readbackPixels.Length];
         }
-        for (int i = 0; i < gpuColumnReadbackPixels.Length; i++)
+        byte[] readbackBlocks = gpuColumnReadbackBlocks;
+        int readbackLength = readbackPixels.Length;
+        int unrolledLimit = readbackLength - 7;
+        int readbackIndex = 0;
+        for (; readbackIndex < unrolledLimit; readbackIndex += 8)
         {
-            gpuColumnReadbackBlocks[i] = gpuColumnReadbackPixels[i].r;
+            readbackBlocks[readbackIndex] = readbackPixels[readbackIndex].r;
+            readbackBlocks[readbackIndex + 1] = readbackPixels[readbackIndex + 1].r;
+            readbackBlocks[readbackIndex + 2] = readbackPixels[readbackIndex + 2].r;
+            readbackBlocks[readbackIndex + 3] = readbackPixels[readbackIndex + 3].r;
+            readbackBlocks[readbackIndex + 4] = readbackPixels[readbackIndex + 4].r;
+            readbackBlocks[readbackIndex + 5] = readbackPixels[readbackIndex + 5].r;
+            readbackBlocks[readbackIndex + 6] = readbackPixels[readbackIndex + 6].r;
+            readbackBlocks[readbackIndex + 7] = readbackPixels[readbackIndex + 7].r;
+        }
+        for (; readbackIndex < readbackLength; readbackIndex++)
+        {
+            readbackBlocks[readbackIndex] = readbackPixels[readbackIndex].r;
         }
 
         gpuColumnReadbackFailed = false;
