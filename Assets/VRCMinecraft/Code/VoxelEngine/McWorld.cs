@@ -162,6 +162,7 @@ public class McWorld : UdonSharpBehaviour
     private readonly byte[] greedyMaskBlockIds = new byte[256];
     private readonly byte[] greedyMaskLightLevels = new byte[256];
     private readonly int[] greedyMaskPackedColors = new int[256];
+    private bool stats_trackCompactEmitInternals = false;
 
     // --- OPTIMIZATION: Deferred Reconciliation System ---
     private readonly System.Collections.Generic.Queue<ChunkData> deferredReconciliationQueue = new System.Collections.Generic.Queue<ChunkData>();
@@ -363,6 +364,9 @@ public class McWorld : UdonSharpBehaviour
     private float stats_gpuFaceCompactMaskDecodeTime = 0f;
     private float stats_gpuFaceCompactEmitTime = 0f;
     private float stats_gpuFaceCompactCrossTime = 0f;
+    private float stats_gpuFaceCompactEmitScanTime = 0f;
+    private float stats_gpuFaceCompactEmitQuadTime = 0f;
+    private float stats_gpuFaceCompactEmitCollisionTime = 0f;
     private int stats_meshDeferredChunks = 0;
 
     // --- Lighting Stats (aggregate) ---
@@ -1963,7 +1967,9 @@ public class McWorld : UdonSharpBehaviour
                     }
 
                     float compactEmitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+                    stats_trackCompactEmitInternals = enableDetailedTimings;
                     _EmitGreedyMask(chunk, direction, slice, maskWidth, maskHeight);
+                    stats_trackCompactEmitInternals = false;
                     if (enableDetailedTimings)
                     {
                         stats_gpuFaceCompactEmitTime += (Time.realtimeSinceStartup - compactEmitStart) * 1000f;
@@ -2585,6 +2591,15 @@ public class McWorld : UdonSharpBehaviour
                     if (chunkIndex == -1) continue;
 
                     ChunkData chunk = chunks_1D[chunkIndex];
+                    if (chunk != null && chunk.pendingColliderMeshRebuild && !chunk.isBuildingMesh)
+                    {
+                        if (!_ShouldEnableChunkCollider(chunk)) continue;
+                        chunk.pendingColliderMeshRebuild = false;
+                        RequestChunkMeshUpdate(chunkIndex);
+                        completedTasks++;
+                        if (completedTasks >= taskLimit) return completedTasks;
+                        continue;
+                    }
                     if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh || !chunk.pendingColliderApply) continue;
                     if (!_ShouldEnableChunkCollider(chunk)) continue;
 
@@ -2620,6 +2635,16 @@ public class McWorld : UdonSharpBehaviour
 
             ChunkData chunk = chunks_1D[chunkIndex];
             if (chunk == null || !chunk.isDataReady) continue;
+
+            if (chunk.pendingColliderMeshRebuild && !chunk.isBuildingMesh)
+            {
+                if (!_ShouldEnableChunkCollider(chunk)) continue;
+                chunk.pendingColliderMeshRebuild = false;
+                RequestChunkMeshUpdate(chunkIndex);
+                completedTasks++;
+                if (completedTasks >= taskLimit) break;
+                continue;
+            }
 
             if (nearOnlyChunkColliders && !chunk.isBuildingMesh && chunk.meshCollider != null && chunk.meshCollider.enabled && !_ShouldEnableChunkCollider(chunk))
             {
@@ -3296,6 +3321,7 @@ public class McWorld : UdonSharpBehaviour
         chunk.isBuildingMesh = true;
         chunk.isMeshDeferred = false;
         chunk.pendingColliderApply = false;
+        chunk.pendingColliderMeshRebuild = !_ShouldEnableChunkCollider(chunk);
 
 #if LOGGING
         chunk.meshBuildStartTime = Time.realtimeSinceStartup;
@@ -4132,11 +4158,22 @@ public class McWorld : UdonSharpBehaviour
             targetVertices[currentVertexCount + 3] = new Vector3(plane, v0, u0);
         }
 
-        for (int i = 0; i < 4; i++) targetNormals[currentVertexCount + i] = faceNormal;
+        targetNormals[currentVertexCount + 0] = faceNormal;
+        targetNormals[currentVertexCount + 1] = faceNormal;
+        targetNormals[currentVertexCount + 2] = faceNormal;
+        targetNormals[currentVertexCount + 3] = faceNormal;
 
-        float brightness = (lightLevel >= 0 && lightLevel < lightBrightnessTable.Length) ? lightBrightnessTable[lightLevel] : 1f;
-        Color biomeColor = _UnpackColorRGB(packedColor, brightness);
-        for (int i = 0; i < 4; i++) targetColors[currentVertexCount + i] = biomeColor;
+        float brightness = lightBrightnessTable[lightLevel];
+        Color biomeColor = new Color(
+            (packedColor & 0xFF) / 255f,
+            ((packedColor >> 8) & 0xFF) / 255f,
+            ((packedColor >> 16) & 0xFF) / 255f,
+            brightness
+        );
+        targetColors[currentVertexCount + 0] = biomeColor;
+        targetColors[currentVertexCount + 1] = biomeColor;
+        targetColors[currentVertexCount + 2] = biomeColor;
+        targetColors[currentVertexCount + 3] = biomeColor;
 
         float textureSlice = _GetTextureSliceCached(blockID, faceIndex);
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice);
@@ -4155,8 +4192,11 @@ public class McWorld : UdonSharpBehaviour
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
         else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
 
-        if (visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4)
+        if (!chunk.pendingColliderMeshRebuild && visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4)
         {
+#if LOGGING
+            float collisionWriteStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
+#endif
             chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
             chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
             chunk._collisionVertices[chunk._collisionVertexCount + 2] = targetVertices[currentVertexCount + 2];
@@ -4168,6 +4208,12 @@ public class McWorld : UdonSharpBehaviour
             chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 2;
             chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 3;
             chunk._collisionVertexCount += 4;
+#if LOGGING
+            if (stats_trackCompactEmitInternals)
+            {
+                stats_gpuFaceCompactEmitCollisionTime += (Time.realtimeSinceStartup - collisionWriteStart) * 1000f;
+            }
+#endif
         }
 
 #if LOGGING
@@ -4387,9 +4433,63 @@ public class McWorld : UdonSharpBehaviour
         byte[] blockIds = greedyMaskBlockIds;
         byte[] lightLevels = greedyMaskLightLevels;
         int[] packedColors = greedyMaskPackedColors;
+        byte[] currentBrightness = chunk._cachedBrightness;
+        byte[] neighborBrightness = null;
         int sizeXZ = chunkSizeXZ;
+        int sizeY = chunkSizeY;
         int sliceStrideBase = slice * chunkStride;
         int sliceRowBase = slice * sizeXZ;
+        byte fallbackLight = UsesGpuLightingBackend() ? (byte)15 : (byte)0;
+        int neighborAxis = slice;
+
+        if (direction == 0) neighborAxis++;
+        else if (direction == 1) neighborAxis--;
+        else if (direction == 2) neighborAxis++;
+        else if (direction == 3) neighborAxis--;
+        else if (direction == 4) neighborAxis++;
+        else neighborAxis--;
+
+        bool usesCurrentBrightness = false;
+        int neighborAxisLocal = neighborAxis;
+        if (direction <= 1)
+        {
+            if (neighborAxis >= 0 && neighborAxis < sizeY)
+            {
+                usesCurrentBrightness = currentBrightness != null;
+            }
+            else
+            {
+                ChunkData neighborChunk = neighborAxis < 0 ? chunk.neighborNY : chunk.neighborPY;
+                neighborAxisLocal = neighborAxis < 0 ? sizeY - 1 : 0;
+                if (neighborChunk != null && neighborChunk.isDataReady) neighborBrightness = neighborChunk._cachedBrightness;
+            }
+        }
+        else if (direction <= 3)
+        {
+            if (neighborAxis >= 0 && neighborAxis < sizeXZ)
+            {
+                usesCurrentBrightness = currentBrightness != null;
+            }
+            else
+            {
+                ChunkData neighborChunk = neighborAxis < 0 ? chunk.neighborNZ : chunk.neighborPZ;
+                neighborAxisLocal = neighborAxis < 0 ? sizeXZ - 1 : 0;
+                if (neighborChunk != null && neighborChunk.isDataReady) neighborBrightness = neighborChunk._cachedBrightness;
+            }
+        }
+        else
+        {
+            if (neighborAxis >= 0 && neighborAxis < sizeXZ)
+            {
+                usesCurrentBrightness = currentBrightness != null;
+            }
+            else
+            {
+                ChunkData neighborChunk = neighborAxis < 0 ? chunk.neighborNX : chunk.neighborPX;
+                neighborAxisLocal = neighborAxis < 0 ? sizeXZ - 1 : 0;
+                if (neighborChunk != null && neighborChunk.isDataReady) neighborBrightness = neighborChunk._cachedBrightness;
+            }
+        }
 
         for (int rowPair = 0; rowPair < rowPairs; rowPair++)
         {
@@ -4408,6 +4508,7 @@ public class McWorld : UdonSharpBehaviour
                 {
                     int selfRowBase = sliceStrideBase + v * sizeXZ;
                     int biomeRowBase = v * sizeXZ;
+                    int lightRowBase = neighborAxisLocal * chunkStride + biomeRowBase;
                     for (int u = 0; u < width && rowMask0 != 0; u++)
                     {
                         int bit = 1 << u;
@@ -4419,7 +4520,18 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, slice, v);
+                        if (usesCurrentBrightness)
+                        {
+                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                        }
+                        else if (neighborBrightness != null)
+                        {
+                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                        }
+                        else
+                        {
+                            lightLevels[maskIndex] = fallbackLight;
+                        }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
@@ -4443,6 +4555,7 @@ public class McWorld : UdonSharpBehaviour
                 else if (direction <= 3)
                 {
                     int selfRowBase = v * chunkStride + sliceRowBase;
+                    int lightRowBase = v * chunkStride + neighborAxisLocal * sizeXZ;
                     for (int u = 0; u < width && rowMask0 != 0; u++)
                     {
                         int bit = 1 << u;
@@ -4454,7 +4567,18 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, v, slice);
+                        if (usesCurrentBrightness)
+                        {
+                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                        }
+                        else if (neighborBrightness != null)
+                        {
+                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                        }
+                        else
+                        {
+                            lightLevels[maskIndex] = fallbackLight;
+                        }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
@@ -4478,6 +4602,7 @@ public class McWorld : UdonSharpBehaviour
                 else
                 {
                     int selfRowBase = v * chunkStride + slice;
+                    int lightRowBase = v * chunkStride + neighborAxisLocal;
                     for (int u = 0; u < width && rowMask0 != 0; u++)
                     {
                         int bit = 1 << u;
@@ -4490,7 +4615,18 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, slice, v, u);
+                        if (usesCurrentBrightness)
+                        {
+                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
+                        }
+                        else if (neighborBrightness != null)
+                        {
+                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
+                        }
+                        else
+                        {
+                            lightLevels[maskIndex] = fallbackLight;
+                        }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
@@ -4518,6 +4654,7 @@ public class McWorld : UdonSharpBehaviour
                 {
                     int selfRowBase = sliceStrideBase + v * sizeXZ;
                     int biomeRowBase = v * sizeXZ;
+                    int lightRowBase = neighborAxisLocal * chunkStride + biomeRowBase;
                     for (int u = 0; u < width && rowMask1 != 0; u++)
                     {
                         int bit = 1 << u;
@@ -4529,7 +4666,18 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, slice, v);
+                        if (usesCurrentBrightness)
+                        {
+                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                        }
+                        else if (neighborBrightness != null)
+                        {
+                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                        }
+                        else
+                        {
+                            lightLevels[maskIndex] = fallbackLight;
+                        }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
@@ -4553,6 +4701,7 @@ public class McWorld : UdonSharpBehaviour
                 else if (direction <= 3)
                 {
                     int selfRowBase = v * chunkStride + sliceRowBase;
+                    int lightRowBase = v * chunkStride + neighborAxisLocal * sizeXZ;
                     for (int u = 0; u < width && rowMask1 != 0; u++)
                     {
                         int bit = 1 << u;
@@ -4564,7 +4713,18 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, v, slice);
+                        if (usesCurrentBrightness)
+                        {
+                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                        }
+                        else if (neighborBrightness != null)
+                        {
+                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                        }
+                        else
+                        {
+                            lightLevels[maskIndex] = fallbackLight;
+                        }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
@@ -4588,6 +4748,7 @@ public class McWorld : UdonSharpBehaviour
                 else
                 {
                     int selfRowBase = v * chunkStride + slice;
+                    int lightRowBase = v * chunkStride + neighborAxisLocal;
                     for (int u = 0; u < width && rowMask1 != 0; u++)
                     {
                         int bit = 1 << u;
@@ -4600,7 +4761,18 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, slice, v, u);
+                        if (usesCurrentBrightness)
+                        {
+                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
+                        }
+                        else if (neighborBrightness != null)
+                        {
+                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
+                        }
+                        else
+                        {
+                            lightLevels[maskIndex] = fallbackLight;
+                        }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
@@ -4655,6 +4827,9 @@ public class McWorld : UdonSharpBehaviour
                 byte lightLevel = lightLevels[maskIndex];
                 int packedColor = packedColors[maskIndex];
 
+#if LOGGING
+                float emitScanStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
+#endif
                 int quadWidth = 1;
                 while (u + quadWidth <= maxU)
                 {
@@ -4680,7 +4855,21 @@ public class McWorld : UdonSharpBehaviour
                     if (canGrow) quadHeight++;
                 }
 
+#if LOGGING
+                if (stats_trackCompactEmitInternals)
+                {
+                    stats_gpuFaceCompactEmitScanTime += (Time.realtimeSinceStartup - emitScanStart) * 1000f;
+                }
+
+                float emitQuadStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
+#endif
                 _AddGreedyQuad(chunk, direction, slice, u, v, quadWidth, quadHeight, blockID, lightLevel, packedColor);
+#if LOGGING
+                if (stats_trackCompactEmitInternals)
+                {
+                    stats_gpuFaceCompactEmitQuadTime += (Time.realtimeSinceStartup - emitQuadStart) * 1000f;
+                }
+#endif
 
                 for (int clearV = 0; clearV < quadHeight; clearV++)
                 {
@@ -8453,6 +8642,10 @@ public class McWorld : UdonSharpBehaviour
                     if (compactDecodeSplitTime > 0f)
                     {
                         logBuilder.AppendLine($"  Compact decode split: mask {stats_gpuFaceCompactMaskDecodeTime:F2}ms, emit {stats_gpuFaceCompactEmitTime:F2}ms, cross {stats_gpuFaceCompactCrossTime:F2}ms");
+                        if (stats_gpuFaceCompactEmitScanTime + stats_gpuFaceCompactEmitQuadTime > 0f)
+                        {
+                            logBuilder.AppendLine($"  Emit split: scan {stats_gpuFaceCompactEmitScanTime:F2}ms, quad {stats_gpuFaceCompactEmitQuadTime:F2}ms, collider {stats_gpuFaceCompactEmitCollisionTime:F2}ms");
+                        }
                     }
                 }
                 float totalGreedy = stats_greedyAxisYTime + stats_greedyAxisZTime + stats_greedyAxisXTime;
@@ -8592,6 +8785,9 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuFaceCompactMaskDecodeTime = 0f;
         stats_gpuFaceCompactEmitTime = 0f;
         stats_gpuFaceCompactCrossTime = 0f;
+        stats_gpuFaceCompactEmitScanTime = 0f;
+        stats_gpuFaceCompactEmitQuadTime = 0f;
+        stats_gpuFaceCompactEmitCollisionTime = 0f;
         stats_meshDeferredChunks = 0;
         stats_rleCompressions = 0;
         stats_rleDecompressions = 0;

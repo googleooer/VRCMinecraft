@@ -27,6 +27,7 @@ public class ChunkData
     public bool isBuildingMesh = false;
     public bool isMeshDeferred = false;
     public bool pendingColliderApply = false;
+    public bool pendingColliderMeshRebuild = false;
     public bool pendingNeighborMeshRebuild = false;
     public bool pendingLightingFinalize = false;
 
