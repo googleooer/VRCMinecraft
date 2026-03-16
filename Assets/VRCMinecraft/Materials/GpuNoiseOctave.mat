@@ -27,6 +27,34 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _ClimateBiomeLookupTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _ClimateOffsetTex0:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _ClimateOffsetTex1:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _ClimateOffsetTex2:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _ClimatePermTex0:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _ClimatePermTex1:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _ClimatePermTex2:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _GradTex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
@@ -42,23 +70,28 @@ Material:
     m_Ints: []
     m_Floats:
     - _Amplitude: 10000
+    - _ChunkX: 16
+    - _ChunkZ: -32
+    - _ClimateOctaveCount0: 4
+    - _ClimateOctaveCount1: 4
+    - _ClimateOctaveCount2: 2
     - _Frequency: 0.000030517578
     - _GridX: 0.0061035156
     - _GridY: 0.000030517578
     - _GridZ: 0.0061035156
-    - _Is2D: 1
+    - _Is2D: 0
     - _Octave: 15
     - _OctaveCount: 16
     - _OctaveRow: 15
     - _XCoord: 135.346
     - _XPos: -4
-    - _XSize: 5
+    - _XSize: 16
     - _YCoord: 216.11534
     - _YPos: 0
-    - _YSize: 1
+    - _YSize: 16
     - _ZCoord: 210.33266
     - _ZPos: -12
-    - _ZSize: 5
+    - _ZSize: 1
     m_Colors:
     - _Color: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []

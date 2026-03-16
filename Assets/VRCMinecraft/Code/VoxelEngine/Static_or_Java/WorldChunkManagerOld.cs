@@ -23,18 +23,15 @@ public class WorldChunkManagerOld {
             biomes = new BetaBiomeEnum[totalSize];
         }
 
-        // CRITICAL FIX: Original Beta 1.7.3 uses xSize for BOTH noise dimensions!
         temperatures = tempNoiseGen.generateNoiseArray(temperatures, x, z, xSize, xSize, 0.02500000037252903D, 0.02500000037252903D, 0.25D, 0.5D);
         rainfall = rainNoiseGen.generateNoiseArray(rainfall, x, z, xSize, xSize, 0.05000000074505806D, 0.05000000074505806D, 0.33333333333333331D, 0.5D);
         modifierNoise = modifierNoiseGen.generateNoiseArray(modifierNoise, x, z, xSize, xSize, 0.25D, 0.25D, 0.58823529411764708D, 0.5D);
         
-        // Cache arrays locally
         double[] temps = temperatures;
         double[] rains = rainfall;
         double[] mods = modifierNoise;
         
         int index = 0;
-        // CRITICAL: Match original Beta 1.7.3 loop order exactly: X-outer, Z-inner
         for(int blockX = 0; blockX < xSize; blockX++) {
             for(int blockZ = 0; blockZ < zSize; blockZ++) {
                 double modifier = mods[index] * 1.1D + 0.5D;

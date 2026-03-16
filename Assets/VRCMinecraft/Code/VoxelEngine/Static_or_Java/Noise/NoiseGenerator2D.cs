@@ -2,39 +2,37 @@ using System;
 using UnityEngine;
 
 public class NoiseGenerator2D {
-    private readonly int[][] arrayI = new int[][]
-    {
-        new int[] {1, 1, 0}, new int[] {-1, 1, 0}, new int[] {1, -1, 0}, new int[] {-1, -1, 0},
-        new int[] {1, 0, 1}, new int[] {-1, 0, 1}, new int[] {1, 0, -1}, new int[] {-1, 0, -1},
-        new int[] {0, 1, 1}, new int[] {0, -1, 1}, new int[] {0, 1, -1}, new int[] {0, -1, -1}
-    };
     private readonly double const1 = 0.5D * (Math.Sqrt(3.0D) - 1.0D);
     private readonly double const2 = (3.0D - Math.Sqrt(3.0D)) / 6.0D;
+    private readonly int[] gradientTable;
     
-    // These must match the field names and order from the Java source
-    public double randomDX; // field_4292_a
-    public double randomDY; // field_4291_b (used for Z-axis noise)
-    public double randomDZ; // field_4297_c (unused in 2D noise)
+    public double randomDX;
+    public double randomDY;
+    public double randomDZ;
     
-    private int[] permutations;
+    public int[] permutations;
 
     private static int wrap(double d) {
         return d > 0.0D ? (int)d : (int)d - 1;
     }
 
-    private static double method1(int[] ai, double d, double d1) {
-        return (double)ai[0] * d + (double)ai[1] * d1;
+    private double dotGradient(int gradientIndex, double d, double d1) {
+        int offset = gradientIndex * 2;
+        return (double)gradientTable[offset] * d + (double)gradientTable[offset + 1] * d1;
     }
     public NoiseGenerator2D() : this(new JavaRandom()) {
     }
 
     public NoiseGenerator2D(JavaRandom random) {
+        gradientTable = new int[]
+        {
+            1, 1, -1, 1, 1, -1, -1, -1,
+            1, 0, -1, 0, 1, 0, -1, 0,
+            0, 1, 0, -1, 0, 1, 0, -1
+        };
         permutations = new int[512];
-        
-        // CRITICAL FIX: The order of random number generation and assignment
-        // must exactly match the original Java class to produce the same noise.
         this.randomDX = random.NextDouble() * 256.0D;
-        this.randomDY = random.NextDouble() * 256.0D; // This was the missing/incorrectly used value
+        this.randomDY = random.NextDouble() * 256.0D;
         this.randomDZ = random.NextDouble() * 256.0D;
 
         for(int i = 0; i < 256; i++) {
@@ -53,9 +51,7 @@ public class NoiseGenerator2D {
     public void generateNoiseArray(double[] array, double xPos, double zPos, int xSize, int zSize,
             double gridX, double gridZ, double amplitude) {
         int k = 0;
-        // Cache locals for faster access
         int[] perm = this.permutations;
-        int[][] grad = this.arrayI;
         double c1 = this.const1;
         double c2 = this.const2;
         double const2x2 = 2D * c2;
@@ -65,7 +61,6 @@ public class NoiseGenerator2D {
         for(int x = 0; x < xSize; x++) {
             double cx = (xPos + (double)x) * gridX + rDX;
             for(int z = 0; z < zSize; z++) {
-                // CRITICAL FIX: Use randomDY for the Z-axis offset, matching the original's field_4291_b
                 double cz = (zPos + (double)z) * gridZ + rDY;
                 
                 double d10 = (cx + cz) * c1;
@@ -100,9 +95,7 @@ public class NoiseGenerator2D {
                     d7 = 0.0D;
                 } else {
                     d20 *= d20;
-                    // Inline method1
-                    int[] g0 = grad[l2];
-                    d7 = d20 * d20 * ((double)g0[0] * d14 + (double)g0[1] * d15);
+                    d7 = d20 * d20 * dotGradient(l2, d14, d15);
                 }
                 double d21 = 0.5D - d16 * d16 - d17 * d17;
                 double d8;
@@ -110,9 +103,7 @@ public class NoiseGenerator2D {
                     d8 = 0.0D;
                 } else {
                     d21 *= d21;
-                    // Inline method1
-                    int[] g1 = grad[i3];
-                    d8 = d21 * d21 * ((double)g1[0] * d16 + (double)g1[1] * d17);
+                    d8 = d21 * d21 * dotGradient(i3, d16, d17);
                 }
                 double d22 = 0.5D - d18 * d18 - d19 * d19;
                 double d9;
@@ -120,9 +111,7 @@ public class NoiseGenerator2D {
                     d9 = 0.0D;
                 } else {
                     d22 *= d22;
-                    // Inline method1
-                    int[] g2 = grad[j3];
-                    d9 = d22 * d22 * ((double)g2[0] * d18 + (double)g2[1] * d19);
+                    d9 = d22 * d22 * dotGradient(j3, d18, d19);
                 }
                 array[k++] += 70.0D * (d7 + d8 + d9) * amplitude;
             }
