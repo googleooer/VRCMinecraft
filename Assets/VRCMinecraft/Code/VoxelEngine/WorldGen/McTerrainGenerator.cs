@@ -98,6 +98,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     [Header("GPU Worldgen")]
     public bool enableGpuWorldgen = true;
+    [Tooltip("Read back finalized GPU columns as single-channel block IDs when supported. Disable this if a target platform rejects R8 readback.")]
+    public bool useSingleChannelGpuColumnReadback = true;
     public Material gpuNoiseOctaveMaterial;
     public Material gpuNoiseCombineMaterial;
     public Material gpuColumnBaseFillMaterial;
@@ -958,6 +960,45 @@ public class McTerrainGenerator : UdonSharpBehaviour
         // for non-current chunk lookups in GetBiomeDataForChunk().
     }
 
+    private bool _RestoreCachedBiomeStateForCurrentColumn()
+    {
+        if (currentChunkX != lastBiomeChunkX || currentChunkZ != lastBiomeChunkZ) return false;
+        if (cachedBiomes == null || cachedTemperatures == null || cachedRainfall == null) return false;
+
+        currentChunkBiomes = cachedBiomes;
+        if (wcm != null)
+        {
+            wcm.temperatures = cachedTemperatures;
+            wcm.rainfall = cachedRainfall;
+        }
+        return true;
+    }
+
+    private bool _HasBiomeInputsReady()
+    {
+        return currentChunkBiomes != null &&
+               wcm != null &&
+               wcm.temperatures != null &&
+               wcm.rainfall != null;
+    }
+
+    private bool _HasCpuNoiseInputsReady()
+    {
+        return noiseCache != null &&
+               noise1 != null &&
+               noise2 != null &&
+               noise3 != null &&
+               noise6 != null &&
+               noise7 != null;
+    }
+
+    private bool _HasSurfaceNoiseInputsReady()
+    {
+        return sandNoise != null &&
+               gravelNoise != null &&
+               stoneNoise != null;
+    }
+
     private Texture2D _CreateGpuFloatTexture(int width, int height, TextureWrapMode wrapMode)
     {
         Texture2D texture = new Texture2D(width, height, TextureFormat.RGBAHalf, false, true);
@@ -1000,6 +1041,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private RenderTexture _CreateGpuColorRenderTexture(int width, int height, string textureName)
     {
         RenderTexture rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+        rt.name = textureName;
+        rt.filterMode = FilterMode.Point;
+        rt.wrapMode = TextureWrapMode.Clamp;
+        rt.useMipMap = false;
+        rt.autoGenerateMips = false;
+        rt.Create();
+        return rt;
+    }
+
+    private RenderTexture _CreateGpuBlockIdRenderTexture(int width, int height, string textureName)
+    {
+        RenderTextureFormat format = useSingleChannelGpuColumnReadback ? RenderTextureFormat.R8 : RenderTextureFormat.ARGB32;
+        RenderTexture rt = new RenderTexture(width, height, 0, format, RenderTextureReadWrite.Linear);
         rt.name = textureName;
         rt.filterMode = FilterMode.Point;
         rt.wrapMode = TextureWrapMode.Clamp;
@@ -1086,9 +1140,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuNoise6Texture = _CreateGpuFloatRenderTexture(densityXSize, densityZSize, "GPU_Noise6");
         gpuNoise7Texture = _CreateGpuFloatRenderTexture(densityXSize, densityZSize, "GPU_Noise7");
         gpuDensityTexture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Density");
-        gpuColumnBaseTexture = _CreateGpuColorRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_ColumnBase");
+        gpuColumnBaseTexture = _CreateGpuBlockIdRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_ColumnBase");
         gpuColumnSurfaceInfoTexture = _CreateGpuColorRenderTexture(world.chunkSizeXZ, world.chunkSizeXZ, "GPU_ColumnSurfaceInfo");
-        gpuColumnFinalTexture = _CreateGpuColorRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_ColumnFinal");
+        gpuColumnFinalTexture = _CreateGpuBlockIdRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_ColumnFinal");
         gpuSandNoiseTexture = _CreateGpuFloatRenderTexture(world.chunkSizeXZ, world.chunkSizeXZ, "GPU_SandNoise");
         gpuGravelNoiseTexture = _CreateGpuFloatRenderTexture(world.chunkSizeXZ, world.chunkSizeXZ, "GPU_GravelNoise");
         gpuStoneNoiseTexture = _CreateGpuFloatRenderTexture(world.chunkSizeXZ, world.chunkSizeXZ, "GPU_StoneNoise");
@@ -1108,8 +1162,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuSurfaceParamPixelsB = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuBedrockMaskPixels = new Color[world.chunkSizeXZ * 5 * world.chunkSizeXZ];
         gpuColumnUploadPixels = new Color[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
-        gpuColumnReadbackPixels = new Color32[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
-        gpuColumnReadbackBlocks = new byte[gpuColumnReadbackPixels.Length];
+        int gpuColumnReadbackLength = world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ;
+        gpuColumnReadbackPixels = useSingleChannelGpuColumnReadback ? null : new Color32[gpuColumnReadbackLength];
+        gpuColumnReadbackBlocks = new byte[gpuColumnReadbackLength];
         gpuSurfaceInfoReadbackPixels = new Color32[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuNoiseDiagnosticReadbackPixels = new Color[densityPackedWidth * densityYSize];
         gpuNoiseDiagnosticLog = new StringBuilder(4096);
@@ -1348,7 +1403,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private bool _EnsureGpuChunkSliceCacheBuilt()
     {
         if (!gpuFinalColumnSliceCachePending) return gpuCachedChunkSlicesReady;
-        if (!gpuColumnReadbackReady || gpuColumnReadbackPixels == null) return false;
+        if (!gpuColumnReadbackReady || (gpuColumnReadbackPixels == null && gpuColumnReadbackBlocks == null)) return false;
 
         _BuildGpuChunkSliceCache();
         gpuCachedColumnX = gpuPendingColumnX;
@@ -1874,10 +1929,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         if (enableDetailedTimings)
         {
             gpuReadbackRequestStartTimeMs = Time.realtimeSinceStartup * 1000f;
-            gpuReadbackRequestBytes = gpuColumnReadbackPixels != null ? gpuColumnReadbackPixels.Length * 4 : world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ * 4;
+            int pixelCount = gpuColumnReadbackBlocks != null ? gpuColumnReadbackBlocks.Length : world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ;
+            gpuReadbackRequestBytes = useSingleChannelGpuColumnReadback ? pixelCount : pixelCount * 4;
         }
 #endif
-        VRCAsyncGPUReadback.Request(source, 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        VRCAsyncGPUReadback.Request(source, 0, useSingleChannelGpuColumnReadback ? TextureFormat.R8 : TextureFormat.RGBA32, (IUdonEventReceiver)this);
         return true;
     }
 
@@ -2409,7 +2465,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         {
             agg_gpuChunkSliceCopies++;
             agg_gpuChunkSliceCopyTime += (Time.realtimeSinceStartup - copyStart) * 1000f;
-            agg_gpuChunkSliceCopyBytes += gpuColumnReadbackPixels.Length;
+            agg_gpuChunkSliceCopyBytes += sourceBlocks != null ? sourceBlocks.Length : gpuColumnReadbackPixels.Length * 4;
         }
 #endif
     }
@@ -2573,7 +2629,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 // GPU readback block (FINALIZED: has surface replacement applied)
                 int gpuX = match1to1TerrainBaseline ? bx : (flipXAxis ? (diagSizeXZ - 1 - bx) : bx);
                 int gpuIdx = ((by * diagSizeXZ) + bz) * diagSizeXZ + gpuX;
-                byte gpuBlock = gpuColumnReadbackPixels[gpuIdx].r;
+                byte gpuBlock = gpuColumnReadbackBlocks != null ? gpuColumnReadbackBlocks[gpuIdx] : gpuColumnReadbackPixels[gpuIdx].r;
 
                 // Compare terrain SHAPE (solid vs non-solid), not exact block IDs.
                 // GPU blocks have been surface-replaced (stone → grass/dirt/sand/bedrock),
@@ -2629,7 +2685,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
                 int tGpuX = match1to1TerrainBaseline ? bx : (flipXAxis ? (diagSXZ - 1 - bx) : bx);
                 int tGpuIdx = ((by * diagSXZ) + bz) * diagSXZ + tGpuX;
-                byte tGpuBlock = gpuColumnReadbackPixels[tGpuIdx].r;
+                byte tGpuBlock = gpuColumnReadbackBlocks != null ? gpuColumnReadbackBlocks[tGpuIdx] : gpuColumnReadbackPixels[tGpuIdx].r;
                 byte tCpuBlock = 0;
                 if (by < 64) tCpuBlock = (byte)BlockMaterial.STATIONARY_WATER;
                 if (tDensity > 0.0D) tCpuBlock = stoneBlockID;
@@ -2710,40 +2766,56 @@ public class McTerrainGenerator : UdonSharpBehaviour
             return;
         }
 
-        if (!request.TryGetData(gpuColumnReadbackPixels, 0))
+        if (useSingleChannelGpuColumnReadback)
         {
-            gpuColumnReadbackFailed = true;
-            gpuReadbackContainsFinalColumn = false;
-            gpuFinalColumnSliceCachePending = false;
+            if (gpuColumnReadbackBlocks == null || !request.TryGetData(gpuColumnReadbackBlocks, 0))
+            {
+                gpuColumnReadbackFailed = true;
+                gpuReadbackContainsFinalColumn = false;
+                gpuFinalColumnSliceCachePending = false;
 #if LOGGING
-            if (enableDetailedTimings) _RecordGpuReadbackCompletion(false, false, latencyMs, 0f, gpuReadbackRequestBytes);
+                if (enableDetailedTimings) _RecordGpuReadbackCompletion(false, false, latencyMs, 0f, gpuReadbackRequestBytes);
 #endif
-            return;
+                return;
+            }
         }
+        else
+        {
+            if (!request.TryGetData(gpuColumnReadbackPixels, 0))
+            {
+                gpuColumnReadbackFailed = true;
+                gpuReadbackContainsFinalColumn = false;
+                gpuFinalColumnSliceCachePending = false;
+#if LOGGING
+                if (enableDetailedTimings) _RecordGpuReadbackCompletion(false, false, latencyMs, 0f, gpuReadbackRequestBytes);
+#endif
+                return;
+            }
 
-        Color32[] readbackPixels = gpuColumnReadbackPixels;
-        if (gpuColumnReadbackBlocks == null || gpuColumnReadbackBlocks.Length != readbackPixels.Length)
-        {
-            gpuColumnReadbackBlocks = new byte[readbackPixels.Length];
-        }
-        byte[] readbackBlocks = gpuColumnReadbackBlocks;
-        int readbackLength = readbackPixels.Length;
-        int unrolledLimit = readbackLength - 7;
-        int readbackIndex = 0;
-        for (; readbackIndex < unrolledLimit; readbackIndex += 8)
-        {
-            readbackBlocks[readbackIndex] = readbackPixels[readbackIndex].r;
-            readbackBlocks[readbackIndex + 1] = readbackPixels[readbackIndex + 1].r;
-            readbackBlocks[readbackIndex + 2] = readbackPixels[readbackIndex + 2].r;
-            readbackBlocks[readbackIndex + 3] = readbackPixels[readbackIndex + 3].r;
-            readbackBlocks[readbackIndex + 4] = readbackPixels[readbackIndex + 4].r;
-            readbackBlocks[readbackIndex + 5] = readbackPixels[readbackIndex + 5].r;
-            readbackBlocks[readbackIndex + 6] = readbackPixels[readbackIndex + 6].r;
-            readbackBlocks[readbackIndex + 7] = readbackPixels[readbackIndex + 7].r;
-        }
-        for (; readbackIndex < readbackLength; readbackIndex++)
-        {
-            readbackBlocks[readbackIndex] = readbackPixels[readbackIndex].r;
+            Color32[] readbackPixels = gpuColumnReadbackPixels;
+            if (gpuColumnReadbackBlocks == null || gpuColumnReadbackBlocks.Length != readbackPixels.Length)
+            {
+                gpuColumnReadbackBlocks = new byte[readbackPixels.Length];
+            }
+            byte[] readbackBlocks = gpuColumnReadbackBlocks;
+            int readbackLength = readbackPixels.Length;
+            int unrolledLimit = readbackLength - 7;
+            int readbackIndex = 0;
+            for (; readbackIndex < unrolledLimit; readbackIndex += 8)
+            {
+                readbackBlocks[readbackIndex] = readbackPixels[readbackIndex].r;
+                readbackBlocks[readbackIndex + 1] = readbackPixels[readbackIndex + 1].r;
+                readbackBlocks[readbackIndex + 2] = readbackPixels[readbackIndex + 2].r;
+                readbackBlocks[readbackIndex + 3] = readbackPixels[readbackIndex + 3].r;
+                readbackBlocks[readbackIndex + 4] = readbackPixels[readbackIndex + 4].r;
+                readbackBlocks[readbackIndex + 5] = readbackPixels[readbackIndex + 5].r;
+                readbackBlocks[readbackIndex + 6] = readbackPixels[readbackIndex + 6].r;
+                readbackBlocks[readbackIndex + 7] = readbackPixels[readbackIndex + 7].r;
+            }
+            for (; readbackIndex < readbackLength; readbackIndex++)
+            {
+                readbackBlocks[readbackIndex] = readbackPixels[readbackIndex].r;
+            }
         }
 
         gpuColumnReadbackFailed = false;
@@ -2777,27 +2849,50 @@ public class McTerrainGenerator : UdonSharpBehaviour
         currentChunkX = chunkX + (chunkOffsetX / world.chunkSizeXZ);
         currentChunkY = chunkY;
         currentChunkZ = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+
+        if (!_HasBiomeInputsReady())
+        {
+            _RestoreCachedBiomeStateForCurrentColumn();
+        }
         
         // Check if column is cached and set initial state appropriately
         if (currentChunkX == cacheCoordX && currentChunkZ == cacheCoordZ)
         {
             // Cached column, skip directly to terrain generation or GPU copy
-            if (gpuWorldgenReady && gpuColumnReadbackReady && gpuCachedChunkSlicesReady && currentChunkX == gpuCachedColumnX && currentChunkZ == gpuCachedColumnZ)
+            bool hasBiomeInputs = _HasBiomeInputsReady();
+            bool canUseGpuCachedColumn = hasBiomeInputs &&
+                gpuWorldgenReady &&
+                gpuColumnReadbackReady &&
+                gpuCachedChunkSlicesReady &&
+                currentChunkX == gpuCachedColumnX &&
+                currentChunkZ == gpuCachedColumnZ;
+            bool canWaitForGpuColumn = hasBiomeInputs &&
+                gpuWorldgenReady &&
+                ((gpuColumnReadbackPending && currentChunkX == gpuPendingColumnX && currentChunkZ == gpuPendingColumnZ) ||
+                 (gpuColumnReadbackReady && currentChunkX == gpuPendingColumnX && currentChunkZ == gpuPendingColumnZ));
+            bool canUseCpuCachedColumn = hasBiomeInputs &&
+                _HasCpuNoiseInputsReady() &&
+                _HasSurfaceNoiseInputsReady();
+
+            if (canUseGpuCachedColumn)
             {
                 currentState = GenerationState.Copy_GpuChunkSlice;
             }
-            else if (gpuWorldgenReady && gpuColumnReadbackPending && currentChunkX == gpuPendingColumnX && currentChunkZ == gpuPendingColumnZ)
+            else if (canWaitForGpuColumn)
             {
                 currentState = GenerationState.Prepare_GpuReadback;
             }
-            else if (gpuWorldgenReady && gpuColumnReadbackReady && currentChunkX == gpuPendingColumnX && currentChunkZ == gpuPendingColumnZ)
-            {
-                currentState = GenerationState.Prepare_GpuReadback;
-            }
-            else
+            else if (canUseCpuCachedColumn)
             {
                 initRand(currentChunkX, currentChunkZ);
                 currentState = GenerationState.GeneratingTerrain;
+            }
+            else
+            {
+                currentState = GenerationState.Prepare_GetBiomes;
+#if LOGGING
+                timingsCached = false;
+#endif
             }
         }
         else
@@ -3399,6 +3494,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
             case GenerationState.Prepare_CombineNoise:
                 {
+                    if (!_HasBiomeInputsReady())
+                    {
+                        currentState = GenerationState.Prepare_GetBiomes;
+                        break;
+                    }
+                    if (!_HasCpuNoiseInputsReady())
+                    {
+                        currentState = GenerationState.Prepare_AllocCache;
+                        break;
+                    }
+
                     byte byte0 = 4;
                     int xSize = byte0 + 1;
                     byte ySize = (byte)(world.worldDimensionY * world.chunkSizeY / 8 + 1);
@@ -3541,6 +3647,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
             case GenerationState.GeneratingTerrain:
 {
+                if (!_HasBiomeInputsReady())
+                {
+                    currentState = GenerationState.Prepare_GetBiomes;
+                    break;
+                }
+                if (!_HasCpuNoiseInputsReady())
+                {
+                    currentState = GenerationState.Prepare_AllocCache;
+                    break;
+                }
+
 #if LOGGING
                 if (enableVerboseLogging && terrain_xPiece == 0 && terrain_zPiece == 0)
                 {
@@ -3695,6 +3812,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 }
 #endif
                 {
+                    if (!_HasBiomeInputsReady())
+                    {
+                        currentState = GenerationState.Prepare_GetBiomes;
+                        break;
+                    }
+                    if (!_HasSurfaceNoiseInputsReady())
+                    {
+                        currentState = GenerationState.Prepare_SandNoise;
+                        break;
+                    }
+
                     int sizeXZ = world.chunkSizeXZ;
                     int sizeY = world.chunkSizeY;
                     int xyStride = sizeXZ * sizeXZ;
