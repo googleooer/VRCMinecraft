@@ -44,7 +44,7 @@ MonoBehaviour:
       Data: 
     - Name: 
       Entry: 12
-      Data: 305
+      Data: 308
     - Name: 
       Entry: 7
       Data: 
@@ -12807,19 +12807,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_meshDeferredChunks
+      Data: stats_gpuFaceCompactMaskDecodeTime
     - Name: $v
       Entry: 7
       Data: 583|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_meshDeferredChunks
+      Data: stats_gpuFaceCompactMaskDecodeTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -12856,19 +12856,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingInitsTotal
+      Data: stats_gpuFaceCompactEmitTime
     - Name: $v
       Entry: 7
       Data: 585|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingInitsTotal
+      Data: stats_gpuFaceCompactEmitTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -12905,13 +12905,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingInitTime
+      Data: stats_gpuFaceCompactCrossTime
     - Name: $v
       Entry: 7
       Data: 587|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingInitTime
+      Data: stats_gpuFaceCompactCrossTime
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 31
@@ -12954,19 +12954,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingImportTime
+      Data: stats_meshDeferredChunks
     - Name: $v
       Entry: 7
       Data: 589|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingImportTime
+      Data: stats_meshDeferredChunks
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13003,19 +13003,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingBfsSkyTime
+      Data: stats_lightingInitsTotal
     - Name: $v
       Entry: 7
       Data: 591|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingBfsSkyTime
+      Data: stats_lightingInitsTotal
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13052,13 +13052,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingBfsBlockTime
+      Data: stats_lightingInitTime
     - Name: $v
       Entry: 7
       Data: 593|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingBfsBlockTime
+      Data: stats_lightingInitTime
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 31
@@ -13101,19 +13101,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingStepsTotal
+      Data: stats_lightingImportTime
     - Name: $v
       Entry: 7
       Data: 595|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingStepsTotal
+      Data: stats_lightingImportTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13150,13 +13150,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingStepTime
+      Data: stats_lightingBfsSkyTime
     - Name: $v
       Entry: 7
       Data: 597|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingStepTime
+      Data: stats_lightingBfsSkyTime
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 31
@@ -13199,19 +13199,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingBFSOps
+      Data: stats_lightingBfsBlockTime
     - Name: $v
       Entry: 7
       Data: 599|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingBFSOps
+      Data: stats_lightingBfsBlockTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13248,13 +13248,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingMaxQueueSize
+      Data: stats_lightingStepsTotal
     - Name: $v
       Entry: 7
       Data: 601|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingMaxQueueSize
+      Data: stats_lightingStepsTotal
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13297,19 +13297,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingSkylightBlocks
+      Data: stats_lightingStepTime
     - Name: $v
       Entry: 7
       Data: 603|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingSkylightBlocks
+      Data: stats_lightingStepTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13346,13 +13346,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingBlocklightBlocks
+      Data: stats_lightingBFSOps
     - Name: $v
       Entry: 7
       Data: 605|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingBlocklightBlocks
+      Data: stats_lightingBFSOps
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13395,13 +13395,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingCrossChunkQueries
+      Data: stats_lightingMaxQueueSize
     - Name: $v
       Entry: 7
       Data: 607|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingCrossChunkQueries
+      Data: stats_lightingMaxQueueSize
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13444,13 +13444,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingPoolAllocations
+      Data: stats_lightingSkylightBlocks
     - Name: $v
       Entry: 7
       Data: 609|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingPoolAllocations
+      Data: stats_lightingSkylightBlocks
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13493,13 +13493,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_lightingPoolReuses
+      Data: stats_lightingBlocklightBlocks
     - Name: $v
       Entry: 7
       Data: 611|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_lightingPoolReuses
+      Data: stats_lightingBlocklightBlocks
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13542,13 +13542,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_rleCompressions
+      Data: stats_lightingCrossChunkQueries
     - Name: $v
       Entry: 7
       Data: 613|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_rleCompressions
+      Data: stats_lightingCrossChunkQueries
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13591,13 +13591,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_rleDecompressions
+      Data: stats_lightingPoolAllocations
     - Name: $v
       Entry: 7
       Data: 615|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_rleDecompressions
+      Data: stats_lightingPoolAllocations
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13640,19 +13640,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_rleCompressionTime
+      Data: stats_lightingPoolReuses
     - Name: $v
       Entry: 7
       Data: 617|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_rleCompressionTime
+      Data: stats_lightingPoolReuses
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13689,19 +13689,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_rleDecompressionTime
+      Data: stats_rleCompressions
     - Name: $v
       Entry: 7
       Data: 619|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_rleDecompressionTime
+      Data: stats_rleCompressions
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13738,13 +13738,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_rleTotalBytesIn
+      Data: stats_rleDecompressions
     - Name: $v
       Entry: 7
       Data: 621|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_rleTotalBytesIn
+      Data: stats_rleDecompressions
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13787,19 +13787,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_rleTotalBytesOut
+      Data: stats_rleCompressionTime
     - Name: $v
       Entry: 7
       Data: 623|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_rleTotalBytesOut
+      Data: stats_rleCompressionTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13836,19 +13836,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_rleHomogeneousChunks
+      Data: stats_rleDecompressionTime
     - Name: $v
       Entry: 7
       Data: 625|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_rleHomogeneousChunks
+      Data: stats_rleDecompressionTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -13885,13 +13885,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_getBlockCalls
+      Data: stats_rleTotalBytesIn
     - Name: $v
       Entry: 7
       Data: 627|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_getBlockCalls
+      Data: stats_rleTotalBytesIn
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13934,13 +13934,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_setBlockCalls
+      Data: stats_rleTotalBytesOut
     - Name: $v
       Entry: 7
       Data: 629|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_setBlockCalls
+      Data: stats_rleTotalBytesOut
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -13983,13 +13983,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_blockModifications
+      Data: stats_rleHomogeneousChunks
     - Name: $v
       Entry: 7
       Data: 631|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_blockModifications
+      Data: stats_rleHomogeneousChunks
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14032,13 +14032,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_neighborRebuildTriggers
+      Data: stats_getBlockCalls
     - Name: $v
       Entry: 7
       Data: 633|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_neighborRebuildTriggers
+      Data: stats_getBlockCalls
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14081,13 +14081,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_decompCacheHits
+      Data: stats_setBlockCalls
     - Name: $v
       Entry: 7
       Data: 635|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_decompCacheHits
+      Data: stats_setBlockCalls
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14130,13 +14130,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_decompCacheMisses
+      Data: stats_blockModifications
     - Name: $v
       Entry: 7
       Data: 637|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_decompCacheMisses
+      Data: stats_blockModifications
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14179,13 +14179,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_neighborCacheHits
+      Data: stats_neighborRebuildTriggers
     - Name: $v
       Entry: 7
       Data: 639|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_neighborCacheHits
+      Data: stats_neighborRebuildTriggers
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14228,13 +14228,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_neighborCacheMisses
+      Data: stats_decompCacheHits
     - Name: $v
       Entry: 7
       Data: 641|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_neighborCacheMisses
+      Data: stats_decompCacheHits
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14277,13 +14277,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_reconciliationOps
+      Data: stats_decompCacheMisses
     - Name: $v
       Entry: 7
       Data: 643|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_reconciliationOps
+      Data: stats_decompCacheMisses
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14326,13 +14326,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_reconciliationBlocks
+      Data: stats_neighborCacheHits
     - Name: $v
       Entry: 7
       Data: 645|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_reconciliationBlocks
+      Data: stats_neighborCacheHits
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14375,13 +14375,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuAtlasOverlayBlits
+      Data: stats_neighborCacheMisses
     - Name: $v
       Entry: 7
       Data: 647|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuAtlasOverlayBlits
+      Data: stats_neighborCacheMisses
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14424,19 +14424,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuAtlasOverlayBlitTime
+      Data: stats_reconciliationOps
     - Name: $v
       Entry: 7
       Data: 649|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuAtlasOverlayBlitTime
+      Data: stats_reconciliationOps
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14473,13 +14473,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuLightingSeedBlits
+      Data: stats_reconciliationBlocks
     - Name: $v
       Entry: 7
       Data: 651|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuLightingSeedBlits
+      Data: stats_reconciliationBlocks
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14522,19 +14522,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuLightingSeedBlitTime
+      Data: stats_gpuAtlasOverlayBlits
     - Name: $v
       Entry: 7
       Data: 653|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuLightingSeedBlitTime
+      Data: stats_gpuAtlasOverlayBlits
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14571,19 +14571,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuLightingPropagateBlits
+      Data: stats_gpuAtlasOverlayBlitTime
     - Name: $v
       Entry: 7
       Data: 655|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuLightingPropagateBlits
+      Data: stats_gpuAtlasOverlayBlitTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14620,19 +14620,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuLightingPropagateBlitTime
+      Data: stats_gpuLightingSeedBlits
     - Name: $v
       Entry: 7
       Data: 657|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuLightingPropagateBlitTime
+      Data: stats_gpuLightingSeedBlits
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14669,19 +14669,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceExtractBlits
+      Data: stats_gpuLightingSeedBlitTime
     - Name: $v
       Entry: 7
       Data: 659|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceExtractBlits
+      Data: stats_gpuLightingSeedBlitTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14718,19 +14718,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceExtractBlitTime
+      Data: stats_gpuLightingPropagateBlits
     - Name: $v
       Entry: 7
       Data: 661|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceExtractBlitTime
+      Data: stats_gpuLightingPropagateBlits
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14767,19 +14767,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceExportBlits
+      Data: stats_gpuLightingPropagateBlitTime
     - Name: $v
       Entry: 7
       Data: 663|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceExportBlits
+      Data: stats_gpuLightingPropagateBlitTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14816,19 +14816,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceExportBlitTime
+      Data: stats_gpuFaceExtractBlits
     - Name: $v
       Entry: 7
       Data: 665|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceExportBlitTime
+      Data: stats_gpuFaceExtractBlits
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14865,19 +14865,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceCompactBuilds
+      Data: stats_gpuFaceExtractBlitTime
     - Name: $v
       Entry: 7
       Data: 667|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceCompactBuilds
+      Data: stats_gpuFaceExtractBlitTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -14914,13 +14914,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceCompactActiveSlices
+      Data: stats_gpuFaceExportBlits
     - Name: $v
       Entry: 7
       Data: 669|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceCompactActiveSlices
+      Data: stats_gpuFaceExportBlits
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -14963,19 +14963,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuChunkUploads
+      Data: stats_gpuFaceExportBlitTime
     - Name: $v
       Entry: 7
       Data: 671|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuChunkUploads
+      Data: stats_gpuFaceExportBlitTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15012,19 +15012,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuChunkUploadTime
+      Data: stats_gpuFaceCompactBuilds
     - Name: $v
       Entry: 7
       Data: 673|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuChunkUploadTime
+      Data: stats_gpuFaceCompactBuilds
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15061,13 +15061,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuChunkUploadBytes
+      Data: stats_gpuFaceCompactActiveSlices
     - Name: $v
       Entry: 7
       Data: 675|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuChunkUploadBytes
+      Data: stats_gpuFaceCompactActiveSlices
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -15110,19 +15110,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackRequestStartMs
+      Data: stats_gpuChunkUploads
     - Name: $v
       Entry: 7
       Data: 677|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackRequestStartMs
+      Data: stats_gpuChunkUploads
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15159,19 +15159,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackRequests
+      Data: stats_gpuChunkUploadTime
     - Name: $v
       Entry: 7
       Data: 679|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackRequests
+      Data: stats_gpuChunkUploadTime
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15208,13 +15208,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbacksCompleted
+      Data: stats_gpuChunkUploadBytes
     - Name: $v
       Entry: 7
       Data: 681|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbacksCompleted
+      Data: stats_gpuChunkUploadBytes
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 7
@@ -15257,19 +15257,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackFailures
+      Data: stats_gpuFaceReadbackRequestStartMs
     - Name: $v
       Entry: 7
       Data: 683|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackFailures
+      Data: stats_gpuFaceReadbackRequestStartMs
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15306,19 +15306,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackLatencyTotal
+      Data: stats_gpuFaceReadbackRequests
     - Name: $v
       Entry: 7
       Data: 685|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackLatencyTotal
+      Data: stats_gpuFaceReadbackRequests
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15355,19 +15355,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackLatencyMin
+      Data: stats_gpuFaceReadbacksCompleted
     - Name: $v
       Entry: 7
       Data: 687|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackLatencyMin
+      Data: stats_gpuFaceReadbacksCompleted
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15404,19 +15404,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackLatencyMax
+      Data: stats_gpuFaceReadbackFailures
     - Name: $v
       Entry: 7
       Data: 689|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackLatencyMax
+      Data: stats_gpuFaceReadbackFailures
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 31
+      Data: 7
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15453,13 +15453,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackCallbackCopyTime
+      Data: stats_gpuFaceReadbackLatencyTotal
     - Name: $v
       Entry: 7
       Data: 691|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackCallbackCopyTime
+      Data: stats_gpuFaceReadbackLatencyTotal
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 31
@@ -15502,19 +15502,19 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceReadbackBytes
+      Data: stats_gpuFaceReadbackLatencyMin
     - Name: $v
       Entry: 7
       Data: 693|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceReadbackBytes
+      Data: stats_gpuFaceReadbackLatencyMin
     - Name: <UserType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SystemType>k__BackingField
       Entry: 9
-      Data: 7
+      Data: 31
     - Name: <SyncMode>k__BackingField
       Entry: 7
       Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
@@ -15551,13 +15551,13 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: stats_gpuFaceTileExtractTime
+      Data: stats_gpuFaceReadbackLatencyMax
     - Name: $v
       Entry: 7
       Data: 695|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
-      Data: stats_gpuFaceTileExtractTime
+      Data: stats_gpuFaceReadbackLatencyMax
     - Name: <UserType>k__BackingField
       Entry: 9
       Data: 31
@@ -15600,10 +15600,157 @@ MonoBehaviour:
       Data: 
     - Name: $k
       Entry: 1
-      Data: gpuLightingKeepAliveCounter
+      Data: stats_gpuFaceReadbackCallbackCopyTime
     - Name: $v
       Entry: 7
       Data: 697|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
+    - Name: <Name>k__BackingField
+      Entry: 1
+      Data: stats_gpuFaceReadbackCallbackCopyTime
+    - Name: <UserType>k__BackingField
+      Entry: 9
+      Data: 31
+    - Name: <SystemType>k__BackingField
+      Entry: 9
+      Data: 31
+    - Name: <SyncMode>k__BackingField
+      Entry: 7
+      Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
+    - Name: 
+      Entry: 6
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: <IsSerialized>k__BackingField
+      Entry: 5
+      Data: false
+    - Name: _fieldAttributes
+      Entry: 7
+      Data: 698|System.Collections.Generic.List`1[[System.Attribute, mscorlib]],
+        mscorlib
+    - Name: 
+      Entry: 12
+      Data: 0
+    - Name: 
+      Entry: 13
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 7
+      Data: 
+    - Name: $k
+      Entry: 1
+      Data: stats_gpuFaceReadbackBytes
+    - Name: $v
+      Entry: 7
+      Data: 699|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
+    - Name: <Name>k__BackingField
+      Entry: 1
+      Data: stats_gpuFaceReadbackBytes
+    - Name: <UserType>k__BackingField
+      Entry: 9
+      Data: 7
+    - Name: <SystemType>k__BackingField
+      Entry: 9
+      Data: 7
+    - Name: <SyncMode>k__BackingField
+      Entry: 7
+      Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
+    - Name: 
+      Entry: 6
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: <IsSerialized>k__BackingField
+      Entry: 5
+      Data: false
+    - Name: _fieldAttributes
+      Entry: 7
+      Data: 700|System.Collections.Generic.List`1[[System.Attribute, mscorlib]],
+        mscorlib
+    - Name: 
+      Entry: 12
+      Data: 0
+    - Name: 
+      Entry: 13
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 7
+      Data: 
+    - Name: $k
+      Entry: 1
+      Data: stats_gpuFaceTileExtractTime
+    - Name: $v
+      Entry: 7
+      Data: 701|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
+    - Name: <Name>k__BackingField
+      Entry: 1
+      Data: stats_gpuFaceTileExtractTime
+    - Name: <UserType>k__BackingField
+      Entry: 9
+      Data: 31
+    - Name: <SystemType>k__BackingField
+      Entry: 9
+      Data: 31
+    - Name: <SyncMode>k__BackingField
+      Entry: 7
+      Data: System.Nullable`1[[UdonSharp.UdonSyncMode, UdonSharp.Runtime]], mscorlib
+    - Name: 
+      Entry: 6
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: <IsSerialized>k__BackingField
+      Entry: 5
+      Data: false
+    - Name: _fieldAttributes
+      Entry: 7
+      Data: 702|System.Collections.Generic.List`1[[System.Attribute, mscorlib]],
+        mscorlib
+    - Name: 
+      Entry: 12
+      Data: 0
+    - Name: 
+      Entry: 13
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 8
+      Data: 
+    - Name: 
+      Entry: 7
+      Data: 
+    - Name: $k
+      Entry: 1
+      Data: gpuLightingKeepAliveCounter
+    - Name: $v
+      Entry: 7
+      Data: 703|UdonSharp.Compiler.FieldDefinition, UdonSharp.Editor
     - Name: <Name>k__BackingField
       Entry: 1
       Data: gpuLightingKeepAliveCounter
@@ -15627,7 +15774,7 @@ MonoBehaviour:
       Data: false
     - Name: _fieldAttributes
       Entry: 7
-      Data: 698|System.Collections.Generic.List`1[[System.Attribute, mscorlib]],
+      Data: 704|System.Collections.Generic.List`1[[System.Attribute, mscorlib]],
         mscorlib
     - Name: 
       Entry: 12

@@ -360,6 +360,9 @@ public class McWorld : UdonSharpBehaviour
     private float stats_gpuFaceDecodeTime = 0f;
     private float stats_gpuFaceDecodeTimeMin = float.MaxValue;
     private float stats_gpuFaceDecodeTimeMax = 0f;
+    private float stats_gpuFaceCompactMaskDecodeTime = 0f;
+    private float stats_gpuFaceCompactEmitTime = 0f;
+    private float stats_gpuFaceCompactCrossTime = 0f;
     private int stats_meshDeferredChunks = 0;
 
     // --- Lighting Stats (aggregate) ---
@@ -1207,10 +1210,13 @@ public class McWorld : UdonSharpBehaviour
     {
         if (!gpuBackendReady) return;
         gpuLightingSeedPending = true;
-        // Additive: give propagation enough budget to converge the new data
-        // without resetting already-accumulated progress from prior chunks.
-        int maxIterationCap = gpuLightingTotalIterations * 2;
-        gpuLightingIterationsRemaining = Mathf.Min(gpuLightingIterationsRemaining + gpuLightingTotalIterations, maxIterationCap);
+        // Multiple chunk uploads often collapse into the same atlas-wide seed pass.
+        // Top up to one full convergence window instead of stacking another full
+        // budget per upload, which keeps propagation saturated for long stretches.
+        if (gpuLightingIterationsRemaining < gpuLightingTotalIterations)
+        {
+            gpuLightingIterationsRemaining = gpuLightingTotalIterations;
+        }
     }
 
     private int gpuLightingKeepAliveCounter = 0;
@@ -1260,6 +1266,26 @@ public class McWorld : UdonSharpBehaviour
 
         int iterations = Mathf.Max(0, gpuLightingIterationsPerUpdate);
         int guaranteedIterations = seededThisFrame ? 8 : 2;
+        int lightingPressure = activeMeshingCount + gpuFaceReadbackReadyCount + gpuFaceReadbackInflightCount;
+        if (lightingPressure >= 6 || activeDataGenCount >= 3)
+        {
+            iterations = Mathf.Max(guaranteedIterations, iterations / 2);
+        }
+
+        if (enableAdaptiveBudgets)
+        {
+            float targetWithHeadroom = Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
+            if (lastUpdateDurationMs > targetWithHeadroom)
+            {
+                guaranteedIterations = seededThisFrame ? 4 : 1;
+                iterations = Mathf.Max(guaranteedIterations, iterations / 2);
+                if (lightingPressure >= 10)
+                {
+                    iterations = guaranteedIterations;
+                }
+            }
+        }
+
         for (int i = 0; i < iterations && gpuLightingIterationsRemaining > 0; i++)
         {
             if (i >= guaranteedIterations && Time.realtimeSinceStartup - frameStart > frameBudget) break;
@@ -1924,12 +1950,24 @@ public class McWorld : UdonSharpBehaviour
                 int slice = chunk._gpuFaceSlice;
                 if (useSummary)
                 {
-                    if (!_BuildGreedySliceMaskCompact(chunk, direction, slice, selfData, stride, out maskWidth, out maskHeight))
+                    float compactMaskStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+                    bool hasMask = _BuildGreedySliceMaskCompact(chunk, direction, slice, selfData, stride, out maskWidth, out maskHeight);
+                    if (enableDetailedTimings)
+                    {
+                        stats_gpuFaceCompactMaskDecodeTime += (Time.realtimeSinceStartup - compactMaskStart) * 1000f;
+                    }
+                    if (!hasMask)
                     {
                         chunk._gpuFaceSlice++;
                         continue;
                     }
+
+                    float compactEmitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
                     _EmitGreedyMask(chunk, direction, slice, maskWidth, maskHeight);
+                    if (enableDetailedTimings)
+                    {
+                        stats_gpuFaceCompactEmitTime += (Time.realtimeSinceStartup - compactEmitStart) * 1000f;
+                    }
                 }
                 else
                 {
@@ -2003,6 +2041,7 @@ public class McWorld : UdonSharpBehaviour
 
             if (chunk._gpuFaceBuildStage == 1)
             {
+                float compactCrossStart = enableDetailedTimings && useSummary ? Time.realtimeSinceStartup : 0f;
                 int crossCount = chunk._crossBlockPackedPositions != null ? chunk._crossBlockCount : 0;
                 while (chunk._gpuFaceCrossIndex < crossCount)
                 {
@@ -2045,6 +2084,10 @@ public class McWorld : UdonSharpBehaviour
                 if (chunk._gpuFaceCrossIndex >= crossCount)
                 {
                     chunk._gpuFaceBuildStage = 2;
+                }
+                if (enableDetailedTimings && useSummary)
+                {
+                    stats_gpuFaceCompactCrossTime += (Time.realtimeSinceStartup - compactCrossStart) * 1000f;
                 }
                 continue;
             }
@@ -2407,12 +2450,11 @@ public class McWorld : UdonSharpBehaviour
 #endif
 
         // Chunks can finish generation after the first lighting window in this frame.
-        // Give the GPU lighting backend one more chance to seed/propagate before render
-        // so freshly published atlas slots do not spend a whole frame sampling black.
-        // CRITICAL: When a seed is pending (slot was just cleared), we MUST run the seed
-        // pass before render, even if over time budget — otherwise cleared slots (alpha=0)
-        // cause the shader to fall back to full brightness for one frame.
-        if (gpuLightingSeedPending || gpuLightingIterationsRemaining > 0)
+        // Give the GPU lighting backend one more chance to seed freshly published slots
+        // before render so cleared atlas entries do not spend a whole frame sampling black.
+        // Only do this when a new seed is actually pending; continuing ordinary propagation
+        // can wait until the next frame.
+        if (gpuLightingSeedPending)
         {
             _ProcessGpuLighting(frameStart, frameBudget);
         }
@@ -4342,6 +4384,12 @@ public class McWorld : UdonSharpBehaviour
         bool anyFace = false;
         int[] packedGrassColors = chunk._cachedPackedGrassBiomeColors;
         byte[] tintModes = biomeTintModeCache;
+        byte[] blockIds = greedyMaskBlockIds;
+        byte[] lightLevels = greedyMaskLightLevels;
+        int[] packedColors = greedyMaskPackedColors;
+        int sizeXZ = chunkSizeXZ;
+        int sliceStrideBase = slice * chunkStride;
+        int sliceRowBase = slice * sizeXZ;
 
         for (int rowPair = 0; rowPair < rowPairs; rowPair++)
         {
@@ -4356,45 +4404,108 @@ public class McWorld : UdonSharpBehaviour
             {
                 int v = rowPair << 1;
                 int rowOffset = v * width;
-                for (int u = 0; u < width && rowMask0 != 0; u++)
+                if (direction <= 1)
                 {
-                    int bit = 1 << u;
-                    if ((rowMask0 & bit) == 0) continue;
-                    rowMask0 &= ~bit;
-                    int x;
-                    int y;
-                    int z;
-                    if (direction <= 1) { x = u; y = slice; z = v; }
-                    else if (direction <= 3) { x = u; y = v; z = slice; }
-                    else { x = slice; y = v; z = u; }
-
-                    int selfIndex = y * chunkStride + z * chunkSizeXZ + x;
-                    if (selfIndex < 0 || selfIndex >= selfData.Length) continue;
-
-                    byte selfID = selfData[selfIndex];
-                    if (selfID == 0) continue;
-
-                    int maskIndex = rowOffset + u;
-                    greedyMaskBlockIds[maskIndex] = selfID;
-                    greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
-                    byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
-                    if (tintMode == 0)
+                    int selfRowBase = sliceStrideBase + v * sizeXZ;
+                    int biomeRowBase = v * sizeXZ;
+                    for (int u = 0; u < width && rowMask0 != 0; u++)
                     {
-                        greedyMaskPackedColors[maskIndex] = PACKED_WHITE_RGB;
-                    }
-                    else
-                    {
-                        int biomeIndex = z * chunkSizeXZ + x;
-                        if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                        int bit = 1 << u;
+                        if ((rowMask0 & bit) == 0) continue;
+                        rowMask0 &= ~bit;
+
+                        byte selfID = selfData[selfRowBase + u];
+                        if (selfID == 0) continue;
+
+                        int maskIndex = rowOffset + u;
+                        blockIds[maskIndex] = selfID;
+                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, slice, v);
+                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        if (tintMode == 0)
                         {
-                            greedyMaskPackedColors[maskIndex] = packedGrassColors[biomeIndex];
+                            packedColors[maskIndex] = PACKED_WHITE_RGB;
                         }
                         else
                         {
-                            greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, x, z));
+                            int biomeIndex = biomeRowBase + u;
+                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            {
+                                packedColors[maskIndex] = packedGrassColors[biomeIndex];
+                            }
+                            else
+                            {
+                                packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
+                            }
                         }
+                        anyFace = true;
                     }
-                    anyFace = true;
+                }
+                else if (direction <= 3)
+                {
+                    int selfRowBase = v * chunkStride + sliceRowBase;
+                    for (int u = 0; u < width && rowMask0 != 0; u++)
+                    {
+                        int bit = 1 << u;
+                        if ((rowMask0 & bit) == 0) continue;
+                        rowMask0 &= ~bit;
+
+                        byte selfID = selfData[selfRowBase + u];
+                        if (selfID == 0) continue;
+
+                        int maskIndex = rowOffset + u;
+                        blockIds[maskIndex] = selfID;
+                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, v, slice);
+                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        if (tintMode == 0)
+                        {
+                            packedColors[maskIndex] = PACKED_WHITE_RGB;
+                        }
+                        else
+                        {
+                            int biomeIndex = sliceRowBase + u;
+                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            {
+                                packedColors[maskIndex] = packedGrassColors[biomeIndex];
+                            }
+                            else
+                            {
+                                packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
+                            }
+                        }
+                        anyFace = true;
+                    }
+                }
+                else
+                {
+                    int selfRowBase = v * chunkStride + slice;
+                    for (int u = 0; u < width && rowMask0 != 0; u++)
+                    {
+                        int bit = 1 << u;
+                        if ((rowMask0 & bit) == 0) continue;
+                        rowMask0 &= ~bit;
+
+                        int biomeIndex = u * sizeXZ + slice;
+                        byte selfID = selfData[selfRowBase + u * sizeXZ];
+                        if (selfID == 0) continue;
+
+                        int maskIndex = rowOffset + u;
+                        blockIds[maskIndex] = selfID;
+                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, slice, v, u);
+                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        if (tintMode == 0)
+                        {
+                            packedColors[maskIndex] = PACKED_WHITE_RGB;
+                        }
+                        else if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                        {
+                            packedColors[maskIndex] = packedGrassColors[biomeIndex];
+                        }
+                        else
+                        {
+                            packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
+                        }
+                        anyFace = true;
+                    }
                 }
             }
 
@@ -4403,45 +4514,108 @@ public class McWorld : UdonSharpBehaviour
                 int v = (rowPair << 1) + 1;
                 if (v >= height) continue;
                 int rowOffset = v * width;
-                for (int u = 0; u < width && rowMask1 != 0; u++)
+                if (direction <= 1)
                 {
-                    int bit = 1 << u;
-                    if ((rowMask1 & bit) == 0) continue;
-                    rowMask1 &= ~bit;
-                    int x;
-                    int y;
-                    int z;
-                    if (direction <= 1) { x = u; y = slice; z = v; }
-                    else if (direction <= 3) { x = u; y = v; z = slice; }
-                    else { x = slice; y = v; z = u; }
-
-                    int selfIndex = y * chunkStride + z * chunkSizeXZ + x;
-                    if (selfIndex < 0 || selfIndex >= selfData.Length) continue;
-
-                    byte selfID = selfData[selfIndex];
-                    if (selfID == 0) continue;
-
-                    int maskIndex = rowOffset + u;
-                    greedyMaskBlockIds[maskIndex] = selfID;
-                    greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
-                    byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
-                    if (tintMode == 0)
+                    int selfRowBase = sliceStrideBase + v * sizeXZ;
+                    int biomeRowBase = v * sizeXZ;
+                    for (int u = 0; u < width && rowMask1 != 0; u++)
                     {
-                        greedyMaskPackedColors[maskIndex] = PACKED_WHITE_RGB;
-                    }
-                    else
-                    {
-                        int biomeIndex = z * chunkSizeXZ + x;
-                        if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                        int bit = 1 << u;
+                        if ((rowMask1 & bit) == 0) continue;
+                        rowMask1 &= ~bit;
+
+                        byte selfID = selfData[selfRowBase + u];
+                        if (selfID == 0) continue;
+
+                        int maskIndex = rowOffset + u;
+                        blockIds[maskIndex] = selfID;
+                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, slice, v);
+                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        if (tintMode == 0)
                         {
-                            greedyMaskPackedColors[maskIndex] = packedGrassColors[biomeIndex];
+                            packedColors[maskIndex] = PACKED_WHITE_RGB;
                         }
                         else
                         {
-                            greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, x, z));
+                            int biomeIndex = biomeRowBase + u;
+                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            {
+                                packedColors[maskIndex] = packedGrassColors[biomeIndex];
+                            }
+                            else
+                            {
+                                packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
+                            }
                         }
+                        anyFace = true;
                     }
-                    anyFace = true;
+                }
+                else if (direction <= 3)
+                {
+                    int selfRowBase = v * chunkStride + sliceRowBase;
+                    for (int u = 0; u < width && rowMask1 != 0; u++)
+                    {
+                        int bit = 1 << u;
+                        if ((rowMask1 & bit) == 0) continue;
+                        rowMask1 &= ~bit;
+
+                        byte selfID = selfData[selfRowBase + u];
+                        if (selfID == 0) continue;
+
+                        int maskIndex = rowOffset + u;
+                        blockIds[maskIndex] = selfID;
+                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, u, v, slice);
+                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        if (tintMode == 0)
+                        {
+                            packedColors[maskIndex] = PACKED_WHITE_RGB;
+                        }
+                        else
+                        {
+                            int biomeIndex = sliceRowBase + u;
+                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            {
+                                packedColors[maskIndex] = packedGrassColors[biomeIndex];
+                            }
+                            else
+                            {
+                                packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
+                            }
+                        }
+                        anyFace = true;
+                    }
+                }
+                else
+                {
+                    int selfRowBase = v * chunkStride + slice;
+                    for (int u = 0; u < width && rowMask1 != 0; u++)
+                    {
+                        int bit = 1 << u;
+                        if ((rowMask1 & bit) == 0) continue;
+                        rowMask1 &= ~bit;
+
+                        int biomeIndex = u * sizeXZ + slice;
+                        byte selfID = selfData[selfRowBase + u * sizeXZ];
+                        if (selfID == 0) continue;
+
+                        int maskIndex = rowOffset + u;
+                        blockIds[maskIndex] = selfID;
+                        lightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, slice, v, u);
+                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        if (tintMode == 0)
+                        {
+                            packedColors[maskIndex] = PACKED_WHITE_RGB;
+                        }
+                        else if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                        {
+                            packedColors[maskIndex] = packedGrassColors[biomeIndex];
+                        }
+                        else
+                        {
+                            packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
+                        }
+                        anyFace = true;
+                    }
                 }
             }
         }
@@ -4461,6 +4635,9 @@ public class McWorld : UdonSharpBehaviour
         if (maxU >= width) maxU = width - 1;
         if (maxV >= height) maxV = height - 1;
         if (maxU < minU || maxV < minV) return;
+        byte[] blockIds = greedyMaskBlockIds;
+        byte[] lightLevels = greedyMaskLightLevels;
+        int[] packedColors = greedyMaskPackedColors;
 
         for (int v = minV; v <= maxV; v++)
         {
@@ -4468,21 +4645,21 @@ public class McWorld : UdonSharpBehaviour
             for (int u = minU; u <= maxU; )
             {
                 int maskIndex = rowOffset + u;
-                byte blockID = greedyMaskBlockIds[maskIndex];
+                byte blockID = blockIds[maskIndex];
                 if (blockID == 0)
                 {
                     u++;
                     continue;
                 }
 
-                byte lightLevel = greedyMaskLightLevels[maskIndex];
-                int packedColor = greedyMaskPackedColors[maskIndex];
+                byte lightLevel = lightLevels[maskIndex];
+                int packedColor = packedColors[maskIndex];
 
                 int quadWidth = 1;
                 while (u + quadWidth <= maxU)
                 {
                     int nextIndex = rowOffset + u + quadWidth;
-                    if (greedyMaskBlockIds[nextIndex] != blockID || greedyMaskLightLevels[nextIndex] != lightLevel || greedyMaskPackedColors[nextIndex] != packedColor) break;
+                    if (blockIds[nextIndex] != blockID || lightLevels[nextIndex] != lightLevel || packedColors[nextIndex] != packedColor) break;
                     quadWidth++;
                 }
 
@@ -4494,7 +4671,7 @@ public class McWorld : UdonSharpBehaviour
                     for (int checkU = 0; checkU < quadWidth; checkU++)
                     {
                         int nextIndex = nextRowOffset + u + checkU;
-                        if (greedyMaskBlockIds[nextIndex] != blockID || greedyMaskLightLevels[nextIndex] != lightLevel || greedyMaskPackedColors[nextIndex] != packedColor)
+                        if (blockIds[nextIndex] != blockID || lightLevels[nextIndex] != lightLevel || packedColors[nextIndex] != packedColor)
                         {
                             canGrow = false;
                             break;
@@ -4507,11 +4684,7 @@ public class McWorld : UdonSharpBehaviour
 
                 for (int clearV = 0; clearV < quadHeight; clearV++)
                 {
-                    int clearRowOffset = (v + clearV) * width;
-                    for (int clearU = 0; clearU < quadWidth; clearU++)
-                    {
-                        greedyMaskBlockIds[clearRowOffset + u + clearU] = 0;
-                    }
+                    System.Array.Clear(blockIds, (v + clearV) * width + u, quadWidth);
                 }
 
                 u += quadWidth;
@@ -8276,6 +8449,11 @@ public class McWorld : UdonSharpBehaviour
                     float avgGpuDecodeStepMs = stats_gpuFaceDecodeTime / stats_gpuFaceDecodeSteps;
                     float minGpuDecodeStepMs = stats_gpuFaceDecodeTimeMin == float.MaxValue ? 0f : stats_gpuFaceDecodeTimeMin;
                     logBuilder.AppendLine($"  GPU decode: {stats_gpuFaceDecodeSteps} steps, {stats_gpuFaceDecodeTime:F2}ms total, avg {avgGpuDecodeStepMs:F2}ms (min {minGpuDecodeStepMs:F2}ms, max {stats_gpuFaceDecodeTimeMax:F2}ms)");
+                    float compactDecodeSplitTime = stats_gpuFaceCompactMaskDecodeTime + stats_gpuFaceCompactEmitTime + stats_gpuFaceCompactCrossTime;
+                    if (compactDecodeSplitTime > 0f)
+                    {
+                        logBuilder.AppendLine($"  Compact decode split: mask {stats_gpuFaceCompactMaskDecodeTime:F2}ms, emit {stats_gpuFaceCompactEmitTime:F2}ms, cross {stats_gpuFaceCompactCrossTime:F2}ms");
+                    }
                 }
                 float totalGreedy = stats_greedyAxisYTime + stats_greedyAxisZTime + stats_greedyAxisXTime;
                 if (totalGreedy > 0)
@@ -8411,6 +8589,9 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuFaceDecodeTime = 0f;
         stats_gpuFaceDecodeTimeMin = float.MaxValue;
         stats_gpuFaceDecodeTimeMax = 0f;
+        stats_gpuFaceCompactMaskDecodeTime = 0f;
+        stats_gpuFaceCompactEmitTime = 0f;
+        stats_gpuFaceCompactCrossTime = 0f;
         stats_meshDeferredChunks = 0;
         stats_rleCompressions = 0;
         stats_rleDecompressions = 0;
