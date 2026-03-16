@@ -214,6 +214,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int agg_gpuChunkSliceCopies;
     private float agg_gpuChunkSliceCopyTime;
     private int agg_gpuChunkSliceCopyBytes;
+    private int agg_gpuWorkingSliceCopies;
+    private float agg_gpuWorkingSliceCopyTime;
+    private float agg_gpuHighestStoneScanTime;
     private int agg_gpuBaseReadbacksCompleted;
     private int agg_gpuBaseReadbackFailures;
     private float agg_gpuBaseReadbackLatencyTotal;
@@ -383,6 +386,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Color[] gpuBedrockMaskPixels;
     private Color[] gpuColumnUploadPixels;
     private Color32[] gpuColumnReadbackPixels;
+    private byte[] gpuColumnReadbackBlocks;
     private Color32[] gpuSurfaceInfoReadbackPixels;
     private Color[] gpuNoiseDiagnosticReadbackPixels;
     private bool gpuClimateUploadValid = false;
@@ -704,6 +708,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 agg_gpuFinalColumnUploads, agg_gpuFinalColumnUploadTime, agg_gpuFinalColumnUploadBytes / 1024f);
             sb.AppendFormat("  GPU->CPU slice cache unpack: {0} columns, {1:F3}ms, {2:F1}KB\n",
                 agg_gpuChunkSliceCopies, agg_gpuChunkSliceCopyTime, agg_gpuChunkSliceCopyBytes / 1024f);
+            if (agg_gpuWorkingSliceCopies > 0)
+            {
+                sb.AppendFormat("  Slice copy split: working {0} slices ({1:F3}ms), highest-stone scan {2:F3}ms\n",
+                    agg_gpuWorkingSliceCopies, agg_gpuWorkingSliceCopyTime, agg_gpuHighestStoneScanTime);
+            }
 
             if (agg_gpuBaseReadbacksCompleted > 0 || agg_gpuBaseReadbackFailures > 0)
             {
@@ -796,6 +805,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_gpuChunkSliceCopies = 0;
         agg_gpuChunkSliceCopyTime = 0f;
         agg_gpuChunkSliceCopyBytes = 0;
+        agg_gpuWorkingSliceCopies = 0;
+        agg_gpuWorkingSliceCopyTime = 0f;
+        agg_gpuHighestStoneScanTime = 0f;
         agg_gpuBaseReadbacksCompleted = 0;
         agg_gpuBaseReadbackFailures = 0;
         agg_gpuBaseReadbackLatencyTotal = 0f;
@@ -1097,6 +1109,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuBedrockMaskPixels = new Color[world.chunkSizeXZ * 5 * world.chunkSizeXZ];
         gpuColumnUploadPixels = new Color[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
         gpuColumnReadbackPixels = new Color32[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
+        gpuColumnReadbackBlocks = new byte[gpuColumnReadbackPixels.Length];
         gpuSurfaceInfoReadbackPixels = new Color32[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuNoiseDiagnosticReadbackPixels = new Color[densityPackedWidth * densityYSize];
         gpuNoiseDiagnosticLog = new StringBuilder(4096);
@@ -2343,7 +2356,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private void _BuildGpuChunkSliceCache()
     {
-        if (gpuColumnReadbackPixels == null || gpuCachedChunkSlices == null || world == null) return;
+        if ((gpuColumnReadbackPixels == null && gpuColumnReadbackBlocks == null) || gpuCachedChunkSlices == null || world == null) return;
 
 #if LOGGING
         float copyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -2352,7 +2365,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int sizeY = world.chunkSizeY;
         int chunkStride = sizeXZ * sizeXZ;
         int chunkSize = sizeXZ * sizeY * sizeXZ;
-        for (int chunkY = 0; chunkY < world.worldDimensionY; chunkY++)
+        int worldChunkCountY = world.worldDimensionY;
+        byte[] sourceBlocks = gpuColumnReadbackBlocks;
+
+        for (int chunkY = 0; chunkY < worldChunkCountY; chunkY++)
         {
             byte[] slice = gpuCachedChunkSlices[chunkY];
             if (slice == null || slice.Length != chunkSize)
@@ -2360,21 +2376,30 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 slice = new byte[chunkSize];
                 gpuCachedChunkSlices[chunkY] = slice;
             }
+        }
 
-            int chunkYBase = chunkY * sizeY;
-            for (int localY = 0; localY < sizeY; localY++)
+        if (sourceBlocks != null && sourceBlocks.Length >= worldChunkCountY * chunkSize)
+        {
+            for (int chunkY = 0; chunkY < worldChunkCountY; chunkY++)
             {
-                int globalY = chunkYBase + localY;
-                int sourceRowBase = globalY * sizeXZ;
-                int targetYBase = localY * chunkStride;
-                for (int z = 0; z < sizeXZ; z++)
+                System.Array.Copy(sourceBlocks, chunkY * chunkSize, gpuCachedChunkSlices[chunkY], 0, chunkSize);
+            }
+        }
+        else
+        {
+            int worldHeightBlocks = worldChunkCountY * sizeY;
+            Color32[] sourcePixels = gpuColumnReadbackPixels;
+            for (int globalY = 0; globalY < worldHeightBlocks; globalY++)
+            {
+                int chunkY = globalY / sizeY;
+                int localY = globalY - chunkY * sizeY;
+                byte[] slice = gpuCachedChunkSlices[chunkY];
+                int sourceIndex = globalY * chunkStride;
+                int targetIndex = localY * chunkStride;
+
+                for (int i = 0; i < chunkStride; i++)
                 {
-                    int sourceIndex = (sourceRowBase + z) * sizeXZ;
-                    int targetIndex = targetYBase + z * sizeXZ;
-                    for (int x = 0; x < sizeXZ; x++)
-                    {
-                        slice[targetIndex + x] = gpuColumnReadbackPixels[sourceIndex + x].r;
-                    }
+                    slice[targetIndex + i] = sourcePixels[sourceIndex + i].r;
                 }
             }
         }
@@ -2399,9 +2424,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
         byte[] slice = currentChunkY >= 0 && currentChunkY < gpuCachedChunkSlices.Length ? gpuCachedChunkSlices[currentChunkY] : null;
         if (slice == null) return;
 
+#if LOGGING
+        float workingCopyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         System.Array.Clear(workingChunkData, 0, workingChunkData.Length);
         for (int i = 0; i < highestStoneYColumn.Length; i++) highestStoneYColumn[i] = -1;
         System.Array.Copy(slice, workingChunkData, slice.Length);
+#if LOGGING
+        float highestStoneStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+        if (enableDetailedTimings)
+        {
+            agg_gpuWorkingSliceCopies++;
+            agg_gpuWorkingSliceCopyTime += (highestStoneStart - workingCopyStart) * 1000f;
+        }
+#endif
         for (int localY = 0; localY < sizeY; localY++)
         {
             int targetYBase = localY * xyStride;
@@ -2419,6 +2455,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 }
             }
         }
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuHighestStoneScanTime += (Time.realtimeSinceStartup - highestStoneStart) * 1000f;
+        }
+#endif
 
         // DIAGNOSTIC: Compare GPU readback base blocks against CPU-computed terrain
         // for this chunk slice (only runs once per column, on the topmost chunk)
@@ -2705,6 +2747,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
             if (enableDetailedTimings) _RecordGpuReadbackCompletion(false, false, latencyMs, 0f, gpuReadbackRequestBytes);
 #endif
             return;
+        }
+
+        if (gpuColumnReadbackBlocks == null || gpuColumnReadbackBlocks.Length != gpuColumnReadbackPixels.Length)
+        {
+            gpuColumnReadbackBlocks = new byte[gpuColumnReadbackPixels.Length];
+        }
+        for (int i = 0; i < gpuColumnReadbackPixels.Length; i++)
+        {
+            gpuColumnReadbackBlocks[i] = gpuColumnReadbackPixels[i].r;
         }
 
         gpuColumnReadbackFailed = false;
