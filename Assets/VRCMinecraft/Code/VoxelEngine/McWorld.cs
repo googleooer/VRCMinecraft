@@ -283,6 +283,9 @@ public class McWorld : UdonSharpBehaviour
     // --- Lighting Stats (aggregate) ---
     private int stats_lightingInitsTotal = 0;
     private float stats_lightingInitTime = 0f;
+    private float stats_lightingImportTime = 0f;
+    private float stats_lightingBfsSkyTime = 0f;
+    private float stats_lightingBfsBlockTime = 0f;
     private int stats_lightingStepsTotal = 0;
     private float stats_lightingStepTime = 0f;
     private int stats_lightingBFSOps = 0;
@@ -317,6 +320,29 @@ public class McWorld : UdonSharpBehaviour
     // --- Reconciliation Stats ---
     private int stats_reconciliationOps = 0;
     private int stats_reconciliationBlocks = 0;
+
+    // --- GPU Backend Stats ---
+    private int stats_gpuAtlasOverlayBlits = 0;
+    private float stats_gpuAtlasOverlayBlitTime = 0f;
+    private int stats_gpuLightingSeedBlits = 0;
+    private float stats_gpuLightingSeedBlitTime = 0f;
+    private int stats_gpuLightingPropagateBlits = 0;
+    private float stats_gpuLightingPropagateBlitTime = 0f;
+    private int stats_gpuFaceExtractBlits = 0;
+    private float stats_gpuFaceExtractBlitTime = 0f;
+    private int stats_gpuChunkUploads = 0;
+    private float stats_gpuChunkUploadTime = 0f;
+    private int stats_gpuChunkUploadBytes = 0;
+    private float stats_gpuFaceReadbackRequestStartMs = -1f;
+    private int stats_gpuFaceReadbackRequests = 0;
+    private int stats_gpuFaceReadbacksCompleted = 0;
+    private int stats_gpuFaceReadbackFailures = 0;
+    private float stats_gpuFaceReadbackLatencyTotal = 0f;
+    private float stats_gpuFaceReadbackLatencyMin = float.MaxValue;
+    private float stats_gpuFaceReadbackLatencyMax = 0f;
+    private float stats_gpuFaceReadbackCallbackCopyTime = 0f;
+    private int stats_gpuFaceReadbackBytes = 0;
+    private float stats_gpuFaceTileExtractTime = 0f;
 #endif
 
     void Start()
@@ -848,7 +874,17 @@ public class McWorld : UdonSharpBehaviour
         if (!gpuBackendReady || overlayTexture == null || currentAtlas == null || scratchAtlas == null || gpuAtlasOverlayMaterial == null) return;
 
         gpuAtlasOverlayMaterial.SetTexture(gpuPropOverlayTexId, overlayTexture);
+#if LOGGING
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(currentAtlas, scratchAtlas, gpuAtlasOverlayMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuAtlasOverlayBlits++;
+            stats_gpuAtlasOverlayBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
         RenderTexture temp = currentAtlas;
         currentAtlas = scratchAtlas;
         scratchAtlas = temp;
@@ -903,8 +939,19 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
+#if LOGGING
+        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         gpuUploadBlockTexture.SetPixels32(gpuUploadBlockPixels);
         gpuUploadBlockTexture.Apply(false, false);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuChunkUploads++;
+            stats_gpuChunkUploadTime += (Time.realtimeSinceStartup - uploadStart) * 1000f;
+            stats_gpuChunkUploadBytes += gpuUploadBlockPixels.Length * 4;
+        }
+#endif
 
         gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetSlotRect(slotIndex));
         _GpuOverlayTextureIntoAtlas(gpuUploadBlockTexture, ref gpuBlockAtlas, ref gpuBlockAtlasScratch);
@@ -1066,7 +1113,17 @@ public class McWorld : UdonSharpBehaviour
         gpuLightingSeedMaterial.SetVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
         gpuLightingSeedMaterial.SetFloat(gpuPropTopSkyLightId, 15f);
 
+#if LOGGING
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(gpuLightAtlas, gpuLightAtlasScratch, gpuLightingSeedMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuLightingSeedBlits++;
+            stats_gpuLightingSeedBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
         RenderTexture temp = gpuLightAtlas;
         gpuLightAtlas = gpuLightAtlasScratch;
         gpuLightAtlasScratch = temp;
@@ -1088,7 +1145,17 @@ public class McWorld : UdonSharpBehaviour
         gpuLightingPropagateMaterial.SetFloat(gpuPropTopSkyLightId, 15f);
         gpuLightingPropagateMaterial.SetInt("_FrameJitter", gpuLightingFrameCursor++);
 
+#if LOGGING
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(gpuLightAtlas, gpuLightAtlasScratch, gpuLightingPropagateMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuLightingPropagateBlits++;
+            stats_gpuLightingPropagateBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
         RenderTexture temp = gpuLightAtlas;
         gpuLightAtlas = gpuLightAtlasScratch;
         gpuLightAtlasScratch = temp;
@@ -1132,7 +1199,17 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
 
+#if LOGGING
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(gpuBlockAtlas, gpuFaceAtlas, gpuFaceExtractMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceExtractBlits++;
+            stats_gpuFaceExtractBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
     }
 
     private bool _GpuRequestChunkFaceReadback(ChunkData chunk)
@@ -1155,6 +1232,13 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceReadbackInFlight = true;
         gpuFaceReadbackReady = false;
 
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceReadbackRequests++;
+            stats_gpuFaceReadbackRequestStartMs = Time.realtimeSinceStartup * 1000f;
+        }
+#endif
         VRCAsyncGPUReadback.Request(gpuFaceAtlas, 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
         return true;
     }
@@ -1163,21 +1247,44 @@ public class McWorld : UdonSharpBehaviour
     {
         if (!gpuFaceReadbackInFlight) return;
 
+#if LOGGING
+        float callbackStartMs = enableDetailedTimings ? Time.realtimeSinceStartup * 1000f : 0f;
+        float latencyMs = enableDetailedTimings && stats_gpuFaceReadbackRequestStartMs >= 0f
+            ? callbackStartMs - stats_gpuFaceReadbackRequestStartMs
+            : 0f;
+#endif
         gpuFaceReadbackInFlight = false;
 
         if (request.hasError)
         {
             gpuFaceReadbackChunk = null;
+#if LOGGING
+            if (enableDetailedTimings) stats_gpuFaceReadbackFailures++;
+#endif
             return;
         }
 
         if (!request.TryGetData(gpuFaceReadbackPixels, 0))
         {
             gpuFaceReadbackChunk = null;
+#if LOGGING
+            if (enableDetailedTimings) stats_gpuFaceReadbackFailures++;
+#endif
             return;
         }
 
         gpuFaceReadbackReady = true;
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceReadbacksCompleted++;
+            stats_gpuFaceReadbackLatencyTotal += latencyMs;
+            if (latencyMs < stats_gpuFaceReadbackLatencyMin) stats_gpuFaceReadbackLatencyMin = latencyMs;
+            if (latencyMs > stats_gpuFaceReadbackLatencyMax) stats_gpuFaceReadbackLatencyMax = latencyMs;
+            stats_gpuFaceReadbackCallbackCopyTime += Time.realtimeSinceStartup * 1000f - callbackStartMs;
+            stats_gpuFaceReadbackBytes += gpuFaceReadbackPixels.Length * 4;
+        }
+#endif
     }
 
     /// <summary>
@@ -1201,6 +1308,9 @@ public class McWorld : UdonSharpBehaviour
 
     private void _GpuExtractChunkTileFromAtlas(int slotIndex, Color32[] atlasPixels, Color32[] tilePixels)
     {
+#if LOGGING
+        float extractStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         int sizeXZ = chunkSizeXZ;
         int sizeY = chunkSizeY;
         int tilePixelW = sizeXZ;
@@ -1229,6 +1339,12 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceTileExtractTime += (Time.realtimeSinceStartup - extractStart) * 1000f;
+        }
+#endif
     }
 
 
@@ -2138,7 +2254,7 @@ public class McWorld : UdonSharpBehaviour
         if (enableCounters) stats_meshBuildTotal++;
         if (enableCounters) stats_chunkStateTransitions++;
 
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             logBuilder.Clear();
             logBuilder.AppendLine($"--- BuildMesh for Chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) ---");
@@ -2151,7 +2267,7 @@ public class McWorld : UdonSharpBehaviour
         _ClearAllMeshBuffers(chunk);
 
 #if LOGGING
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             // Reset extended profiling counters
             chunk.time_SentinelEnsure = 0f; chunk.time_DecompressNeighbors = 0f; chunk.time_SentinelBuild = 0f;
@@ -2219,7 +2335,7 @@ public class McWorld : UdonSharpBehaviour
 
 
 #if LOGGING
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             chunk.time_NeighborCache = (Time.realtimeSinceStartup - chunk.timer_start_stage) * 1000f;
             chunk.timer_start_stage = Time.realtimeSinceStartup;
@@ -2227,7 +2343,7 @@ public class McWorld : UdonSharpBehaviour
 #endif
 
 #if LOGGING
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             // Will be replaced by detailed breakdown, but keep timer for total DataPrep
             chunk.time_DataPrep = 0f;
@@ -2244,7 +2360,7 @@ public class McWorld : UdonSharpBehaviour
 #endif
         _DecompressNeighborsOnce(chunk);
 #if LOGGING
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             chunk.time_DecompressNeighbors = (Time.realtimeSinceStartup - t_prepare) * 1000f;
             chunk.time_SentinelEnsure = 0f; // Not used with direct access
@@ -2312,7 +2428,7 @@ public class McWorld : UdonSharpBehaviour
 
 #if LOGGING
         float timer_start_stage = 0f;
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             timer_start_stage = Time.realtimeSinceStartup;
             chunk.mesh_step_count++;
@@ -2403,7 +2519,7 @@ public class McWorld : UdonSharpBehaviour
             }
 
 #if LOGGING
-            float axisStart = 0f; if (enableVerboseLogging) axisStart = Time.realtimeSinceStartup;
+            float axisStart = 0f; if (enableDetailedTimings) axisStart = Time.realtimeSinceStartup;
 #endif
 
             int maskWidth, maskHeight;
@@ -2418,7 +2534,7 @@ public class McWorld : UdonSharpBehaviour
             }
 
 #if LOGGING
-            if (enableVerboseLogging)
+            if (enableDetailedTimings)
             {
                 float axisElapsed = (Time.realtimeSinceStartup - axisStart) * 1000f;
                 if (direction <= 1) chunk.time_AxisY += axisElapsed;
@@ -2429,7 +2545,7 @@ public class McWorld : UdonSharpBehaviour
         }
 
 #if LOGGING
-        if (enableVerboseLogging) chunk.time_MainLoop += (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
+        if (enableDetailedTimings) chunk.time_MainLoop += (Time.realtimeSinceStartup - timer_start_stage) * 1000f;
 #endif
 
         if (chunk._greedyAxis > 5)
@@ -2486,29 +2602,6 @@ public class McWorld : UdonSharpBehaviour
             // A more robust solution might involve another queue. For now, this is simpler.
             _ApplyDataToCollider(chunk);
 
-#if LOGGING
-            if (enableVerboseLogging)
-            {
-                logBuilder.AppendLine("--- Timings ---");
-                logBuilder.AppendLine($"1. Neighbor Caching: {chunk.time_NeighborCache:F3} ms");
-                logBuilder.AppendLine($"2. Data Prep (Total): {chunk.time_DataPrep:F3} ms");
-                logBuilder.AppendLine($"   2a. Sentinel Ensure: {chunk.time_SentinelEnsure:F3} ms");
-                logBuilder.AppendLine($"   2b. Decompress Neighbors: {chunk.time_DecompressNeighbors:F3} ms");
-                logBuilder.AppendLine($"   2c. Sentinel Build: {chunk.time_SentinelBuild:F3} ms");
-                logBuilder.AppendLine($"3. Main Loop (Total): {chunk.time_MainLoop:F3} ms ({chunk.mesh_step_count} steps)");
-                logBuilder.AppendLine($"   3a. Axis Y: {chunk.time_AxisY:F3} ms, Boundaries: {chunk.boundaryChecksY}");
-                logBuilder.AppendLine($"   3b. Axis Z: {chunk.time_AxisZ:F3} ms, Boundaries: {chunk.boundaryChecksZ}");
-                logBuilder.AppendLine($"   3c. Axis X: {chunk.time_AxisX:F3} ms, Boundaries: {chunk.boundaryChecksX}");
-                logBuilder.AppendLine($"   3d. ShouldDraw tests: {chunk.shouldDrawTests}, True: {chunk.shouldDrawTrue}");
-                logBuilder.AppendLine($"   3e. Faces - Total: {chunk.facesTotal}, Opaque: {chunk.facesOpaque}, Transparent: {chunk.facesTransparent}, Cutout: {chunk.facesCutout}");
-                logBuilder.AppendLine($"   3f. Sentinel Copies - Interior: {chunk.sentinelInteriorCopied}, Border: {chunk.sentinelBorderCopied}");
-                logBuilder.AppendLine($"4. Apply Opaque: {chunk.time_ApplyOpaque:F3} ms ({chunk._opaqueVertexCount} verts)");
-                logBuilder.AppendLine($"5. Apply Transparent: {chunk.time_ApplyTransparent:F3} ms ({chunk._transparentVertexCount} verts)");
-                logBuilder.AppendLine($"6. Apply Cutout: {chunk.time_ApplyCutout:F3} ms ({chunk._cutoutVertexCount} verts)");
-                logBuilder.AppendLine($"7. Apply Collision: {chunk.time_ApplyCollision:F3} ms ({chunk._collisionVertexCount} verts)");
-                Debug.Log(logBuilder.ToString());
-            }
-#endif
         }
     }
 
@@ -3456,7 +3549,7 @@ public class McWorld : UdonSharpBehaviour
         // NOTE: Cross-shaped blocks have no collision in Minecraft Beta 1.7.3
 
 #if LOGGING
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             chunk.facesTotal += 2;
             if (visibility == BlockVisibilityType.Opaque) chunk.facesOpaque += 2;
@@ -3514,7 +3607,7 @@ public class McWorld : UdonSharpBehaviour
     private void _ApplyAllMeshData(ChunkData chunk)
     {
 #if LOGGING
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             float timer_start = Time.realtimeSinceStartup;
             _ApplyDataToMesh(chunk.opaqueMeshFilter, chunk._opaqueVertices, chunk._opaqueTriangles, chunk._opaqueUVs, chunk._opaqueNormals, chunk._opaqueColors, chunk._opaqueVertexCount, chunk._opaqueTriangleCount);
@@ -3556,7 +3649,7 @@ public class McWorld : UdonSharpBehaviour
     {
 #if LOGGING
         float timer_start = 0f;
-        if(enableVerboseLogging) timer_start = Time.realtimeSinceStartup;
+        if(enableDetailedTimings) timer_start = Time.realtimeSinceStartup;
 #endif
 
         if (chunk.meshCollider == null) return;
@@ -3572,7 +3665,7 @@ public class McWorld : UdonSharpBehaviour
         chunk.meshCollider.sharedMesh = colMesh;
 
 #if LOGGING
-        if(enableVerboseLogging) chunk.time_ApplyCollision = (Time.realtimeSinceStartup - timer_start) * 1000f;
+        if(enableDetailedTimings) chunk.time_ApplyCollision = (Time.realtimeSinceStartup - timer_start) * 1000f;
 #endif
     }
 
@@ -4540,63 +4633,19 @@ public class McWorld : UdonSharpBehaviour
         _PropagateChunkLightingOptimized(chunk, fullData, skylightReachedBlocks, skylightZeroBlocks);
 
 #if LOGGING
-        // Log detailed lighting performance metrics with Y-layer visualization
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
-            System.Text.StringBuilder sb = new System.Text.StringBuilder();
-            sb.AppendLine($"=== Chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) Lighting Performance ===");
-            sb.AppendLine($"--- Timing ---");
-            sb.AppendLine($"  Init: {chunk.time_LightingInit:F3}ms");
-            sb.AppendLine($"  Import: {chunk.time_LightingImport:F3}ms");
-            sb.AppendLine($"  BFS Sky: {chunk.time_LightingBFS_Sky:F3}ms ({chunk.lightingBlocksProcessed_Sky} blocks, {chunk.lightingUpdatesApplied_Sky} updates)");
-            sb.AppendLine($"  BFS Block: {chunk.time_LightingBFS_Block:F3}ms ({chunk.lightingBlocksProcessed_Block} blocks, {chunk.lightingUpdatesApplied_Block} updates)");
-            sb.AppendLine($"--- Stats ---");
-            sb.AppendLine($"  Skylight=15: {chunk.lightingSkylightReachedBlocks}/{lightDataSize} blocks ({chunk.lightingSkylightReachedBlocks * 100f / lightDataSize:F1}%)");
-            sb.AppendLine($"  Skylight=0: {chunk.lightingSkylightZeroBlocks}/{lightDataSize} blocks ({chunk.lightingSkylightZeroBlocks * 100f / lightDataSize:F1}%)");
-            sb.AppendLine($"  Neighbor Queries: {chunk.lightingNeighborQueries_Sky + chunk.lightingNeighborQueries_Block}");
-            sb.AppendLine($"  Cross-Chunk Ops: {chunk.lightingCrossChunkOps_Sky + chunk.lightingCrossChunkOps_Block}");
-            sb.AppendLine($"  Queue Ops: {chunk.lightingQueueOps_Sky + chunk.lightingQueueOps_Block}");
-
-            // DETAILED: Print Y-layer visualization
-            sb.AppendLine($"--- Y-Layer Analysis ---");
-            for (int y = chunkSizeY - 1; y >= 0; y--)
-            {
-                int skylight15 = 0, skylight0 = 0, skylightOther = 0;
-                int blocklight0 = 0, blocklightOther = 0;
-                int airCount = 0, solidCount = 0;
-
-                for (int z = 0; z < chunkSizeXZ; z++)
-                {
-                    for (int x = 0; x < chunkSizeXZ; x++)
-                    {
-                        int blockIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
-                        byte lightByte = chunk.lightData[blockIndex];
-                        int skyLight = (lightByte >> 4) & 0xF;
-                        int blockLight = lightByte & 0xF;
-                        byte blockID = fullData[blockIndex];
-
-                        if (skyLight == 15) skylight15++;
-                        else if (skyLight == 0) skylight0++;
-                        else skylightOther++;
-
-                        if (blockLight == 0) blocklight0++;
-                        else blocklightOther++;
-
-                        if (blockID == 0) airCount++;
-                        else solidCount++;
-                    }
-                }
-
-                // Only print layers with interesting data
-                if (skylightOther > 0 || blocklightOther > 0 || (skylight0 > 0 && skylight0 < 256))
-                {
-                    sb.AppendLine($"  Y{y:D2}: Sky[15:{skylight15:D3} 0:{skylight0:D3} other:{skylightOther:D3}] " +
-                        $"Block[0:{blocklight0:D3} lit:{blocklightOther:D3}] " +
-                        $"Blocks[air:{airCount:D3} solid:{solidCount:D3}]");
-                }
-            }
-
-            Debug.Log(sb.ToString());
+            stats_lightingInitsTotal++;
+            stats_lightingStepsTotal++;
+            stats_lightingInitTime += chunk.time_LightingInit;
+            stats_lightingImportTime += chunk.time_LightingImport;
+            stats_lightingBfsSkyTime += chunk.time_LightingBFS_Sky;
+            stats_lightingBfsBlockTime += chunk.time_LightingBFS_Block;
+            stats_lightingStepTime += chunk.time_LightingInit + chunk.time_LightingImport + chunk.time_LightingBFS_Sky + chunk.time_LightingBFS_Block;
+            stats_lightingBFSOps += chunk.lightingQueueOps_Sky + chunk.lightingQueueOps_Block;
+            stats_lightingSkylightBlocks += chunk.lightingSkylightReachedBlocks;
+            stats_lightingBlocklightBlocks += chunk.lightingUpdatesApplied_Block;
+            stats_lightingCrossChunkQueries += chunk.lightingCrossChunkOps_Sky + chunk.lightingCrossChunkOps_Block;
         }
 #endif
     }
@@ -6883,29 +6932,41 @@ public class McWorld : UdonSharpBehaviour
         logBuilder.Clear();
         logBuilder.AppendLine($"=== Performance Summary (last {aggregateLogInterval} frames, {windowDuration:F1} seconds) ===");
 
-        // Update stats
         if (stats_frameCount > 0)
         {
             float avgUpdateTime = stats_updateTotalTime / stats_frameCount;
             logBuilder.AppendLine($"Update: avg {avgUpdateTime:F2}ms, min {stats_updateTimeMin:F2}ms, max {stats_updateTimeMax:F2}ms");
             logBuilder.AppendLine($"  Budget exceeded: {stats_budgetExceededCount} times ({(stats_budgetExceededCount / (float)stats_frameCount * 100f):F1}%)");
+            if (enableDetailedTimings)
+            {
+                logBuilder.AppendLine($"  Active processing: {stats_processActiveChunksTime:F2}ms total, reconciliation {stats_reconciliationTime:F2}ms total");
+            }
         }
 
-        // Mesh building stats
+        if (coordinator != null)
+        {
+            coordinator.AppendAggregatePerformanceStats(logBuilder);
+        }
+
+        if (terrainGenerator != null)
+        {
+            terrainGenerator.AppendAggregatePerformanceStats(logBuilder);
+        }
+
         if (stats_meshBuildTotal > 0)
         {
             float avgMeshTime = stats_meshBuildTimeTotal / stats_meshBuildTotal;
             float avgStepsPerChunk = stats_meshStepsTotal / (float)stats_meshBuildTotal;
             logBuilder.AppendLine($"Mesh Building: {stats_meshBuildTotal} chunks, avg {avgMeshTime:F2}ms (min {stats_meshBuildTimeMin:F2}ms, max {stats_meshBuildTimeMax:F2}ms)");
             logBuilder.AppendLine($"  Steps: avg {avgStepsPerChunk:F1} per chunk");
-
-            if (enableDetailedTimings)
+            if (enableDetailedTimings && stats_meshBuildTotal > 0)
             {
                 float totalGreedy = stats_greedyAxisYTime + stats_greedyAxisZTime + stats_greedyAxisXTime;
                 if (totalGreedy > 0)
                 {
                     logBuilder.AppendLine($"  Greedy Meshing: Y={stats_greedyAxisYTime / totalGreedy * 100f:F0}% ({stats_greedyAxisYTime:F1}ms), Z={stats_greedyAxisZTime / totalGreedy * 100f:F0}% ({stats_greedyAxisZTime:F1}ms), X={stats_greedyAxisXTime / totalGreedy * 100f:F0}% ({stats_greedyAxisXTime:F1}ms)");
                 }
+                logBuilder.AppendLine($"  Apply mesh: opaque {stats_meshApplyOpaqueTime:F2}ms, transparent {stats_meshApplyTransparentTime:F2}ms, cutout {stats_meshApplyCutoutTime:F2}ms, collider {stats_meshApplyColliderTime:F2}ms");
             }
 
             if (enableCounters && stats_faceCullingTests > 0)
@@ -6916,7 +6977,34 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
-        // RLE stats
+        if (stats_lightingInitsTotal > 0)
+        {
+            logBuilder.AppendLine($"Lighting: {stats_lightingInitsTotal} chunks");
+            logBuilder.AppendLine($"  Avg init {stats_lightingInitTime / stats_lightingInitsTotal:F2}ms, import {stats_lightingImportTime / stats_lightingInitsTotal:F2}ms, BFS sky {stats_lightingBfsSkyTime / stats_lightingInitsTotal:F2}ms, BFS block {stats_lightingBfsBlockTime / stats_lightingInitsTotal:F2}ms");
+            logBuilder.AppendLine($"  Queue ops {stats_lightingBFSOps}, skylit blocks {stats_lightingSkylightBlocks}, block-light updates {stats_lightingBlocklightBlocks}, cross-chunk ops {stats_lightingCrossChunkQueries}");
+        }
+
+        bool hasGpuBackendStats =
+            stats_gpuAtlasOverlayBlits > 0 ||
+            stats_gpuLightingSeedBlits > 0 ||
+            stats_gpuLightingPropagateBlits > 0 ||
+            stats_gpuFaceExtractBlits > 0 ||
+            stats_gpuChunkUploads > 0 ||
+            stats_gpuFaceReadbackRequests > 0;
+
+        if (hasGpuBackendStats)
+        {
+            logBuilder.AppendLine("GPU Backend:");
+            logBuilder.AppendLine($"  Blit submit: atlas overlay {stats_gpuAtlasOverlayBlits} ({stats_gpuAtlasOverlayBlitTime:F3}ms), light seed {stats_gpuLightingSeedBlits} ({stats_gpuLightingSeedBlitTime:F3}ms), light propagate {stats_gpuLightingPropagateBlits} ({stats_gpuLightingPropagateBlitTime:F3}ms), face extract {stats_gpuFaceExtractBlits} ({stats_gpuFaceExtractBlitTime:F3}ms)");
+            logBuilder.AppendLine($"  CPU->GPU uploads: chunk blocks {stats_gpuChunkUploads} ({stats_gpuChunkUploadTime:F3}ms, {stats_gpuChunkUploadBytes / 1024f:F1}KB)");
+            if (stats_gpuFaceReadbackRequests > 0)
+            {
+                float avgLatency = stats_gpuFaceReadbacksCompleted > 0 ? stats_gpuFaceReadbackLatencyTotal / stats_gpuFaceReadbacksCompleted : 0f;
+                logBuilder.AppendLine($"  GPU->CPU face readback: req {stats_gpuFaceReadbackRequests}, ok {stats_gpuFaceReadbacksCompleted}, fail {stats_gpuFaceReadbackFailures}, latency avg {avgLatency:F3}ms min {(stats_gpuFaceReadbackLatencyMin == float.MaxValue ? 0f : stats_gpuFaceReadbackLatencyMin):F3}ms max {stats_gpuFaceReadbackLatencyMax:F3}ms");
+                logBuilder.AppendLine($"  Readback copy {stats_gpuFaceReadbackCallbackCopyTime:F3}ms, tile extract {stats_gpuFaceTileExtractTime:F3}ms, data {stats_gpuFaceReadbackBytes / 1024f:F1}KB");
+            }
+        }
+
         if (stats_rleCompressions > 0 || stats_rleDecompressions > 0)
         {
             float compressionRatio = stats_rleTotalBytesIn > 0 ? (stats_rleTotalBytesOut / (float)stats_rleTotalBytesIn) : 0f;
@@ -6938,7 +7026,6 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
-        // Block operation stats
         if (enableCounters && stats_getBlockCalls > 0)
         {
             logBuilder.AppendLine($"Block Ops: {stats_getBlockCalls} gets, {stats_setBlockCalls} sets, {stats_blockModifications} modifications");
@@ -6948,7 +7035,6 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
-        // Cache stats
         if (enableCacheTracking)
         {
             int totalDecomp = stats_decompCacheHits + stats_decompCacheMisses;
@@ -6958,14 +7044,12 @@ public class McWorld : UdonSharpBehaviour
             logBuilder.AppendLine($"Cache: Decomp {decompHitRate:F1}% ({stats_decompCacheHits}/{totalDecomp}), Neighbor {neighborHitRate:F1}% ({stats_neighborCacheHits}/{totalNeighbor})");
         }
 
-        // Reconciliation stats
         if (stats_reconciliationOps > 0)
         {
             float avgReconcilTime = stats_reconciliationTime / stats_reconciliationOps;
             logBuilder.AppendLine($"Reconciliation: {stats_reconciliationOps} ops, {stats_reconciliationBlocks} blocks, avg {avgReconcilTime:F2}ms");
         }
 
-        // Chunk management stats
         if (enableCounters)
         {
             logBuilder.AppendLine($"Chunks: {stats_chunkCreations} created, {stats_chunkStateTransitions} state transitions");
@@ -7021,6 +7105,51 @@ public class McWorld : UdonSharpBehaviour
         stats_reconciliationBlocks = 0;
         stats_chunkCreations = 0;
         stats_chunkStateTransitions = 0;
+        stats_lightingInitsTotal = 0;
+        stats_lightingInitTime = 0f;
+        stats_lightingImportTime = 0f;
+        stats_lightingBfsSkyTime = 0f;
+        stats_lightingBfsBlockTime = 0f;
+        stats_lightingStepsTotal = 0;
+        stats_lightingStepTime = 0f;
+        stats_lightingBFSOps = 0;
+        stats_lightingMaxQueueSize = 0;
+        stats_lightingSkylightBlocks = 0;
+        stats_lightingBlocklightBlocks = 0;
+        stats_lightingCrossChunkQueries = 0;
+        stats_lightingPoolAllocations = 0;
+        stats_lightingPoolReuses = 0;
+        stats_gpuAtlasOverlayBlits = 0;
+        stats_gpuAtlasOverlayBlitTime = 0f;
+        stats_gpuLightingSeedBlits = 0;
+        stats_gpuLightingSeedBlitTime = 0f;
+        stats_gpuLightingPropagateBlits = 0;
+        stats_gpuLightingPropagateBlitTime = 0f;
+        stats_gpuFaceExtractBlits = 0;
+        stats_gpuFaceExtractBlitTime = 0f;
+        stats_gpuChunkUploads = 0;
+        stats_gpuChunkUploadTime = 0f;
+        stats_gpuChunkUploadBytes = 0;
+        stats_gpuFaceReadbackRequestStartMs = -1f;
+        stats_gpuFaceReadbackRequests = 0;
+        stats_gpuFaceReadbacksCompleted = 0;
+        stats_gpuFaceReadbackFailures = 0;
+        stats_gpuFaceReadbackLatencyTotal = 0f;
+        stats_gpuFaceReadbackLatencyMin = float.MaxValue;
+        stats_gpuFaceReadbackLatencyMax = 0f;
+        stats_gpuFaceReadbackCallbackCopyTime = 0f;
+        stats_gpuFaceReadbackBytes = 0;
+        stats_gpuFaceTileExtractTime = 0f;
+
+        if (coordinator != null)
+        {
+            coordinator.ResetAggregatePerformanceStats();
+        }
+
+        if (terrainGenerator != null)
+        {
+            terrainGenerator.ResetAggregatePerformanceStats();
+        }
     }
 #endif
 }

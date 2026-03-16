@@ -48,6 +48,7 @@ Material:
     - _GridZ: 0.0061035156
     - _Is2D: 1
     - _Octave: 15
+    - _OctaveCount: 16
     - _OctaveRow: 15
     - _XCoord: 135.346
     - _XPos: -4

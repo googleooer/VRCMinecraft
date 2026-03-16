@@ -61,8 +61,8 @@ Shader "VRCM/GpuColumnSurfaceInfo"
 
             float4 frag(v2f i) : SV_Target
             {
-                int x = clamp((int)floor(i.uv.x * _ChunkSizeXZ), 0, _ChunkSizeXZ - 1);
-                int z = clamp((int)floor(i.uv.y * _ChunkSizeXZ), 0, _ChunkSizeXZ - 1);
+                int x = clamp((int)floor(i.vertex.x), 0, _ChunkSizeXZ - 1);
+                int z = clamp((int)floor(i.vertex.y), 0, _ChunkSizeXZ - 1);
 
                 int surfaceY = 0;
                 int hasStone = 0;

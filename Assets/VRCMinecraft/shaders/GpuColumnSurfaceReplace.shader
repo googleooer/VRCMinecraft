@@ -94,8 +94,8 @@ Shader "VRCM/GpuColumnSurfaceReplace"
             float4 frag(v2f i) : SV_Target
             {
                 int packedHeight = _WorldHeight * _ChunkSizeXZ;
-                int x = clamp((int)floor(i.uv.x * _ChunkSizeXZ), 0, _ChunkSizeXZ - 1);
-                int packedRow = clamp((int)floor(i.uv.y * packedHeight), 0, packedHeight - 1);
+                int x = clamp((int)floor(i.vertex.x), 0, _ChunkSizeXZ - 1);
+                int packedRow = clamp((int)floor(i.vertex.y), 0, packedHeight - 1);
                 int z = packedRow % _ChunkSizeXZ;
                 int y = packedRow / _ChunkSizeXZ;
 

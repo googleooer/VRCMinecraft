@@ -116,13 +116,11 @@ Shader "VRCM/CombineFixed"
             
             float4 frag (v2f i) : SV_Target
             {
-                float2 uv = i.uv;
-                
                 // Decompose the packed XZ index and Y from uv:
                 // Given the packed output RT: width = _XSize * _ZSize, height = _YSize
                 int width = _XSize * _ZSize;
-                int xzIndex = clamp((int)floor(uv.x * width), 0, width - 1);
-                int y = clamp((int)floor(uv.y * _YSize), 0, _YSize - 1);
+                int xzIndex = clamp((int)floor(i.vertex.x), 0, width - 1);
+                int y = clamp((int)floor(i.vertex.y), 0, _YSize - 1);
                 
                 // Recover x and z from the packed index (NOTE: modulo by _XSize, divide by _XSize):
                 int x = xzIndex % _XSize;

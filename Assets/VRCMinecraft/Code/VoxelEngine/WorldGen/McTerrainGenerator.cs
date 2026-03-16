@@ -42,7 +42,13 @@ public enum GenerationState
 public enum GpuWorldgenReadbackPhase
 {
     None,
-    BaseColumn
+    BaseColumn,
+    DiagnosticNoise1,
+    DiagnosticNoise2,
+    DiagnosticNoise3,
+    DiagnosticNoise6,
+    DiagnosticNoise7,
+    DiagnosticDensity
 }
 
 [Singleton]
@@ -97,6 +103,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public Material gpuColumnSurfaceInfoMaterial;
     public Material gpuColumnSurfaceReplaceMaterial;
 
+    [Header("GPU Noise Diagnostics")]
+    public bool enableGpuNoiseDiagnostics = false;
+    public bool gpuNoiseDiagnosticDumpAllCells = true;
+    public int gpuNoiseDiagnosticChunkX = 0;
+    public int gpuNoiseDiagnosticChunkZ = 0;
+    public bool gpuNoiseDiagnosticRunOncePerChunk = true;
+
     [Header("Structure & Feature Templates")]
     public McStructureTemplate[] structureTemplates;
 
@@ -131,6 +144,89 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private float cached_time_NoiseGen1, cached_time_NoiseGen2, cached_time_NoiseGen3, cached_time_Noise6, cached_time_Noise7, cached_time_NoiseCombine;
     private int cached_noiseGen1Cells, cached_noiseGen2Cells, cached_noiseGen3Cells, cached_noise6Cells, cached_noise7Cells, cached_noiseCombineCells;
     private bool timingsCached = false;
+
+    // Centralized aggregate window for McWorld's profiler log.
+    private int agg_chunksCompleted;
+    private int agg_cachedColumnsUsed;
+    private float agg_time_Preparation;
+    private float agg_time_Prep_GetBiomes;
+    private float agg_time_Prep_SandNoise;
+    private float agg_time_Prep_GravelNoise;
+    private float agg_time_Prep_StoneNoise;
+    private float agg_time_Prep_AllocNoiseCache;
+    private float agg_time_NoiseGen1;
+    private float agg_time_NoiseGen2;
+    private float agg_time_NoiseGen3;
+    private float agg_time_Noise6;
+    private float agg_time_Noise7;
+    private float agg_time_NoiseCombine;
+    private float agg_time_GeneratingTerrain;
+    private float agg_time_ReplacingBiomes;
+    private float agg_time_ActualChunkWork;
+    private float agg_time_WallClock;
+    private int agg_totalSteps;
+    private float agg_stepTimeMax;
+    private float agg_stepTimeMin = float.MaxValue;
+    private int agg_noiseGen1Cells;
+    private int agg_noiseGen2Cells;
+    private int agg_noiseGen3Cells;
+    private int agg_noise6Cells;
+    private int agg_noise7Cells;
+    private int agg_noiseCombineCells;
+    private int agg_terrainVoxelsVisited;
+    private int agg_terrainAssignments;
+    private int agg_terrainStoneAssignments;
+    private int agg_terrainWaterAssignments;
+    private int agg_terrainIceAssignments;
+    private int agg_biomeTopAssignments;
+    private int agg_biomeFillerAssignments;
+    private int agg_biomeBedrockAssignments;
+    private int agg_biomeWaterAssignments;
+    private int agg_biomeGravelAssignments;
+    private int agg_biomeSandAssignments;
+    private int agg_biomeSandstoneAssignments;
+    private int agg_gpuColumnsStarted;
+    private int agg_gpuColumnsFinalized;
+    private int agg_gpuFallbacks;
+    private int agg_gpuNoiseBlits;
+    private float agg_gpuNoiseBlitTime;
+    private int agg_gpuCombineBlits;
+    private float agg_gpuCombineBlitTime;
+    private int agg_gpuBaseFillBlits;
+    private float agg_gpuBaseFillBlitTime;
+    private int agg_gpuSurfaceInfoBlits;
+    private float agg_gpuSurfaceInfoBlitTime;
+    private int agg_gpuFinalizeBlits;
+    private float agg_gpuFinalizeBlitTime;
+    private int agg_gpuClimateUploads;
+    private float agg_gpuClimateUploadTime;
+    private int agg_gpuClimateUploadBytes;
+    private int agg_gpuNoiseInputUploads;
+    private float agg_gpuNoiseInputUploadTime;
+    private int agg_gpuNoiseInputUploadBytes;
+    private int agg_gpuSurfaceUploads;
+    private float agg_gpuSurfaceUploadTime;
+    private int agg_gpuSurfaceUploadBytes;
+    private int agg_gpuFinalColumnUploads;
+    private float agg_gpuFinalColumnUploadTime;
+    private int agg_gpuFinalColumnUploadBytes;
+    private int agg_gpuChunkSliceCopies;
+    private float agg_gpuChunkSliceCopyTime;
+    private int agg_gpuChunkSliceCopyBytes;
+    private int agg_gpuBaseReadbacksCompleted;
+    private int agg_gpuBaseReadbackFailures;
+    private float agg_gpuBaseReadbackLatencyTotal;
+    private float agg_gpuBaseReadbackLatencyMin = float.MaxValue;
+    private float agg_gpuBaseReadbackLatencyMax;
+    private float agg_gpuBaseReadbackCallbackCopyTime;
+    private int agg_gpuBaseReadbackBytes;
+    private int agg_gpuDiagnosticReadbacksCompleted;
+    private int agg_gpuDiagnosticReadbackFailures;
+    private float agg_gpuDiagnosticReadbackLatencyTotal;
+    private float agg_gpuDiagnosticReadbackLatencyMin = float.MaxValue;
+    private float agg_gpuDiagnosticReadbackLatencyMax;
+    private float agg_gpuDiagnosticReadbackCallbackCopyTime;
+    private int agg_gpuDiagnosticReadbackBytes;
 #endif
 
     [SerializeField, FindObjectOfType(true)]
@@ -205,6 +301,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private GpuWorldgenReadbackPhase gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
     private int gpuWorldHeightBlocks = 0;
     private Texture2D gpuPermTexture;
+    private Texture2D gpuCoordXTexture;
+    private Texture2D gpuCoordYTexture;
+    private Texture2D gpuCoordZTexture;
     private Texture2D gpuTemperatureTexture;
     private Texture2D gpuRainfallTexture;
     private Texture2D gpuSurfaceParamsTextureA;
@@ -232,6 +331,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Texture2D gpuClearTexture;
     private Color[] gpuClimatePixels;
     private Color[] gpuPermutationPixels; // 256 * MAX_OCTAVES for batched upload
+    private Color[] gpuCoordXPixels;
+    private Color[] gpuCoordYPixels;
+    private Color[] gpuCoordZPixels;
     private const int GPU_MAX_OCTAVES = 16;
     private Color[] gpuSurfaceParamPixelsA;
     private Color[] gpuSurfaceParamPixelsB;
@@ -239,6 +341,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Color[] gpuColumnUploadPixels;
     private Color32[] gpuColumnReadbackPixels;
     private Color32[] gpuSurfaceInfoReadbackPixels;
+    private Color[] gpuNoiseDiagnosticReadbackPixels;
     private int gpuPropPermTexId;
     private int gpuPropAccumulationTexId;
     private int gpuPropOctaveId;
@@ -300,6 +403,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuPropPermIdxYId, gpuPropFracYId;
     private int gpuPropPermIdxZId, gpuPropFracZId;
     private int gpuPropGradFracYId;
+    private int gpuPropCoordXTexId;
+    private int gpuPropCoordYTexId;
+    private int gpuPropCoordZTexId;
+    private double[] gpuDiagCpuNoise1;
+    private double[] gpuDiagCpuNoise2;
+    private double[] gpuDiagCpuNoise3;
+    private double[] gpuDiagCpuNoise6;
+    private double[] gpuDiagCpuNoise7;
+    private double[] gpuDiagCpuDensity;
+    private int gpuDiagChunkX = int.MaxValue;
+    private int gpuDiagChunkZ = int.MaxValue;
+    private int gpuDiagLastLoggedChunkX = int.MaxValue;
+    private int gpuDiagLastLoggedChunkZ = int.MaxValue;
+    private StringBuilder gpuNoiseDiagnosticLog;
+    private int gpuDiagnosticReadbackStallFrames = 0;
+    private const int GPU_DIAGNOSTIC_READBACK_STALL_LIMIT = 180;
+    private float gpuReadbackRequestStartTimeMs = -1f;
+    private int gpuReadbackRequestBytes = 0;
 
     // Time-slicing progress trackers for the preparation state
     private int noiseCombine_x;
@@ -413,6 +534,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
         caves = new WorldGenCavesOld();
         _InitializeGpuWorldgen();
+        ResetAggregatePerformanceStats();
         
         isInitialized = true;
 
@@ -426,9 +548,320 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
     }
 
+#if LOGGING
+    public void AppendAggregatePerformanceStats(StringBuilder sb)
+    {
+        if (sb == null) return;
+
+        if (enableDetailedTimings && agg_chunksCompleted > 0)
+        {
+            float avgPrep = agg_time_Preparation / agg_chunksCompleted;
+            float avgGenerate = agg_time_GeneratingTerrain / agg_chunksCompleted;
+            float avgReplace = agg_time_ReplacingBiomes / agg_chunksCompleted;
+            float avgActual = agg_time_ActualChunkWork / agg_chunksCompleted;
+            float avgWallClock = agg_time_WallClock / agg_chunksCompleted;
+            float avgSteps = agg_totalSteps / (float)agg_chunksCompleted;
+            float avgStep = agg_totalSteps > 0 ? agg_time_WallClock / agg_totalSteps : 0f;
+
+            sb.AppendLine("Terrain Generation:");
+            sb.AppendFormat("  Chunks: {0} ({1} cached columns), prep {2:F3}ms, terrain {3:F3}ms, replace biomes {4:F3}ms\n",
+                agg_chunksCompleted, agg_cachedColumnsUsed, avgPrep, avgGenerate, avgReplace);
+            sb.AppendFormat("  Chunk work: actual {0:F3}ms, wall-clock {1:F3}ms, steps/chunk {2:F1}, avg step {3:F3}ms, max step {4:F3}ms, min step {5:F3}ms\n",
+                avgActual, avgWallClock, avgSteps, avgStep, agg_stepTimeMax, agg_stepTimeMin == float.MaxValue ? 0f : agg_stepTimeMin);
+            sb.AppendFormat("  Prep breakdown: biomes {0:F3}ms, sand {1:F3}ms, gravel {2:F3}ms, stone {3:F3}ms, alloc noise cache {4:F3}ms\n",
+                agg_time_Prep_GetBiomes / agg_chunksCompleted,
+                agg_time_Prep_SandNoise / agg_chunksCompleted,
+                agg_time_Prep_GravelNoise / agg_chunksCompleted,
+                agg_time_Prep_StoneNoise / agg_chunksCompleted,
+                agg_time_Prep_AllocNoiseCache / agg_chunksCompleted);
+            sb.AppendFormat("  Noise breakdown: n1 {0:F3}ms, n2 {1:F3}ms, n3 {2:F3}ms, n6 {3:F3}ms, n7 {4:F3}ms, combine {5:F3}ms\n",
+                agg_time_NoiseGen1 / agg_chunksCompleted,
+                agg_time_NoiseGen2 / agg_chunksCompleted,
+                agg_time_NoiseGen3 / agg_chunksCompleted,
+                agg_time_Noise6 / agg_chunksCompleted,
+                agg_time_Noise7 / agg_chunksCompleted,
+                agg_time_NoiseCombine / agg_chunksCompleted);
+            sb.AppendFormat("  Noise cells: n1 {0}, n2 {1}, n3 {2}, n6 {3}, n7 {4}, combine {5}\n",
+                agg_noiseGen1Cells, agg_noiseGen2Cells, agg_noiseGen3Cells, agg_noise6Cells, agg_noise7Cells, agg_noiseCombineCells);
+            sb.AppendFormat("  Terrain voxels: visited {0}, assignments {1}, stone {2}, water {3}, ice {4}\n",
+                agg_terrainVoxelsVisited, agg_terrainAssignments, agg_terrainStoneAssignments, agg_terrainWaterAssignments, agg_terrainIceAssignments);
+            sb.AppendFormat("  Surface assignments: top {0}, filler {1}, bedrock {2}, water {3}, gravel {4}, sand {5}, sandstone {6}\n",
+                agg_biomeTopAssignments, agg_biomeFillerAssignments, agg_biomeBedrockAssignments,
+                agg_biomeWaterAssignments, agg_biomeGravelAssignments, agg_biomeSandAssignments, agg_biomeSandstoneAssignments);
+        }
+
+        bool hasGpuStats =
+            agg_gpuColumnsStarted > 0 ||
+            agg_gpuNoiseBlits > 0 ||
+            agg_gpuBaseReadbacksCompleted > 0 ||
+            agg_gpuDiagnosticReadbacksCompleted > 0 ||
+            agg_gpuBaseReadbackFailures > 0 ||
+            agg_gpuDiagnosticReadbackFailures > 0;
+
+        if (hasGpuStats)
+        {
+            sb.AppendLine("GPU Worldgen:");
+            sb.AppendFormat("  Columns: started {0}, finalized {1}, fallbacks {2}\n",
+                agg_gpuColumnsStarted, agg_gpuColumnsFinalized, agg_gpuFallbacks);
+            sb.AppendFormat("  Blit submit: noise {0} ({1:F3}ms), combine {2} ({3:F3}ms), base fill {4} ({5:F3}ms), surface info {6} ({7:F3}ms), finalize {8} ({9:F3}ms)\n",
+                agg_gpuNoiseBlits, agg_gpuNoiseBlitTime,
+                agg_gpuCombineBlits, agg_gpuCombineBlitTime,
+                agg_gpuBaseFillBlits, agg_gpuBaseFillBlitTime,
+                agg_gpuSurfaceInfoBlits, agg_gpuSurfaceInfoBlitTime,
+                agg_gpuFinalizeBlits, agg_gpuFinalizeBlitTime);
+            sb.AppendFormat("  CPU->GPU uploads: climate {0} ({1:F3}ms, {2:F1}KB), noise inputs {3} ({4:F3}ms, {5:F1}KB), surface {6} ({7:F3}ms, {8:F1}KB), final column {9} ({10:F3}ms, {11:F1}KB)\n",
+                agg_gpuClimateUploads, agg_gpuClimateUploadTime, agg_gpuClimateUploadBytes / 1024f,
+                agg_gpuNoiseInputUploads, agg_gpuNoiseInputUploadTime, agg_gpuNoiseInputUploadBytes / 1024f,
+                agg_gpuSurfaceUploads, agg_gpuSurfaceUploadTime, agg_gpuSurfaceUploadBytes / 1024f,
+                agg_gpuFinalColumnUploads, agg_gpuFinalColumnUploadTime, agg_gpuFinalColumnUploadBytes / 1024f);
+            sb.AppendFormat("  GPU->CPU chunk copy: {0} copies, {1:F3}ms, {2:F1}KB\n",
+                agg_gpuChunkSliceCopies, agg_gpuChunkSliceCopyTime, agg_gpuChunkSliceCopyBytes / 1024f);
+
+            if (agg_gpuBaseReadbacksCompleted > 0 || agg_gpuBaseReadbackFailures > 0)
+            {
+                float avgLatency = agg_gpuBaseReadbacksCompleted > 0 ? agg_gpuBaseReadbackLatencyTotal / agg_gpuBaseReadbacksCompleted : 0f;
+                sb.AppendFormat("  Base readback: ok {0}, fail {1}, latency avg {2:F3}ms min {3:F3}ms max {4:F3}ms, callback copy {5:F3}ms, {6:F1}KB\n",
+                    agg_gpuBaseReadbacksCompleted, agg_gpuBaseReadbackFailures, avgLatency,
+                    agg_gpuBaseReadbackLatencyMin == float.MaxValue ? 0f : agg_gpuBaseReadbackLatencyMin,
+                    agg_gpuBaseReadbackLatencyMax, agg_gpuBaseReadbackCallbackCopyTime,
+                    agg_gpuBaseReadbackBytes / 1024f);
+            }
+
+            if (agg_gpuDiagnosticReadbacksCompleted > 0 || agg_gpuDiagnosticReadbackFailures > 0)
+            {
+                float avgLatency = agg_gpuDiagnosticReadbacksCompleted > 0 ? agg_gpuDiagnosticReadbackLatencyTotal / agg_gpuDiagnosticReadbacksCompleted : 0f;
+                sb.AppendFormat("  Diagnostic readback: ok {0}, fail {1}, latency avg {2:F3}ms min {3:F3}ms max {4:F3}ms, callback copy {5:F3}ms, {6:F1}KB\n",
+                    agg_gpuDiagnosticReadbacksCompleted, agg_gpuDiagnosticReadbackFailures, avgLatency,
+                    agg_gpuDiagnosticReadbackLatencyMin == float.MaxValue ? 0f : agg_gpuDiagnosticReadbackLatencyMin,
+                    agg_gpuDiagnosticReadbackLatencyMax, agg_gpuDiagnosticReadbackCallbackCopyTime,
+                    agg_gpuDiagnosticReadbackBytes / 1024f);
+            }
+        }
+    }
+
+    public void ResetAggregatePerformanceStats()
+    {
+        agg_chunksCompleted = 0;
+        agg_cachedColumnsUsed = 0;
+        agg_time_Preparation = 0f;
+        agg_time_Prep_GetBiomes = 0f;
+        agg_time_Prep_SandNoise = 0f;
+        agg_time_Prep_GravelNoise = 0f;
+        agg_time_Prep_StoneNoise = 0f;
+        agg_time_Prep_AllocNoiseCache = 0f;
+        agg_time_NoiseGen1 = 0f;
+        agg_time_NoiseGen2 = 0f;
+        agg_time_NoiseGen3 = 0f;
+        agg_time_Noise6 = 0f;
+        agg_time_Noise7 = 0f;
+        agg_time_NoiseCombine = 0f;
+        agg_time_GeneratingTerrain = 0f;
+        agg_time_ReplacingBiomes = 0f;
+        agg_time_ActualChunkWork = 0f;
+        agg_time_WallClock = 0f;
+        agg_totalSteps = 0;
+        agg_stepTimeMax = 0f;
+        agg_stepTimeMin = float.MaxValue;
+        agg_noiseGen1Cells = 0;
+        agg_noiseGen2Cells = 0;
+        agg_noiseGen3Cells = 0;
+        agg_noise6Cells = 0;
+        agg_noise7Cells = 0;
+        agg_noiseCombineCells = 0;
+        agg_terrainVoxelsVisited = 0;
+        agg_terrainAssignments = 0;
+        agg_terrainStoneAssignments = 0;
+        agg_terrainWaterAssignments = 0;
+        agg_terrainIceAssignments = 0;
+        agg_biomeTopAssignments = 0;
+        agg_biomeFillerAssignments = 0;
+        agg_biomeBedrockAssignments = 0;
+        agg_biomeWaterAssignments = 0;
+        agg_biomeGravelAssignments = 0;
+        agg_biomeSandAssignments = 0;
+        agg_biomeSandstoneAssignments = 0;
+        agg_gpuColumnsStarted = 0;
+        agg_gpuColumnsFinalized = 0;
+        agg_gpuFallbacks = 0;
+        agg_gpuNoiseBlits = 0;
+        agg_gpuNoiseBlitTime = 0f;
+        agg_gpuCombineBlits = 0;
+        agg_gpuCombineBlitTime = 0f;
+        agg_gpuBaseFillBlits = 0;
+        agg_gpuBaseFillBlitTime = 0f;
+        agg_gpuSurfaceInfoBlits = 0;
+        agg_gpuSurfaceInfoBlitTime = 0f;
+        agg_gpuFinalizeBlits = 0;
+        agg_gpuFinalizeBlitTime = 0f;
+        agg_gpuClimateUploads = 0;
+        agg_gpuClimateUploadTime = 0f;
+        agg_gpuClimateUploadBytes = 0;
+        agg_gpuNoiseInputUploads = 0;
+        agg_gpuNoiseInputUploadTime = 0f;
+        agg_gpuNoiseInputUploadBytes = 0;
+        agg_gpuSurfaceUploads = 0;
+        agg_gpuSurfaceUploadTime = 0f;
+        agg_gpuSurfaceUploadBytes = 0;
+        agg_gpuFinalColumnUploads = 0;
+        agg_gpuFinalColumnUploadTime = 0f;
+        agg_gpuFinalColumnUploadBytes = 0;
+        agg_gpuChunkSliceCopies = 0;
+        agg_gpuChunkSliceCopyTime = 0f;
+        agg_gpuChunkSliceCopyBytes = 0;
+        agg_gpuBaseReadbacksCompleted = 0;
+        agg_gpuBaseReadbackFailures = 0;
+        agg_gpuBaseReadbackLatencyTotal = 0f;
+        agg_gpuBaseReadbackLatencyMin = float.MaxValue;
+        agg_gpuBaseReadbackLatencyMax = 0f;
+        agg_gpuBaseReadbackCallbackCopyTime = 0f;
+        agg_gpuBaseReadbackBytes = 0;
+        agg_gpuDiagnosticReadbacksCompleted = 0;
+        agg_gpuDiagnosticReadbackFailures = 0;
+        agg_gpuDiagnosticReadbackLatencyTotal = 0f;
+        agg_gpuDiagnosticReadbackLatencyMin = float.MaxValue;
+        agg_gpuDiagnosticReadbackLatencyMax = 0f;
+        agg_gpuDiagnosticReadbackCallbackCopyTime = 0f;
+        agg_gpuDiagnosticReadbackBytes = 0;
+    }
+
+    private void _RecordGpuClimateUpload(float timeMs, int bytes)
+    {
+        agg_gpuClimateUploads++;
+        agg_gpuClimateUploadTime += timeMs;
+        agg_gpuClimateUploadBytes += bytes;
+    }
+
+    private void _RecordGpuNoiseInputUpload(float timeMs, int bytes)
+    {
+        agg_gpuNoiseInputUploads++;
+        agg_gpuNoiseInputUploadTime += timeMs;
+        agg_gpuNoiseInputUploadBytes += bytes;
+    }
+
+    private void _RecordGpuSurfaceUpload(float timeMs, int bytes)
+    {
+        agg_gpuSurfaceUploads++;
+        agg_gpuSurfaceUploadTime += timeMs;
+        agg_gpuSurfaceUploadBytes += bytes;
+    }
+
+    private void _RecordGpuFinalColumnUpload(float timeMs, int bytes)
+    {
+        agg_gpuFinalColumnUploads++;
+        agg_gpuFinalColumnUploadTime += timeMs;
+        agg_gpuFinalColumnUploadBytes += bytes;
+    }
+
+    private void _RecordGpuReadbackCompletion(bool diagnostic, bool success, float latencyMs, float callbackCopyMs, int bytes)
+    {
+        if (diagnostic)
+        {
+            if (success)
+            {
+                agg_gpuDiagnosticReadbacksCompleted++;
+                agg_gpuDiagnosticReadbackLatencyTotal += latencyMs;
+                if (latencyMs < agg_gpuDiagnosticReadbackLatencyMin) agg_gpuDiagnosticReadbackLatencyMin = latencyMs;
+                if (latencyMs > agg_gpuDiagnosticReadbackLatencyMax) agg_gpuDiagnosticReadbackLatencyMax = latencyMs;
+                agg_gpuDiagnosticReadbackCallbackCopyTime += callbackCopyMs;
+                agg_gpuDiagnosticReadbackBytes += bytes;
+            }
+            else
+            {
+                agg_gpuDiagnosticReadbackFailures++;
+            }
+            return;
+        }
+
+        if (success)
+        {
+            agg_gpuBaseReadbacksCompleted++;
+            agg_gpuBaseReadbackLatencyTotal += latencyMs;
+            if (latencyMs < agg_gpuBaseReadbackLatencyMin) agg_gpuBaseReadbackLatencyMin = latencyMs;
+            if (latencyMs > agg_gpuBaseReadbackLatencyMax) agg_gpuBaseReadbackLatencyMax = latencyMs;
+            agg_gpuBaseReadbackCallbackCopyTime += callbackCopyMs;
+            agg_gpuBaseReadbackBytes += bytes;
+        }
+        else
+        {
+            agg_gpuBaseReadbackFailures++;
+        }
+    }
+
+    private void _AccumulateCompletedChunkProfile(
+        float preparation,
+        float prepGetBiomes,
+        float prepSandNoise,
+        float prepGravelNoise,
+        float prepStoneNoise,
+        float prepAllocNoiseCache,
+        float noiseGen1Time,
+        float noiseGen2Time,
+        float noiseGen3Time,
+        float noise6Time,
+        float noise7Time,
+        float noiseCombineTime,
+        int noiseGen1Count,
+        int noiseGen2Count,
+        int noiseGen3Count,
+        int noise6Count,
+        int noise7Count,
+        int noiseCombineCount,
+        float actualChunkTime,
+        float totalTime)
+    {
+        agg_chunksCompleted++;
+        if (timingsCached) agg_cachedColumnsUsed++;
+        agg_time_Preparation += preparation;
+        agg_time_Prep_GetBiomes += prepGetBiomes;
+        agg_time_Prep_SandNoise += prepSandNoise;
+        agg_time_Prep_GravelNoise += prepGravelNoise;
+        agg_time_Prep_StoneNoise += prepStoneNoise;
+        agg_time_Prep_AllocNoiseCache += prepAllocNoiseCache;
+        agg_time_NoiseGen1 += noiseGen1Time;
+        agg_time_NoiseGen2 += noiseGen2Time;
+        agg_time_NoiseGen3 += noiseGen3Time;
+        agg_time_Noise6 += noise6Time;
+        agg_time_Noise7 += noise7Time;
+        agg_time_NoiseCombine += noiseCombineTime;
+        agg_time_GeneratingTerrain += time_GeneratingTerrain;
+        agg_time_ReplacingBiomes += time_ReplacingBiomes;
+        agg_time_ActualChunkWork += actualChunkTime;
+        agg_time_WallClock += totalTime;
+        agg_totalSteps += totalSteps;
+        if (maxStepTime > agg_stepTimeMax) agg_stepTimeMax = maxStepTime;
+        if (minStepTime < agg_stepTimeMin) agg_stepTimeMin = minStepTime;
+        agg_noiseGen1Cells += noiseGen1Count;
+        agg_noiseGen2Cells += noiseGen2Count;
+        agg_noiseGen3Cells += noiseGen3Count;
+        agg_noise6Cells += noise6Count;
+        agg_noise7Cells += noise7Count;
+        agg_noiseCombineCells += noiseCombineCount;
+        agg_terrainVoxelsVisited += terrainVoxelsVisited;
+        agg_terrainAssignments += terrainAssignments;
+        agg_terrainStoneAssignments += terrainStoneAssignments;
+        agg_terrainWaterAssignments += terrainWaterAssignments;
+        agg_terrainIceAssignments += terrainIceAssignments;
+        agg_biomeTopAssignments += biomeTopAssignments;
+        agg_biomeFillerAssignments += biomeFillerAssignments;
+        agg_biomeBedrockAssignments += biomeBedrockAssignments;
+        agg_biomeWaterAssignments += biomeWaterAssignments;
+        agg_biomeGravelAssignments += biomeGravelAssignments;
+        agg_biomeSandAssignments += biomeSandAssignments;
+        agg_biomeSandstoneAssignments += biomeSandstoneAssignments;
+    }
+#endif
+
     private Texture2D _CreateGpuFloatTexture(int width, int height, TextureWrapMode wrapMode)
     {
         Texture2D texture = new Texture2D(width, height, TextureFormat.RGBAHalf, false, true);
+        texture.filterMode = FilterMode.Point;
+        texture.wrapMode = wrapMode;
+        return texture;
+    }
+
+    private Texture2D _CreateGpuPreciseFloatTexture(int width, int height, TextureWrapMode wrapMode)
+    {
+        Texture2D texture = new Texture2D(width, height, TextureFormat.RGBAFloat, false, true);
         texture.filterMode = FilterMode.Point;
         texture.wrapMode = wrapMode;
         return texture;
@@ -489,7 +922,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
         // Values 0-255 divided by 255 are NOT exactly representable in half-float,
         // causing permutation indices to be off-by-one when read back in the shader.
         // RGBA32 preserves exact integers via the round-trip: store(v/255)→8bit(v)→read(v/255)→×255=v
-        gpuPermTexture = _CreateGpuColorTexture(256, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        // Width is 512 (not 256) because the Perlin double-table uses indices 0-511.
+        gpuPermTexture = _CreateGpuColorTexture(512, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        // These tables carry the lattice indices and fractional coordinates that drive
+        // the entire Perlin lookup. Keep them at full float precision to minimize
+        // CPU-vs-GPU drift before considering software-emulated doubles.
+        gpuCoordXTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuCoordYTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_YSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuCoordZTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
         gpuTemperatureTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuRainfallTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuSurfaceParamsTextureA = _CreateGpuColorTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
@@ -520,17 +960,22 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuColumnUploadTexture = _CreateGpuColorTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, TextureWrapMode.Clamp);
 
         gpuClimatePixels = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
-        gpuPermutationPixels = new Color[256 * GPU_MAX_OCTAVES];
+        gpuPermutationPixels = new Color[512 * GPU_MAX_OCTAVES]; // 512 entries per octave (Perlin double-table)
+        gpuCoordXPixels = new Color[GPU_MAX_XZSIZE * GPU_MAX_OCTAVES];
+        gpuCoordYPixels = new Color[GPU_MAX_YSIZE * GPU_MAX_OCTAVES];
+        gpuCoordZPixels = new Color[GPU_MAX_XZSIZE * GPU_MAX_OCTAVES];
         gpuSurfaceParamPixelsA = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuSurfaceParamPixelsB = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuBedrockMaskPixels = new Color[world.chunkSizeXZ * 5 * world.chunkSizeXZ];
         gpuColumnUploadPixels = new Color[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
         gpuColumnReadbackPixels = new Color32[world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ];
         gpuSurfaceInfoReadbackPixels = new Color32[world.chunkSizeXZ * world.chunkSizeXZ];
+        gpuNoiseDiagnosticReadbackPixels = new Color[densityPackedWidth * densityYSize];
+        gpuNoiseDiagnosticLog = new StringBuilder(4096);
 
         gpuPropPermTexId = VRCShader.PropertyToID("_PermTex");
         gpuPropAccumulationTexId = VRCShader.PropertyToID("_AccumulationTex");
-        gpuPropOctaveId = VRCShader.PropertyToID("_Octave");
+        gpuPropOctaveId = VRCShader.PropertyToID("_OctaveCount");
         gpuPropFrequencyId = VRCShader.PropertyToID("_Frequency");
         gpuPropAmplitudeId = VRCShader.PropertyToID("_Amplitude");
         gpuPropXCoordId = VRCShader.PropertyToID("_XCoord");
@@ -581,6 +1026,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuPropGradFracYId = VRCShader.PropertyToID("_GradFracY");
         gpuPropPermIdxZId = VRCShader.PropertyToID("_PermIdxZ");
         gpuPropFracZId = VRCShader.PropertyToID("_FracZ");
+        gpuPropCoordXTexId = VRCShader.PropertyToID("_CoordXTex");
+        gpuPropCoordYTexId = VRCShader.PropertyToID("_CoordYTex");
+        gpuPropCoordZTexId = VRCShader.PropertyToID("_CoordZTex");
 
         // Allocate precompute arrays
         gpuPrePermX = new float[GPU_MAX_XZSIZE];
@@ -613,6 +1061,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         if (gpuTemperatureTexture == null || gpuRainfallTexture == null || wcm == null || wcm.temperatures == null || wcm.rainfall == null) return;
 
+#if LOGGING
+        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         int sizeXZ = world.chunkSizeXZ;
         for (int x = 0; x < sizeXZ; x++)
         {
@@ -639,6 +1090,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
         gpuRainfallTexture.SetPixels(gpuClimatePixels);
         gpuRainfallTexture.Apply(false, false);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            int bytes = sizeXZ * sizeXZ * 8 * 2;
+            _RecordGpuClimateUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, bytes);
+        }
+#endif
     }
 
     /// <summary>
@@ -714,30 +1172,25 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
     }
 
-    private void _RunGpuNoiseOctaves(NoiseGenerator3dPerlin[] generators, int octaveCount, RenderTexture resultTexture, int xPos, int yPos, int zPos, int xSize, int ySize, int zSize, double gridX, double gridY, double gridZ, bool is2D)
+    private void _UploadGpuNoiseCoordTextures(NoiseGenerator3dPerlin[] generators, int octaveCount, int xSize, int ySize, int zSize, int xPos, int yPos, int zPos, double gridX, double gridY, double gridZ, bool is2D)
     {
-        if (!gpuWorldgenReady || generators == null || resultTexture == null) return;
+        if (gpuCoordXTexture == null || gpuCoordYTexture == null || gpuCoordZTexture == null) return;
 
-        RenderTexture current = is2D ? gpuNoiseWork2D_A : gpuNoiseWork3D_A;
-        RenderTexture next = is2D ? gpuNoiseWork2D_B : gpuNoiseWork3D_B;
-        VRCGraphics.Blit(gpuClearTexture, current);
-
-        // BATCH UPLOAD: Write ALL octaves' permutation data into a single 256×N texture
-        // so we only call Apply() ONCE before the blit loop. This eliminates the race
-        // condition where Apply() for octave N+1 could overwrite texture data before
-        // the GPU finishes reading octave N's Blit.
-        for (int octave = 0; octave < octaveCount; octave++)
+#if LOGGING
+        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+        for (int i = 0; i < gpuCoordXPixels.Length; i++)
         {
-            NoiseGenerator3dPerlin generator = generators[octave];
-            if (generator == null) continue;
-            int rowOffset = octave * 256;
-            for (int i = 0; i < 256; i++)
-            {
-                gpuPermutationPixels[rowOffset + i] = new Color(generator.permutations[i] / 255.0f, 0f, 0f, 1f);
-            }
+            gpuCoordXPixels[i] = new Color(0f, 0f, 0f, 1f);
         }
-        gpuPermTexture.SetPixels(gpuPermutationPixels);
-        gpuPermTexture.Apply(false, false);
+        for (int i = 0; i < gpuCoordYPixels.Length; i++)
+        {
+            gpuCoordYPixels[i] = new Color(0f, 0f, 0f, 1f);
+        }
+        for (int i = 0; i < gpuCoordZPixels.Length; i++)
+        {
+            gpuCoordZPixels[i] = new Color(0f, 0f, 0f, 1f);
+        }
 
         for (int octave = 0; octave < octaveCount; octave++)
         {
@@ -745,50 +1198,114 @@ public class McTerrainGenerator : UdonSharpBehaviour
             if (generator == null) continue;
 
             double octaveFrequency = System.Math.Pow(0.5, octave);
-            float octaveAmplitude = 1.0f / Mathf.Max(0.0001f, (float)octaveFrequency);
-
             double scaledGridX = gridX * octaveFrequency;
             double scaledGridY = gridY * octaveFrequency;
             double scaledGridZ = gridZ * octaveFrequency;
 
-            _PrecomputeNoiseCoords(gpuPrePermX, gpuPreFracX, xSize,
-                                   (double)xPos, scaledGridX, generator.xCoord);
+            _PrecomputeNoiseCoords(gpuPrePermX, gpuPreFracX, xSize, (double)xPos, scaledGridX, generator.xCoord);
             if (!is2D)
             {
-                _PrecomputeNoiseCoordsY(gpuPrePermY, gpuPreFracY, gpuPreGradFracY, ySize,
-                                        (double)yPos, scaledGridY, generator.yCoord);
+                _PrecomputeNoiseCoordsY(gpuPrePermY, gpuPreFracY, gpuPreGradFracY, ySize, (double)yPos, scaledGridY, generator.yCoord);
             }
-            _PrecomputeNoiseCoords(gpuPrePermZ, gpuPreFracZ, zSize,
-                                   (double)zPos, scaledGridZ, generator.zCoord);
+            _PrecomputeNoiseCoords(gpuPrePermZ, gpuPreFracZ, zSize, (double)zPos, scaledGridZ, generator.zCoord);
 
-            gpuNoiseOctaveMaterial.SetTexture(gpuPropAccumulationTexId, current);
-            gpuNoiseOctaveMaterial.SetTexture(gpuPropPermTexId, gpuPermTexture);
-            gpuNoiseOctaveMaterial.SetFloat(gpuPropAmplitudeId, octaveAmplitude);
-            gpuNoiseOctaveMaterial.SetInt(gpuPropXSizeId, xSize);
-            gpuNoiseOctaveMaterial.SetInt(gpuPropYSizeId, ySize);
-            gpuNoiseOctaveMaterial.SetInt(gpuPropZSizeId, zSize);
-            gpuNoiseOctaveMaterial.SetInt(gpuPropIs2DId, is2D ? 1 : 0);
-            gpuNoiseOctaveMaterial.SetInt("_OctaveRow", octave);
-
-            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropPermIdxXId, gpuPrePermX);
-            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropFracXId, gpuPreFracX);
-            if (!is2D)
+            int xRowOffset = octave * GPU_MAX_XZSIZE;
+            for (int i = 0; i < GPU_MAX_XZSIZE; i++)
             {
-                gpuNoiseOctaveMaterial.SetFloatArray(gpuPropPermIdxYId, gpuPrePermY);
-                gpuNoiseOctaveMaterial.SetFloatArray(gpuPropFracYId, gpuPreFracY);
-                gpuNoiseOctaveMaterial.SetFloatArray(gpuPropGradFracYId, gpuPreGradFracY);
+                gpuCoordXPixels[xRowOffset + i] = i < xSize
+                    ? new Color(gpuPrePermX[i] / 255.0f, gpuPreFracX[i], 0f, 1f)
+                    : new Color(0f, 0f, 0f, 1f);
+                gpuCoordZPixels[xRowOffset + i] = i < zSize
+                    ? new Color(gpuPrePermZ[i] / 255.0f, gpuPreFracZ[i], 0f, 1f)
+                    : new Color(0f, 0f, 0f, 1f);
             }
-            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropPermIdxZId, gpuPrePermZ);
-            gpuNoiseOctaveMaterial.SetFloatArray(gpuPropFracZId, gpuPreFracZ);
 
-            VRCGraphics.Blit(current, next, gpuNoiseOctaveMaterial, 1);
-
-            RenderTexture temp = current;
-            current = next;
-            next = temp;
+            int yRowOffset = octave * GPU_MAX_YSIZE;
+            for (int i = 0; i < GPU_MAX_YSIZE; i++)
+            {
+                if (!is2D && i < ySize)
+                {
+                    gpuCoordYPixels[yRowOffset + i] = new Color(gpuPrePermY[i] / 255.0f, gpuPreFracY[i], gpuPreGradFracY[i], 1f);
+                }
+                else
+                {
+                    gpuCoordYPixels[yRowOffset + i] = new Color(0f, 0f, 0f, 1f);
+                }
+            }
         }
 
-        VRCGraphics.Blit(current, resultTexture);
+        gpuCoordXTexture.SetPixels(gpuCoordXPixels);
+        gpuCoordXTexture.Apply(false, false);
+        gpuCoordYTexture.SetPixels(gpuCoordYPixels);
+        gpuCoordYTexture.Apply(false, false);
+        gpuCoordZTexture.SetPixels(gpuCoordZPixels);
+        gpuCoordZTexture.Apply(false, false);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            int bytes = gpuCoordXPixels.Length * 16 + gpuCoordYPixels.Length * 16 + gpuCoordZPixels.Length * 16;
+            _RecordGpuNoiseInputUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, bytes);
+        }
+#endif
+    }
+
+    private void _RunGpuNoiseOctaves(NoiseGenerator3dPerlin[] generators, int octaveCount, RenderTexture resultTexture, int xPos, int yPos, int zPos, int xSize, int ySize, int zSize, double gridX, double gridY, double gridZ, bool is2D)
+    {
+        if (!gpuWorldgenReady || generators == null || resultTexture == null) return;
+
+#if LOGGING
+        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+        // BATCH UPLOAD: Write ALL octaves' permutation data into a single 256×N texture
+        // so we only call Apply() ONCE before the blit loop. This eliminates the race
+        // condition where Apply() for octave N+1 could overwrite texture data before
+        // the GPU finishes reading octave N's Blit.
+        for (int i = 0; i < gpuPermutationPixels.Length; i++)
+        {
+            gpuPermutationPixels[i] = new Color(0f, 0f, 0f, 1f);
+        }
+        for (int octave = 0; octave < octaveCount; octave++)
+        {
+            NoiseGenerator3dPerlin generator = generators[octave];
+            if (generator == null) continue;
+            int rowOffset = octave * 512;
+            for (int i = 0; i < 512; i++)
+            {
+                gpuPermutationPixels[rowOffset + i] = new Color(generator.permutations[i] / 255.0f, 0f, 0f, 1f);
+            }
+        }
+        gpuPermTexture.SetPixels(gpuPermutationPixels);
+        gpuPermTexture.Apply(false, false);
+        _UploadGpuNoiseCoordTextures(generators, octaveCount, xSize, ySize, zSize, xPos, yPos, zPos, gridX, gridY, gridZ, is2D);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            int permBytes = gpuPermutationPixels.Length * 4;
+            _RecordGpuNoiseInputUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, permBytes);
+        }
+#endif
+
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropPermTexId, gpuPermTexture);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordXTexId, gpuCoordXTexture);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordYTexId, gpuCoordYTexture);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordZTexId, gpuCoordZTexture);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropOctaveId, octaveCount);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropXSizeId, xSize);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropYSizeId, ySize);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropZSizeId, zSize);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropIs2DId, is2D ? 1 : 0);
+
+#if LOGGING
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+        VRCGraphics.Blit(gpuClearTexture, resultTexture, gpuNoiseOctaveMaterial, 1);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuNoiseBlits++;
+            agg_gpuNoiseBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
     }
 
     /// <summary>
@@ -831,10 +1348,333 @@ public class McTerrainGenerator : UdonSharpBehaviour
         VRCGraphics.Blit(gpuNoiseUpload2D, target);
     }
 
+    private bool _ShouldRunGpuNoiseDiagnosticsForCurrentChunk()
+    {
+        if (!enableGpuNoiseDiagnostics) return false;
+        if (currentChunkX != gpuNoiseDiagnosticChunkX || currentChunkZ != gpuNoiseDiagnosticChunkZ) return false;
+        if (gpuNoiseDiagnosticRunOncePerChunk && gpuDiagLastLoggedChunkX == currentChunkX && gpuDiagLastLoggedChunkZ == currentChunkZ) return false;
+        return true;
+    }
+
+    private void _BuildGpuNoiseDiagnosticCpuReference()
+    {
+        int xSize = 5;
+        int ySize = gpuWorldHeightBlocks / 8 + 1;
+        int zSize = 5;
+        double d0 = 684.412D;
+        double d1 = 684.412D;
+        int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, 4);
+        int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, 4);
+
+        gpuDiagCpuNoise1 = noiseGen1.generateNoiseOctaves(gpuDiagCpuNoise1, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0, d1, d0);
+        gpuDiagCpuNoise2 = noiseGen2.generateNoiseOctaves(gpuDiagCpuNoise2, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0, d1, d0);
+        gpuDiagCpuNoise3 = noiseGen3.generateNoiseOctaves(gpuDiagCpuNoise3, noiseStartX, 0, noiseStartZ, xSize, ySize, zSize, d0 / 80.0D, d1 / 160.0D, d0 / 80.0D);
+        gpuDiagCpuNoise6 = noiseGen6.generateNoiseArray(gpuDiagCpuNoise6, noiseStartX, noiseStartZ, xSize, zSize, 1.121D, 1.121D, 0.5D);
+        gpuDiagCpuNoise7 = noiseGen7.generateNoiseArray(gpuDiagCpuNoise7, noiseStartX, noiseStartZ, xSize, zSize, 200.0D, 200.0D, 0.5D);
+
+        int densityCount = xSize * ySize * zSize;
+        if (gpuDiagCpuDensity == null || gpuDiagCpuDensity.Length != densityCount)
+        {
+            gpuDiagCpuDensity = new double[densityCount];
+        }
+        else
+        {
+            System.Array.Clear(gpuDiagCpuDensity, 0, gpuDiagCpuDensity.Length);
+        }
+
+        int i2 = 16 / xSize;
+        double[] temp = wcm.temperatures;
+        double[] rain = wcm.rainfall;
+        int k1 = 0;
+        int l1 = 0;
+        for (int x = 0; x < xSize; x++)
+        {
+            int k2 = x * i2 + i2 / 2;
+            for (int z = 0; z < zSize; z++)
+            {
+                int i3 = z * i2 + i2 / 2;
+                int tempIndex = k2 * 16 + i3;
+                double d2 = temp[tempIndex];
+                double d3 = rain[tempIndex] * d2;
+                double d4 = 1.0D - d3;
+                d4 *= d4;
+                d4 *= d4;
+                d4 = 1.0D - d4;
+                double d5 = (gpuDiagCpuNoise6[l1] + 256.0D) / 512.0D;
+                d5 *= d4;
+                if (d5 > 1.0D) d5 = 1.0D;
+                double d6 = gpuDiagCpuNoise7[l1] / 8000.0D;
+                if (d6 < 0.0D) d6 = -d6 * 0.3D;
+                d6 = d6 * 3.0D - 2.0D;
+                if (d6 < 0.0D)
+                {
+                    d6 *= 0.5D;
+                    if (d6 < -1D) d6 = -1D;
+                    d6 *= 0.3571428571428571D;
+                    d5 = 0.0D;
+                }
+                else
+                {
+                    if (d6 > 1.0D) d6 = 1.0D;
+                    d6 *= 0.125D;
+                }
+                if (d5 < 0.0D) d5 = 0.0D;
+                d5 += 0.5D;
+                d6 = (d6 * (double)ySize) / 16.0D;
+                double d7 = (double)ySize / 2.0D + d6 * 4.0D;
+
+                for (int y = 0; y < ySize; y++)
+                {
+                    double d9 = (((double)y - d7) * 12D) / d5;
+                    if (d9 < 0.0D) d9 *= 4.0D;
+                    double d10 = gpuDiagCpuNoise1[k1] / 512.0D;
+                    double d11 = gpuDiagCpuNoise2[k1] / 512.0D;
+                    double d12 = (gpuDiagCpuNoise3[k1] * 0.1D + 1.0D) * 0.5D;
+                    double d8;
+                    if (d12 < 0.0D) d8 = d10;
+                    else if (d12 > 1.0D) d8 = d11;
+                    else d8 = d10 + (d11 - d10) * d12;
+                    d8 -= d9;
+                    if (y > ySize - 4)
+                    {
+                        double d13 = (double)((float)(y - (ySize - 4)) * 0.33333334F);
+                        d8 = d8 * (1.0D - d13) - 10.0D * d13;
+                    }
+                    gpuDiagCpuDensity[k1] = d8;
+                    k1++;
+                }
+                l1++;
+            }
+        }
+
+        gpuDiagChunkX = currentChunkX;
+        gpuDiagChunkZ = currentChunkZ;
+    }
+
+    private bool _BeginGpuBaseColumnReadback()
+    {
+        gpuDiagnosticReadbackStallFrames = 0;
+        gpuReadbackPhase = GpuWorldgenReadbackPhase.BaseColumn;
+        gpuColumnReadbackPending = true;
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            gpuReadbackRequestStartTimeMs = Time.realtimeSinceStartup * 1000f;
+            gpuReadbackRequestBytes = gpuColumnReadbackPixels != null ? gpuColumnReadbackPixels.Length * 4 : world.chunkSizeXZ * gpuWorldHeightBlocks * world.chunkSizeXZ * 4;
+        }
+#endif
+        VRCAsyncGPUReadback.Request(gpuColumnBaseTexture, 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        return true;
+    }
+
+    private bool _RequestGpuNoiseDiagnosticReadback(RenderTexture source, GpuWorldgenReadbackPhase phase)
+    {
+        if (source == null) return false;
+        gpuDiagnosticReadbackStallFrames = 0;
+        gpuReadbackPhase = phase;
+        gpuColumnReadbackPending = true;
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            gpuReadbackRequestStartTimeMs = Time.realtimeSinceStartup * 1000f;
+            gpuReadbackRequestBytes = source.width * source.height * 16;
+        }
+#endif
+        VRCAsyncGPUReadback.Request(source, 0, TextureFormat.RGBAFloat, (IUdonEventReceiver)this);
+        return true;
+    }
+
+    private void _AppendGpuNoiseDiagnosticComparison(string label, double[] cpuValues, bool is2D)
+    {
+        if (gpuNoiseDiagnosticLog == null || cpuValues == null || gpuNoiseDiagnosticReadbackPixels == null) return;
+
+        int xSize = 5;
+        int ySize = gpuWorldHeightBlocks / 8 + 1;
+        int zSize = 5;
+        int packedWidth = xSize * zSize;
+        double maxAbsDiff = 0.0D;
+        double sumAbsDiff = 0.0D;
+        int signMismatchCount = 0;
+        int over1e3Count = 0;
+        int over1e2Count = 0;
+        int worstX = 0;
+        int worstY = 0;
+        int worstZ = 0;
+        double worstCpu = 0.0D;
+        double worstGpu = 0.0D;
+        int total = is2D ? xSize * zSize : xSize * ySize * zSize;
+
+        if (gpuNoiseDiagnosticDumpAllCells)
+        {
+            gpuNoiseDiagnosticLog.Append(label).Append(" values").AppendLine();
+        }
+
+        if (is2D)
+        {
+            for (int z = 0; z < zSize; z++)
+            {
+                for (int x = 0; x < xSize; x++)
+                {
+                    int cpuIndex = x * zSize + z;
+                    int texIndex = z * xSize + x;
+                    double cpuValue = cpuValues[cpuIndex];
+                    double gpuValue = gpuNoiseDiagnosticReadbackPixels[texIndex].r;
+                    double absDiff = System.Math.Abs(cpuValue - gpuValue);
+                    sumAbsDiff += absDiff;
+                    if (absDiff > maxAbsDiff)
+                    {
+                        maxAbsDiff = absDiff;
+                        worstX = x;
+                        worstY = 0;
+                        worstZ = z;
+                        worstCpu = cpuValue;
+                        worstGpu = gpuValue;
+                    }
+                    if ((cpuValue > 0.0D) != (gpuValue > 0.0D)) signMismatchCount++;
+                    if (absDiff > 0.001D) over1e3Count++;
+                    if (absDiff > 0.01D) over1e2Count++;
+                    if (gpuNoiseDiagnosticDumpAllCells)
+                    {
+                        gpuNoiseDiagnosticLog.Append("  [x=").Append(x).Append(",z=").Append(z)
+                            .Append("] cpu=").Append(cpuValue.ToString("F6"))
+                            .Append(" gpu=").Append(gpuValue.ToString("F6"))
+                            .Append(" diff=").Append((cpuValue - gpuValue).ToString("F6"))
+                            .AppendLine();
+                    }
+                }
+            }
+        }
+        else
+        {
+            for (int y = 0; y < ySize; y++)
+            {
+                int rowBase = y * packedWidth;
+                for (int z = 0; z < zSize; z++)
+                {
+                    int packedXZ = z * xSize;
+                    for (int x = 0; x < xSize; x++)
+                    {
+                        int cpuIndex = x * zSize * ySize + z * ySize + y;
+                        int texIndex = rowBase + packedXZ + x;
+                        double cpuValue = cpuValues[cpuIndex];
+                        double gpuValue = gpuNoiseDiagnosticReadbackPixels[texIndex].r;
+                        double absDiff = System.Math.Abs(cpuValue - gpuValue);
+                        sumAbsDiff += absDiff;
+                        if (absDiff > maxAbsDiff)
+                        {
+                            maxAbsDiff = absDiff;
+                            worstX = x;
+                            worstY = y;
+                            worstZ = z;
+                            worstCpu = cpuValue;
+                            worstGpu = gpuValue;
+                        }
+                        if ((cpuValue > 0.0D) != (gpuValue > 0.0D)) signMismatchCount++;
+                        if (absDiff > 0.001D) over1e3Count++;
+                        if (absDiff > 0.01D) over1e2Count++;
+                        if (gpuNoiseDiagnosticDumpAllCells)
+                        {
+                            gpuNoiseDiagnosticLog.Append("  [x=").Append(x).Append(",y=").Append(y).Append(",z=").Append(z)
+                                .Append("] cpu=").Append(cpuValue.ToString("F6"))
+                                .Append(" gpu=").Append(gpuValue.ToString("F6"))
+                                .Append(" diff=").Append((cpuValue - gpuValue).ToString("F6"))
+                                .AppendLine();
+                        }
+                    }
+                }
+            }
+        }
+
+        gpuNoiseDiagnosticLog.Append(label)
+            .Append(" summary: avgAbs=").Append((sumAbsDiff / (double)total).ToString("F6"))
+            .Append(" maxAbs=").Append(maxAbsDiff.ToString("F6"))
+            .Append(" signMismatches=").Append(signMismatchCount).Append("/").Append(total)
+            .Append(" gt1e-3=").Append(over1e3Count)
+            .Append(" gt1e-2=").Append(over1e2Count)
+            .Append(" worst=(").Append(worstX).Append(",").Append(worstY).Append(",").Append(worstZ).Append(")")
+            .Append(" cpu=").Append(worstCpu.ToString("F6"))
+            .Append(" gpu=").Append(worstGpu.ToString("F6"))
+            .AppendLine();
+    }
+
+    private bool _RequestNextGpuNoiseDiagnosticPhase(GpuWorldgenReadbackPhase completedPhase)
+    {
+        switch (completedPhase)
+        {
+            case GpuWorldgenReadbackPhase.DiagnosticNoise1:
+                return _RequestGpuNoiseDiagnosticReadback(gpuNoise2Texture, GpuWorldgenReadbackPhase.DiagnosticNoise2);
+            case GpuWorldgenReadbackPhase.DiagnosticNoise2:
+                return _RequestGpuNoiseDiagnosticReadback(gpuNoise3Texture, GpuWorldgenReadbackPhase.DiagnosticNoise3);
+            case GpuWorldgenReadbackPhase.DiagnosticNoise3:
+                return _RequestGpuNoiseDiagnosticReadback(gpuNoise6Texture, GpuWorldgenReadbackPhase.DiagnosticNoise6);
+            case GpuWorldgenReadbackPhase.DiagnosticNoise6:
+                return _RequestGpuNoiseDiagnosticReadback(gpuNoise7Texture, GpuWorldgenReadbackPhase.DiagnosticNoise7);
+            case GpuWorldgenReadbackPhase.DiagnosticNoise7:
+                return _RequestGpuNoiseDiagnosticReadback(gpuDensityTexture, GpuWorldgenReadbackPhase.DiagnosticDensity);
+            default:
+                return false;
+        }
+    }
+
+    private bool _HandleGpuNoiseDiagnosticReadback(VRCAsyncGPUReadbackRequest request, float latencyMs, float callbackStartMs)
+    {
+        GpuWorldgenReadbackPhase phase = gpuReadbackPhase;
+        gpuColumnReadbackPending = false;
+        gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
+
+#if LOGGING
+        bool success = false;
+        float callbackCopyMs = 0f;
+#endif
+
+        if (request.hasError)
+        {
+            gpuNoiseDiagnosticLog.Append("[GPU Noise Diagnostic] Readback error in phase ").Append(phase).AppendLine();
+        }
+        else if (!request.TryGetData(gpuNoiseDiagnosticReadbackPixels, 0))
+        {
+            gpuNoiseDiagnosticLog.Append("[GPU Noise Diagnostic] TryGetData failed in phase ").Append(phase).AppendLine();
+        }
+        else
+        {
+#if LOGGING
+            success = true;
+            callbackCopyMs = Time.realtimeSinceStartup * 1000f - callbackStartMs;
+#endif
+            if (phase == GpuWorldgenReadbackPhase.DiagnosticNoise1) _AppendGpuNoiseDiagnosticComparison("noise1", gpuDiagCpuNoise1, false);
+            else if (phase == GpuWorldgenReadbackPhase.DiagnosticNoise2) _AppendGpuNoiseDiagnosticComparison("noise2", gpuDiagCpuNoise2, false);
+            else if (phase == GpuWorldgenReadbackPhase.DiagnosticNoise3) _AppendGpuNoiseDiagnosticComparison("noise3", gpuDiagCpuNoise3, false);
+            else if (phase == GpuWorldgenReadbackPhase.DiagnosticNoise6) _AppendGpuNoiseDiagnosticComparison("noise6", gpuDiagCpuNoise6, true);
+            else if (phase == GpuWorldgenReadbackPhase.DiagnosticNoise7) _AppendGpuNoiseDiagnosticComparison("noise7", gpuDiagCpuNoise7, true);
+            else if (phase == GpuWorldgenReadbackPhase.DiagnosticDensity) _AppendGpuNoiseDiagnosticComparison("density", gpuDiagCpuDensity, false);
+        }
+
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            _RecordGpuReadbackCompletion(true, success, latencyMs, callbackCopyMs, gpuReadbackRequestBytes);
+        }
+#endif
+
+        if (phase == GpuWorldgenReadbackPhase.DiagnosticDensity)
+        {
+            gpuNoiseDiagnosticLog.Append("[GPU Noise Diagnostic] chunk=(").Append(gpuDiagChunkX).Append(",").Append(gpuDiagChunkZ).Append(")").AppendLine();
+            Debug.Log(gpuNoiseDiagnosticLog.ToString());
+            gpuDiagLastLoggedChunkX = gpuDiagChunkX;
+            gpuDiagLastLoggedChunkZ = gpuDiagChunkZ;
+            return _BeginGpuBaseColumnReadback();
+        }
+
+        return _RequestNextGpuNoiseDiagnosticPhase(phase);
+    }
+
     private bool _StartGpuColumnGeneration()
     {
         if (!gpuWorldgenReady) return false;
 
+#if LOGGING
+        if (enableDetailedTimings) agg_gpuColumnsStarted++;
+#endif
         _UploadGpuClimateTextures();
 
         int densityXSize = 5;
@@ -865,50 +1705,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
             densityXPos, 10, densityZPos, densityXSize, 1, densityZSize,
             200.0D, 1.0D, 200.0D, true);
 
-        // Let's print the CPU's internal variables for the first octave at x=0, z=0
-        if (currentChunkX == 0 && currentChunkZ == 0)
-        {
-            double c_gridX = d0 * 1.0D;
-            double c_gridY = d1 * 1.0D;
-            double c_gridZ = d0 * 1.0D;
-            double cx = (double)densityXPos * c_gridX + noiseGen1.generatorCollection[0].xCoord;
-            double cy = (double)0 * c_gridY + noiseGen1.generatorCollection[0].yCoord; // Will change in loop
-            double cz = (double)densityZPos * c_gridZ + noiseGen1.generatorCollection[0].zCoord;
-            
-            int intX = NoiseGenerator3dPerlin.floor_and_clamp_int(cx);
-            int p1 = intX & 255;
-            double relX = cx - intX;
-            double fx = relX * relX * relX * (relX * (relX * 6D - 15D) + 10D);
-            
-            int intZ = NoiseGenerator3dPerlin.floor_and_clamp_int(cz);
-            int p3 = intZ & 255;
-            double relZ = cz - intZ;
-            
-            int[] perm3d = noiseGen1.generatorCollection[0].permutations;
-            double[] GRAD_X = NoiseGenerator3dPerlin.GRAD_X;
-            double[] GRAD_Y = NoiseGenerator3dPerlin.GRAD_Y;
-            double[] GRAD_Z = NoiseGenerator3dPerlin.GRAD_Z;
-            
-            StringBuilder sb = new StringBuilder();
-            sb.Append("[NOISE MATH DEBUG] CPU Octave 0 at x=0,z=0\n");
-            for (int gy = 7; gy <= 8 && gy < densityYSize; gy++)
-            {
-                double cuy = (double)gy * c_gridY + noiseGen1.generatorCollection[0].yCoord;
-                int intY = NoiseGenerator3dPerlin.floor_and_clamp_int(cuy);
-                int p2 = intY & 255;
-                double relY = cuy - intY;
-                
-                int a1 = perm3d[p1] + p2;
-                int a2 = perm3d[a1] + p3;
-                int h0 = perm3d[a2] & 15;
-                double g0 = GRAD_X[h0] * relX + GRAD_Y[h0] * relY + GRAD_Z[h0] * relZ;
-                
-                sb.Append("  y=").Append(gy).Append(": hash0=").Append(h0)
-                  .Append(" g0=").Append(g0.ToString("F4"))
-                  .Append(" fx=").Append(fx.ToString("F4")).Append("\n");
-            }
-            Debug.Log(sb.ToString());
-        }
 
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise1TexId, gpuNoise1Texture);
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise2TexId, gpuNoise2Texture);
@@ -925,7 +1721,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuNoiseCombineMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
         gpuNoiseCombineMaterial.SetInt(gpuPropBuiltinOffsetXId, BUILTIN_OFFSET_X);
         gpuNoiseCombineMaterial.SetInt(gpuPropBuiltinOffsetZId, BUILTIN_OFFSET_Z);
+#if LOGGING
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(gpuNoise1Texture, gpuDensityTexture, gpuNoiseCombineMaterial, 1);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuCombineBlits++;
+            agg_gpuCombineBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
 
         gpuColumnBaseFillMaterial.SetTexture(gpuPropDensityTexId, gpuDensityTexture);
         gpuColumnBaseFillMaterial.SetTexture(gpuPropTemperatureTexId, gpuTemperatureTexture);
@@ -936,7 +1742,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuColumnBaseFillMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
         gpuColumnBaseFillMaterial.SetInt(gpuPropWaterBlockId, waterBlockID);
         gpuColumnBaseFillMaterial.SetInt(gpuPropIceBlockId, (int)BlockMaterial.ICE);
+#if LOGGING
+        blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(gpuDensityTexture, gpuColumnBaseTexture, gpuColumnBaseFillMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuBaseFillBlits++;
+            agg_gpuBaseFillBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
 
         gpuColumnReadbackPending = false;
         gpuColumnReadbackReady = false;
@@ -947,24 +1763,49 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropChunkSizeXZId, world.chunkSizeXZ);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+#if LOGGING
+        blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(gpuColumnBaseTexture, gpuColumnSurfaceInfoTexture, gpuColumnSurfaceInfoMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuSurfaceInfoBlits++;
+            agg_gpuSurfaceInfoBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
 
-        gpuReadbackPhase = GpuWorldgenReadbackPhase.BaseColumn;
-        gpuColumnReadbackPending = true;
-        VRCAsyncGPUReadback.Request(gpuColumnBaseTexture, 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
-        return true;
+        if (_ShouldRunGpuNoiseDiagnosticsForCurrentChunk())
+        {
+            _BuildGpuNoiseDiagnosticCpuReference();
+            gpuNoiseDiagnosticLog.Length = 0;
+            gpuNoiseDiagnosticLog.Append("[GPU Noise Diagnostic] Begin chunk=(").Append(currentChunkX).Append(",").Append(currentChunkZ).Append(")").AppendLine();
+            return _RequestGpuNoiseDiagnosticReadback(gpuNoise1Texture, GpuWorldgenReadbackPhase.DiagnosticNoise1);
+        }
+
+        return _BeginGpuBaseColumnReadback();
     }
 
     private void _UploadGpuSurfaceTextures()
     {
         if (gpuSurfaceParamsTextureA == null || gpuSurfaceParamsTextureB == null || gpuBedrockMaskTexture == null) return;
 
+#if LOGGING
+        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         gpuSurfaceParamsTextureA.SetPixels(gpuSurfaceParamPixelsA);
         gpuSurfaceParamsTextureA.Apply(false, false);
         gpuSurfaceParamsTextureB.SetPixels(gpuSurfaceParamPixelsB);
         gpuSurfaceParamsTextureB.Apply(false, false);
         gpuBedrockMaskTexture.SetPixels(gpuBedrockMaskPixels);
         gpuBedrockMaskTexture.Apply(false, false);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            int bytes = (gpuSurfaceParamPixelsA.Length + gpuSurfaceParamPixelsB.Length + gpuBedrockMaskPixels.Length) * 4;
+            _RecordGpuSurfaceUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, bytes);
+        }
+#endif
     }
 
     private void _BuildGpuSurfaceParamsFromSurfaceInfo()
@@ -1183,14 +2024,40 @@ public class McTerrainGenerator : UdonSharpBehaviour
             }
         }
 
+ #if LOGGING
+        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+ #endif
         gpuColumnUploadTexture.SetPixels(gpuColumnUploadPixels);
         gpuColumnUploadTexture.Apply(false, false);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            _RecordGpuFinalColumnUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, gpuColumnUploadPixels.Length * 4);
+        }
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCGraphics.Blit(gpuColumnUploadTexture, gpuColumnFinalTexture);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuFinalizeBlits++;
+            agg_gpuFinalizeBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+        blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         gpuColumnSurfaceInfoMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnFinalTexture);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropChunkSizeXZId, world.chunkSizeXZ);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
         VRCGraphics.Blit(gpuColumnFinalTexture, gpuColumnSurfaceInfoTexture, gpuColumnSurfaceInfoMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuSurfaceInfoBlits++;
+            agg_gpuSurfaceInfoBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+            agg_gpuColumnsFinalized++;
+        }
+#endif
 
         gpuCachedColumnX = gpuPendingColumnX;
         gpuCachedColumnZ = gpuPendingColumnZ;
@@ -1201,6 +2068,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         if (!gpuColumnReadbackReady || gpuColumnReadbackPixels == null || workingChunkData == null) return;
 
+#if LOGGING
+        float copyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         int sizeXZ = world.chunkSizeXZ;
         int sizeY = world.chunkSizeY;
         int xyStride = sizeXZ * sizeXZ;
@@ -1235,6 +2105,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
         {
             _DiagnosticCompareGpuVsCpuBaseColumn();
         }
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuChunkSliceCopies++;
+            agg_gpuChunkSliceCopyTime += (Time.realtimeSinceStartup - copyStart) * 1000f;
+            agg_gpuChunkSliceCopyBytes += workingChunkData.Length;
+        }
+#endif
     }
 
     private void _DiagnosticCompareGpuVsCpuBaseColumn()
@@ -1459,7 +2337,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
     {
-        if (gpuReadbackPhase != GpuWorldgenReadbackPhase.BaseColumn) return;
+        if (gpuReadbackPhase == GpuWorldgenReadbackPhase.None) return;
+
+#if LOGGING
+        float callbackStartMs = enableDetailedTimings ? Time.realtimeSinceStartup * 1000f : 0f;
+        float latencyMs = enableDetailedTimings && gpuReadbackRequestStartTimeMs >= 0f
+            ? callbackStartMs - gpuReadbackRequestStartTimeMs
+            : 0f;
+#endif
+        if (gpuReadbackPhase != GpuWorldgenReadbackPhase.BaseColumn)
+        {
+            _HandleGpuNoiseDiagnosticReadback(request, latencyMs, callbackStartMs);
+            return;
+        }
 
         gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
         gpuColumnReadbackPending = false;
@@ -1468,17 +2358,30 @@ public class McTerrainGenerator : UdonSharpBehaviour
         if (request.hasError)
         {
             gpuColumnReadbackFailed = true;
+#if LOGGING
+            if (enableDetailedTimings) _RecordGpuReadbackCompletion(false, false, latencyMs, 0f, gpuReadbackRequestBytes);
+#endif
             return;
         }
 
         if (!request.TryGetData(gpuColumnReadbackPixels, 0))
         {
             gpuColumnReadbackFailed = true;
+#if LOGGING
+            if (enableDetailedTimings) _RecordGpuReadbackCompletion(false, false, latencyMs, 0f, gpuReadbackRequestBytes);
+#endif
             return;
         }
 
         gpuColumnReadbackFailed = false;
         gpuColumnReadbackReady = true;
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            float callbackCopyMs = Time.realtimeSinceStartup * 1000f - callbackStartMs;
+            _RecordGpuReadbackCompletion(false, true, latencyMs, callbackCopyMs, gpuReadbackRequestBytes);
+        }
+#endif
     }
 
     public void StartChunkGeneration(int chunkX, int chunkY, int chunkZ)
@@ -1640,7 +2543,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                     
 #if LOGGING
-                    if (enableVerboseLogging) { time_Prep_GetBiomes = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+                    if (enableDetailedTimings) { time_Prep_GetBiomes = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
 #endif
                     currentState = GenerationState.Prepare_SandNoise;
                 }
@@ -1656,7 +2559,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
                 this.sandNoise = this.noiseGen4.generateNoiseOctaves(this.sandNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.03125D, 0.03125D, 1.0D);
 #if LOGGING
-                if (enableVerboseLogging) { time_Prep_SandNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+                if (enableDetailedTimings) { time_Prep_SandNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
 #endif
                 currentState = GenerationState.Prepare_GravelNoise;
                 break;
@@ -1670,7 +2573,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
                 this.gravelNoise = this.noiseGen4.generateNoiseOctaves(this.gravelNoise, noiseX, 109.0134D, noiseZ, 16, 1, 16, 0.03125D, 1.0D, 0.03125D);
 #if LOGGING
-                if (enableVerboseLogging) { time_Prep_GravelNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+                if (enableDetailedTimings) { time_Prep_GravelNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
 #endif
                 currentState = GenerationState.Prepare_StoneNoise;
                 break;
@@ -1684,8 +2587,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
                 this.stoneNoise = this.noiseGen5.generateNoiseOctaves(this.stoneNoise, noiseX, noiseZ, 0.0D, 16, 16, 1, 0.0625D, 0.0625D, 0.0625D);
 #if LOGGING
-                if (enableVerboseLogging) { time_Prep_StoneNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
-                if (enableVerboseLogging && gpuWorldgenReady)
+                if (enableDetailedTimings) { time_Prep_StoneNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
+                if (enableDetailedTimings && gpuWorldgenReady)
                 {
                     time_Preparation = time_Prep_GetBiomes + time_Prep_SandNoise + time_Prep_GravelNoise + time_Prep_StoneNoise;
                 }
@@ -1697,6 +2600,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 {
                     if (!_StartGpuColumnGeneration())
                     {
+#if LOGGING
+                        if (enableDetailedTimings) agg_gpuFallbacks++;
+#endif
                         currentState = GenerationState.Prepare_AllocCache;
                         break;
                     }
@@ -1709,6 +2615,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 {
                     if (!_StartGpuColumnFinalize())
                     {
+#if LOGGING
+                        if (enableDetailedTimings) agg_gpuFallbacks++;
+#endif
                         currentState = GenerationState.Prepare_AllocCache;
                         break;
                     }
@@ -1719,8 +2628,23 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
             case GenerationState.Prepare_GpuReadback:
                 {
+                    if (gpuColumnReadbackPending && gpuReadbackPhase != GpuWorldgenReadbackPhase.None && gpuReadbackPhase != GpuWorldgenReadbackPhase.BaseColumn)
+                    {
+                        gpuDiagnosticReadbackStallFrames++;
+                        if (gpuDiagnosticReadbackStallFrames > GPU_DIAGNOSTIC_READBACK_STALL_LIMIT)
+                        {
+                            Debug.LogWarning("[GPU Noise Diagnostic] Readback stalled; aborting diagnostic and continuing normal GPU worldgen.");
+                            gpuColumnReadbackPending = false;
+                            gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
+                            _BeginGpuBaseColumnReadback();
+                        }
+                    }
+
                     if (gpuColumnReadbackFailed)
                     {
+#if LOGGING
+                        if (enableDetailedTimings) agg_gpuFallbacks++;
+#endif
                         currentState = GenerationState.Prepare_AllocCache;
                         break;
                     }
@@ -1736,12 +2660,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 {
 #if LOGGING
                     DateTime tGpuCopy = DateTime.MinValue;
-                    if (enableVerboseLogging) tGpuCopy = DateTime.UtcNow;
+                    if (enableDetailedTimings) tGpuCopy = DateTime.UtcNow;
 #endif
                     _CopyGpuChunkSliceToWorkingData();
                     terrain_gen_step_count = 1;
 #if LOGGING
-                    if (enableVerboseLogging) time_GeneratingTerrain += (float)(DateTime.UtcNow - tGpuCopy).TotalMilliseconds;
+                    if (enableDetailedTimings) time_GeneratingTerrain += (float)(DateTime.UtcNow - tGpuCopy).TotalMilliseconds;
 #endif
                     if (!match1to1TerrainBaseline && currentChunkY == world.worldDimensionY - 1)
                     {
@@ -1771,7 +2695,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         noiseCache = new double[xSize * ySize * zSize];
                     }
 #if LOGGING
-                    if (enableVerboseLogging) { 
+                    if (enableDetailedTimings) { 
                         time_Prep_AllocNoiseCache = (float)(DateTime.UtcNow - t0).TotalMilliseconds;
                         time_Preparation = time_Prep_GetBiomes + time_Prep_SandNoise + time_Prep_GravelNoise + time_Prep_StoneNoise + time_Prep_AllocNoiseCache;
                     }
@@ -1837,7 +2761,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         if (currentOctave >= 16) {
                             noise1 = currentNoiseOutput;
 #if LOGGING
-                            if (enableVerboseLogging) { noiseGen1Cells = xSize * ySize * zSize; }
+                            if (enableDetailedTimings) { noiseGen1Cells = xSize * ySize * zSize; }
 #endif
                             currentNoiseGenerator = 1;
                             currentOctave = 0;
@@ -1857,7 +2781,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         if (currentOctave >= 16) {
                             noise2 = currentNoiseOutput;
 #if LOGGING
-                            if (enableVerboseLogging) { noiseGen2Cells = xSize * ySize * zSize; }
+                            if (enableDetailedTimings) { noiseGen2Cells = xSize * ySize * zSize; }
 #endif
                             currentNoiseGenerator = 2;
                             currentOctave = 0;
@@ -1877,7 +2801,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         if (currentOctave >= 8) {
                             noise3 = currentNoiseOutput;
 #if LOGGING
-                            if (enableVerboseLogging) { noiseGen3Cells = xSize * ySize * zSize; }
+                            if (enableDetailedTimings) { noiseGen3Cells = xSize * ySize * zSize; }
 #endif
                             currentNoiseGenerator = 3;
                         }
@@ -1890,7 +2814,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, byte0);
                         noise6 = noiseGen6.generateNoiseArray(noise6, noiseStartX, noiseStartZ, xSize, zSize, 1.121D, 1.121D, 0.5D);
 #if LOGGING
-                        if (enableVerboseLogging) { noise6Cells = xSize * zSize; }
+                        if (enableDetailedTimings) { noise6Cells = xSize * zSize; }
 #endif
                         currentNoiseGenerator = 4;
                     }
@@ -1902,7 +2826,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         int noiseStartZ = _GetTerrainNoiseStartZ(currentChunkZ, byte0);
                         noise7 = noiseGen7.generateNoiseArray(noise7, noiseStartX, noiseStartZ, xSize, zSize, 200.0D, 200.0D, 0.5D);
 #if LOGGING
-                        if (enableVerboseLogging) { noise7Cells = xSize * zSize; }
+                        if (enableDetailedTimings) { noise7Cells = xSize * zSize; }
 #endif
                         
                         // All noise generation complete
@@ -1914,7 +2838,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
 #if LOGGING
                     // Accumulate timing for noise generation (across all octaves)
-                    if (enableVerboseLogging)
+                    if (enableDetailedTimings)
                     {
                         float elapsed = (float)(DateTime.UtcNow - tNoiseStart).TotalMilliseconds;
                         if (currentNoiseGenerator == 0) time_NoiseGen1 += elapsed;
@@ -1942,7 +2866,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     int k2 = x * i2 + i2 / 2;
 
 #if LOGGING
-                    DateTime tCombine = DateTime.MinValue; if (enableVerboseLogging) tCombine = DateTime.UtcNow;
+                    DateTime tCombine = DateTime.MinValue; if (enableDetailedTimings) tCombine = DateTime.UtcNow;
 #endif
                     // Cache noise arrays locally to reduce field access overhead
                     double[] n1 = noise1;
@@ -2024,11 +2948,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         }
                         l1++;
 #if LOGGING
-                        if (enableVerboseLogging) noiseCombineCells += ySize;
+                        if (enableDetailedTimings) noiseCombineCells += ySize;
 #endif
                     }
 #if LOGGING
-                    if (enableVerboseLogging) time_NoiseCombine += (float)(DateTime.UtcNow - tCombine).TotalMilliseconds;
+                    if (enableDetailedTimings) time_NoiseCombine += (float)(DateTime.UtcNow - tCombine).TotalMilliseconds;
 #endif
                     
                     noiseCombine_k1 = k1;
@@ -2042,7 +2966,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         currentState = GenerationState.GeneratingTerrain;
 #if LOGGING
                         // Cache timings from first chunk in this column
-                        if (enableVerboseLogging && !timingsCached)
+                        if (enableDetailedTimings && !timingsCached)
                         {
                             cached_time_Preparation = time_Preparation;
                             cached_time_Prep_GetBiomes = time_Prep_GetBiomes;
@@ -2165,7 +3089,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                         int index = yOffset + currentZ * sizeXZ + finalX;
                                         chunkData[index] = (byte)block;
 #if LOGGING
-                                        if (enableVerboseLogging)
+                                        if (enableDetailedTimings)
                                         {
                                             terrainVoxelsVisited++;
                                             terrainAssignments++;
@@ -2200,7 +3124,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 }
 
 #if LOGGING
-                if (enableVerboseLogging) time_GeneratingTerrain += (float)(DateTime.UtcNow - stepStartTime).TotalMilliseconds;
+                if (enableDetailedTimings) time_GeneratingTerrain += (float)(DateTime.UtcNow - stepStartTime).TotalMilliseconds;
 #endif
 
                 if (terrain_xPiece >= byte0_gt)
@@ -2308,7 +3232,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                         {
                                             data[idx] = (byte)topBlock;
 #if LOGGING
-                                            if (enableVerboseLogging)
+                                            if (enableDetailedTimings)
                                             {
                                                 biomeColumnsProcessed++;
                                                 biomeTopAssignments++;
@@ -2319,7 +3243,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                         {
                                             data[idx] = (byte)fillerBlock;
 #if LOGGING
-                                            if (enableVerboseLogging)
+                                            if (enableDetailedTimings)
                                             {
                                                 if (fillerBlock == BlockMaterial.SAND) biomeSandAssignments++;
                                                 else if (fillerBlock == BlockMaterial.SANDSTONE) biomeSandstoneAssignments++;
@@ -2351,7 +3275,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                         }
                                         
 #if LOGGING
-                                        if (enableVerboseLogging)
+                                        if (enableDetailedTimings)
                                         {
                                             if (fillerBlock == BlockMaterial.SAND) biomeSandAssignments++;
                                             else if (fillerBlock == BlockMaterial.SANDSTONE) biomeSandstoneAssignments++;
@@ -2389,7 +3313,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                         int idx = yBase + zBase + x;
                                         data[idx] = bedrockID;
 #if LOGGING
-                                        if (enableVerboseLogging) biomeBedrockAssignments++;
+                                        if (enableDetailedTimings) biomeBedrockAssignments++;
 #endif
                                     }
                                 }
@@ -2399,7 +3323,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 }
                 
 #if LOGGING
-                if (enableVerboseLogging) time_ReplacingBiomes += (float)(DateTime.UtcNow - stepStartTime).TotalMilliseconds;
+                if (enableDetailedTimings) time_ReplacingBiomes += (float)(DateTime.UtcNow - stepStartTime).TotalMilliseconds;
 #endif
                 
                 // CRITICAL: Only decorate the TOP chunk in a column (highest Y chunk)
@@ -2588,13 +3512,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     Debug.Log(diagBuf.ToString());
                 }
 #if LOGGING
-                if (enableVerboseLogging)
+                if (enableDetailedTimings)
                 {
-                    // Calculate actual per-chunk work time (excluding cached column preparation)
                     float actualChunkTime = time_GeneratingTerrain + time_ReplacingBiomes;
                     float totalTime = (float)(DateTime.UtcNow - time_Total_Start).TotalMilliseconds;
-                    
-                    // Use cached timings for display (they're computed once per column)
                     float display_time_Preparation = timingsCached ? cached_time_Preparation : time_Preparation;
                     float display_time_Prep_GetBiomes = timingsCached ? cached_time_Prep_GetBiomes : time_Prep_GetBiomes;
                     float display_time_Prep_SandNoise = timingsCached ? cached_time_Prep_SandNoise : time_Prep_SandNoise;
@@ -2613,44 +3534,27 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     int display_noise6Cells = timingsCached ? cached_noise6Cells : noise6Cells;
                     int display_noise7Cells = timingsCached ? cached_noise7Cells : noise7Cells;
                     int display_noiseCombineCells = timingsCached ? cached_noiseCombineCells : noiseCombineCells;
-                    
-                    logBuilder.Clear();
-                    logBuilder.Append("--- Terrain Gen Timings for Chunk (").Append(currentChunkX).Append(",").Append(currentChunkY).Append(",").Append(currentChunkZ).Append(") ---").AppendLine();
-                    logBuilder.Append("1. Preparation (Total): ").Append(display_time_Preparation.ToString("F3")).Append(" ms");
-                    if (timingsCached) logBuilder.Append(" [Cached per column]");
-                    logBuilder.AppendLine();
-                    logBuilder.Append("   1a. GetBiomes:       ").Append(display_time_Prep_GetBiomes.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("   1b. SandNoise:       ").Append(display_time_Prep_SandNoise.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("   1c. GravelNoise:     ").Append(display_time_Prep_GravelNoise.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("   1d. StoneNoise:      ").Append(display_time_Prep_StoneNoise.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("   1e. AllocNoiseCache: ").Append(display_time_Prep_AllocNoiseCache.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("2. Noise3D Stages:");
-                    if (timingsCached) logBuilder.Append(" [Cached per column]");
-                    logBuilder.AppendLine();
-                    logBuilder.Append("   2a. NoiseGen1:       ").Append(display_time_NoiseGen1.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseGen1Cells).Append(")").AppendLine();
-                    logBuilder.Append("   2b. NoiseGen2:       ").Append(display_time_NoiseGen2.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseGen2Cells).Append(")").AppendLine();
-                    logBuilder.Append("   2c. NoiseGen3:       ").Append(display_time_NoiseGen3.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseGen3Cells).Append(")").AppendLine();
-                    logBuilder.Append("   2d. Noise6:          ").Append(display_time_Noise6.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noise6Cells).Append(")").AppendLine();
-                    logBuilder.Append("   2e. Noise7:          ").Append(display_time_Noise7.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noise7Cells).Append(")").AppendLine();
-                    logBuilder.Append("   2f. CombineNoise:    ").Append(display_time_NoiseCombine.ToString("F3")).Append(" ms").Append(" (cells: ").Append(display_noiseCombineCells).Append(")").AppendLine();
-                    logBuilder.Append("3. Terrain Generation:  ").Append(time_GeneratingTerrain.ToString("F3")).Append(" ms").Append(" (steps: ").Append(terrain_gen_step_count).Append(")").AppendLine();
-                    logBuilder.Append("   3a. Voxels visited:  ").Append(terrainVoxelsVisited).Append(", Assignments: ").Append(terrainAssignments).AppendLine();
-                    logBuilder.Append("   3b. Stone: ").Append(terrainStoneAssignments).Append(", Water: ").Append(terrainWaterAssignments).Append(", Ice: ").Append(terrainIceAssignments).AppendLine();
-                    logBuilder.Append("4. Replace Biomes:      ").Append(time_ReplacingBiomes.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("   4a. Columns visited: ").Append(256).AppendLine();
-                    logBuilder.Append("   4b. Top: ").Append(biomeTopAssignments).Append(", Filler: ").Append(biomeFillerAssignments).Append(", Bedrock: ").Append(biomeBedrockAssignments).AppendLine();
-                    logBuilder.Append("   4c. Water: ").Append(biomeWaterAssignments).Append(", Gravel: ").Append(biomeGravelAssignments).Append(", Sand: ").Append(biomeSandAssignments).Append(", Sandstone: ").Append(biomeSandstoneAssignments).AppendLine();
-                    logBuilder.Append("--- Performance Summary ---").AppendLine();
-                    logBuilder.Append("Actual Per-Chunk Work:  ").Append(actualChunkTime.ToString("F3")).Append(" ms (3+4 only)").AppendLine();
-                    logBuilder.Append("Total Time-Sliced Gen:  ").Append(totalTime.ToString("F3")).Append(" ms (wall-clock time across all frames)").AppendLine();
-                    logBuilder.Append("--- Per-Step Performance ---").AppendLine();
-                    logBuilder.Append("Total Steps: ").Append(totalSteps).AppendLine();
-                    logBuilder.Append("Last Step: ").Append(lastStepTime.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("Max Step: ").Append(maxStepTime.ToString("F3")).Append(" ms").AppendLine();
-                    logBuilder.Append("Min Step: ").Append(minStepTime.ToString("F3")).Append(" ms").AppendLine();
-                    float avgStepTime = totalSteps > 0 ? totalTime / totalSteps : 0f;
-                    logBuilder.Append("Avg Step: ").Append(avgStepTime.ToString("F3")).Append(" ms").AppendLine();
-                    Debug.Log(logBuilder.ToString());
+                    _AccumulateCompletedChunkProfile(
+                        display_time_Preparation,
+                        display_time_Prep_GetBiomes,
+                        display_time_Prep_SandNoise,
+                        display_time_Prep_GravelNoise,
+                        display_time_Prep_StoneNoise,
+                        display_time_Prep_AllocNoiseCache,
+                        display_time_NoiseGen1,
+                        display_time_NoiseGen2,
+                        display_time_NoiseGen3,
+                        display_time_Noise6,
+                        display_time_Noise7,
+                        display_time_NoiseCombine,
+                        display_noiseGen1Cells,
+                        display_noiseGen2Cells,
+                        display_noiseGen3Cells,
+                        display_noise6Cells,
+                        display_noise7Cells,
+                        display_noiseCombineCells,
+                        actualChunkTime,
+                        totalTime);
                 }
 #endif
                 currentState = GenerationState.Idle;
@@ -2664,7 +3568,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
         
 #if LOGGING
-        if (enableVerboseLogging)
+        if (enableDetailedTimings)
         {
             // Track per-step timing
             lastStepTime = (Time.realtimeSinceStartup - frameStepStart) * 1000f;
@@ -2911,5 +3815,5 @@ public class McTerrainGenerator : UdonSharpBehaviour
             Debug.Log($"[McTerrainGenerator] Generated debug pillar at ({pillarX}, {pillarZ}) spanning height 0-{worldHeight-1}");
         }
 #endif
-
+    }
 }
