@@ -58,6 +58,7 @@ public class ChunkData
     public int _gpuFaceSlice = 0;
     public int _gpuFaceCrossIndex = 0;
     public int _gpuFaceSummaryIndex = 0;
+    public bool _gpuFaceBuildUsesSummary = false;
     public Color32[] _gpuFacePixels;
     public byte[] _gpuFaceSliceActive;
     public byte[] _gpuFaceSliceMinU;
