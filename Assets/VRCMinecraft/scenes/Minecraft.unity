@@ -4793,7 +4793,6 @@ MonoBehaviour:
   generateCaves: 1
   generateBedrock: 1
   acknowledgeVRChatPerformance: 0
-  maxConcurrentGenerationContexts: 2
   enableGpuWorldgen: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
     type: 2}
@@ -15702,6 +15701,9 @@ MonoBehaviour:
   shellMeshPriorityRadiusY: 1
   deferredInteriorMeshRequestsPerFrame: 1
   deferredInteriorMeshScanCountPerFrame: 64
+  deferFarChunkSecondaryWork: 1
+  deferredSecondaryWorkTasksPerFrame: 2
+  deferredSecondaryWorkScanCountPerFrame: 64
   enableAdaptiveBudgets: 1
   adaptiveFrameHeadroomMs: 1.5
   adaptiveBudgetRecoverRate: 0.08
