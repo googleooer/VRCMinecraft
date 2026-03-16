@@ -88,6 +88,10 @@ public class McCoordinator : UdonSharpBehaviour
     private int workers_MeshCompleted;
     private int rebuilds_Processed;
     private int worldChunks_Assigned;
+    private int peak_ActiveWorkers;
+    private int peak_DataGenWorkers;
+    private int peak_MeshingWorkers;
+    private int peak_RebuildQueue;
 #endif
 
     public void InitializeAndStartProcessing(McWorld worldInstance, int[] generatedRadialOrder, int worldTotalChunks)
@@ -139,7 +143,7 @@ public class McCoordinator : UdonSharpBehaviour
 #if LOGGING
         System.DateTime cycleStart = System.DateTime.MinValue;
         System.DateTime stepStart = System.DateTime.MinValue;
-        if (enableDetailedTimings)
+        if (enableDetailedTimings || enableAggregateLogging)
         {
             cycleStart = System.DateTime.UtcNow;
             stepStart = cycleStart;
@@ -216,7 +220,7 @@ public class McCoordinator : UdonSharpBehaviour
                         }
                         recheck = true; // Re-evaluate the new state immediately
 #if LOGGING
-                        if (enableDetailedTimings) workers_DataGenCompleted++;
+                        if (enableDetailedTimings || enableAggregateLogging) workers_DataGenCompleted++;
 #endif
                     }
                 }
@@ -284,7 +288,7 @@ public class McCoordinator : UdonSharpBehaviour
                             Debug.Log($"[BENCHMARK] 100% world gen at {elapsed:F3}s — last chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) #{chunksCompletedCount}/{totalWorldChunks}");
                         }
 #if LOGGING
-                        if (enableDetailedTimings) workers_MeshCompleted++;
+                        if (enableDetailedTimings || enableAggregateLogging) workers_MeshCompleted++;
 #endif
                         // Don't recheck — worker is now IDLE
                     }
@@ -293,7 +297,7 @@ public class McCoordinator : UdonSharpBehaviour
         }
 
 #if LOGGING
-        if (enableDetailedTimings)
+        if (enableDetailedTimings || enableAggregateLogging)
         {
             time_UpdateWorkers += (float)(System.DateTime.UtcNow - stepStart).TotalMilliseconds;
             stepStart = System.DateTime.UtcNow;
@@ -325,7 +329,7 @@ public class McCoordinator : UdonSharpBehaviour
                     assigned = true;
                     assignedThisCycle++;
 #if LOGGING
-                    if (enableDetailedTimings) rebuilds_Processed++;
+                    if (enableDetailedTimings || enableAggregateLogging) rebuilds_Processed++;
 #endif
                 }
             }
@@ -348,7 +352,7 @@ public class McCoordinator : UdonSharpBehaviour
                     assigned = true;
                     assignedThisCycle++;
 #if LOGGING
-                    if (enableDetailedTimings) worldChunks_Assigned++;
+                    if (enableDetailedTimings || enableAggregateLogging) worldChunks_Assigned++;
 #endif
                 }
                 else
@@ -362,7 +366,7 @@ public class McCoordinator : UdonSharpBehaviour
         }
 
 #if LOGGING
-        if (enableDetailedTimings)
+        if (enableDetailedTimings || enableAggregateLogging)
         {
             time_AssignWork += (float)(System.DateTime.UtcNow - stepStart).TotalMilliseconds;
         }
@@ -391,64 +395,68 @@ public class McCoordinator : UdonSharpBehaviour
 #endif
 
 #if LOGGING
-        if (enableDetailedTimings)
+        if (enableDetailedTimings || enableAggregateLogging)
         {
             time_TotalCycle += (float)(System.DateTime.UtcNow - cycleStart).TotalMilliseconds;
             cycles_Processed++;
-            
-            // Log detailed timing stats every 100 cycles
-            if (cycles_Processed % 100 == 0)
+
+            int activeWorkers = 0;
+            int dataGenWorkers = 0;
+            int meshingWorkers = 0;
+            for (int i = 0; i < maxConcurrentWorkers; i++)
             {
-                float avgCycle = time_TotalCycle / cycles_Processed;
-                float avgUpdate = time_UpdateWorkers / cycles_Processed;
-                float avgAssign = time_AssignWork / cycles_Processed;
-                
-                System.Text.StringBuilder sb = new System.Text.StringBuilder(512);
-                sb.AppendLine("--- Coordinator Performance (Last 100 cycles) ---");
-                sb.AppendFormat("Avg Cycle Time: {0:F3} ms\n", avgCycle);
-                sb.AppendFormat("  1. Update Workers: {0:F3} ms\n", avgUpdate);
-                sb.AppendFormat("  2. Assign Work: {0:F3} ms\n", avgAssign);
-                sb.AppendLine("--- Worker Activity ---");
-                sb.AppendFormat("  Data Gen Completed: {0}\n", workers_DataGenCompleted);
-                sb.AppendFormat("  Mesh Completed: {0}\n", workers_MeshCompleted);
-                sb.AppendFormat("  Rebuilds Processed: {0}\n", rebuilds_Processed);
-                sb.AppendFormat("  World Chunks Assigned: {0}\n", worldChunks_Assigned);
-                sb.AppendLine("--- Current State ---");
-                
-                int activeWorkers = 0;
-                int dataGenWorkers = 0;
-                int meshingWorkers = 0;
-                for (int i = 0; i < maxConcurrentWorkers; i++)
-                {
-                    if (worker_state[i] != STATE_IDLE) activeWorkers++;
-                    if (worker_state[i] == STATE_DATA_GEN) dataGenWorkers++;
-                    if (worker_state[i] == STATE_MESHING) meshingWorkers++;
-                }
-                
-                sb.AppendFormat("  Active Workers: {0}/{1}\n", activeWorkers, maxConcurrentWorkers);
-                sb.AppendFormat("  Data Gen: {0}, Meshing: {1}\n", dataGenWorkers, meshingWorkers);
-                sb.AppendFormat("  Rebuild Queue: {0}/{1}\n", chunkRebuildQueue_count, MAX_REBUILD_QUEUE_SIZE);
-                sb.AppendFormat("  Progress: {0}/{1} chunks ({2:F1}%)\n", 
-                    chunksCompletedCount, totalWorldChunks, 
-                    totalWorldChunks > 0 ? (chunksCompletedCount * 100f / totalWorldChunks) : 0f);
-                
-                Debug.Log(sb.ToString());
-                
-                // Reset counters for next period
-                time_UpdateWorkers = 0f;
-                time_AssignWork = 0f;
-                time_TotalCycle = 0f;
-                cycles_Processed = 0;
-                workers_DataGenCompleted = 0;
-                workers_MeshCompleted = 0;
-                rebuilds_Processed = 0;
-                worldChunks_Assigned = 0;
+                if (worker_state[i] != STATE_IDLE) activeWorkers++;
+                if (worker_state[i] == STATE_DATA_GEN) dataGenWorkers++;
+                if (worker_state[i] == STATE_MESHING) meshingWorkers++;
             }
+
+            if (activeWorkers > peak_ActiveWorkers) peak_ActiveWorkers = activeWorkers;
+            if (dataGenWorkers > peak_DataGenWorkers) peak_DataGenWorkers = dataGenWorkers;
+            if (meshingWorkers > peak_MeshingWorkers) peak_MeshingWorkers = meshingWorkers;
+            if (chunkRebuildQueue_count > peak_RebuildQueue) peak_RebuildQueue = chunkRebuildQueue_count;
         }
 #endif
 
         // No longer need to reschedule - Update() runs every frame automatically!
     }
+
+#if LOGGING
+    public void AppendAggregatePerformanceStats(StringBuilder sb)
+    {
+        if (sb == null || (!enableDetailedTimings && !enableAggregateLogging) || cycles_Processed <= 0) return;
+
+        float avgCycle = time_TotalCycle / cycles_Processed;
+        float avgUpdate = time_UpdateWorkers / cycles_Processed;
+        float avgAssign = time_AssignWork / cycles_Processed;
+
+        sb.AppendLine("Coordinator:");
+        sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms, update workers {2:F3}ms, assign work {3:F3}ms\n",
+            cycles_Processed, avgCycle, avgUpdate, avgAssign);
+        sb.AppendFormat("  Worker completions: data {0}, mesh {1}, rebuilds {2}, world assigns {3}\n",
+            workers_DataGenCompleted, workers_MeshCompleted, rebuilds_Processed, worldChunks_Assigned);
+        sb.AppendFormat("  Peaks: active {0}/{1}, data {2}, meshing {3}, rebuild queue {4}/{5}\n",
+            peak_ActiveWorkers, maxConcurrentWorkers, peak_DataGenWorkers, peak_MeshingWorkers, peak_RebuildQueue, MAX_REBUILD_QUEUE_SIZE);
+        sb.AppendFormat("  Progress: {0}/{1} chunks ({2:F1}%)\n",
+            chunksCompletedCount, totalWorldChunks,
+            totalWorldChunks > 0 ? (chunksCompletedCount * 100f / totalWorldChunks) : 0f);
+    }
+
+    public void ResetAggregatePerformanceStats()
+    {
+        time_UpdateWorkers = 0f;
+        time_AssignWork = 0f;
+        time_TotalCycle = 0f;
+        cycles_Processed = 0;
+        workers_DataGenCompleted = 0;
+        workers_MeshCompleted = 0;
+        rebuilds_Processed = 0;
+        worldChunks_Assigned = 0;
+        peak_ActiveWorkers = 0;
+        peak_DataGenWorkers = 0;
+        peak_MeshingWorkers = 0;
+        peak_RebuildQueue = 0;
+    }
+#endif
 
     private bool AreAnyWorkersActive()
     {
