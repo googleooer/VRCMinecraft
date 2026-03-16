@@ -48,6 +48,12 @@ public class ChunkData
     public int _gpuFaceSlotIndex = -1;
     public int _gpuFaceReadbackQueueSlot = -1;
     public bool _gpuMeshPending = false;
+    public bool _gpuFaceBuildActive = false;
+    public int _gpuFaceBuildStage = 0; // 0=greedy faces, 1=cross blocks, 2=apply, 3=done
+    public int _gpuFaceDirection = 0;
+    public int _gpuFaceSlice = 0;
+    public int _gpuFaceCrossIndex = 0;
+    public Color32[] _gpuFacePixels;
 
     // --- Time-slicing State (for meshing) ---
     public int _greedyAxis;
@@ -120,6 +126,7 @@ public class ChunkData
     // Cache biome colors per XZ column (256 values for 16x16 grid)
     // Indexed by: z * 16 + x. Reduces biome texture lookups from ~10,000 to 256 per chunk
     public Color[] _cachedBiomeColors;
+    public int[] _cachedPackedGrassBiomeColors;
     public bool _cachedBiomeColorsValid = false;
 
 #if LOGGING

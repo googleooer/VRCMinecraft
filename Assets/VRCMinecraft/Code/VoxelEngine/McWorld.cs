@@ -33,6 +33,16 @@ public class McWorld : UdonSharpBehaviour
     public float meshStepTimeBudgetMs = 8.0f;
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
     public float updateTimeBudgetMs = 12.0f;
+    [Tooltip("Budget per incremental GPU mesh decode step in milliseconds. Lower values reduce hitches from GPU mesh completion.")]
+    public float gpuMeshDecodeStepBudgetMs = 2.5f;
+    [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame.")]
+    public int gpuMeshDecodeStepsPerFrame = 2;
+    [Tooltip("Total GPU mesh decode budget per frame in milliseconds. Caps aggregate decode work across all chunks.")]
+    public float gpuMeshDecodeFrameBudgetMs = 3.5f;
+    [Tooltip("Budget per GPU worldgen step in milliseconds. Lower values reduce frame spikes during terrain generation.")]
+    public float gpuWorldgenStepBudgetMs = 3.0f;
+    [Tooltip("Maximum GPU worldgen steps per chunk each frame.")]
+    public int gpuWorldgenStepsPerFrame = 4;
 
     [Header("System References")]
     [SerializeField, FindObjectOfType(true)]
@@ -164,14 +174,27 @@ public class McWorld : UdonSharpBehaviour
     private int gpuLightingFrameCursor = 0;
 
     // --- GPU Face Extraction State ---
+    private const int GPU_FACE_READBACK_BUFFER_COUNT = 2;
+    private const int GPU_FACE_READBACKS_PER_FRAME = 1;
     private Texture2D gpuShouldDrawTexture;
     private RenderTexture gpuFaceAtlas;
+    private RenderTexture[] gpuFaceReadbackTextures;
     private int gpuPropDrawTableTexId;
-    private bool gpuFaceReadbackInFlight = false;
-    private bool gpuFaceReadbackReady = false;
-    private ChunkData gpuFaceReadbackChunk = null;
-    private Color32[] gpuFaceReadbackPixels; // full atlas readback
-    private Color32[] gpuFaceChunkPixels; // extracted per-chunk tile
+    private int gpuPropFaceModeId;
+    private int gpuPropFaceReadSlotId;
+    private Color32[][] gpuFaceReadbackPixels; // per-buffer, per-chunk face readback
+    private ChunkData[] gpuFaceReadbackChunks;
+    private int[] gpuFaceReadbackSlots;
+    private float[] gpuFaceReadbackStartMs;
+    private int[] gpuFaceReadbackState; // 0 idle, 1 in-flight, 2 ready
+    private int[] gpuFaceReadbackInflightOrder;
+    private int gpuFaceReadbackInflightHead = 0;
+    private int gpuFaceReadbackInflightTail = 0;
+    private int gpuFaceReadbackInflightCount = 0;
+    private int[] gpuFaceReadbackReadyOrder;
+    private int gpuFaceReadbackReadyHead = 0;
+    private int gpuFaceReadbackReadyTail = 0;
+    private int gpuFaceReadbackReadyCount = 0;
     private int gpuPropGpuEnabledId;
     private int gpuPropLightAtlasId;
     private int gpuPropBlockAtlasGlobalId;
@@ -213,6 +236,7 @@ public class McWorld : UdonSharpBehaviour
     private readonly Vector3 Normal_North = Vector3.forward; private readonly Vector3 Normal_East = Vector3.right; private readonly Vector3 Normal_South = Vector3.back;
     private readonly Vector3 Normal_West = Vector3.left; private readonly Vector3 Normal_Up = Vector3.up; private readonly Vector3 Normal_Down = Vector3.down;
     private const int FACE_INDEX_SIDE = 0; private const int FACE_INDEX_TOP = 2; private const int FACE_INDEX_BOTTOM = 3;
+    private const int PACKED_WHITE_RGB = 0xFFFFFF;
 
     // --- RLE Constants ---
     private const ushort RLE_TYPE_1D = 0;
@@ -260,6 +284,9 @@ public class McWorld : UdonSharpBehaviour
 
     // --- Mesh Building Stats (aggregate) ---
     private int stats_meshBuildTotal = 0;
+    private int stats_meshBuildCpuCompletions = 0;
+    private int stats_meshBuildGpuCompletions = 0;
+    private int stats_meshBuildEmptyCompletions = 0;
     private float stats_meshBuildTimeTotal = 0f;
     private float stats_meshBuildTimeMin = float.MaxValue;
     private float stats_meshBuildTimeMax = 0f;
@@ -279,6 +306,10 @@ public class McWorld : UdonSharpBehaviour
     private float stats_meshApplyTransparentTime = 0f;
     private float stats_meshApplyCutoutTime = 0f;
     private float stats_meshApplyColliderTime = 0f;
+    private int stats_gpuFaceDecodeSteps = 0;
+    private float stats_gpuFaceDecodeTime = 0f;
+    private float stats_gpuFaceDecodeTimeMin = float.MaxValue;
+    private float stats_gpuFaceDecodeTimeMax = 0f;
 
     // --- Lighting Stats (aggregate) ---
     private int stats_lightingInitsTotal = 0;
@@ -330,6 +361,8 @@ public class McWorld : UdonSharpBehaviour
     private float stats_gpuLightingPropagateBlitTime = 0f;
     private int stats_gpuFaceExtractBlits = 0;
     private float stats_gpuFaceExtractBlitTime = 0f;
+    private int stats_gpuFaceExportBlits = 0;
+    private float stats_gpuFaceExportBlitTime = 0f;
     private int stats_gpuChunkUploads = 0;
     private float stats_gpuChunkUploadTime = 0f;
     private int stats_gpuChunkUploadBytes = 0;
@@ -493,14 +526,30 @@ public class McWorld : UdonSharpBehaviour
         gpuPropOverlayRectId = VRCShader.PropertyToID("_OverlayRect");
         gpuPropTopSkyLightId = VRCShader.PropertyToID("_TopSkyLight");
         gpuPropDrawTableTexId = VRCShader.PropertyToID("_DrawTableTex");
+        gpuPropFaceModeId = VRCShader.PropertyToID("_Mode");
+        gpuPropFaceReadSlotId = VRCShader.PropertyToID("_ReadSlotIndex");
 
         // --- GPU Face Extraction Init ---
         gpuFaceAtlas = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_FaceAtlas");
         VRCGraphics.Blit(gpuClearTexture, gpuFaceAtlas);
+        gpuFaceReadbackTextures = new RenderTexture[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuFaceReadbackPixels = new Color32[GPU_FACE_READBACK_BUFFER_COUNT][];
+        gpuFaceReadbackChunks = new ChunkData[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuFaceReadbackSlots = new int[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuFaceReadbackStartMs = new float[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuFaceReadbackState = new int[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuFaceReadbackInflightOrder = new int[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuFaceReadbackReadyOrder = new int[GPU_FACE_READBACK_BUFFER_COUNT];
+        for (int i = 0; i < GPU_FACE_READBACK_BUFFER_COUNT; i++)
+        {
+            gpuFaceReadbackTextures[i] = _CreateGpuRenderTexture(gpuTileWidth, gpuTileHeight, "GPU_FaceReadback_" + i);
+            VRCGraphics.Blit(gpuClearTexture, gpuFaceReadbackTextures[i]);
+            gpuFaceReadbackPixels[i] = new Color32[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
+            gpuFaceReadbackSlots[i] = -1;
+            gpuFaceReadbackStartMs[i] = -1f;
+        }
 
         // Readback buffers
-        gpuFaceReadbackPixels = new Color32[gpuAtlasWidth * gpuAtlasHeight];
-        gpuFaceChunkPixels = new Color32[chunkSizeXZ * chunkSizeY * chunkSizeXZ];
 
         gpuBackendReady = true;
         _GpuBuildShouldDrawTexture();
@@ -1187,13 +1236,30 @@ public class McWorld : UdonSharpBehaviour
 
     private bool _GpuFaceExtractionReady()
     {
-        return gpuBackendReady && gpuFaceExtractMaterial != null && gpuShouldDrawTexture != null && gpuFaceAtlas != null;
+        return gpuBackendReady && gpuFaceExtractMaterial != null && gpuShouldDrawTexture != null && gpuFaceReadbackTextures != null;
     }
 
-    private void _GpuRunFaceExtraction()
+    private int _GpuFindAvailableReadbackBuffer()
     {
-        if (!_GpuFaceExtractionReady()) return;
+        if (gpuFaceReadbackState == null) return -1;
+        for (int i = 0; i < gpuFaceReadbackState.Length; i++)
+        {
+            if (gpuFaceReadbackState[i] == 0) return i;
+        }
+        return -1;
+    }
 
+    private bool _GpuHasAvailableReadbackBuffer()
+    {
+        return _GpuFindAvailableReadbackBuffer() != -1;
+    }
+
+    private void _GpuRunFaceExtractionDirect(int bufferIndex, int slotIndex)
+    {
+        if (!_GpuFaceExtractionReady() || bufferIndex < 0 || bufferIndex >= gpuFaceReadbackTextures.Length) return;
+
+        gpuFaceExtractMaterial.SetFloat(gpuPropFaceModeId, 1f);
+        gpuFaceExtractMaterial.SetFloat(gpuPropFaceReadSlotId, slotIndex);
         gpuFaceExtractMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
@@ -1202,7 +1268,7 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
-        VRCGraphics.Blit(gpuBlockAtlas, gpuFaceAtlas, gpuFaceExtractMaterial);
+        VRCGraphics.Blit(gpuBlockAtlas, gpuFaceReadbackTextures[bufferIndex], gpuFaceExtractMaterial);
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -1215,7 +1281,8 @@ public class McWorld : UdonSharpBehaviour
     private bool _GpuRequestChunkFaceReadback(ChunkData chunk)
     {
         if (!_GpuFaceExtractionReady() || chunk == null) return false;
-        if (gpuFaceReadbackInFlight) return false; // one at a time
+        int bufferIndex = _GpuFindAvailableReadbackBuffer();
+        if (bufferIndex == -1) return false;
 
         int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
         if (chunkIndex < 0 || chunkIndex >= totalWorldChunks) return false;
@@ -1223,57 +1290,69 @@ public class McWorld : UdonSharpBehaviour
         if (slotIndex < 0 || slotIndex >= gpuChunkSlotCapacity) return false;
 
         chunk._gpuFaceSlotIndex = slotIndex;
-
-        // Run face extraction Blit on entire atlas
-        _GpuRunFaceExtraction();
-
-        // Request async readback of the face atlas
-        gpuFaceReadbackChunk = chunk;
-        gpuFaceReadbackInFlight = true;
-        gpuFaceReadbackReady = false;
+        gpuFaceReadbackChunks[bufferIndex] = chunk;
+        gpuFaceReadbackSlots[bufferIndex] = slotIndex;
+        gpuFaceReadbackState[bufferIndex] = 1;
+        gpuFaceReadbackInflightOrder[gpuFaceReadbackInflightTail] = bufferIndex;
+        gpuFaceReadbackInflightTail = (gpuFaceReadbackInflightTail + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
+        gpuFaceReadbackInflightCount++;
 
 #if LOGGING
         if (enableDetailedTimings)
         {
             stats_gpuFaceReadbackRequests++;
-            stats_gpuFaceReadbackRequestStartMs = Time.realtimeSinceStartup * 1000f;
+            float requestStartMs = Time.realtimeSinceStartup * 1000f;
+            stats_gpuFaceReadbackRequestStartMs = requestStartMs;
+            gpuFaceReadbackStartMs[bufferIndex] = requestStartMs;
         }
 #endif
-        VRCAsyncGPUReadback.Request(gpuFaceAtlas, 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        _GpuRunFaceExtractionDirect(bufferIndex, slotIndex);
+        VRCAsyncGPUReadback.Request(gpuFaceReadbackTextures[bufferIndex], 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
         return true;
     }
 
     public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
     {
-        if (!gpuFaceReadbackInFlight) return;
+        if (gpuFaceReadbackInflightCount <= 0) return;
+
+        int bufferIndex = gpuFaceReadbackInflightOrder[gpuFaceReadbackInflightHead];
+        gpuFaceReadbackInflightHead = (gpuFaceReadbackInflightHead + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
+        gpuFaceReadbackInflightCount--;
 
 #if LOGGING
         float callbackStartMs = enableDetailedTimings ? Time.realtimeSinceStartup * 1000f : 0f;
-        float latencyMs = enableDetailedTimings && stats_gpuFaceReadbackRequestStartMs >= 0f
-            ? callbackStartMs - stats_gpuFaceReadbackRequestStartMs
+        float latencyMs = enableDetailedTimings && gpuFaceReadbackStartMs[bufferIndex] >= 0f
+            ? callbackStartMs - gpuFaceReadbackStartMs[bufferIndex]
             : 0f;
 #endif
-        gpuFaceReadbackInFlight = false;
+        gpuFaceReadbackStartMs[bufferIndex] = -1f;
 
         if (request.hasError)
         {
-            gpuFaceReadbackChunk = null;
+            gpuFaceReadbackChunks[bufferIndex] = null;
+            gpuFaceReadbackSlots[bufferIndex] = -1;
+            gpuFaceReadbackState[bufferIndex] = 0;
 #if LOGGING
             if (enableDetailedTimings) stats_gpuFaceReadbackFailures++;
 #endif
             return;
         }
 
-        if (!request.TryGetData(gpuFaceReadbackPixels, 0))
+        if (!request.TryGetData(gpuFaceReadbackPixels[bufferIndex], 0))
         {
-            gpuFaceReadbackChunk = null;
+            gpuFaceReadbackChunks[bufferIndex] = null;
+            gpuFaceReadbackSlots[bufferIndex] = -1;
+            gpuFaceReadbackState[bufferIndex] = 0;
 #if LOGGING
             if (enableDetailedTimings) stats_gpuFaceReadbackFailures++;
 #endif
             return;
         }
 
-        gpuFaceReadbackReady = true;
+        gpuFaceReadbackState[bufferIndex] = 2;
+        gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyTail] = bufferIndex;
+        gpuFaceReadbackReadyTail = (gpuFaceReadbackReadyTail + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
+        gpuFaceReadbackReadyCount++;
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -1282,7 +1361,7 @@ public class McWorld : UdonSharpBehaviour
             if (latencyMs < stats_gpuFaceReadbackLatencyMin) stats_gpuFaceReadbackLatencyMin = latencyMs;
             if (latencyMs > stats_gpuFaceReadbackLatencyMax) stats_gpuFaceReadbackLatencyMax = latencyMs;
             stats_gpuFaceReadbackCallbackCopyTime += Time.realtimeSinceStartup * 1000f - callbackStartMs;
-            stats_gpuFaceReadbackBytes += gpuFaceReadbackPixels.Length * 4;
+            stats_gpuFaceReadbackBytes += gpuFaceReadbackPixels[bufferIndex].Length * 4;
         }
 #endif
     }
@@ -1291,19 +1370,25 @@ public class McWorld : UdonSharpBehaviour
     /// Called from the meshing processing loop to check if face readback is ready
     /// and trigger mesh building.
     /// </summary>
-    private void _ProcessGpuFaceReadback()
+    private void _ProcessGpuFaceReadback(float frameStart, float frameBudget)
     {
-        if (!gpuFaceReadbackReady || gpuFaceReadbackChunk == null) return;
+        int processedThisFrame = 0;
+        while (gpuFaceReadbackReadyCount > 0)
+        {
+            if (processedThisFrame >= GPU_FACE_READBACKS_PER_FRAME) break;
+            if (Time.realtimeSinceStartup - frameStart > frameBudget) break;
 
-        ChunkData chunk = gpuFaceReadbackChunk;
-        gpuFaceReadbackReady = false;
-        gpuFaceReadbackChunk = null;
+            int bufferIndex = gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyHead];
+            gpuFaceReadbackReadyHead = (gpuFaceReadbackReadyHead + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
+            gpuFaceReadbackReadyCount--;
 
-        // Extract this chunk's tile from the full atlas readback
-        _GpuExtractChunkTileFromAtlas(chunk._gpuFaceSlotIndex, gpuFaceReadbackPixels, gpuFaceChunkPixels);
-
-        // Build mesh from extracted face data
-        _GpuBuildMeshFromFaceData(chunk, gpuFaceChunkPixels);
+            ChunkData chunk = gpuFaceReadbackChunks[bufferIndex];
+            if (chunk != null)
+            {
+                _StartGpuBuildMeshFromFaceData(chunk, gpuFaceReadbackPixels[bufferIndex], bufferIndex);
+            }
+            processedThisFrame++;
+        }
     }
 
     private void _GpuExtractChunkTileFromAtlas(int slotIndex, Color32[] atlasPixels, Color32[] tilePixels)
@@ -1348,28 +1433,113 @@ public class McWorld : UdonSharpBehaviour
     }
 
 
-    private void _GpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels)
+    private void _StartGpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels, int bufferIndex)
     {
         if (chunk == null || facePixels == null) return;
 
         _ClearAllMeshBuffers(chunk);
         _PreComputeBiomeColors(chunk);
+        chunk._gpuFacePixels = facePixels;
+        chunk._gpuFaceReadbackQueueSlot = bufferIndex;
+        chunk._gpuFaceBuildActive = true;
+        chunk._gpuFaceBuildStage = 0;
+        chunk._gpuFaceDirection = 0;
+        chunk._gpuFaceSlice = 0;
+        chunk._gpuFaceCrossIndex = 0;
+
+        if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
+        {
+            activeMeshingChunks[activeMeshingCount++] = chunk;
+        }
+        else
+        {
+            // Rare fallback: if the active meshing queue is saturated, finish this
+            // GPU-decoded mesh immediately rather than deadlocking a readback buffer.
+            while (chunk.isBuildingMesh && chunk._gpuFaceBuildActive)
+            {
+                _GpuBuildMeshFromFaceDataStep(chunk);
+            }
+        }
+    }
+
+    private void _ReleaseGpuFaceBuildBuffer(ChunkData chunk)
+    {
+        if (chunk == null) return;
+
+        int bufferIndex = chunk._gpuFaceReadbackQueueSlot;
+        if (bufferIndex >= 0 && gpuFaceReadbackState != null && bufferIndex < gpuFaceReadbackState.Length)
+        {
+            gpuFaceReadbackChunks[bufferIndex] = null;
+            gpuFaceReadbackSlots[bufferIndex] = -1;
+            gpuFaceReadbackState[bufferIndex] = 0;
+        }
+
+        chunk._gpuFacePixels = null;
+        chunk._gpuFaceReadbackQueueSlot = -1;
+        chunk._gpuFaceBuildActive = false;
+    }
+
+    private void _GpuBuildMeshFromFaceDataStep(ChunkData chunk)
+    {
+#if LOGGING
+        float decodeStepStartTime = 0f;
+        if (enableDetailedTimings)
+        {
+            decodeStepStartTime = Time.realtimeSinceStartup;
+            stats_gpuFaceDecodeSteps++;
+        }
+#endif
+        if (chunk == null || chunk._gpuFacePixels == null)
+        {
+            if (chunk != null)
+            {
+                _ReleaseGpuFaceBuildBuffer(chunk);
+                chunk.isBuildingMesh = false;
+            }
+#if LOGGING
+            if (enableDetailedTimings)
+            {
+                float decodeStepMs = (Time.realtimeSinceStartup - decodeStepStartTime) * 1000f;
+                stats_gpuFaceDecodeTime += decodeStepMs;
+                if (decodeStepMs < stats_gpuFaceDecodeTimeMin) stats_gpuFaceDecodeTimeMin = decodeStepMs;
+                if (decodeStepMs > stats_gpuFaceDecodeTimeMax) stats_gpuFaceDecodeTimeMax = decodeStepMs;
+            }
+#endif
+            return;
+        }
 
         int sizeXZ = chunkSizeXZ;
         int sizeY = chunkSizeY;
         int stride = sizeXZ * sizeXZ;
+        float budgetStart = Time.realtimeSinceStartup;
+        float budgetSec = Mathf.Max(0.25f, gpuMeshDecodeStepBudgetMs) * 0.001f;
+        Color32[] facePixels = chunk._gpuFacePixels;
 
-        for (int direction = 0; direction < 6; direction++)
+        while (Time.realtimeSinceStartup - budgetStart <= budgetSec)
         {
-            int bit = 1 << direction;
-            int maskWidth, maskHeight, sliceCount;
-
-            if (direction <= 1) { maskWidth = sizeXZ; maskHeight = sizeXZ; sliceCount = sizeY; }
-            else if (direction <= 3) { maskWidth = sizeXZ; maskHeight = sizeY; sliceCount = sizeXZ; }
-            else { maskWidth = sizeXZ; maskHeight = sizeY; sliceCount = sizeXZ; }
-
-            for (int slice = 0; slice < sliceCount; slice++)
+            if (chunk._gpuFaceBuildStage == 0)
             {
+                if (chunk._gpuFaceDirection >= 6)
+                {
+                    chunk._gpuFaceBuildStage = 1;
+                    continue;
+                }
+
+                int direction = chunk._gpuFaceDirection;
+                int bit = 1 << direction;
+                int maskWidth, maskHeight, sliceCount;
+                if (direction <= 1) { maskWidth = sizeXZ; maskHeight = sizeXZ; sliceCount = sizeY; }
+                else if (direction <= 3) { maskWidth = sizeXZ; maskHeight = sizeY; sliceCount = sizeXZ; }
+                else { maskWidth = sizeXZ; maskHeight = sizeY; sliceCount = sizeXZ; }
+
+                if (chunk._gpuFaceSlice >= sliceCount)
+                {
+                    chunk._gpuFaceSlice = 0;
+                    chunk._gpuFaceDirection++;
+                    continue;
+                }
+
+                int slice = chunk._gpuFaceSlice;
                 int maskCount = maskWidth * maskHeight;
                 System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
 
@@ -1398,33 +1568,74 @@ public class McWorld : UdonSharpBehaviour
                         int maskIndex = v * maskWidth + u;
                         greedyMaskBlockIds[maskIndex] = (byte)blockID;
                         greedyMaskLightLevels[maskIndex] = 0;
-                        greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, (byte)blockID, x, z));
+                        greedyMaskPackedColors[maskIndex] = _GetPackedBiomeColor(chunk, (byte)blockID, x, z);
                     }
                 }
 
                 _EmitGreedyMask(chunk, direction, slice, maskWidth, maskHeight);
+                chunk._gpuFaceSlice++;
+                continue;
             }
-        }
 
-        // Handle cross-shaped blocks
-        for (int y = 0; y < sizeY; y++)
-        {
-            for (int z = 0; z < sizeXZ; z++)
+            if (chunk._gpuFaceBuildStage == 1)
             {
-                for (int x = 0; x < sizeXZ; x++)
+                int totalPixels = sizeY * stride;
+                while (chunk._gpuFaceCrossIndex < totalPixels)
                 {
-                    int pixelIndex = y * stride + z * sizeXZ + x;
-                    if (pixelIndex >= facePixels.Length) continue;
+                    int pixelIndex = chunk._gpuFaceCrossIndex++;
+                    if (pixelIndex >= facePixels.Length) break;
+
                     Color32 pixel = facePixels[pixelIndex];
                     if (pixel.a < 128 || pixel.g == 0 || pixel.b < 1) continue;
+
+                    int y = pixelIndex / stride;
+                    int z = (pixelIndex / sizeXZ) % sizeXZ;
+                    int x = pixelIndex % sizeXZ;
                     _AddCrossBlockQuads(chunk, (byte)pixel.g, x, y, z);
+
+                    if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
                 }
+
+                if (chunk._gpuFaceCrossIndex >= totalPixels)
+                {
+                    chunk._gpuFaceBuildStage = 2;
+                }
+                continue;
             }
+
+            if (chunk._gpuFaceBuildStage == 2)
+            {
+                _ApplyAllMeshData(chunk);
+                _ApplyDataToCollider(chunk);
+#if LOGGING
+                _RecordMeshBuildCompletion(chunk, true, false);
+#endif
+                _ReleaseGpuFaceBuildBuffer(chunk);
+                chunk.isBuildingMesh = false;
+#if LOGGING
+                if (enableDetailedTimings)
+                {
+                    float decodeStepMs = (Time.realtimeSinceStartup - decodeStepStartTime) * 1000f;
+                    stats_gpuFaceDecodeTime += decodeStepMs;
+                    if (decodeStepMs < stats_gpuFaceDecodeTimeMin) stats_gpuFaceDecodeTimeMin = decodeStepMs;
+                    if (decodeStepMs > stats_gpuFaceDecodeTimeMax) stats_gpuFaceDecodeTimeMax = decodeStepMs;
+                }
+#endif
+                return;
+            }
+
+            break;
         }
 
-        _ApplyAllMeshData(chunk);
-        _ApplyDataToCollider(chunk);
-        chunk.isBuildingMesh = false;
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            float decodeStepMs = (Time.realtimeSinceStartup - decodeStepStartTime) * 1000f;
+            stats_gpuFaceDecodeTime += decodeStepMs;
+            if (decodeStepMs < stats_gpuFaceDecodeTimeMin) stats_gpuFaceDecodeTimeMin = decodeStepMs;
+            if (decodeStepMs > stats_gpuFaceDecodeTimeMax) stats_gpuFaceDecodeTimeMax = decodeStepMs;
+        }
+#endif
     }
 
     private void _AddCrossBlockQuads(ChunkData chunk, byte blockID, int x, int y, int z)
@@ -1655,8 +1866,10 @@ public class McWorld : UdonSharpBehaviour
         // without enough passes to converge.
         _ProcessGpuLighting(frameStart, frameBudget);
 
-        // Process any completed GPU face readbacks → build meshes
-        _ProcessGpuFaceReadback();
+        // Process a small number of completed GPU face readbacks. Draining the whole
+        // queue in one frame causes large hitches when multiple async requests complete
+        // together, so keep this budget-aware.
+        _ProcessGpuFaceReadback(frameStart, frameBudget);
 
         // --- Process Data Generation ---
         for (int i = 0; i < activeDataGenCount; i++)
@@ -1676,6 +1889,8 @@ public class McWorld : UdonSharpBehaviour
         }
 
         // --- Process Meshing ---
+        float gpuMeshDecodeFrameBudgetSec = Mathf.Max(0.25f, gpuMeshDecodeFrameBudgetMs) * 0.001f;
+        float gpuMeshDecodeSpentSec = 0f;
         for (int i = 0; i < activeMeshingCount; i++)
         {
             if (Time.realtimeSinceStartup - frameStart > frameBudget) break; // Don't exceed budget
@@ -1690,13 +1905,27 @@ public class McWorld : UdonSharpBehaviour
                 continue;
             }
 
+            if (chunk._gpuFaceBuildActive && gpuMeshDecodeSpentSec >= gpuMeshDecodeFrameBudgetSec)
+            {
+                continue;
+            }
+
             // OPTIMIZATION: Process multiple mesh steps per frame to reduce overhead
-            int maxMeshStepsPerFrame = 20;
+            int maxMeshStepsPerFrame = chunk._gpuFaceBuildActive ? Mathf.Max(1, gpuMeshDecodeStepsPerFrame) : 20;
             for (int step = 0; step < maxMeshStepsPerFrame; step++)
             {
                 if (!chunk.isBuildingMesh) break; // Mesh complete
                 if (Time.realtimeSinceStartup - frameStart > frameBudget) break; // Don't exceed budget
+
+                bool isGpuDecodeStep = chunk._gpuFaceBuildActive;
+                if (isGpuDecodeStep && gpuMeshDecodeSpentSec >= gpuMeshDecodeFrameBudgetSec) break;
+
+                float gpuDecodeStepStart = isGpuDecodeStep ? Time.realtimeSinceStartup : 0f;
                 _BuildChunkMeshStep(chunk);
+                if (isGpuDecodeStep)
+                {
+                    gpuMeshDecodeSpentSec += Time.realtimeSinceStartup - gpuDecodeStepStart;
+                }
             }
         }
 
@@ -1764,8 +1993,8 @@ public class McWorld : UdonSharpBehaviour
         byte[] generatedData = null;
         bool isComplete = false;
         float stepStart = Time.realtimeSinceStartup;
-        float stepBudget = useGpuWorldgen ? 0.016f : 0.008f;
-        int maxStepsPerFrame = useGpuWorldgen ? 20 : 1;
+        float stepBudget = useGpuWorldgen ? Mathf.Max(0.5f, gpuWorldgenStepBudgetMs) * 0.001f : 0.008f;
+        int maxStepsPerFrame = useGpuWorldgen ? Mathf.Max(1, gpuWorldgenStepsPerFrame) : 1;
 
         for (int step = 0; step < maxStepsPerFrame; step++)
         {
@@ -2208,6 +2437,11 @@ public class McWorld : UdonSharpBehaviour
         return enableGpuVoxelBackend && gpuBackendReady;
     }
 
+    public bool HasAvailableGpuMeshReadbackSlot()
+    {
+        return !_GpuFaceExtractionReady() || _GpuHasAvailableReadbackBuffer();
+    }
+
     public bool AreAllNeighborsReady(int chunkIndex)
     {
         if (chunkIndex == -1) return false;
@@ -2251,7 +2485,6 @@ public class McWorld : UdonSharpBehaviour
 
 #if LOGGING
         chunk.meshBuildStartTime = Time.realtimeSinceStartup;
-        if (enableCounters) stats_meshBuildTotal++;
         if (enableCounters) stats_chunkStateTransitions++;
 
         if (enableDetailedTimings)
@@ -2289,7 +2522,15 @@ public class McWorld : UdonSharpBehaviour
                     isFullyOccluded = false; break;
                 }
             }
-            if (isFullyOccluded) { _ApplyEmptyMesh(chunk); chunk.isBuildingMesh = false; return; }
+            if (isFullyOccluded)
+            {
+                _ApplyEmptyMesh(chunk);
+#if LOGGING
+                _RecordMeshBuildCompletion(chunk, false, true);
+#endif
+                chunk.isBuildingMesh = false;
+                return;
+            }
         }
 
         // OPTIMIZATION: Skip all-air chunks that are fully surrounded by air or out-of-bounds
@@ -2305,13 +2546,21 @@ public class McWorld : UdonSharpBehaviour
                     hasNonAirNeighbor = true; break;
                 }
             }
-            if (!hasNonAirNeighbor) { _ApplyEmptyMesh(chunk); chunk.isBuildingMesh = false; return; }
+            if (!hasNonAirNeighbor)
+            {
+                _ApplyEmptyMesh(chunk);
+#if LOGGING
+                _RecordMeshBuildCompletion(chunk, false, true);
+#endif
+                chunk.isBuildingMesh = false;
+                return;
+            }
         }
 
         // GPU face extraction path: trigger Blit + async readback, mesh will be built in _ProcessGpuFaceReadback
         if (_GpuFaceExtractionReady())
         {
-            if (!gpuFaceReadbackInFlight)
+            if (_GpuHasAvailableReadbackBuffer())
             {
                 _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
                 _PreComputeBiomeColors(chunk);
@@ -2404,10 +2653,16 @@ public class McWorld : UdonSharpBehaviour
     {
         if (!chunk.isBuildingMesh) return;
 
+        if (chunk._gpuFaceBuildActive)
+        {
+            _GpuBuildMeshFromFaceDataStep(chunk);
+            return;
+        }
+
         // OPTIMIZATION: GPU face extraction retry — chunk was deferred because GPU was busy
         if (chunk._gpuMeshPending)
         {
-            if (_GpuFaceExtractionReady() && !gpuFaceReadbackInFlight)
+            if (_GpuFaceExtractionReady() && _GpuHasAvailableReadbackBuffer())
             {
                 chunk._gpuMeshPending = false;
                 _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
@@ -2554,35 +2809,8 @@ public class McWorld : UdonSharpBehaviour
             _AddCrossShapedBlocks(chunk);
 
             _ApplyAllMeshData(chunk);
-
 #if LOGGING
-            // Track aggregate mesh building stats
-            if (enableDetailedTimings)
-            {
-                float meshBuildTime = (Time.realtimeSinceStartup - chunk.meshBuildStartTime) * 1000f;
-                stats_meshBuildTimeTotal += meshBuildTime;
-                if (meshBuildTime < stats_meshBuildTimeMin) stats_meshBuildTimeMin = meshBuildTime;
-                if (meshBuildTime > stats_meshBuildTimeMax) stats_meshBuildTimeMax = meshBuildTime;
-                stats_meshStepsTotal += chunk.mesh_step_count;
-                stats_greedyAxisYTime += chunk.time_AxisY;
-                stats_greedyAxisZTime += chunk.time_AxisZ;
-                stats_greedyAxisXTime += chunk.time_AxisX;
-                stats_sentinelBuildTime += chunk.time_SentinelBuild;
-                stats_meshApplyOpaqueTime += chunk.time_ApplyOpaque;
-                stats_meshApplyTransparentTime += chunk.time_ApplyTransparent;
-                stats_meshApplyCutoutTime += chunk.time_ApplyCutout;
-                stats_meshApplyColliderTime += chunk.time_ApplyCollision;
-            }
-            if (enableCounters)
-            {
-                stats_sentinelBuilds++;
-                stats_faceCullingTests += chunk.shouldDrawTests;
-                stats_facesCulled += (chunk.shouldDrawTests - chunk.shouldDrawTrue);
-                stats_facesDrawn += chunk.facesTotal;
-                stats_verticesOpaque += chunk._opaqueVertexCount;
-                stats_verticesTransparent += chunk._transparentVertexCount;
-                stats_verticesCutout += chunk._cutoutVertexCount;
-            }
+            _RecordMeshBuildCompletion(chunk, false, false);
 #endif
 
             chunk.isBuildingMesh = false;
@@ -2604,6 +2832,49 @@ public class McWorld : UdonSharpBehaviour
 
         }
     }
+
+#if LOGGING
+    private void _RecordMeshBuildCompletion(ChunkData chunk, bool usedGpuFaces, bool emptyMesh)
+    {
+        if (chunk == null) return;
+
+        stats_meshBuildTotal++;
+
+        if (enableCounters)
+        {
+            if (emptyMesh) stats_meshBuildEmptyCompletions++;
+            else if (usedGpuFaces) stats_meshBuildGpuCompletions++;
+            else stats_meshBuildCpuCompletions++;
+
+            stats_sentinelBuilds++;
+            if (!usedGpuFaces)
+            {
+                stats_faceCullingTests += chunk.shouldDrawTests;
+                stats_facesCulled += (chunk.shouldDrawTests - chunk.shouldDrawTrue);
+                stats_facesDrawn += chunk.facesTotal;
+            }
+            stats_verticesOpaque += chunk._opaqueVertexCount;
+            stats_verticesTransparent += chunk._transparentVertexCount;
+            stats_verticesCutout += chunk._cutoutVertexCount;
+        }
+
+        if (!enableDetailedTimings) return;
+
+        float meshBuildTime = (Time.realtimeSinceStartup - chunk.meshBuildStartTime) * 1000f;
+        stats_meshBuildTimeTotal += meshBuildTime;
+        if (meshBuildTime < stats_meshBuildTimeMin) stats_meshBuildTimeMin = meshBuildTime;
+        if (meshBuildTime > stats_meshBuildTimeMax) stats_meshBuildTimeMax = meshBuildTime;
+        stats_meshStepsTotal += chunk.mesh_step_count;
+        stats_greedyAxisYTime += chunk.time_AxisY;
+        stats_greedyAxisZTime += chunk.time_AxisZ;
+        stats_greedyAxisXTime += chunk.time_AxisX;
+        stats_sentinelBuildTime += chunk.time_SentinelBuild;
+        stats_meshApplyOpaqueTime += chunk.time_ApplyOpaque;
+        stats_meshApplyTransparentTime += chunk.time_ApplyTransparent;
+        stats_meshApplyCutoutTime += chunk.time_ApplyCutout;
+        stats_meshApplyColliderTime += chunk.time_ApplyCollision;
+    }
+#endif
 
     private void _EnsureSentinelBuffer(ChunkData chunk)
     {
@@ -3183,7 +3454,7 @@ public class McWorld : UdonSharpBehaviour
                 int maskIndex = v * width + u;
                 greedyMaskBlockIds[maskIndex] = selfID;
                 greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
-                greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, x, z));
+                greedyMaskPackedColors[maskIndex] = _GetPackedBiomeColor(chunk, selfID, x, z);
             }
         }
     }
@@ -6282,6 +6553,12 @@ public class McWorld : UdonSharpBehaviour
         if (chunk._cachedBiomeColors == null || chunk._cachedBiomeColors.Length != chunkSizeXZ * chunkSizeXZ)
         {
             chunk._cachedBiomeColors = new Color[chunkSizeXZ * chunkSizeXZ];
+            chunk._cachedPackedGrassBiomeColors = new int[chunkSizeXZ * chunkSizeXZ];
+            chunk._cachedBiomeColorsValid = false;
+        }
+        else if (chunk._cachedPackedGrassBiomeColors == null || chunk._cachedPackedGrassBiomeColors.Length != chunk._cachedBiomeColors.Length)
+        {
+            chunk._cachedPackedGrassBiomeColors = new int[chunk._cachedBiomeColors.Length];
             chunk._cachedBiomeColorsValid = false;
         }
 
@@ -6295,6 +6572,7 @@ public class McWorld : UdonSharpBehaviour
             for (int i = 0; i < chunk._cachedBiomeColors.Length; i++)
             {
                 chunk._cachedBiomeColors[i] = defaultColor;
+                chunk._cachedPackedGrassBiomeColors[i] = PACKED_WHITE_RGB;
             }
             chunk._cachedBiomeColorsValid = true;
             return;
@@ -6318,10 +6596,35 @@ public class McWorld : UdonSharpBehaviour
                 grassColor.a = 1f; // Keep full alpha
 
                 chunk._cachedBiomeColors[idx] = grassColor;
+                chunk._cachedPackedGrassBiomeColors[idx] = _PackColorRGB(grassColor);
             }
         }
 
         chunk._cachedBiomeColorsValid = true;
+    }
+
+    private int _GetPackedBiomeColor(ChunkData chunk, byte blockID, int localX, int localZ)
+    {
+        if (chunk == null || localX < 0 || localX >= chunkSizeXZ || localZ < 0 || localZ >= chunkSizeXZ)
+        {
+            return PACKED_WHITE_RGB;
+        }
+
+        bool isGrassTinted = BetaBiome.IsGrassTintedBlock(blockID);
+        bool isFoliageTinted = BetaBiome.IsFoliageTintedBlock(blockID);
+        bool isWaterTinted = BetaBiome.IsWaterTintedBlock(blockID);
+        if (!isGrassTinted && !isFoliageTinted && !isWaterTinted)
+        {
+            return PACKED_WHITE_RGB;
+        }
+
+        int idx = localZ * chunkSizeXZ + localX;
+        if (isGrassTinted && chunk._cachedPackedGrassBiomeColors != null && idx < chunk._cachedPackedGrassBiomeColors.Length)
+        {
+            return chunk._cachedPackedGrassBiomeColors[idx];
+        }
+
+        return _PackColorRGB(_GetCachedBiomeColor(chunk, blockID, localX, localZ));
     }
 
     // OPTIMIZATION Phase 6: Get cached biome color with block-specific tinting
@@ -6959,8 +7262,15 @@ public class McWorld : UdonSharpBehaviour
             float avgStepsPerChunk = stats_meshStepsTotal / (float)stats_meshBuildTotal;
             logBuilder.AppendLine($"Mesh Building: {stats_meshBuildTotal} chunks, avg {avgMeshTime:F2}ms (min {stats_meshBuildTimeMin:F2}ms, max {stats_meshBuildTimeMax:F2}ms)");
             logBuilder.AppendLine($"  Steps: avg {avgStepsPerChunk:F1} per chunk");
+            logBuilder.AppendLine($"  Completions: cpu {stats_meshBuildCpuCompletions}, gpu {stats_meshBuildGpuCompletions}, empty {stats_meshBuildEmptyCompletions}");
             if (enableDetailedTimings && stats_meshBuildTotal > 0)
             {
+                if (stats_gpuFaceDecodeSteps > 0)
+                {
+                    float avgGpuDecodeStepMs = stats_gpuFaceDecodeTime / stats_gpuFaceDecodeSteps;
+                    float minGpuDecodeStepMs = stats_gpuFaceDecodeTimeMin == float.MaxValue ? 0f : stats_gpuFaceDecodeTimeMin;
+                    logBuilder.AppendLine($"  GPU decode: {stats_gpuFaceDecodeSteps} steps, {stats_gpuFaceDecodeTime:F2}ms total, avg {avgGpuDecodeStepMs:F2}ms (min {minGpuDecodeStepMs:F2}ms, max {stats_gpuFaceDecodeTimeMax:F2}ms)");
+                }
                 float totalGreedy = stats_greedyAxisYTime + stats_greedyAxisZTime + stats_greedyAxisXTime;
                 if (totalGreedy > 0)
                 {
@@ -6989,19 +7299,21 @@ public class McWorld : UdonSharpBehaviour
             stats_gpuLightingSeedBlits > 0 ||
             stats_gpuLightingPropagateBlits > 0 ||
             stats_gpuFaceExtractBlits > 0 ||
+            stats_gpuFaceExportBlits > 0 ||
             stats_gpuChunkUploads > 0 ||
             stats_gpuFaceReadbackRequests > 0;
 
         if (hasGpuBackendStats)
         {
             logBuilder.AppendLine("GPU Backend:");
-            logBuilder.AppendLine($"  Blit submit: atlas overlay {stats_gpuAtlasOverlayBlits} ({stats_gpuAtlasOverlayBlitTime:F3}ms), light seed {stats_gpuLightingSeedBlits} ({stats_gpuLightingSeedBlitTime:F3}ms), light propagate {stats_gpuLightingPropagateBlits} ({stats_gpuLightingPropagateBlitTime:F3}ms), face extract {stats_gpuFaceExtractBlits} ({stats_gpuFaceExtractBlitTime:F3}ms)");
+            logBuilder.AppendLine($"  Blit submit: atlas overlay {stats_gpuAtlasOverlayBlits} ({stats_gpuAtlasOverlayBlitTime:F3}ms), light seed {stats_gpuLightingSeedBlits} ({stats_gpuLightingSeedBlitTime:F3}ms), light propagate {stats_gpuLightingPropagateBlits} ({stats_gpuLightingPropagateBlitTime:F3}ms), face extract {stats_gpuFaceExtractBlits} ({stats_gpuFaceExtractBlitTime:F3}ms), face export {stats_gpuFaceExportBlits} ({stats_gpuFaceExportBlitTime:F3}ms)");
             logBuilder.AppendLine($"  CPU->GPU uploads: chunk blocks {stats_gpuChunkUploads} ({stats_gpuChunkUploadTime:F3}ms, {stats_gpuChunkUploadBytes / 1024f:F1}KB)");
             if (stats_gpuFaceReadbackRequests > 0)
             {
                 float avgLatency = stats_gpuFaceReadbacksCompleted > 0 ? stats_gpuFaceReadbackLatencyTotal / stats_gpuFaceReadbacksCompleted : 0f;
+                float bytesPerRequestKb = stats_gpuFaceReadbackRequests > 0 ? (stats_gpuFaceReadbackBytes / (float)stats_gpuFaceReadbackRequests) / 1024f : 0f;
                 logBuilder.AppendLine($"  GPU->CPU face readback: req {stats_gpuFaceReadbackRequests}, ok {stats_gpuFaceReadbacksCompleted}, fail {stats_gpuFaceReadbackFailures}, latency avg {avgLatency:F3}ms min {(stats_gpuFaceReadbackLatencyMin == float.MaxValue ? 0f : stats_gpuFaceReadbackLatencyMin):F3}ms max {stats_gpuFaceReadbackLatencyMax:F3}ms");
-                logBuilder.AppendLine($"  Readback copy {stats_gpuFaceReadbackCallbackCopyTime:F3}ms, tile extract {stats_gpuFaceTileExtractTime:F3}ms, data {stats_gpuFaceReadbackBytes / 1024f:F1}KB");
+                logBuilder.AppendLine($"  Readback copy {stats_gpuFaceReadbackCallbackCopyTime:F3}ms, bytes/request {bytesPerRequestKb:F1}KB, data {stats_gpuFaceReadbackBytes / 1024f:F1}KB");
             }
         }
 
@@ -7067,6 +7379,9 @@ public class McWorld : UdonSharpBehaviour
         stats_processActiveChunksTime = 0f;
         stats_reconciliationTime = 0f;
         stats_meshBuildTotal = 0;
+        stats_meshBuildCpuCompletions = 0;
+        stats_meshBuildGpuCompletions = 0;
+        stats_meshBuildEmptyCompletions = 0;
         stats_meshBuildTimeTotal = 0f;
         stats_meshBuildTimeMin = float.MaxValue;
         stats_meshBuildTimeMax = 0f;
@@ -7086,6 +7401,10 @@ public class McWorld : UdonSharpBehaviour
         stats_meshApplyTransparentTime = 0f;
         stats_meshApplyCutoutTime = 0f;
         stats_meshApplyColliderTime = 0f;
+        stats_gpuFaceDecodeSteps = 0;
+        stats_gpuFaceDecodeTime = 0f;
+        stats_gpuFaceDecodeTimeMin = float.MaxValue;
+        stats_gpuFaceDecodeTimeMax = 0f;
         stats_rleCompressions = 0;
         stats_rleDecompressions = 0;
         stats_rleCompressionTime = 0f;
@@ -7127,6 +7446,8 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuLightingPropagateBlitTime = 0f;
         stats_gpuFaceExtractBlits = 0;
         stats_gpuFaceExtractBlitTime = 0f;
+        stats_gpuFaceExportBlits = 0;
+        stats_gpuFaceExportBlitTime = 0f;
         stats_gpuChunkUploads = 0;
         stats_gpuChunkUploadTime = 0f;
         stats_gpuChunkUploadBytes = 0;

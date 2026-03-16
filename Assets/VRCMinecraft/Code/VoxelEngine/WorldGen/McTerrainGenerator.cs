@@ -298,9 +298,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuCachedColumnZ = int.MaxValue;
     private int gpuPendingColumnX = int.MaxValue;
     private int gpuPendingColumnZ = int.MaxValue;
+    private bool gpuCachedChunkSlicesReady = false;
+    private byte[][] gpuCachedChunkSlices;
     private GpuWorldgenReadbackPhase gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
     private int gpuWorldHeightBlocks = 0;
     private Texture2D gpuPermTexture;
+    private Texture2D gpuPermTextureNoise1;
+    private Texture2D gpuPermTextureNoise2;
+    private Texture2D gpuPermTextureNoise3;
+    private Texture2D gpuPermTextureNoise6;
+    private Texture2D gpuPermTextureNoise7;
     private Texture2D gpuCoordXTexture;
     private Texture2D gpuCoordYTexture;
     private Texture2D gpuCoordZTexture;
@@ -342,6 +349,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Color32[] gpuColumnReadbackPixels;
     private Color32[] gpuSurfaceInfoReadbackPixels;
     private Color[] gpuNoiseDiagnosticReadbackPixels;
+    private bool gpuClimateUploadValid = false;
+    private int gpuClimateUploadChunkX = int.MaxValue;
+    private int gpuClimateUploadChunkZ = int.MaxValue;
+    private NoiseGenerator3dPerlin[] gpuLastCoordUploadGenerators;
+    private int gpuLastCoordUploadXPos = int.MinValue;
+    private int gpuLastCoordUploadYPos = int.MinValue;
+    private int gpuLastCoordUploadZPos = int.MinValue;
+    private int gpuLastCoordUploadXSize = -1;
+    private int gpuLastCoordUploadYSize = -1;
+    private int gpuLastCoordUploadZSize = -1;
+    private double gpuLastCoordUploadGridX = double.NaN;
+    private double gpuLastCoordUploadGridY = double.NaN;
+    private double gpuLastCoordUploadGridZ = double.NaN;
+    private bool gpuLastCoordUploadIs2D = false;
     private int gpuPropPermTexId;
     private int gpuPropAccumulationTexId;
     private int gpuPropOctaveId;
@@ -614,7 +635,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 agg_gpuNoiseInputUploads, agg_gpuNoiseInputUploadTime, agg_gpuNoiseInputUploadBytes / 1024f,
                 agg_gpuSurfaceUploads, agg_gpuSurfaceUploadTime, agg_gpuSurfaceUploadBytes / 1024f,
                 agg_gpuFinalColumnUploads, agg_gpuFinalColumnUploadTime, agg_gpuFinalColumnUploadBytes / 1024f);
-            sb.AppendFormat("  GPU->CPU chunk copy: {0} copies, {1:F3}ms, {2:F1}KB\n",
+            sb.AppendFormat("  GPU->CPU slice cache unpack: {0} columns, {1:F3}ms, {2:F1}KB\n",
                 agg_gpuChunkSliceCopies, agg_gpuChunkSliceCopyTime, agg_gpuChunkSliceCopyBytes / 1024f);
 
             if (agg_gpuBaseReadbacksCompleted > 0 || agg_gpuBaseReadbackFailures > 0)
@@ -908,6 +929,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuColumnReadbackPending = false;
         gpuColumnReadbackReady = false;
         gpuColumnReadbackFailed = false;
+        gpuCachedChunkSlicesReady = false;
+        gpuClimateUploadValid = false;
+        gpuClimateUploadChunkX = int.MaxValue;
+        gpuClimateUploadChunkZ = int.MaxValue;
+        gpuLastCoordUploadGenerators = null;
         gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
         if (!enableGpuWorldgen) return;
         if (world == null || gpuNoiseOctaveMaterial == null || gpuNoiseCombineMaterial == null || gpuColumnBaseFillMaterial == null || gpuColumnSurfaceInfoMaterial == null || gpuColumnSurfaceReplaceMaterial == null) return;
@@ -924,6 +950,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         // RGBA32 preserves exact integers via the round-trip: store(v/255)→8bit(v)→read(v/255)→×255=v
         // Width is 512 (not 256) because the Perlin double-table uses indices 0-511.
         gpuPermTexture = _CreateGpuColorTexture(512, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuPermTextureNoise1 = _CreateGpuColorTexture(512, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuPermTextureNoise2 = _CreateGpuColorTexture(512, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuPermTextureNoise3 = _CreateGpuColorTexture(512, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuPermTextureNoise6 = _CreateGpuColorTexture(512, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuPermTextureNoise7 = _CreateGpuColorTexture(512, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
         // These tables carry the lattice indices and fractional coordinates that drive
         // the entire Perlin lookup. Keep them at full float precision to minimize
         // CPU-vs-GPU drift before considering software-emulated doubles.
@@ -972,6 +1003,18 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuSurfaceInfoReadbackPixels = new Color32[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuNoiseDiagnosticReadbackPixels = new Color[densityPackedWidth * densityYSize];
         gpuNoiseDiagnosticLog = new StringBuilder(4096);
+        gpuCachedChunkSlices = new byte[world.worldDimensionY][];
+        int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
+        for (int chunkY = 0; chunkY < world.worldDimensionY; chunkY++)
+        {
+            gpuCachedChunkSlices[chunkY] = new byte[chunkSize];
+        }
+
+        _UploadGpuPermutationTable(gpuPermTextureNoise1, noiseGen1.generatorCollection, 16);
+        _UploadGpuPermutationTable(gpuPermTextureNoise2, noiseGen2.generatorCollection, 16);
+        _UploadGpuPermutationTable(gpuPermTextureNoise3, noiseGen3.generatorCollection, 8);
+        _UploadGpuPermutationTable(gpuPermTextureNoise6, noiseGen6.generatorCollection, 10);
+        _UploadGpuPermutationTable(gpuPermTextureNoise7, noiseGen7.generatorCollection, 16);
 
         gpuPropPermTexId = VRCShader.PropertyToID("_PermTex");
         gpuPropAccumulationTexId = VRCShader.PropertyToID("_AccumulationTex");
@@ -1042,24 +1085,46 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuWorldgenReady = true;
     }
 
-
-
-    private void _UploadGpuPermutationTexture(NoiseGenerator3dPerlin perlin)
+    private void _UploadGpuPermutationTable(Texture2D targetTexture, NoiseGenerator3dPerlin[] generators, int octaveCount)
     {
-        if (gpuPermTexture == null || perlin == null || perlin.permutations == null) return;
+        if (targetTexture == null || generators == null || gpuPermutationPixels == null) return;
 
-        for (int i = 0; i < 256; i++)
+        for (int i = 0; i < gpuPermutationPixels.Length; i++)
         {
-            gpuPermutationPixels[i] = new Color(perlin.permutations[i] / 255.0f, 0f, 0f, 1f);
+            gpuPermutationPixels[i] = new Color(0f, 0f, 0f, 1f);
         }
 
-        gpuPermTexture.SetPixels(gpuPermutationPixels);
-        gpuPermTexture.Apply(false, false);
+        for (int octave = 0; octave < octaveCount; octave++)
+        {
+            NoiseGenerator3dPerlin generator = generators[octave];
+            if (generator == null || generator.permutations == null) continue;
+
+            int rowOffset = octave * 512;
+            for (int i = 0; i < 512; i++)
+            {
+                gpuPermutationPixels[rowOffset + i] = new Color(generator.permutations[i] / 255.0f, 0f, 0f, 1f);
+            }
+        }
+
+        targetTexture.SetPixels(gpuPermutationPixels);
+        targetTexture.Apply(false, false);
+    }
+
+    private Texture2D _ResolveGpuPermutationTexture(NoiseGenerator3dPerlin[] generators)
+    {
+        if (generators == null) return null;
+        if (noiseGen1 != null && generators == noiseGen1.generatorCollection) return gpuPermTextureNoise1;
+        if (noiseGen2 != null && generators == noiseGen2.generatorCollection) return gpuPermTextureNoise2;
+        if (noiseGen3 != null && generators == noiseGen3.generatorCollection) return gpuPermTextureNoise3;
+        if (noiseGen6 != null && generators == noiseGen6.generatorCollection) return gpuPermTextureNoise6;
+        if (noiseGen7 != null && generators == noiseGen7.generatorCollection) return gpuPermTextureNoise7;
+        return null;
     }
 
     private void _UploadGpuClimateTextures()
     {
         if (gpuTemperatureTexture == null || gpuRainfallTexture == null || wcm == null || wcm.temperatures == null || wcm.rainfall == null) return;
+        if (gpuClimateUploadValid && gpuClimateUploadChunkX == currentChunkX && gpuClimateUploadChunkZ == currentChunkZ) return;
 
 #if LOGGING
         float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -1090,6 +1155,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
         gpuRainfallTexture.SetPixels(gpuClimatePixels);
         gpuRainfallTexture.Apply(false, false);
+        gpuClimateUploadValid = true;
+        gpuClimateUploadChunkX = currentChunkX;
+        gpuClimateUploadChunkZ = currentChunkZ;
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -1175,6 +1243,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void _UploadGpuNoiseCoordTextures(NoiseGenerator3dPerlin[] generators, int octaveCount, int xSize, int ySize, int zSize, int xPos, int yPos, int zPos, double gridX, double gridY, double gridZ, bool is2D)
     {
         if (gpuCoordXTexture == null || gpuCoordYTexture == null || gpuCoordZTexture == null) return;
+        if (gpuLastCoordUploadGenerators == generators &&
+            gpuLastCoordUploadXPos == xPos &&
+            gpuLastCoordUploadYPos == yPos &&
+            gpuLastCoordUploadZPos == zPos &&
+            gpuLastCoordUploadXSize == xSize &&
+            gpuLastCoordUploadYSize == ySize &&
+            gpuLastCoordUploadZSize == zSize &&
+            gpuLastCoordUploadGridX == gridX &&
+            gpuLastCoordUploadGridY == gridY &&
+            gpuLastCoordUploadGridZ == gridZ &&
+            gpuLastCoordUploadIs2D == is2D)
+        {
+            return;
+        }
 
 #if LOGGING
         float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -1240,6 +1322,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuCoordYTexture.Apply(false, false);
         gpuCoordZTexture.SetPixels(gpuCoordZPixels);
         gpuCoordZTexture.Apply(false, false);
+        gpuLastCoordUploadGenerators = generators;
+        gpuLastCoordUploadXPos = xPos;
+        gpuLastCoordUploadYPos = yPos;
+        gpuLastCoordUploadZPos = zPos;
+        gpuLastCoordUploadXSize = xSize;
+        gpuLastCoordUploadYSize = ySize;
+        gpuLastCoordUploadZSize = zSize;
+        gpuLastCoordUploadGridX = gridX;
+        gpuLastCoordUploadGridY = gridY;
+        gpuLastCoordUploadGridZ = gridZ;
+        gpuLastCoordUploadIs2D = is2D;
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -1252,40 +1345,25 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void _RunGpuNoiseOctaves(NoiseGenerator3dPerlin[] generators, int octaveCount, RenderTexture resultTexture, int xPos, int yPos, int zPos, int xSize, int ySize, int zSize, double gridX, double gridY, double gridZ, bool is2D)
     {
         if (!gpuWorldgenReady || generators == null || resultTexture == null) return;
-
+        Texture2D permutationTexture = _ResolveGpuPermutationTexture(generators);
 #if LOGGING
         float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
-        // BATCH UPLOAD: Write ALL octaves' permutation data into a single 256×N texture
-        // so we only call Apply() ONCE before the blit loop. This eliminates the race
-        // condition where Apply() for octave N+1 could overwrite texture data before
-        // the GPU finishes reading octave N's Blit.
-        for (int i = 0; i < gpuPermutationPixels.Length; i++)
+        if (permutationTexture == null)
         {
-            gpuPermutationPixels[i] = new Color(0f, 0f, 0f, 1f);
-        }
-        for (int octave = 0; octave < octaveCount; octave++)
-        {
-            NoiseGenerator3dPerlin generator = generators[octave];
-            if (generator == null) continue;
-            int rowOffset = octave * 512;
-            for (int i = 0; i < 512; i++)
-            {
-                gpuPermutationPixels[rowOffset + i] = new Color(generator.permutations[i] / 255.0f, 0f, 0f, 1f);
-            }
-        }
-        gpuPermTexture.SetPixels(gpuPermutationPixels);
-        gpuPermTexture.Apply(false, false);
-        _UploadGpuNoiseCoordTextures(generators, octaveCount, xSize, ySize, zSize, xPos, yPos, zPos, gridX, gridY, gridZ, is2D);
+            _UploadGpuPermutationTable(gpuPermTexture, generators, octaveCount);
+            permutationTexture = gpuPermTexture;
 #if LOGGING
-        if (enableDetailedTimings)
-        {
-            int permBytes = gpuPermutationPixels.Length * 4;
-            _RecordGpuNoiseInputUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, permBytes);
-        }
+            if (enableDetailedTimings)
+            {
+                int permBytes = gpuPermutationPixels.Length * 4;
+                _RecordGpuNoiseInputUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, permBytes);
+            }
 #endif
+        }
+        _UploadGpuNoiseCoordTextures(generators, octaveCount, xSize, ySize, zSize, xPos, yPos, zPos, gridX, gridY, gridZ, is2D);
 
-        gpuNoiseOctaveMaterial.SetTexture(gpuPropPermTexId, gpuPermTexture);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropPermTexId, permutationTexture);
         gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordXTexId, gpuCoordXTexture);
         gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordYTexId, gpuCoordYTexture);
         gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordZTexId, gpuCoordZTexture);
@@ -1759,6 +1837,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuColumnReadbackFailed = false;
         gpuPendingColumnX = currentChunkX;
         gpuPendingColumnZ = currentChunkZ;
+        gpuCachedChunkSlicesReady = false;
         gpuColumnSurfaceInfoMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnBaseTexture);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropChunkSizeXZId, world.chunkSizeXZ);
@@ -2058,42 +2137,89 @@ public class McTerrainGenerator : UdonSharpBehaviour
             agg_gpuColumnsFinalized++;
         }
 #endif
+        _BuildGpuChunkSliceCache();
 
         gpuCachedColumnX = gpuPendingColumnX;
         gpuCachedColumnZ = gpuPendingColumnZ;
+        gpuCachedChunkSlicesReady = true;
         return true;
     }
 
-    private void _CopyGpuChunkSliceToWorkingData()
+    private void _BuildGpuChunkSliceCache()
     {
-        if (!gpuColumnReadbackReady || gpuColumnReadbackPixels == null || workingChunkData == null) return;
+        if (gpuColumnReadbackPixels == null || gpuCachedChunkSlices == null || world == null) return;
 
 #if LOGGING
         float copyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
         int sizeXZ = world.chunkSizeXZ;
         int sizeY = world.chunkSizeY;
+        int chunkStride = sizeXZ * sizeXZ;
+        int chunkSize = sizeXZ * sizeY * sizeXZ;
+
+        for (int chunkY = 0; chunkY < world.worldDimensionY; chunkY++)
+        {
+            byte[] slice = gpuCachedChunkSlices[chunkY];
+            if (slice == null || slice.Length != chunkSize)
+            {
+                slice = new byte[chunkSize];
+                gpuCachedChunkSlices[chunkY] = slice;
+            }
+
+            int chunkYBase = chunkY * sizeY;
+            for (int localY = 0; localY < sizeY; localY++)
+            {
+                int globalY = chunkYBase + localY;
+                int sourceRowBase = globalY * sizeXZ;
+                int targetYBase = localY * chunkStride;
+                for (int z = 0; z < sizeXZ; z++)
+                {
+                    int sourceIndex = (sourceRowBase + z) * sizeXZ;
+                    int targetIndex = targetYBase + z * sizeXZ;
+                    for (int x = 0; x < sizeXZ; x++)
+                    {
+                        slice[targetIndex + x] = gpuColumnReadbackPixels[sourceIndex + x].r;
+                    }
+                }
+            }
+        }
+
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            agg_gpuChunkSliceCopies++;
+            agg_gpuChunkSliceCopyTime += (Time.realtimeSinceStartup - copyStart) * 1000f;
+            agg_gpuChunkSliceCopyBytes += gpuColumnReadbackPixels.Length;
+        }
+#endif
+    }
+
+    private void _CopyGpuChunkSliceToWorkingData()
+    {
+        if (!gpuColumnReadbackReady || !gpuCachedChunkSlicesReady || gpuCachedChunkSlices == null || workingChunkData == null) return;
+
+        int sizeXZ = world.chunkSizeXZ;
+        int sizeY = world.chunkSizeY;
         int xyStride = sizeXZ * sizeXZ;
-        int chunkYBase = currentChunkY * sizeY;
+        byte[] slice = currentChunkY >= 0 && currentChunkY < gpuCachedChunkSlices.Length ? gpuCachedChunkSlices[currentChunkY] : null;
+        if (slice == null) return;
+
         System.Array.Clear(workingChunkData, 0, workingChunkData.Length);
         for (int i = 0; i < highestStoneYColumn.Length; i++) highestStoneYColumn[i] = -1;
-
+        System.Array.Copy(slice, workingChunkData, slice.Length);
         for (int localY = 0; localY < sizeY; localY++)
         {
-            int globalY = chunkYBase + localY;
-            int sourceRowBase = globalY * sizeXZ;
             int targetYBase = localY * xyStride;
             for (int z = 0; z < sizeXZ; z++)
             {
-                int sourceIndex = (sourceRowBase + z) * sizeXZ;
                 int targetIndex = targetYBase + z * sizeXZ;
+                int columnIndex = z * sizeXZ;
                 for (int x = 0; x < sizeXZ; x++)
                 {
-                    byte blockID = gpuColumnReadbackPixels[sourceIndex + x].r;
-                    workingChunkData[targetIndex + x] = blockID;
-                    if (blockID == stoneBlockID && localY > highestStoneYColumn[z * sizeXZ + x])
+                    byte blockID = slice[targetIndex + x];
+                    if (blockID == stoneBlockID && localY > highestStoneYColumn[columnIndex + x])
                     {
-                        highestStoneYColumn[z * sizeXZ + x] = localY;
+                        highestStoneYColumn[columnIndex + x] = localY;
                     }
                 }
             }
@@ -2101,18 +2227,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
         // DIAGNOSTIC: Compare GPU readback base blocks against CPU-computed terrain
         // for this chunk slice (only runs once per column, on the topmost chunk)
-        if (currentChunkY == world.worldDimensionY - 1)
+        if (enableGpuNoiseDiagnostics && currentChunkY == world.worldDimensionY - 1)
         {
             _DiagnosticCompareGpuVsCpuBaseColumn();
         }
-#if LOGGING
-        if (enableDetailedTimings)
-        {
-            agg_gpuChunkSliceCopies++;
-            agg_gpuChunkSliceCopyTime += (Time.realtimeSinceStartup - copyStart) * 1000f;
-            agg_gpuChunkSliceCopyBytes += workingChunkData.Length;
-        }
-#endif
     }
 
     private void _DiagnosticCompareGpuVsCpuBaseColumn()
@@ -2403,7 +2521,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         if (currentChunkX == cacheCoordX && currentChunkZ == cacheCoordZ)
         {
             // Cached column, skip directly to terrain generation or GPU copy
-            if (gpuWorldgenReady && gpuColumnReadbackReady && currentChunkX == gpuCachedColumnX && currentChunkZ == gpuCachedColumnZ)
+            if (gpuWorldgenReady && gpuColumnReadbackReady && gpuCachedChunkSlicesReady && currentChunkX == gpuCachedColumnX && currentChunkZ == gpuCachedColumnZ)
             {
                 currentState = GenerationState.Copy_GpuChunkSlice;
             }

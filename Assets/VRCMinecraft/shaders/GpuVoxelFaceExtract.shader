@@ -7,6 +7,8 @@ Shader "VRCM/GpuVoxelFaceExtract"
         _SlotLookupTex ("Slot Lookup", 2D) = "black" {}
         _SlotMetaTex ("Slot Meta", 2D) = "black" {}
         _DrawTableTex ("Draw Table 256x256", 2D) = "black" {}
+        _Mode ("Mode", Float) = 0
+        _ReadSlotIndex ("Read Slot Index", Float) = 0
     }
 
     SubShader
@@ -44,6 +46,8 @@ Shader "VRCM/GpuVoxelFaceExtract"
             sampler2D _SlotLookupTex;
             sampler2D _SlotMetaTex;
             sampler2D _DrawTableTex;  // 256x256 shouldDraw lookup
+            float _Mode;
+            float _ReadSlotIndex;
             float4 _UdonVRCM_GpuAtlasInfo;   // (atlasWidth, atlasHeight, atlasSlotsX, atlasSlotsY)
             float4 _UdonVRCM_GpuWorldInfo;    // (worldDimX, worldDimY, worldDimZ, worldDimY*worldDimZ)
             float4 _UdonVRCM_GpuChunkInfo;    // (chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ)
@@ -134,6 +138,57 @@ Shader "VRCM/GpuVoxelFaceExtract"
 
             float4 frag(v2f i) : SV_Target
             {
+                if (_Mode > 0.5)
+                {
+                    float slotIndex = floor(_ReadSlotIndex + 0.5);
+                    if (slotIndex < 0.0 || slotIndex >= _UdonVRCM_GpuVoxelOffset.w) return 0;
+
+                    float2 slotMetaUv = float2((slotIndex + 0.5) / _UdonVRCM_GpuVoxelOffset.w, 0.5);
+                    float4 slotMeta = tex2D(_SlotMetaTex, slotMetaUv);
+                    if (slotMeta.a < 0.5) return 0;
+
+                    float localX = floor(i.uv.x * _UdonVRCM_GpuChunkInfo.x);
+                    float packedYZ = floor(i.uv.y * (_UdonVRCM_GpuChunkInfo.y * _UdonVRCM_GpuChunkInfo.x));
+                    float localY = floor(packedYZ / _UdonVRCM_GpuChunkInfo.x);
+                    float localZ = packedYZ - localY * _UdonVRCM_GpuChunkInfo.x;
+
+                    float selfId = SampleBlockId(slotIndex, localX, localY, localZ);
+                    if (selfId < 0.5) return 0;
+
+                    float2 propUv = float2((selfId + 0.5) / 256.0, 0.5);
+                    float4 blockProps = tex2D(_BlockPropsTex, propUv);
+                    float shapeType = floor(blockProps.b * 255.0 + 0.5);
+                    if (shapeType >= 1.0)
+                    {
+                        return float4(0.0, selfId / 255.0, shapeType / 255.0, 1.0);
+                    }
+
+                    float chunkX = floor(slotMeta.r * 255.0 + 0.5);
+                    float chunkY = floor(slotMeta.g * 255.0 + 0.5);
+                    float chunkZ = floor(slotMeta.b * 255.0 + 0.5);
+                    float faceMask = 0.0;
+
+                    float nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 1, 0);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 1.0;
+
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, -1, 0);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 2.0;
+
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, 1);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 4.0;
+
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, -1);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 8.0;
+
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 1, 0, 0);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 16.0;
+
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, -1, 0, 0);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 32.0;
+
+                    return float4(faceMask / 255.0, selfId / 255.0, shapeType / 255.0, 1.0);
+                }
+
                 // Decode atlas pixel position → slot + local (x, y, z)
                 float pixelX = floor(i.uv.x * _UdonVRCM_GpuAtlasInfo.x);
                 float pixelY = floor(i.uv.y * _UdonVRCM_GpuAtlasInfo.y);
