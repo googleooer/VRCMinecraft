@@ -288,6 +288,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private BetaBiomeEnum[] cachedBiomes;
     private double[] cachedTemperatures;
     private double[] cachedRainfall;
+    private const int BIOME_COLUMN_CACHE_SIZE = 16;
+    private int[] biomeCacheChunkX;
+    private int[] biomeCacheChunkZ;
+    private double[][] biomeCacheTemperatures;
+    private double[][] biomeCacheRainfall;
+    private int biomeCacheWriteIndex = 0;
 
     // GPU worldgen runtime state
     private bool gpuWorldgenReady = false;
@@ -541,6 +547,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
             // Fallback, though world should always be available.
             columnDepthCache = new int[16 * 16];
             columnFillerCache = new byte[16 * 16];
+        }
+
+        biomeCacheChunkX = new int[BIOME_COLUMN_CACHE_SIZE];
+        biomeCacheChunkZ = new int[BIOME_COLUMN_CACHE_SIZE];
+        biomeCacheTemperatures = new double[BIOME_COLUMN_CACHE_SIZE][];
+        biomeCacheRainfall = new double[BIOME_COLUMN_CACHE_SIZE][];
+        for (int i = 0; i < BIOME_COLUMN_CACHE_SIZE; i++)
+        {
+            biomeCacheChunkX[i] = int.MaxValue;
+            biomeCacheChunkZ[i] = int.MaxValue;
         }
 
         rand = new JavaRandom(seed);
@@ -871,6 +887,42 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_biomeSandstoneAssignments += biomeSandstoneAssignments;
     }
 #endif
+
+    private void _CacheBiomeColumnData(int chunkX, int chunkZ, double[] temperatures, double[] rainfall)
+    {
+        if (temperatures == null || rainfall == null || biomeCacheChunkX == null || biomeCacheTemperatures == null || biomeCacheRainfall == null) return;
+
+        int slot = -1;
+        for (int i = 0; i < BIOME_COLUMN_CACHE_SIZE; i++)
+        {
+            if (biomeCacheChunkX[i] == chunkX && biomeCacheChunkZ[i] == chunkZ)
+            {
+                slot = i;
+                break;
+            }
+        }
+
+        if (slot == -1)
+        {
+            slot = biomeCacheWriteIndex;
+            biomeCacheWriteIndex = (biomeCacheWriteIndex + 1) % BIOME_COLUMN_CACHE_SIZE;
+        }
+
+        biomeCacheChunkX[slot] = chunkX;
+        biomeCacheChunkZ[slot] = chunkZ;
+
+        if (biomeCacheTemperatures[slot] == null || biomeCacheTemperatures[slot].Length != temperatures.Length)
+        {
+            biomeCacheTemperatures[slot] = new double[temperatures.Length];
+        }
+        if (biomeCacheRainfall[slot] == null || biomeCacheRainfall[slot].Length != rainfall.Length)
+        {
+            biomeCacheRainfall[slot] = new double[rainfall.Length];
+        }
+
+        System.Array.Copy(temperatures, biomeCacheTemperatures[slot], temperatures.Length);
+        System.Array.Copy(rainfall, biomeCacheRainfall[slot], rainfall.Length);
+    }
 
     private Texture2D _CreateGpuFloatTexture(int width, int height, TextureWrapMode wrapMode)
     {
@@ -2601,6 +2653,94 @@ public class McTerrainGenerator : UdonSharpBehaviour
         totalSteps = 0;
 #endif
     }
+
+    public bool CanCopyCachedGpuChunkSlice(int chunkX, int chunkY, int chunkZ)
+    {
+        if (!isInitialized || !enableGpuWorldgen || !gpuWorldgenReady || !gpuColumnReadbackReady || !gpuCachedChunkSlicesReady || gpuCachedChunkSlices == null || world == null)
+        {
+            return false;
+        }
+
+        if (chunkY < 0 || chunkY >= world.worldDimensionY) return false;
+        if (chunkY >= world.worldDimensionY - 1) return false; // top chunk still needs decoration
+
+        int adjustedChunkX = chunkX + (chunkOffsetX / world.chunkSizeXZ);
+        int adjustedChunkZ = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+        if (adjustedChunkX != gpuCachedColumnX || adjustedChunkZ != gpuCachedColumnZ) return false;
+
+        return gpuCachedChunkSlices[chunkY] != null;
+    }
+
+    public bool TryCopyCachedGpuChunkSlice(int chunkX, int chunkY, int chunkZ, out byte[] completedData)
+    {
+        completedData = null;
+        if (!CanCopyCachedGpuChunkSlice(chunkX, chunkY, chunkZ)) return false;
+
+        int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
+        if (workingChunkData == null || workingChunkData.Length != chunkSize)
+        {
+            workingChunkData = new byte[chunkSize];
+        }
+
+#if LOGGING
+        float copyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+        System.Array.Copy(gpuCachedChunkSlices[chunkY], workingChunkData, chunkSize);
+        completedData = workingChunkData;
+
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            float copyMs = (Time.realtimeSinceStartup - copyStart) * 1000f;
+            float display_time_Preparation = timingsCached ? cached_time_Preparation : time_Preparation;
+            float display_time_Prep_GetBiomes = timingsCached ? cached_time_Prep_GetBiomes : time_Prep_GetBiomes;
+            float display_time_Prep_SandNoise = timingsCached ? cached_time_Prep_SandNoise : time_Prep_SandNoise;
+            float display_time_Prep_GravelNoise = timingsCached ? cached_time_Prep_GravelNoise : time_Prep_GravelNoise;
+            float display_time_Prep_StoneNoise = timingsCached ? cached_time_Prep_StoneNoise : time_Prep_StoneNoise;
+            float display_time_Prep_AllocNoiseCache = timingsCached ? cached_time_Prep_AllocNoiseCache : time_Prep_AllocNoiseCache;
+            float display_time_NoiseGen1 = timingsCached ? cached_time_NoiseGen1 : time_NoiseGen1;
+            float display_time_NoiseGen2 = timingsCached ? cached_time_NoiseGen2 : time_NoiseGen2;
+            float display_time_NoiseGen3 = timingsCached ? cached_time_NoiseGen3 : time_NoiseGen3;
+            float display_time_Noise6 = timingsCached ? cached_time_Noise6 : time_Noise6;
+            float display_time_Noise7 = timingsCached ? cached_time_Noise7 : time_Noise7;
+            float display_time_NoiseCombine = timingsCached ? cached_time_NoiseCombine : time_NoiseCombine;
+            int display_noiseGen1Cells = timingsCached ? cached_noiseGen1Cells : noiseGen1Cells;
+            int display_noiseGen2Cells = timingsCached ? cached_noiseGen2Cells : noiseGen2Cells;
+            int display_noiseGen3Cells = timingsCached ? cached_noiseGen3Cells : noiseGen3Cells;
+            int display_noise6Cells = timingsCached ? cached_noise6Cells : noise6Cells;
+            int display_noise7Cells = timingsCached ? cached_noise7Cells : noise7Cells;
+            int display_noiseCombineCells = timingsCached ? cached_noiseCombineCells : noiseCombineCells;
+
+            time_GeneratingTerrain = copyMs;
+            time_ReplacingBiomes = 0f;
+            totalSteps = 1;
+            maxStepTime = copyMs;
+            minStepTime = copyMs;
+            _AccumulateCompletedChunkProfile(
+                display_time_Preparation,
+                display_time_Prep_GetBiomes,
+                display_time_Prep_SandNoise,
+                display_time_Prep_GravelNoise,
+                display_time_Prep_StoneNoise,
+                display_time_Prep_AllocNoiseCache,
+                display_time_NoiseGen1,
+                display_time_NoiseGen2,
+                display_time_NoiseGen3,
+                display_time_Noise6,
+                display_time_Noise7,
+                display_time_NoiseCombine,
+                display_noiseGen1Cells,
+                display_noiseGen2Cells,
+                display_noiseGen3Cells,
+                display_noise6Cells,
+                display_noise7Cells,
+                display_noiseCombineCells,
+                copyMs,
+                copyMs);
+        }
+#endif
+        return true;
+    }
     
     public bool StepChunkGeneration(out byte[] completedData)
     {
@@ -2658,6 +2798,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         }
                         System.Array.Copy(wcm.temperatures, cachedTemperatures, wcm.temperatures.Length);
                         System.Array.Copy(wcm.rainfall, cachedRainfall, wcm.rainfall.Length);
+                    }
+
+                    if (wcm != null && wcm.temperatures != null && wcm.rainfall != null)
+                    {
+                        _CacheBiomeColumnData(currentChunkX, currentChunkZ, wcm.temperatures, wcm.rainfall);
                     }
                     
 #if LOGGING
@@ -3710,6 +3855,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
     /// </summary>
     public void GetBiomeDataForChunk(int chunkX, int chunkZ, double[] outTemperatures, double[] outRainfall)
     {
+        if (biomeCacheChunkX != null && biomeCacheTemperatures != null && biomeCacheRainfall != null)
+        {
+            for (int i = 0; i < BIOME_COLUMN_CACHE_SIZE; i++)
+            {
+                if (biomeCacheChunkX[i] != chunkX || biomeCacheChunkZ[i] != chunkZ) continue;
+                if (biomeCacheTemperatures[i] == null || biomeCacheRainfall[i] == null) break;
+
+                int cachedCopySize = System.Math.Min(outTemperatures.Length, biomeCacheTemperatures[i].Length);
+                System.Array.Copy(biomeCacheTemperatures[i], outTemperatures, cachedCopySize);
+                System.Array.Copy(biomeCacheRainfall[i], outRainfall, cachedCopySize);
+                return;
+            }
+        }
+
         // Check if we have cached data for this chunk
         if (chunkX == lastBiomeChunkX && chunkZ == lastBiomeChunkZ && cachedTemperatures != null && cachedRainfall != null)
         {

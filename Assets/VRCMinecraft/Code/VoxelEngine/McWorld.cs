@@ -43,6 +43,32 @@ public class McWorld : UdonSharpBehaviour
     public float gpuWorldgenStepBudgetMs = 3.0f;
     [Tooltip("Maximum GPU worldgen steps per chunk each frame.")]
     public int gpuWorldgenStepsPerFrame = 4;
+    [Tooltip("Prioritize meshing the exposed shell and chunks near the player before fully enclosed interiors.")]
+    public bool prioritizeVisibleShellMeshing = true;
+    [Tooltip("Chunks within this XZ radius of the player are always eligible for meshing.")]
+    public int shellMeshPriorityRadiusXZ = 2;
+    [Tooltip("Chunks within this Y radius of the player are always eligible for meshing.")]
+    public int shellMeshPriorityRadiusY = 1;
+    [Tooltip("How many deferred interior chunks to reconsider per frame when headroom is available.")]
+    public int deferredInteriorMeshRequestsPerFrame = 1;
+    [Tooltip("How many chunk slots to scan per frame when looking for deferred interior meshes to wake up.")]
+    public int deferredInteriorMeshScanCountPerFrame = 64;
+    [Tooltip("Defer collider application, lighting finalize, and neighbor mesh rebuilds for far chunks until there is frame headroom.")]
+    public bool deferFarChunkSecondaryWork = true;
+    [Tooltip("How many deferred secondary tasks to finish per frame when there is headroom.")]
+    public int deferredSecondaryWorkTasksPerFrame = 2;
+    [Tooltip("How many chunk slots to scan per frame for deferred secondary work.")]
+    public int deferredSecondaryWorkScanCountPerFrame = 64;
+    [Tooltip("Adapt GPU worldgen and mesh decode budgets based on recent frame time.")]
+    public bool enableAdaptiveBudgets = true;
+    [Tooltip("Target headroom below the frame budget before adaptive budgets ramp up.")]
+    public float adaptiveFrameHeadroomMs = 1.5f;
+    [Tooltip("Rate used to grow adaptive budgets on frames with spare headroom.")]
+    public float adaptiveBudgetRecoverRate = 0.08f;
+    [Tooltip("Rate used to shrink adaptive budgets on over-budget frames.")]
+    public float adaptiveBudgetBackoffRate = 0.20f;
+    [Tooltip("Minimum fraction of the configured GPU budgets that adaptive throttling will allow.")]
+    public float adaptiveBudgetMinScale = 0.45f;
 
     [Header("System References")]
     [SerializeField, FindObjectOfType(true)]
@@ -223,6 +249,14 @@ public class McWorld : UdonSharpBehaviour
     private bool gpuDebugHudVisible = false;
     private int gpuDebugHudPage = 0;
     private const int GPU_DEBUG_PAGE_COUNT = 4;
+    private float adaptiveGpuMeshDecodeStepBudgetMs;
+    private int adaptiveGpuMeshDecodeStepsPerFrame;
+    private float adaptiveGpuMeshDecodeFrameBudgetMs;
+    private float adaptiveGpuWorldgenStepBudgetMs;
+    private int adaptiveGpuWorldgenStepsPerFrame;
+    private float lastUpdateDurationMs = 0f;
+    private int deferredInteriorMeshScanCursor = 0;
+    private int deferredSecondaryWorkScanCursor = 0;
 
     // --- Meshing Constants & Buffers (could be pooled) ---
     private const int MAX_VERTS = 12288;
@@ -310,6 +344,7 @@ public class McWorld : UdonSharpBehaviour
     private float stats_gpuFaceDecodeTime = 0f;
     private float stats_gpuFaceDecodeTimeMin = float.MaxValue;
     private float stats_gpuFaceDecodeTimeMax = 0f;
+    private int stats_meshDeferredChunks = 0;
 
     // --- Lighting Stats (aggregate) ---
     private int stats_lightingInitsTotal = 0;
@@ -404,6 +439,7 @@ public class McWorld : UdonSharpBehaviour
         _BuildLightingTables();
         _InitializeGpuVoxelBackend();
         _InitializeGpuDebugHud();
+        _ResetAdaptiveBudgets();
         
         terrainGenerator.init(McUtils.GetMinecraftSeed(worldSeedString));
 
@@ -415,6 +451,68 @@ public class McWorld : UdonSharpBehaviour
 #endif
 
         // No longer using SendCustomEventDelayedSeconds - Update() will handle processing
+    }
+
+    private void _ResetAdaptiveBudgets()
+    {
+        adaptiveGpuMeshDecodeStepBudgetMs = gpuMeshDecodeStepBudgetMs;
+        adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(1, gpuMeshDecodeStepsPerFrame);
+        adaptiveGpuMeshDecodeFrameBudgetMs = gpuMeshDecodeFrameBudgetMs;
+        adaptiveGpuWorldgenStepBudgetMs = gpuWorldgenStepBudgetMs;
+        adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(1, gpuWorldgenStepsPerFrame);
+        lastUpdateDurationMs = updateTimeBudgetMs;
+    }
+
+    private void _UpdateAdaptiveBudgets(float updateTimeMs)
+    {
+        lastUpdateDurationMs = updateTimeMs;
+
+        if (!enableAdaptiveBudgets)
+        {
+            _ResetAdaptiveBudgets();
+            lastUpdateDurationMs = updateTimeMs;
+            return;
+        }
+
+        float minScale = Mathf.Clamp01(adaptiveBudgetMinScale);
+        float growFactor = 1f + Mathf.Max(0f, adaptiveBudgetRecoverRate);
+        float shrinkFactor = 1f - Mathf.Clamp01(adaptiveBudgetBackoffRate);
+        float targetWithHeadroom = Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
+
+        if (updateTimeMs > updateTimeBudgetMs)
+        {
+            adaptiveGpuMeshDecodeStepBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeStepBudgetMs * shrinkFactor, gpuMeshDecodeStepBudgetMs * minScale, gpuMeshDecodeStepBudgetMs);
+            adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeFrameBudgetMs * shrinkFactor, gpuMeshDecodeFrameBudgetMs * minScale, gpuMeshDecodeFrameBudgetMs);
+            adaptiveGpuWorldgenStepBudgetMs = Mathf.Clamp(adaptiveGpuWorldgenStepBudgetMs * shrinkFactor, gpuWorldgenStepBudgetMs * minScale, gpuWorldgenStepBudgetMs);
+
+            if (adaptiveGpuMeshDecodeStepsPerFrame > 1 && updateTimeMs > updateTimeBudgetMs + 1f)
+            {
+                adaptiveGpuMeshDecodeStepsPerFrame--;
+            }
+            if (adaptiveGpuWorldgenStepsPerFrame > 1 && updateTimeMs > updateTimeBudgetMs + 1f)
+            {
+                adaptiveGpuWorldgenStepsPerFrame--;
+            }
+            return;
+        }
+
+        if (updateTimeMs >= targetWithHeadroom)
+        {
+            return;
+        }
+
+        adaptiveGpuMeshDecodeStepBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeStepBudgetMs * growFactor, gpuMeshDecodeStepBudgetMs * minScale, gpuMeshDecodeStepBudgetMs);
+        adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeFrameBudgetMs * growFactor, gpuMeshDecodeFrameBudgetMs * minScale, gpuMeshDecodeFrameBudgetMs);
+        adaptiveGpuWorldgenStepBudgetMs = Mathf.Clamp(adaptiveGpuWorldgenStepBudgetMs * growFactor, gpuWorldgenStepBudgetMs * minScale, gpuWorldgenStepBudgetMs);
+
+        if (adaptiveGpuMeshDecodeStepsPerFrame < Mathf.Max(1, gpuMeshDecodeStepsPerFrame) && updateTimeMs < targetWithHeadroom - 1f)
+        {
+            adaptiveGpuMeshDecodeStepsPerFrame++;
+        }
+        if (adaptiveGpuWorldgenStepsPerFrame < Mathf.Max(1, gpuWorldgenStepsPerFrame) && updateTimeMs < targetWithHeadroom - 1f)
+        {
+            adaptiveGpuWorldgenStepsPerFrame++;
+        }
     }
 
     void InitializeWorldParameters()
@@ -1512,7 +1610,7 @@ public class McWorld : UdonSharpBehaviour
         int sizeY = chunkSizeY;
         int stride = sizeXZ * sizeXZ;
         float budgetStart = Time.realtimeSinceStartup;
-        float budgetSec = Mathf.Max(0.25f, gpuMeshDecodeStepBudgetMs) * 0.001f;
+        float budgetSec = Mathf.Max(0.25f, adaptiveGpuMeshDecodeStepBudgetMs) * 0.001f;
         Color32[] facePixels = chunk._gpuFacePixels;
 
         while (Time.realtimeSinceStartup - budgetStart <= budgetSec)
@@ -1606,7 +1704,8 @@ public class McWorld : UdonSharpBehaviour
             if (chunk._gpuFaceBuildStage == 2)
             {
                 _ApplyAllMeshData(chunk);
-                _ApplyDataToCollider(chunk);
+                if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
+                else _ApplyDataToCollider(chunk);
 #if LOGGING
                 _RecordMeshBuildCompletion(chunk, true, false);
 #endif
@@ -1813,7 +1912,7 @@ public class McWorld : UdonSharpBehaviour
 
 #if LOGGING
         float updateStartTime = 0f;
-        if (enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
+        if (enableAdaptiveBudgets || enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
         {
             updateStartTime = Time.realtimeSinceStartup;
         }
@@ -1823,9 +1922,10 @@ public class McWorld : UdonSharpBehaviour
         _UpdateGpuDebugHud();
 
 #if LOGGING
-        if (enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
+        if (enableAdaptiveBudgets || enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
         {
             float updateTime = (Time.realtimeSinceStartup - updateStartTime) * 1000f;
+            _UpdateAdaptiveBudgets(updateTime);
             stats_updateTotalTime += updateTime;
             if (updateTime < stats_updateTimeMin) stats_updateTimeMin = updateTime;
             if (updateTime > stats_updateTimeMax) stats_updateTimeMax = updateTime;
@@ -1889,7 +1989,7 @@ public class McWorld : UdonSharpBehaviour
         }
 
         // --- Process Meshing ---
-        float gpuMeshDecodeFrameBudgetSec = Mathf.Max(0.25f, gpuMeshDecodeFrameBudgetMs) * 0.001f;
+        float gpuMeshDecodeFrameBudgetSec = Mathf.Max(0.25f, adaptiveGpuMeshDecodeFrameBudgetMs) * 0.001f;
         float gpuMeshDecodeSpentSec = 0f;
         for (int i = 0; i < activeMeshingCount; i++)
         {
@@ -1911,7 +2011,7 @@ public class McWorld : UdonSharpBehaviour
             }
 
             // OPTIMIZATION: Process multiple mesh steps per frame to reduce overhead
-            int maxMeshStepsPerFrame = chunk._gpuFaceBuildActive ? Mathf.Max(1, gpuMeshDecodeStepsPerFrame) : 20;
+            int maxMeshStepsPerFrame = chunk._gpuFaceBuildActive ? Mathf.Max(1, adaptiveGpuMeshDecodeStepsPerFrame) : 20;
             for (int step = 0; step < maxMeshStepsPerFrame; step++)
             {
                 if (!chunk.isBuildingMesh) break; // Mesh complete
@@ -1928,6 +2028,8 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
+
+        _ScheduleDeferredInteriorMeshUpdates(frameStart, frameBudget);
 
         // --- FIXED: Process Incremental Lighting (managed by coordinator) ---
         // Note: Lighting is now handled by coordinator's STATE_LIGHTING, not here
@@ -1955,6 +2057,8 @@ public class McWorld : UdonSharpBehaviour
             _ProcessGpuLighting(frameStart, frameBudget);
         }
 
+        _ProcessDeferredChunkSecondaryWork(frameStart, frameBudget);
+
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -1965,23 +2069,163 @@ public class McWorld : UdonSharpBehaviour
         // No longer need to reschedule - Update() runs every frame automatically!
     }
 
-    // Called by Coordinator
-    public void StartChunkDataGeneration(int chunkIndex)
+    private void _ScheduleDeferredInteriorMeshUpdates(float frameStart, float frameBudget)
     {
-        if (chunkIndex == -1) return;
+        if (!prioritizeVisibleShellMeshing || coordinator == null || chunks_1D == null || chunks_1D.Length == 0) return;
+        if (Time.realtimeSinceStartup - frameStart > frameBudget * 0.75f) return;
+
+        bool hasHeadroom = !enableAdaptiveBudgets || lastUpdateDurationMs < Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
+        int requestLimit = Mathf.Max(1, deferredInteriorMeshRequestsPerFrame);
+
+        int scheduled = 0;
+        int scansRemaining = Mathf.Max(1, deferredInteriorMeshScanCountPerFrame);
+        int totalChunks = chunks_1D.Length;
+        while (scansRemaining-- > 0)
+        {
+            int chunkIndex = deferredInteriorMeshScanCursor;
+            deferredInteriorMeshScanCursor++;
+            if (deferredInteriorMeshScanCursor >= totalChunks) deferredInteriorMeshScanCursor = 0;
+
+            ChunkData chunk = chunks_1D[chunkIndex];
+            if (chunk == null || !chunk.isMeshDeferred || chunk.isBuildingMesh || !chunk.isDataReady) continue;
+            if (!AreAllNeighborsReady(chunkIndex)) continue;
+
+            bool shouldWake = _ShouldPrioritizeChunkMesh(chunk);
+            if (!shouldWake)
+            {
+                if (!hasHeadroom) continue;
+            }
+
+            chunk.isMeshDeferred = false;
+            RequestChunkMeshUpdate(chunkIndex);
+            scheduled++;
+            if (scheduled >= requestLimit) break;
+        }
+    }
+
+    private bool _ShouldPrioritizeChunkSecondaryWork(ChunkData chunk)
+    {
+        if (chunk == null) return true;
+        if (_IsChunkNearPlayer(chunk)) return true;
+        return _ShouldPrioritizeChunkMesh(chunk);
+    }
+
+    private bool _ShouldDeferChunkSecondaryWork(ChunkData chunk)
+    {
+        if (!deferFarChunkSecondaryWork || chunk == null) return false;
+        return !_ShouldPrioritizeChunkSecondaryWork(chunk);
+    }
+
+    private void _QueueDeferredColliderApply(ChunkData chunk)
+    {
+        if (chunk == null) return;
+        chunk.pendingColliderApply = true;
+    }
+
+    private void _QueueDeferredLightingFinalize(ChunkData chunk)
+    {
+        if (chunk == null) return;
+        chunk.pendingLightingFinalize = true;
+    }
+
+    public void HandleChunkPostDataGpuLighting(ChunkData chunk)
+    {
+        if (chunk == null) return;
+        if (_ShouldDeferChunkSecondaryWork(chunk))
+        {
+            chunk.pendingNeighborMeshRebuild = true;
+            return;
+        }
+
+        TriggerNeighborMeshRebuilds(chunk);
+    }
+
+    private void _ProcessDeferredChunkSecondaryWork(float frameStart, float frameBudget)
+    {
+        if (!deferFarChunkSecondaryWork || chunks_1D == null || chunks_1D.Length == 0) return;
+        if (Time.realtimeSinceStartup - frameStart > frameBudget * 0.75f) return;
+
+        bool hasHeadroom = !enableAdaptiveBudgets || lastUpdateDurationMs < Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
+        int taskLimit = Mathf.Max(1, deferredSecondaryWorkTasksPerFrame);
+        int scansRemaining = Mathf.Max(1, deferredSecondaryWorkScanCountPerFrame);
+        int totalChunks = chunks_1D.Length;
+        int completedTasks = 0;
+
+        while (scansRemaining-- > 0)
+        {
+            int chunkIndex = deferredSecondaryWorkScanCursor;
+            deferredSecondaryWorkScanCursor++;
+            if (deferredSecondaryWorkScanCursor >= totalChunks) deferredSecondaryWorkScanCursor = 0;
+
+            ChunkData chunk = chunks_1D[chunkIndex];
+            if (chunk == null || !chunk.isDataReady) continue;
+
+            bool shouldRunNow = _ShouldPrioritizeChunkSecondaryWork(chunk) || hasHeadroom;
+            if (!shouldRunNow) continue;
+
+            if (chunk.pendingLightingFinalize)
+            {
+                chunk.pendingLightingFinalize = false;
+                ImmediateReconciliation(chunk);
+                if (chunk.pendingNeighborMeshRebuild)
+                {
+                    chunk.pendingNeighborMeshRebuild = false;
+                    TriggerNeighborMeshRebuilds(chunk);
+                }
+                completedTasks++;
+            }
+            else if (chunk.pendingNeighborMeshRebuild)
+            {
+                chunk.pendingNeighborMeshRebuild = false;
+                TriggerNeighborMeshRebuilds(chunk);
+                completedTasks++;
+            }
+            else if (chunk.pendingColliderApply && !chunk.isBuildingMesh)
+            {
+                chunk.pendingColliderApply = false;
+                _ApplyDataToCollider(chunk);
+                completedTasks++;
+            }
+
+            if (completedTasks >= taskLimit) break;
+        }
+    }
+
+    public bool CanStartChunkDataGenerationWithoutExclusiveGenerator(int chunkIndex)
+    {
+        if (chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length || terrainGenerator == null) return false;
         ChunkData chunk = chunks_1D[chunkIndex];
-        if (chunk == null || chunk.isGeneratingData) return;
+        if (chunk == null) return false;
+        return terrainGenerator.CanCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+    }
+
+    // Called by Coordinator
+    public bool StartChunkDataGeneration(int chunkIndex)
+    {
+        if (chunkIndex == -1) return false;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk == null || chunk.isGeneratingData) return false;
 
         chunk.isGeneratingData = true;
+        bool usesExclusiveGenerator = true;
 
         // Pass centered chunk coordinates directly - they ARE the Minecraft chunk coordinates
         // Engine centered coords (e.g., -2,-1,0,1) map to Minecraft chunks (-2,-1,0,1)
-        terrainGenerator.StartChunkGeneration(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        if (!terrainGenerator.CanCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world))
+        {
+            terrainGenerator.StartChunkGeneration(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        }
+        else
+        {
+            usesExclusiveGenerator = false;
+        }
 
         if (activeDataGenCount < MAX_ACTIVE_CHUNKS)
         {
             activeDataGenChunks[activeDataGenCount++] = chunk;
         }
+
+        return usesExclusiveGenerator;
     }
 
     // Called by Coordinator or ProcessActiveChunks loop
@@ -1993,16 +2237,23 @@ public class McWorld : UdonSharpBehaviour
         byte[] generatedData = null;
         bool isComplete = false;
         float stepStart = Time.realtimeSinceStartup;
-        float stepBudget = useGpuWorldgen ? Mathf.Max(0.5f, gpuWorldgenStepBudgetMs) * 0.001f : 0.008f;
-        int maxStepsPerFrame = useGpuWorldgen ? Mathf.Max(1, gpuWorldgenStepsPerFrame) : 1;
+        float stepBudget = useGpuWorldgen ? Mathf.Max(0.5f, adaptiveGpuWorldgenStepBudgetMs) * 0.001f : 0.008f;
+        int maxStepsPerFrame = useGpuWorldgen ? Mathf.Max(1, adaptiveGpuWorldgenStepsPerFrame) : 1;
 
-        for (int step = 0; step < maxStepsPerFrame; step++)
+        if (useGpuWorldgen && terrainGenerator.TryCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world, out generatedData))
         {
-            isComplete = terrainGenerator.StepChunkGeneration(out generatedData);
-            if (isComplete) break;
+            isComplete = true;
+        }
+        else
+        {
+            for (int step = 0; step < maxStepsPerFrame; step++)
+            {
+                isComplete = terrainGenerator.StepChunkGeneration(out generatedData);
+                if (isComplete) break;
 
-            // Stop if we've used our budget (prevents stutters)
-            if (Time.realtimeSinceStartup - stepStart > stepBudget) break;
+                // Stop if we've used our budget (prevents stutters)
+                if (Time.realtimeSinceStartup - stepStart > stepBudget) break;
+            }
         }
 
         if (isComplete)
@@ -2096,8 +2347,16 @@ public class McWorld : UdonSharpBehaviour
             }
             chunk.isProcessingLighting = false;
             chunk.lightingPhase = 2;
-            ImmediateReconciliation(chunk);
-            TriggerNeighborMeshRebuilds(chunk);
+            if (_ShouldDeferChunkSecondaryWork(chunk))
+            {
+                _QueueDeferredLightingFinalize(chunk);
+                chunk.pendingNeighborMeshRebuild = true;
+            }
+            else
+            {
+                ImmediateReconciliation(chunk);
+                TriggerNeighborMeshRebuilds(chunk);
+            }
             return;
         }
 
@@ -2114,8 +2373,16 @@ public class McWorld : UdonSharpBehaviour
             }
             chunk.isProcessingLighting = false;
             chunk.lightingPhase = 2;
-            ImmediateReconciliation(chunk);
-            TriggerNeighborMeshRebuilds(chunk);
+            if (_ShouldDeferChunkSecondaryWork(chunk))
+            {
+                _QueueDeferredLightingFinalize(chunk);
+                chunk.pendingNeighborMeshRebuild = true;
+            }
+            else
+            {
+                ImmediateReconciliation(chunk);
+                TriggerNeighborMeshRebuilds(chunk);
+            }
             return;
         }
 
@@ -2220,8 +2487,16 @@ public class McWorld : UdonSharpBehaviour
                     chunk.lightingQueue = null;
 
                     // Now do reconciliation and trigger neighbor mesh rebuilds
-                    ImmediateReconciliation(chunk);
-                    TriggerNeighborMeshRebuilds(chunk);
+                    if (_ShouldDeferChunkSecondaryWork(chunk))
+                    {
+                        _QueueDeferredLightingFinalize(chunk);
+                        chunk.pendingNeighborMeshRebuild = true;
+                    }
+                    else
+                    {
+                        ImmediateReconciliation(chunk);
+                        TriggerNeighborMeshRebuilds(chunk);
+                    }
                 }
             }
         }
@@ -2464,6 +2739,73 @@ public class McWorld : UdonSharpBehaviour
         return true;
     }
 
+    private bool _TryGetPlayerChunkCoords(out int playerChunkX, out int playerChunkY, out int playerChunkZ)
+    {
+        VRCPlayerApi localPlayer = Networking.LocalPlayer;
+        if (localPlayer == null)
+        {
+            playerChunkX = 0;
+            playerChunkY = 0;
+            playerChunkZ = 0;
+            return false;
+        }
+
+        Vector3 playerPos = localPlayer.GetPosition();
+        playerChunkX = Mathf.FloorToInt(playerPos.x / chunkSizeXZ);
+        playerChunkY = Mathf.FloorToInt(playerPos.y / chunkSizeY);
+        playerChunkZ = Mathf.FloorToInt(playerPos.z / chunkSizeXZ);
+        return true;
+    }
+
+    private bool _IsChunkNearPlayer(ChunkData chunk)
+    {
+        if (chunk == null) return false;
+        if (!_TryGetPlayerChunkCoords(out int playerChunkX, out int playerChunkY, out int playerChunkZ)) return true;
+
+        int dx = Mathf.Abs(chunk.chunkX_world - playerChunkX);
+        int dy = Mathf.Abs(chunk.chunkY_world - playerChunkY);
+        int dz = Mathf.Abs(chunk.chunkZ_world - playerChunkZ);
+        return dx <= shellMeshPriorityRadiusXZ && dz <= shellMeshPriorityRadiusXZ && dy <= shellMeshPriorityRadiusY;
+    }
+
+    private bool _ShouldPrioritizeChunkMesh(ChunkData chunk)
+    {
+        if (!prioritizeVisibleShellMeshing || chunk == null) return true;
+        if (_IsChunkNearPlayer(chunk)) return true;
+        if (chunk._isAllAir) return false;
+
+        ChunkData[] neighbors = _GetCachedNeighbors(chunk);
+        for (int i = 0; i < 6; i++)
+        {
+            ChunkData neighbor = neighbors[i];
+            if (neighbor == null || !neighbor.isDataReady) return true;
+            if (neighbor._isAllAir) return true;
+        }
+
+        return false;
+    }
+
+    public bool ShouldDeferChunkMesh(int chunkIndex)
+    {
+        if (!prioritizeVisibleShellMeshing || chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length) return false;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh) return false;
+        return !_ShouldPrioritizeChunkMesh(chunk);
+    }
+
+    public void MarkChunkMeshDeferred(int chunkIndex)
+    {
+        if (chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length) return;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk == null) return;
+        if (chunk.isMeshDeferred) return;
+
+        chunk.isMeshDeferred = true;
+#if LOGGING
+        if (enableCounters) stats_meshDeferredChunks++;
+#endif
+    }
+
     public bool IsChunkSingleOpaqueSolid(int centered_cx, int cy, int centered_cz)
     {
         ChunkData chunk = GetChunkAt(centered_cx, cy, centered_cz);
@@ -2482,6 +2824,8 @@ public class McWorld : UdonSharpBehaviour
         if (chunk == null || chunk.isBuildingMesh || chunk._chunkData == null) return;
 
         chunk.isBuildingMesh = true;
+        chunk.isMeshDeferred = false;
+        chunk.pendingColliderApply = false;
 
 #if LOGGING
         chunk.meshBuildStartTime = Time.realtimeSinceStartup;
@@ -2828,7 +3172,8 @@ public class McWorld : UdonSharpBehaviour
             // Can't use SendCustomEventDelayedFrames here easily without more state,
             // so we'll just apply the collider directly after a few frames in the main loop.
             // A more robust solution might involve another queue. For now, this is simpler.
-            _ApplyDataToCollider(chunk);
+            if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
+            else _ApplyDataToCollider(chunk);
 
         }
     }
@@ -3835,7 +4180,8 @@ public class McWorld : UdonSharpBehaviour
         _ApplyDataToMesh(chunk.opaqueMeshFilter, chunk._opaqueVertices, chunk._opaqueTriangles, chunk._opaqueUVs, chunk._opaqueNormals, chunk._opaqueColors, 0, 0);
         _ApplyDataToMesh(chunk.transparentMeshFilter, chunk._transparentVertices, chunk._transparentTriangles, chunk._transparentUVs, chunk._transparentNormals, chunk._transparentColors, 0, 0);
         _ApplyDataToMesh(chunk.cutoutMeshFilter, chunk._cutoutVertices, chunk._cutoutTriangles, chunk._cutoutUVs, chunk._cutoutNormals, chunk._cutoutColors, 0, 0);
-        _ApplyDataToCollider(chunk);
+        if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
+        else _ApplyDataToCollider(chunk);
     }
 
     private byte[] _GetDecompressedData(ChunkData chunk)
@@ -7244,6 +7590,10 @@ public class McWorld : UdonSharpBehaviour
             {
                 logBuilder.AppendLine($"  Active processing: {stats_processActiveChunksTime:F2}ms total, reconciliation {stats_reconciliationTime:F2}ms total");
             }
+            if (enableAdaptiveBudgets)
+            {
+                logBuilder.AppendLine($"  Adaptive budgets: mesh decode {adaptiveGpuMeshDecodeStepBudgetMs:F2}ms x{adaptiveGpuMeshDecodeStepsPerFrame}, frame {adaptiveGpuMeshDecodeFrameBudgetMs:F2}ms, worldgen {adaptiveGpuWorldgenStepBudgetMs:F2}ms x{adaptiveGpuWorldgenStepsPerFrame}");
+            }
         }
 
         if (coordinator != null)
@@ -7263,6 +7613,10 @@ public class McWorld : UdonSharpBehaviour
             logBuilder.AppendLine($"Mesh Building: {stats_meshBuildTotal} chunks, avg {avgMeshTime:F2}ms (min {stats_meshBuildTimeMin:F2}ms, max {stats_meshBuildTimeMax:F2}ms)");
             logBuilder.AppendLine($"  Steps: avg {avgStepsPerChunk:F1} per chunk");
             logBuilder.AppendLine($"  Completions: cpu {stats_meshBuildCpuCompletions}, gpu {stats_meshBuildGpuCompletions}, empty {stats_meshBuildEmptyCompletions}");
+            if (stats_meshDeferredChunks > 0)
+            {
+                logBuilder.AppendLine($"  Deferred interior meshes: {stats_meshDeferredChunks}");
+            }
             if (enableDetailedTimings && stats_meshBuildTotal > 0)
             {
                 if (stats_gpuFaceDecodeSteps > 0)
@@ -7405,6 +7759,7 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuFaceDecodeTime = 0f;
         stats_gpuFaceDecodeTimeMin = float.MaxValue;
         stats_gpuFaceDecodeTimeMax = 0f;
+        stats_meshDeferredChunks = 0;
         stats_rleCompressions = 0;
         stats_rleDecompressions = 0;
         stats_rleCompressionTime = 0f;

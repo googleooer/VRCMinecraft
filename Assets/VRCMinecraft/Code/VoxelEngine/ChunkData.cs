@@ -25,6 +25,10 @@ public class ChunkData
     public bool isSingleOpaqueSolid = false;
     public bool isGeneratingData = false;
     public bool isBuildingMesh = false;
+    public bool isMeshDeferred = false;
+    public bool pendingColliderApply = false;
+    public bool pendingNeighborMeshRebuild = false;
+    public bool pendingLightingFinalize = false;
 
     // --- Persistent Decompression Cache (OPTIMIZATION) ---
     public byte[] _cachedDecompressedData;

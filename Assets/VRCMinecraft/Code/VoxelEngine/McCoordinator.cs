@@ -43,6 +43,7 @@ public class McCoordinator : UdonSharpBehaviour
     // --- Worker Pool State ---
     private int[] worker_targetChunkIndex;
     private int[] worker_state;
+    private bool[] worker_usesExclusiveGenerator;
     private int[] worker_skipCheckCounter; // Skip state checks for N cycles to reduce overhead
     private const int STATE_IDLE = 0;
     private const int STATE_DATA_GEN = 1;
@@ -86,6 +87,7 @@ public class McCoordinator : UdonSharpBehaviour
     private int cycles_Processed;
     private int workers_DataGenCompleted;
     private int workers_MeshCompleted;
+    private int workers_MeshDeferred;
     private int rebuilds_Processed;
     private int worldChunks_Assigned;
     private int peak_ActiveWorkers;
@@ -115,11 +117,13 @@ public class McCoordinator : UdonSharpBehaviour
         
         worker_targetChunkIndex = new int[maxConcurrentWorkers];
         worker_state = new int[maxConcurrentWorkers];
+        worker_usesExclusiveGenerator = new bool[maxConcurrentWorkers];
         worker_skipCheckCounter = new int[maxConcurrentWorkers];
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
             worker_targetChunkIndex[i] = -1; // -1 indicates no chunk
             worker_state[i] = STATE_IDLE;
+            worker_usesExclusiveGenerator[i] = false;
             worker_skipCheckCounter[i] = 0;
         }
 
@@ -165,6 +169,7 @@ public class McCoordinator : UdonSharpBehaviour
             int chunkIndex = worker_targetChunkIndex[i];
             if (chunkIndex == -1 || chunkIndex >= chunksLen) {
                 worker_state[i] = STATE_IDLE;
+                worker_usesExclusiveGenerator[i] = false;
                 worker_skipCheckCounter[i] = 0;
                 continue;
             }
@@ -175,6 +180,7 @@ public class McCoordinator : UdonSharpBehaviour
             {
                 worker_state[i] = STATE_IDLE;
                 worker_targetChunkIndex[i] = -1;
+                worker_usesExclusiveGenerator[i] = false;
                 continue;
             }
 
@@ -201,7 +207,11 @@ public class McCoordinator : UdonSharpBehaviour
                     // Check if data generation is complete
                     if (!chunk.isGeneratingData)
                     {
-                        isGeneratorBusy = false;
+                        if (worker_usesExclusiveGenerator[i])
+                        {
+                            isGeneratorBusy = false;
+                            worker_usesExclusiveGenerator[i] = false;
+                        }
 
                         if (world.UsesGpuLightingBackend())
                         {
@@ -209,7 +219,7 @@ public class McCoordinator : UdonSharpBehaviour
                             worker_skipCheckCounter[i] = 0;
                             // Trigger neighbor re-meshing so already-meshed neighbors
                             // update their boundary faces with this chunk's data
-                            world.TriggerNeighborMeshRebuilds(chunk);
+                            world.HandleChunkPostDataGpuLighting(chunk);
                         }
                         else
                         {
@@ -254,6 +264,22 @@ public class McCoordinator : UdonSharpBehaviour
                         // Check if neighbors are ready (expensive, but only when needed)
                         if (world.AreAllNeighborsReady(chunkIndex))
                         {
+                            if (world.ShouldDeferChunkMesh(chunkIndex))
+                            {
+                                world.MarkChunkMeshDeferred(chunkIndex);
+                                worker_targetChunkIndex[i] = -1;
+                                worker_state[i] = STATE_IDLE;
+                                worker_skipCheckCounter[i] = 0;
+
+                                if (chunksCompletedCount < totalWorldChunks)
+                                {
+                                    chunksCompletedCount++;
+                                }
+#if LOGGING
+                                if (enableDetailedTimings || enableAggregateLogging) workers_MeshDeferred++;
+#endif
+                                continue;
+                            }
                             if (!world.HasAvailableGpuMeshReadbackSlot())
                             {
                                 continue;
@@ -338,7 +364,7 @@ public class McCoordinator : UdonSharpBehaviour
                 }
             }
             // Priority 2: Initial world generation (only one data gen at a time)
-            else if (nextChunkIndexToAssign < totalWorldChunks && !isGeneratorBusy)
+            else if (nextChunkIndexToAssign < totalWorldChunks && (!isGeneratorBusy || world.CanStartChunkDataGenerationWithoutExclusiveGenerator(radialChunkOrder[nextChunkIndexToAssign])))
             {
                 int chunk1DIndex = radialChunkOrder[nextChunkIndexToAssign];
                 nextChunkIndexToAssign++;
@@ -351,13 +377,61 @@ public class McCoordinator : UdonSharpBehaviour
                 {
                     worker_targetChunkIndex[i] = newChunkIndex;
                     worker_state[i] = STATE_DATA_GEN;
-                    world.StartChunkDataGeneration(newChunkIndex);
-                    isGeneratorBusy = true;
+                    worker_usesExclusiveGenerator[i] = world.StartChunkDataGeneration(newChunkIndex);
+                    if (worker_usesExclusiveGenerator[i]) isGeneratorBusy = true;
                     assigned = true;
                     assignedThisCycle++;
 #if LOGGING
                     if (enableDetailedTimings || enableAggregateLogging) worldChunks_Assigned++;
 #endif
+
+                    // Cached lower-Y GPU slices can complete immediately without holding the
+                    // exclusive generator. Collapse that handoff here so workers are freed
+                    // in the same coordinator cycle when possible.
+                    if (!worker_usesExclusiveGenerator[i])
+                    {
+                        ChunkData assignedChunk = chunks != null && newChunkIndex >= 0 && newChunkIndex < chunksLen ? chunks[newChunkIndex] : null;
+                        if (assignedChunk != null && assignedChunk.isGeneratingData)
+                        {
+                            world.StepChunkDataGeneration(assignedChunk);
+
+                            if (!assignedChunk.isGeneratingData)
+                            {
+                                if (world.UsesGpuLightingBackend())
+                                {
+                                    worker_state[i] = STATE_WAITING_FOR_MESH;
+                                    worker_skipCheckCounter[i] = 0;
+                                    world.HandleChunkPostDataGpuLighting(assignedChunk);
+
+                                    if (world.AreAllNeighborsReady(newChunkIndex) && world.ShouldDeferChunkMesh(newChunkIndex))
+                                    {
+                                        world.MarkChunkMeshDeferred(newChunkIndex);
+                                        worker_targetChunkIndex[i] = -1;
+                                        worker_state[i] = STATE_IDLE;
+                                        worker_skipCheckCounter[i] = 0;
+
+                                        if (chunksCompletedCount < totalWorldChunks)
+                                        {
+                                            chunksCompletedCount++;
+                                        }
+#if LOGGING
+                                        if (enableDetailedTimings || enableAggregateLogging) workers_MeshDeferred++;
+#endif
+                                    }
+                                }
+                                else
+                                {
+                                    worker_state[i] = STATE_LIGHTING;
+                                    worker_skipCheckCounter[i] = 0;
+                                    world.StartChunkLighting(newChunkIndex);
+                                }
+
+#if LOGGING
+                                if (enableDetailedTimings || enableAggregateLogging) workers_DataGenCompleted++;
+#endif
+                            }
+                        }
+                    }
                 }
                 else
                 {
@@ -436,8 +510,8 @@ public class McCoordinator : UdonSharpBehaviour
         sb.AppendLine("Coordinator:");
         sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms, update workers {2:F3}ms, assign work {3:F3}ms\n",
             cycles_Processed, avgCycle, avgUpdate, avgAssign);
-        sb.AppendFormat("  Worker completions: data {0}, mesh {1}, rebuilds {2}, world assigns {3}\n",
-            workers_DataGenCompleted, workers_MeshCompleted, rebuilds_Processed, worldChunks_Assigned);
+        sb.AppendFormat("  Worker completions: data {0}, mesh {1}, deferred {2}, rebuilds {3}, world assigns {4}\n",
+            workers_DataGenCompleted, workers_MeshCompleted, workers_MeshDeferred, rebuilds_Processed, worldChunks_Assigned);
         sb.AppendFormat("  Peaks: active {0}/{1}, data {2}, meshing {3}, rebuild queue {4}/{5}\n",
             peak_ActiveWorkers, maxConcurrentWorkers, peak_DataGenWorkers, peak_MeshingWorkers, peak_RebuildQueue, MAX_REBUILD_QUEUE_SIZE);
         sb.AppendFormat("  Progress: {0}/{1} chunks ({2:F1}%)\n",
@@ -453,6 +527,7 @@ public class McCoordinator : UdonSharpBehaviour
         cycles_Processed = 0;
         workers_DataGenCompleted = 0;
         workers_MeshCompleted = 0;
+        workers_MeshDeferred = 0;
         rebuilds_Processed = 0;
         worldChunks_Assigned = 0;
         peak_ActiveWorkers = 0;
