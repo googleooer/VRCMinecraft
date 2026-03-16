@@ -2418,9 +2418,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         if (!gpuColumnReadbackReady || !gpuCachedChunkSlicesReady || gpuCachedChunkSlices == null || workingChunkData == null) return;
 
-        int sizeXZ = world.chunkSizeXZ;
-        int sizeY = world.chunkSizeY;
-        int xyStride = sizeXZ * sizeXZ;
         byte[] slice = currentChunkY >= 0 && currentChunkY < gpuCachedChunkSlices.Length ? gpuCachedChunkSlices[currentChunkY] : null;
         if (slice == null) return;
 
@@ -2428,37 +2425,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
         float workingCopyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
         System.Array.Clear(workingChunkData, 0, workingChunkData.Length);
-        for (int i = 0; i < highestStoneYColumn.Length; i++) highestStoneYColumn[i] = -1;
         System.Array.Copy(slice, workingChunkData, slice.Length);
 #if LOGGING
-        float highestStoneStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
         if (enableDetailedTimings)
         {
             agg_gpuWorkingSliceCopies++;
-            agg_gpuWorkingSliceCopyTime += (highestStoneStart - workingCopyStart) * 1000f;
-        }
-#endif
-        for (int localY = 0; localY < sizeY; localY++)
-        {
-            int targetYBase = localY * xyStride;
-            for (int z = 0; z < sizeXZ; z++)
-            {
-                int targetIndex = targetYBase + z * sizeXZ;
-                int columnIndex = z * sizeXZ;
-                for (int x = 0; x < sizeXZ; x++)
-                {
-                    byte blockID = slice[targetIndex + x];
-                    if (blockID == stoneBlockID && localY > highestStoneYColumn[columnIndex + x])
-                    {
-                        highestStoneYColumn[columnIndex + x] = localY;
-                    }
-                }
-            }
-        }
-#if LOGGING
-        if (enableDetailedTimings)
-        {
-            agg_gpuHighestStoneScanTime += (Time.realtimeSinceStartup - highestStoneStart) * 1000f;
+            agg_gpuWorkingSliceCopyTime += (Time.realtimeSinceStartup - workingCopyStart) * 1000f;
         }
 #endif
 
