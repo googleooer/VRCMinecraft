@@ -211,7 +211,17 @@ public class McWorld : UdonSharpBehaviour
     private const int COLLIDER_DEFER_FRAMES = 2;
     private const byte BLOCK_WATER_MOVING = 8;
     private const byte BLOCK_WATER_STILL = 9;
+    private const byte BLOCK_TORCH = 50;
+    private const byte BLOCK_REDSTONE_TORCH_OFF = 75;
+    private const byte BLOCK_REDSTONE_TORCH_ON = 76;
+    private const byte BLOCK_FENCE = 85;
     private const byte BLOCK_ICE = 79;
+    private const byte TORCH_MOUNT_WEST = 1;
+    private const byte TORCH_MOUNT_EAST = 2;
+    private const byte TORCH_MOUNT_NORTH = 3;
+    private const byte TORCH_MOUNT_SOUTH = 4;
+    private const byte TORCH_MOUNT_FLOOR = 5;
+    private const byte TORCH_MOUNT_CEILING = 6;
     private Material sharedOpaqueChunkMaterial;
     private Material sharedTransparentChunkMaterial;
     private Material sharedCutoutChunkMaterial;
@@ -1903,6 +1913,12 @@ public class McWorld : UdonSharpBehaviour
             {
                 _ReleaseGpuFaceBuildBuffer(chunk);
                 chunk.isBuildingMesh = false;
+                chunk.interactionMeshPriority = false;
+                if (chunk.pendingNeighborMeshRebuild)
+                {
+                    chunk.pendingNeighborMeshRebuild = false;
+                    TriggerNeighborMeshRebuilds(chunk);
+                }
             }
 #if LOGGING
             if (enableDetailedTimings)
@@ -2196,6 +2212,15 @@ public class McWorld : UdonSharpBehaviour
 #endif
                 _ReleaseGpuFaceBuildBuffer(chunk);
                 chunk.isBuildingMesh = false;
+                chunk.interactionMeshPriority = false;
+                // The GPU readback decode spans multiple frames. If a neighbor chunk finished
+                // data-gen during that window, its trigger landed on pendingNeighborMeshRebuild
+                // rather than firing live — consume it now before nulling neighbor refs.
+                if (chunk.pendingNeighborMeshRebuild)
+                {
+                    chunk.pendingNeighborMeshRebuild = false;
+                    TriggerNeighborMeshRebuilds(chunk);
+                }
                 if (useSummary)
                 {
                     chunk.neighborPX = null; chunk.neighborNX = null;
@@ -2718,7 +2743,11 @@ public class McWorld : UdonSharpBehaviour
             }
 
             // OPTIMIZATION: Process multiple mesh steps per frame to reduce overhead
-            int maxMeshStepsPerFrame = chunk._gpuFaceBuildActive ? Mathf.Max(1, adaptiveGpuMeshDecodeStepsPerFrame) : 20;
+            // Interaction-priority chunks (player block break/place) get uncapped steps
+            // so the mesh completes in a single frame instead of spread across ~5.
+            int maxMeshStepsPerFrame = chunk._gpuFaceBuildActive
+                ? Mathf.Max(1, adaptiveGpuMeshDecodeStepsPerFrame)
+                : (chunk.interactionMeshPriority ? 9999 : 20);
             for (int step = 0; step < maxMeshStepsPerFrame; step++)
             {
                 if (!chunk.isBuildingMesh) break; // Mesh complete
@@ -2922,7 +2951,7 @@ public class McWorld : UdonSharpBehaviour
         int totalChunks = chunks_1D.Length;
         int completedTasks = _ProcessNearbyChunkColliderUpdates();
 
-        if (completedTasks >= Mathf.Max(1, nearColliderUpdatesPerFrame)) return;
+        if (completedTasks >= taskLimit) return;
         if (Time.realtimeSinceStartup - frameStart > frameBudget * 0.75f) return;
 
         while (scansRemaining-- > 0)
@@ -2952,27 +2981,42 @@ public class McWorld : UdonSharpBehaviour
                 continue;
             }
 
-            bool shouldRunNow = _ShouldPrioritizeChunkSecondaryWork(chunk) || hasHeadroom;
-            if (!shouldRunNow) continue;
-
-            if (chunk.pendingLightingFinalize)
-            {
-                chunk.pendingLightingFinalize = false;
-                ImmediateReconciliation(chunk);
-                if (chunk.pendingNeighborMeshRebuild)
-                {
-                    chunk.pendingNeighborMeshRebuild = false;
-                    TriggerNeighborMeshRebuilds(chunk);
-                }
-                completedTasks++;
-            }
-            else if (chunk.pendingNeighborMeshRebuild)
+            // pendingNeighborMeshRebuild is just 6 RequestChunkMeshUpdate calls — no per-block
+            // work. Always consume it regardless of player proximity or frame headroom.
+            // Under sustained load far chunks would be permanently skipped here because
+            // shouldRunNow stays false; the GPU lighting path sets this flag via
+            // HandleChunkPostDataGpuLighting when _ShouldDeferChunkSecondaryWork returns true.
+            if (chunk.pendingNeighborMeshRebuild && !chunk.isBuildingMesh)
             {
                 chunk.pendingNeighborMeshRebuild = false;
                 TriggerNeighborMeshRebuilds(chunk);
                 completedTasks++;
+                if (completedTasks >= taskLimit) break;
+                continue;
             }
-            else if (chunk.pendingColliderApply && !chunk.isBuildingMesh)
+
+            if (chunk.pendingLightingFinalize)
+            {
+                chunk.pendingLightingFinalize = false;
+                if (_ShouldPrioritizeChunkSecondaryWork(chunk) || hasHeadroom)
+                {
+                    ImmediateReconciliation(chunk);
+                }
+                else
+                {
+                    // Far chunks still need to enter the deferred reconciliation queue even
+                    // when we do not have headroom for the immediate finalize path.
+                    DeferReconciliation(chunk);
+                }
+                completedTasks++;
+                if (completedTasks >= taskLimit) break;
+                continue;
+            }
+
+            bool shouldRunNow = _ShouldPrioritizeChunkSecondaryWork(chunk) || hasHeadroom;
+            if (!shouldRunNow) continue;
+
+            if (chunk.pendingColliderApply && !chunk.isBuildingMesh)
             {
                 if (!_ShouldEnableChunkCollider(chunk)) continue;
                 chunk.pendingColliderApply = false;
@@ -3349,6 +3393,22 @@ public class McWorld : UdonSharpBehaviour
     // Called by Coordinator
     public void RequestChunkMeshUpdate(int chunkIndex)
     {
+        if (chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length) return;
+
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk != null
+            && chunk.interactionMeshPriority
+            && chunk.isDataReady
+            && !chunk.isBuildingMesh
+            && chunk._chunkData != null
+            && activeMeshingCount < MAX_ACTIVE_CHUNKS
+            && AreAllNeighborsReady(chunkIndex)
+            && (coordinator == null || !coordinator.IsChunkScheduledForMeshUpdate(chunkIndex)))
+        {
+            BuildChunkMesh(chunkIndex);
+            return;
+        }
+
         if (coordinator != null) coordinator.RequestChunkMeshUpdate(chunkIndex);
     }
 
@@ -3371,6 +3431,57 @@ public class McWorld : UdonSharpBehaviour
 
     public void SetBlock(int globalX, int globalY, int globalZ, byte blockType)
     {
+        _SetBlockGlobal(globalX, globalY, globalZ, blockType, false);
+    }
+
+    public void SetBlockFromInteraction(int globalX, int globalY, int globalZ, byte blockType)
+    {
+        _SetBlockGlobal(globalX, globalY, globalZ, blockType, true);
+    }
+
+    public bool PlaceTorchFromInteraction(int globalX, int globalY, int globalZ, Vector3 hitNormal, byte blockType)
+    {
+        if (!_IsTorchBlock(blockType))
+        {
+            _SetBlockGlobal(globalX, globalY, globalZ, blockType, true);
+            return true;
+        }
+
+        byte torchMount = _GetTorchMountFromHitNormal(hitNormal);
+        if (!_CanPlaceTorchAt(globalX, globalY, globalZ, torchMount))
+        {
+            return false;
+        }
+
+        _SetBlockGlobal(globalX, globalY, globalZ, blockType, true);
+        _SetTorchMountGlobal(globalX, globalY, globalZ, torchMount, true);
+        return true;
+    }
+
+    public byte GetTorchMount(int globalX, int globalY, int globalZ)
+    {
+        int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;
+        int chunkY = globalY >> CHUNK_SIZE_SHIFT;
+        int centeredChunkZ = globalZ >> CHUNK_SIZE_SHIFT;
+
+        ChunkData chunk = GetChunkAt(centeredChunkX, chunkY, centeredChunkZ);
+        if (chunk == null || !chunk.isDataReady) return 0;
+
+        int localX = globalX & CHUNK_SIZE_MASK;
+        int localY = globalY & CHUNK_SIZE_MASK;
+        int localZ = globalZ & CHUNK_SIZE_MASK;
+        byte blockType = _GetBlockLocal(chunk, localX, localY, localZ);
+        if (!_IsTorchBlock(blockType)) return 0;
+        return _GetTorchMountLocal(chunk, localX, localY, localZ);
+    }
+
+    public void SetTorchMount(int globalX, int globalY, int globalZ, byte torchMount)
+    {
+        _SetTorchMountGlobal(globalX, globalY, globalZ, torchMount, false);
+    }
+
+    private void _SetBlockGlobal(int globalX, int globalY, int globalZ, byte blockType, bool interactionPriority)
+    {
         // OPTIMIZATION: Use bitwise operations instead of division/modulus
         int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;
         int chunkY = globalY >> CHUNK_SIZE_SHIFT;
@@ -3384,27 +3495,204 @@ public class McWorld : UdonSharpBehaviour
         int localZ = globalZ & CHUNK_SIZE_MASK;
 
         byte oldBlockType = _GetBlockLocal(chunk, localX, localY, localZ);
-        _SetBlockLocal(chunk, localX, localY, localZ, blockType, true);
+        _SetBlockLocal(chunk, localX, localY, localZ, blockType, true, interactionPriority);
 
         // Update lighting if block changed
         if (oldBlockType != blockType && chunk.lightData != null && !_UsesGpuTerrainLightSampling())
         {
             _UpdateBlockLighting(chunk, localX, localY, localZ, oldBlockType, blockType);
         }
+
+        _DropUnsupportedTorchNeighbors(globalX, globalY, globalZ, interactionPriority);
+    }
+
+    private bool _IsTorchBlock(byte blockType)
+    {
+        return blockType == BLOCK_TORCH || blockType == BLOCK_REDSTONE_TORCH_OFF || blockType == BLOCK_REDSTONE_TORCH_ON;
+    }
+
+    private bool _UsesCustomBlockMesh(byte blockType, McBlockShapeType[] shapeCache, int shapeCacheLen)
+    {
+        if (_IsTorchBlock(blockType)) return true;
+        return blockType < shapeCacheLen && shapeCache[blockType] == McBlockShapeType.Cross;
+    }
+
+    private byte _GetTorchMountLocal(ChunkData chunk, int localX, int localY, int localZ)
+    {
+        if (chunk == null || !_IsValidLocalVoxel(localX, localY, localZ)) return TORCH_MOUNT_FLOOR;
+
+        int localIndex = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
+        if (chunk.torchMountData == null || localIndex < 0 || localIndex >= chunk.torchMountData.Length)
+        {
+            return TORCH_MOUNT_FLOOR;
+        }
+
+        byte torchMount = chunk.torchMountData[localIndex];
+        if (torchMount >= TORCH_MOUNT_WEST && torchMount <= TORCH_MOUNT_CEILING)
+        {
+            return torchMount;
+        }
+
+        return TORCH_MOUNT_FLOOR;
+    }
+
+    private void _SetTorchMountGlobal(int globalX, int globalY, int globalZ, byte torchMount, bool interactionPriority)
+    {
+        int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;
+        int chunkY = globalY >> CHUNK_SIZE_SHIFT;
+        int centeredChunkZ = globalZ >> CHUNK_SIZE_SHIFT;
+
+        ChunkData chunk = GetChunkAt(centeredChunkX, chunkY, centeredChunkZ);
+        if (chunk == null || !chunk.isDataReady) return;
+
+        int localX = globalX & CHUNK_SIZE_MASK;
+        int localY = globalY & CHUNK_SIZE_MASK;
+        int localZ = globalZ & CHUNK_SIZE_MASK;
+        _SetTorchMountLocal(chunk, localX, localY, localZ, torchMount, interactionPriority);
+    }
+
+    private void _SetTorchMountLocal(ChunkData chunk, int localX, int localY, int localZ, byte torchMount, bool interactionPriority)
+    {
+        if (chunk == null || !_IsValidLocalVoxel(localX, localY, localZ)) return;
+
+        byte blockType = _GetBlockLocal(chunk, localX, localY, localZ);
+        if (!_IsTorchBlock(blockType)) return;
+
+        int localIndex = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
+        if (chunk.torchMountData == null || chunk.torchMountData.Length != chunk._chunkDataSize)
+        {
+            chunk.torchMountData = new byte[chunk._chunkDataSize];
+        }
+
+        byte clampedMount = (torchMount >= TORCH_MOUNT_WEST && torchMount <= TORCH_MOUNT_CEILING) ? torchMount : TORCH_MOUNT_FLOOR;
+        if (chunk.torchMountData[localIndex] == clampedMount) return;
+
+        chunk.torchMountData[localIndex] = clampedMount;
+        chunk._hasTorchBlocks = true;
+        if (interactionPriority)
+        {
+            chunk.interactionMeshPriority = true;
+        }
+
+        int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        RequestChunkMeshUpdate(chunkIndex);
+
+        if (localX == 0 || localX == chunkSizeXZ - 1 || localY == 0 || localY == chunkSizeY - 1 || localZ == 0 || localZ == chunkSizeXZ - 1)
+        {
+            TriggerNeighborMeshRebuilds(chunk, interactionPriority);
+        }
+    }
+
+    private bool _IsValidLocalVoxel(int localX, int localY, int localZ)
+    {
+        return localX >= 0 && localX < chunkSizeXZ && localY >= 0 && localY < chunkSizeY && localZ >= 0 && localZ < chunkSizeXZ;
+    }
+
+    private byte _GetTorchMountFromHitNormal(Vector3 hitNormal)
+    {
+        if (hitNormal.y > 0.5f) return TORCH_MOUNT_FLOOR;
+        if (hitNormal.y < -0.5f) return TORCH_MOUNT_CEILING;
+        if (hitNormal.x > 0.5f) return TORCH_MOUNT_WEST;
+        if (hitNormal.x < -0.5f) return TORCH_MOUNT_EAST;
+        if (hitNormal.z > 0.5f) return TORCH_MOUNT_NORTH;
+        if (hitNormal.z < -0.5f) return TORCH_MOUNT_SOUTH;
+        return 0;
+    }
+
+    private bool _CanPlaceTorchAt(int globalX, int globalY, int globalZ, byte torchMount)
+    {
+        if (GetBlock(globalX, globalY, globalZ) != 0) return false;
+        return _CanTorchStayAt(globalX, globalY, globalZ, torchMount);
+    }
+
+    private bool _CanTorchStayAt(int globalX, int globalY, int globalZ, byte torchMount)
+    {
+        switch (torchMount)
+        {
+            case TORCH_MOUNT_WEST:
+                return _CanSupportTorchOnSide(globalX - 1, globalY, globalZ);
+            case TORCH_MOUNT_EAST:
+                return _CanSupportTorchOnSide(globalX + 1, globalY, globalZ);
+            case TORCH_MOUNT_NORTH:
+                return _CanSupportTorchOnSide(globalX, globalY, globalZ - 1);
+            case TORCH_MOUNT_SOUTH:
+                return _CanSupportTorchOnSide(globalX, globalY, globalZ + 1);
+            case TORCH_MOUNT_FLOOR:
+                return _CanSupportTorchOnTop(globalX, globalY - 1, globalZ);
+            case TORCH_MOUNT_CEILING:
+                return _CanSupportTorchOnCeiling(globalX, globalY + 1, globalZ);
+            default:
+                return false;
+        }
+    }
+
+    private bool _CanSupportTorchOnSide(int globalX, int globalY, int globalZ)
+    {
+        return _IsOpaqueCubeForTorchSupport((byte)(GetBlock(globalX, globalY, globalZ) & 0xFF));
+    }
+
+    private bool _CanSupportTorchOnTop(int globalX, int globalY, int globalZ)
+    {
+        byte supportBlock = (byte)(GetBlock(globalX, globalY, globalZ) & 0xFF);
+        return supportBlock == BLOCK_FENCE || _IsOpaqueCubeForTorchSupport(supportBlock);
+    }
+
+    private bool _CanSupportTorchOnCeiling(int globalX, int globalY, int globalZ)
+    {
+        return _IsOpaqueCubeForTorchSupport((byte)(GetBlock(globalX, globalY, globalZ) & 0xFF));
+    }
+
+    private bool _IsOpaqueCubeForTorchSupport(byte blockType)
+    {
+        if (blockType == 0) return false;
+        if (visibilityCache == null || blockType >= visibilityCache.Length) return false;
+        if (visibilityCache[blockType] != BlockVisibilityType.Opaque) return false;
+        if (shapeTypeCache != null && blockType < shapeTypeCache.Length && shapeTypeCache[blockType] != McBlockShapeType.Cube) return false;
+        return true;
+    }
+
+    private void _DropUnsupportedTorchNeighbors(int globalX, int globalY, int globalZ, bool interactionPriority)
+    {
+        _DropTorchIfUnsupported(globalX - 1, globalY, globalZ, interactionPriority);
+        _DropTorchIfUnsupported(globalX + 1, globalY, globalZ, interactionPriority);
+        _DropTorchIfUnsupported(globalX, globalY - 1, globalZ, interactionPriority);
+        _DropTorchIfUnsupported(globalX, globalY + 1, globalZ, interactionPriority);
+        _DropTorchIfUnsupported(globalX, globalY, globalZ - 1, interactionPriority);
+        _DropTorchIfUnsupported(globalX, globalY, globalZ + 1, interactionPriority);
+    }
+
+    private void _DropTorchIfUnsupported(int globalX, int globalY, int globalZ, bool interactionPriority)
+    {
+        byte blockType = (byte)(GetBlock(globalX, globalY, globalZ) & 0xFF);
+        if (!_IsTorchBlock(blockType)) return;
+
+        byte torchMount = GetTorchMount(globalX, globalY, globalZ);
+        if (_CanTorchStayAt(globalX, globalY, globalZ, torchMount)) return;
+
+        _SetBlockGlobal(globalX, globalY, globalZ, 0, interactionPriority);
     }
 
     public void TriggerNeighborMeshRebuilds(ChunkData chunk)
     {
+        TriggerNeighborMeshRebuilds(chunk, false);
+    }
+
+    public void TriggerNeighborMeshRebuilds(ChunkData chunk, bool interactionPriority)
+    {
+        if (chunk == null) return;
+
         for (int i = 0; i < 6; i++) {
             int neighborX = chunk.chunkX_world + neighbor_dx_offsets[i];
             int neighborY = chunk.chunkY_world + neighbor_dy_offsets[i];
             int neighborZ = chunk.chunkZ_world + neighbor_dz_offsets[i];
             int neighborIndex = ChunkCenteredCoordsTo1D(neighborX, neighborY, neighborZ);
+            if (neighborIndex == -1) continue;
 
-            if (neighborIndex != -1 && GetChunkAt(neighborX, neighborY, neighborZ) != null)
-            {
-                 RequestChunkMeshUpdate(neighborIndex);
-            }
+            ChunkData neighborChunk = GetChunkAt(neighborX, neighborY, neighborZ);
+            if (neighborChunk == null || !neighborChunk.isDataReady) continue;
+            if (interactionPriority) neighborChunk.interactionMeshPriority = true;
+
+            RequestChunkMeshUpdate(neighborIndex);
         }
     }
 
@@ -3640,6 +3928,9 @@ public class McWorld : UdonSharpBehaviour
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null || chunk.isBuildingMesh || chunk._chunkData == null) return;
 
+        bool interactionPriority = chunk.interactionMeshPriority;
+        // Keep interactionMeshPriority alive — the step loop reads it to uncap steps.
+        // Cleared when the mesh build finishes.
         chunk.isBuildingMesh = true;
         chunk.isMeshDeferred = false;
         chunk.pendingColliderApply = false;
@@ -3691,6 +3982,7 @@ public class McWorld : UdonSharpBehaviour
                 _RecordMeshBuildCompletion(chunk, false, true);
 #endif
                 chunk.isBuildingMesh = false;
+                chunk.interactionMeshPriority = false;
                 return;
             }
         }
@@ -3715,12 +4007,13 @@ public class McWorld : UdonSharpBehaviour
                 _RecordMeshBuildCompletion(chunk, false, true);
 #endif
                 chunk.isBuildingMesh = false;
+                chunk.interactionMeshPriority = false;
                 return;
             }
         }
 
         // GPU face extraction path: trigger Blit + async readback, mesh will be built in _ProcessGpuFaceReadback
-        if (_GpuFaceExtractionReady() && !chunk._hasWaterBlocks)
+        if (_GpuFaceExtractionReady() && !chunk._hasWaterBlocks && !chunk._hasTorchBlocks)
         {
             if (_GpuHasAvailableReadbackBuffer())
             {
@@ -3803,7 +4096,12 @@ public class McWorld : UdonSharpBehaviour
             if (chunk.neighborPZ != null && chunk.neighborPZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborPZ);
             if (chunk.neighborNZ != null && chunk.neighborNZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborNZ);
         }
-        _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+        // _SetBlockLocal already synced this chunk's data to the GPU atlas.
+        // Skip the redundant upload for interaction rebuilds.
+        if (!interactionPriority)
+        {
+            _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+        }
 
         if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
         {
@@ -3860,6 +4158,7 @@ public class McWorld : UdonSharpBehaviour
         if (selfData == null)
         {
             chunk.isBuildingMesh = false;
+            chunk.interactionMeshPriority = false;
             return;
         }
 
@@ -3969,6 +4268,7 @@ public class McWorld : UdonSharpBehaviour
         {
             // After all boundary processing, add cross-shaped blocks
             _AddCrossShapedBlocks(chunk);
+            _AddTorchBlocks(chunk);
             _AddWaterBlocks(chunk);
 
             _ApplyAllMeshData(chunk);
@@ -3977,6 +4277,15 @@ public class McWorld : UdonSharpBehaviour
 #endif
 
             chunk.isBuildingMesh = false;
+            chunk.interactionMeshPriority = false;
+            // Water chunks always take this CPU path (GPU extraction excludes _hasWaterBlocks).
+            // If a neighbor finished data-gen during the multi-frame greedy build, its trigger
+            // landed on pendingNeighborMeshRebuild — consume it before nulling neighbor refs.
+            if (chunk.pendingNeighborMeshRebuild)
+            {
+                chunk.pendingNeighborMeshRebuild = false;
+                TriggerNeighborMeshRebuilds(chunk);
+            }
 
             // Null out neighbor references to free memory
             chunk.neighborPX = null; chunk.neighborNX = null;
@@ -5116,7 +5425,7 @@ public class McWorld : UdonSharpBehaviour
                 int selfIndex = y * chunkStride + z * chunkSizeXZ + x;
                 byte selfID = selfData[selfIndex];
                 if (selfID == 0) continue;
-                if (selfID < shapeCacheLen && shapeCache[selfID] == McBlockShapeType.Cross) continue;
+                if (_UsesCustomBlockMesh(selfID, shapeCache, shapeCacheLen)) continue;
 
                 int neighborX = x;
                 int neighborY = y;
@@ -5219,7 +5528,7 @@ public class McWorld : UdonSharpBehaviour
                 int selfIndex = y * chunkStride + z * chunkSizeXZ + x;
                 byte selfID = selfData[selfIndex];
                 if (selfID == 0) continue;
-                if (selfID < shapeCacheLen && shapeCache[selfID] == McBlockShapeType.Cross) continue;
+                if (_UsesCustomBlockMesh(selfID, shapeCache, shapeCacheLen)) continue;
 
                 int neighborX = x;
                 int neighborY = y;
@@ -6096,6 +6405,185 @@ public class McWorld : UdonSharpBehaviour
 #endif
     }
 
+    private void _AddTorchBlocks(ChunkData chunk)
+    {
+        byte[] decompressed = chunk._decompSelf;
+        if (decompressed == null || chunk._torchBlockPackedPositions == null || chunk._torchBlockCount == 0) return;
+
+        for (int i = 0; i < chunk._torchBlockCount; i++)
+        {
+            int packed = chunk._torchBlockPackedPositions[i];
+            int x = (packed >> 16) & 0xFF;
+            int y = (packed >> 8) & 0xFF;
+            int z = packed & 0xFF;
+            int idx = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
+            byte blockID = decompressed[idx];
+            if (!_IsTorchBlock(blockID)) continue;
+
+            _AddTorchBlock(chunk, x, y, z, blockID);
+        }
+    }
+
+    private void _AddTorchBlock(ChunkData chunk, int x, int y, int z, byte blockID)
+    {
+        if (chunk == null || chunk._cutoutVertexCount + 20 > MAX_VERTS) return;
+
+        float brightness = (blockID < lightEmissionCache.Length && lightEmissionCache[blockID] > 0)
+            ? 1.0f
+            : _GetCachedBrightnessAtBlock(chunk, x, y, z);
+        Color torchColor = new Color(1.0f, 1.0f, 1.0f, brightness);
+        float textureSlice = _GetTextureSlice(blockID, FACE_INDEX_SIDE);
+        byte torchMount = _GetTorchMountLocal(chunk, x, y, z);
+
+        float baseX = x;
+        float baseY = y;
+        float baseZ = z;
+        float leanX = 0.0f;
+        float leanZ = 0.0f;
+        bool upsideDown = false;
+
+        switch (torchMount)
+        {
+            case TORCH_MOUNT_WEST:
+                baseX -= 0.1f;
+                baseY += 0.2f;
+                leanX = -0.4f;
+                break;
+            case TORCH_MOUNT_EAST:
+                baseX += 0.1f;
+                baseY += 0.2f;
+                leanX = 0.4f;
+                break;
+            case TORCH_MOUNT_NORTH:
+                baseY += 0.2f;
+                baseZ -= 0.1f;
+                leanZ = -0.4f;
+                break;
+            case TORCH_MOUNT_SOUTH:
+                baseY += 0.2f;
+                baseZ += 0.1f;
+                leanZ = 0.4f;
+                break;
+            case TORCH_MOUNT_CEILING:
+                upsideDown = true;
+                break;
+        }
+
+        float centerX = baseX + 0.5f;
+        float centerZ = baseZ + 0.5f;
+        float minX = centerX - 0.5f;
+        float maxX = centerX + 0.5f;
+        float minZ = centerZ - 0.5f;
+        float maxZ = centerZ + 0.5f;
+        float halfThickness = 1.0f / 16.0f;
+        float torchPivotY = 0.625f;
+        float capMin = 7.0f / 16.0f;
+        float capMax = 9.0f / 16.0f;
+
+        _AppendTorchQuad(chunk, torchColor, textureSlice,
+            new Vector3(centerX + leanX * (1.0f - torchPivotY) - halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) - halfThickness),
+            new Vector3(centerX + leanX * (1.0f - torchPivotY) - halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) + halfThickness),
+            new Vector3(centerX + leanX * (1.0f - torchPivotY) + halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) + halfThickness),
+            new Vector3(centerX + leanX * (1.0f - torchPivotY) + halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) - halfThickness),
+            new Vector2(capMin, capMin),
+            new Vector2(capMin, capMax),
+            new Vector2(capMax, capMax),
+            new Vector2(capMax, capMin));
+
+        _AppendTorchQuad(chunk, torchColor, textureSlice,
+            new Vector3(centerX - halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), minZ),
+            new Vector3(centerX - halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), minZ + leanZ),
+            new Vector3(centerX - halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), maxZ + leanZ),
+            new Vector3(centerX - halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), maxZ),
+            new Vector2(0.0f, 0.0f),
+            new Vector2(0.0f, 1.0f),
+            new Vector2(1.0f, 1.0f),
+            new Vector2(1.0f, 0.0f));
+
+        _AppendTorchQuad(chunk, torchColor, textureSlice,
+            new Vector3(centerX + halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), maxZ),
+            new Vector3(centerX + halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), maxZ + leanZ),
+            new Vector3(centerX + halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), minZ + leanZ),
+            new Vector3(centerX + halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), minZ),
+            new Vector2(0.0f, 0.0f),
+            new Vector2(0.0f, 1.0f),
+            new Vector2(1.0f, 1.0f),
+            new Vector2(1.0f, 0.0f));
+
+        _AppendTorchQuad(chunk, torchColor, textureSlice,
+            new Vector3(minX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ + halfThickness),
+            new Vector3(minX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ + halfThickness + leanZ),
+            new Vector3(maxX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ + halfThickness + leanZ),
+            new Vector3(maxX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ + halfThickness),
+            new Vector2(0.0f, 0.0f),
+            new Vector2(0.0f, 1.0f),
+            new Vector2(1.0f, 1.0f),
+            new Vector2(1.0f, 0.0f));
+
+        _AppendTorchQuad(chunk, torchColor, textureSlice,
+            new Vector3(maxX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ - halfThickness),
+            new Vector3(maxX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ - halfThickness + leanZ),
+            new Vector3(minX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ - halfThickness + leanZ),
+            new Vector3(minX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ - halfThickness),
+            new Vector2(0.0f, 0.0f),
+            new Vector2(0.0f, 1.0f),
+            new Vector2(1.0f, 1.0f),
+            new Vector2(1.0f, 0.0f));
+
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            chunk.facesTotal += 5;
+            chunk.facesCutout += 5;
+        }
+#endif
+    }
+
+    private float _GetTorchLocalY(float localY, bool upsideDown)
+    {
+        return upsideDown ? 1.0f - localY : localY;
+    }
+
+    private void _AppendTorchQuad(ChunkData chunk, Color torchColor, float textureSlice, Vector3 v0, Vector3 v1, Vector3 v2, Vector3 v3, Vector2 uv0, Vector2 uv1, Vector2 uv2, Vector2 uv3)
+    {
+        if (chunk == null || chunk._cutoutVertexCount + 4 > MAX_VERTS) return;
+
+        int vertexIndex = chunk._cutoutVertexCount;
+        int triangleIndex = chunk._cutoutTriangleCount;
+        Vector3 quadNormal = Vector3.Cross(v1 - v0, v2 - v0).normalized;
+        if (quadNormal.sqrMagnitude < 0.0001f) quadNormal = Vector3.up;
+
+        chunk._cutoutVertices[vertexIndex + 0] = v0;
+        chunk._cutoutVertices[vertexIndex + 1] = v1;
+        chunk._cutoutVertices[vertexIndex + 2] = v2;
+        chunk._cutoutVertices[vertexIndex + 3] = v3;
+
+        chunk._cutoutNormals[vertexIndex + 0] = quadNormal;
+        chunk._cutoutNormals[vertexIndex + 1] = quadNormal;
+        chunk._cutoutNormals[vertexIndex + 2] = quadNormal;
+        chunk._cutoutNormals[vertexIndex + 3] = quadNormal;
+
+        chunk._cutoutColors[vertexIndex + 0] = torchColor;
+        chunk._cutoutColors[vertexIndex + 1] = torchColor;
+        chunk._cutoutColors[vertexIndex + 2] = torchColor;
+        chunk._cutoutColors[vertexIndex + 3] = torchColor;
+
+        chunk._cutoutUVs[vertexIndex + 0] = new Vector3(uv0.x, uv0.y, textureSlice);
+        chunk._cutoutUVs[vertexIndex + 1] = new Vector3(uv1.x, uv1.y, textureSlice);
+        chunk._cutoutUVs[vertexIndex + 2] = new Vector3(uv2.x, uv2.y, textureSlice);
+        chunk._cutoutUVs[vertexIndex + 3] = new Vector3(uv3.x, uv3.y, textureSlice);
+
+        chunk._cutoutTriangles[triangleIndex + 0] = vertexIndex + 0;
+        chunk._cutoutTriangles[triangleIndex + 1] = vertexIndex + 1;
+        chunk._cutoutTriangles[triangleIndex + 2] = vertexIndex + 2;
+        chunk._cutoutTriangles[triangleIndex + 3] = vertexIndex + 0;
+        chunk._cutoutTriangles[triangleIndex + 4] = vertexIndex + 2;
+        chunk._cutoutTriangles[triangleIndex + 5] = vertexIndex + 3;
+
+        chunk._cutoutVertexCount += 4;
+        chunk._cutoutTriangleCount += 6;
+    }
+
     private bool _IsWaterBlock(byte blockID)
     {
         return blockID == BLOCK_WATER_MOVING || blockID == BLOCK_WATER_STILL;
@@ -6660,7 +7148,7 @@ public class McWorld : UdonSharpBehaviour
         return 0; // Fallback for out of bounds Y or error
     }
 
-    private void _SetBlockLocal(ChunkData chunk, int x, int y, int z, byte blockType, bool updateMesh)
+    private void _SetBlockLocal(ChunkData chunk, int x, int y, int z, byte blockType, bool updateMesh, bool interactionPriority)
     {
 #if LOGGING
         if (enableCounters) stats_setBlockCalls++;
@@ -6679,6 +7167,11 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         if (enableCounters) stats_blockModifications++;
 #endif
+
+        if (interactionPriority)
+        {
+            chunk.interactionMeshPriority = true;
+        }
 
         // OPTIMIZATION: Invalidate chunk-owned caches since data is changing
         chunk._decompCacheValid = false;
@@ -6720,6 +7213,21 @@ public class McWorld : UdonSharpBehaviour
 
         chunk._cachedDecompressedData = null;
         chunk._decompCacheValid = false;
+        int torchMountIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
+        if (chunk.torchMountData != null && torchMountIndex >= 0 && torchMountIndex < chunk.torchMountData.Length)
+        {
+            if (_IsTorchBlock(blockType))
+            {
+                if (chunk.torchMountData[torchMountIndex] == 0)
+                {
+                    chunk.torchMountData[torchMountIndex] = TORCH_MOUNT_FLOOR;
+                }
+            }
+            else
+            {
+                chunk.torchMountData[torchMountIndex] = 0;
+            }
+        }
         _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
         _GpuRequestLightingRebuild();
 
@@ -6730,7 +7238,7 @@ public class McWorld : UdonSharpBehaviour
 
         if (x == 0 || x == chunkSizeXZ - 1 || y == 0 || y == chunkSizeY - 1 || z == 0 || z == chunkSizeXZ - 1)
         {
-            TriggerNeighborMeshRebuilds(chunk);
+            TriggerNeighborMeshRebuilds(chunk, interactionPriority);
         }
     }
 
@@ -8800,11 +9308,17 @@ public class McWorld : UdonSharpBehaviour
         {
             chunk._crossBlockPackedPositions = new int[fullData.Length];
         }
+        if (chunk._torchBlockPackedPositions == null || chunk._torchBlockPackedPositions.Length != fullData.Length)
+        {
+            chunk._torchBlockPackedPositions = new int[fullData.Length];
+        }
 
         chunk._crossBlockCount = 0;
+        chunk._torchBlockCount = 0;
         chunk._isAllAir = true;
         chunk._hasWaterBlocks = false;
         chunk._hasEmissiveBlocks = false;
+        chunk._hasTorchBlocks = false;
         chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
         chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
         chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
@@ -8853,6 +9367,11 @@ public class McWorld : UdonSharpBehaviour
                     if (blockID < shapeTypeCache.Length && shapeTypeCache[blockID] == McBlockShapeType.Cross)
                     {
                         chunk._crossBlockPackedPositions[chunk._crossBlockCount++] = (x << 16) | (y << 8) | z;
+                    }
+                    else if (_IsTorchBlock(blockID))
+                    {
+                        chunk._hasTorchBlocks = true;
+                        chunk._torchBlockPackedPositions[chunk._torchBlockCount++] = (x << 16) | (y << 8) | z;
                     }
                 }
             }

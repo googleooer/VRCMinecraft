@@ -2,6 +2,7 @@ using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using Nessie.Udon.Movement;
+using VRRefAssist;
 
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McMovement : NUMovement
@@ -27,6 +28,7 @@ public class McMovement : NUMovement
 
     [Header("World References")]
     public McWorld world;
+    [SerializeField, FindObjectOfType(true)] private McParticleManager particleManager;
     public bool flipXAxis = false;
 
     private Vector3 mcVelocity; // Minecraft displacement per tick.
@@ -39,6 +41,7 @@ public class McMovement : NUMovement
     private bool onLadder;
     private bool inWeb;
     private float groundSlipperiness = DEFAULT_SLIPPERINESS;
+    private bool hasEnvironmentStateSample;
 
     protected override void ControllerStart()
     {
@@ -61,6 +64,7 @@ public class McMovement : NUMovement
 
         mcVelocity = Vector3.zero;
         Velocity = Vector3.zero;
+        hasEnvironmentStateSample = false;
     }
 
     protected override void ControllerUpdate()
@@ -71,7 +75,13 @@ public class McMovement : NUMovement
         }
 
         ApplyGround();
+        bool wasInWater = inWater;
         UpdateEnvironmentState();
+        if (hasEnvironmentStateSample && inWater && !wasInWater)
+        {
+            EmitWaterEntryParticles();
+        }
+        hasEnvironmentStateSample = true;
 
         float tickRatio = DeltaTime > 0f ? DeltaTime / MC_TICK : 0f;
         if (tickRatio <= 0f)
@@ -528,5 +538,47 @@ public class McMovement : NUMovement
         }
 
         return blockId == (byte)BlockMaterial.LAVA || blockId == (byte)BlockMaterial.STATIONARY_LAVA;
+    }
+
+    private void EmitWaterEntryParticles()
+    {
+        if (particleManager == null || Controller == null)
+        {
+            return;
+        }
+
+        float particleRadius = Controller.radius;
+        float particleSurfaceY = Mathf.Floor(transform.position.y) + 1.0f;
+        int particleCount = Mathf.CeilToInt(1.0f + particleRadius * 40.0f);
+
+        for (int i = 0; i < particleCount; i++)
+        {
+            float offsetX = (Random.value * 2.0f - 1.0f) * particleRadius;
+            float offsetZ = (Random.value * 2.0f - 1.0f) * particleRadius;
+            particleManager.SpawnParticle(
+                McParticleManager.PT_BUBBLE,
+                transform.position.x + offsetX,
+                particleSurfaceY,
+                transform.position.z + offsetZ,
+                mcVelocity.x,
+                mcVelocity.y - Random.value * 0.2f,
+                mcVelocity.z
+            );
+        }
+
+        for (int i = 0; i < particleCount; i++)
+        {
+            float offsetX = (Random.value * 2.0f - 1.0f) * particleRadius;
+            float offsetZ = (Random.value * 2.0f - 1.0f) * particleRadius;
+            particleManager.SpawnParticle(
+                McParticleManager.PT_SPLASH,
+                transform.position.x + offsetX,
+                particleSurfaceY,
+                transform.position.z + offsetZ,
+                mcVelocity.x,
+                mcVelocity.y,
+                mcVelocity.z
+            );
+        }
     }
 }

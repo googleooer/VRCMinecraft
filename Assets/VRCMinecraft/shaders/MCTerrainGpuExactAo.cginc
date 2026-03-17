@@ -196,13 +196,13 @@ half gpuVoxelComputeExactAoBrightness(float3 worldPos, float3 faceNormal)
     float3 tangentV;
     gpuVoxelGetAoBasis(faceNormal, normalAxis, tangentU, tangentV);
 
-    float3 blockPos = floor(worldPos - normalAxis * 0.501 + 0.0001);
+    float3 blockPos = floor(worldPos - normalAxis * 0.501);
     float emittedLight = gpuVoxelSampleEmissionLevel(blockPos);
 
     float rawU = abs(tangentU.x) > 0.5 ? worldPos.x : (abs(tangentU.y) > 0.5 ? worldPos.y : worldPos.z);
     float rawV = abs(tangentV.x) > 0.5 ? worldPos.x : (abs(tangentV.y) > 0.5 ? worldPos.y : worldPos.z);
-    float fracU = frac(rawU);
-    float fracV = frac(rawV);
+    float fracU = clamp(frac(rawU), 0.001, 0.999);
+    float fracV = clamp(frac(rawV), 0.001, 0.999);
 
     half corner0 = gpuVoxelComputeExactAoCornerBrightness(blockPos, normalAxis, tangentU, tangentV, emittedLight, -1.0, -1.0);
     half corner1 = gpuVoxelComputeExactAoCornerBrightness(blockPos, normalAxis, tangentU, tangentV, emittedLight, -1.0, 1.0);

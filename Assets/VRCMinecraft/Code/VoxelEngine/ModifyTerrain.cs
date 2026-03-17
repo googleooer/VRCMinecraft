@@ -19,15 +19,18 @@ public class ModifyTerrain : UdonSharpBehaviour
     public float blockInteractionRange = 7f;
     public LayerMask terrainLayerMask;
     public byte blockTypeToPlace = 1;
+    public byte[] placeableBlockPalette;
 
     // State for the block currently being targeted by the player's gaze.
     private Vector3Int _currentLookingAtPos = new Vector3Int(0, -123456, 0);
     private byte _currentLookingAtBlock = 0;
+    private int _selectedPlaceableBlockIndex = 0;
     
     // State for block breaking progress
-    private int _currentDestructionProgress = 0;
+    private float _currentDestructionProgress = 0f;
     [SerializeField] private int _defaultBreakIncrement = 1;
     [SerializeField] private int _defaultBlockHardness = 100;
+    [SerializeField] private float _defaultBreakDurationSeconds = 0.35f;
 
     [Header("Visuals")]
     [SerializeField] private Transform blockOutline;
@@ -45,10 +48,22 @@ public class ModifyTerrain : UdonSharpBehaviour
 
     // Raycast info is updated once per frame in Update()
     private bool currentFrameHitValid;
-    private RaycastHit currentFrameHitInfo;
+    private Vector3 currentFrameHitPoint;
+    private Vector3 currentFrameHitNormal;
+    private float currentFrameHitDistance;
+    private bool placeTriggerWasHeld;
 
     private const float RAYCAST_OFFSET_ALONG_NORMAL = 0.01f;
     private const float RAYCAST_OFFSET_INTO_BLOCK = 0.01f;
+    private const byte BLOCK_TORCH = 50;
+    private const byte BLOCK_REDSTONE_TORCH_OFF = 75;
+    private const byte BLOCK_REDSTONE_TORCH_ON = 76;
+    private const byte TORCH_MOUNT_WEST = 1;
+    private const byte TORCH_MOUNT_EAST = 2;
+    private const byte TORCH_MOUNT_NORTH = 3;
+    private const byte TORCH_MOUNT_SOUTH = 4;
+    private const byte TORCH_MOUNT_FLOOR = 5;
+    private const byte TORCH_MOUNT_CEILING = 6;
 
     void Start()
     {
@@ -79,6 +94,9 @@ public class ModifyTerrain : UdonSharpBehaviour
         if (blockTypeManager == null) Debug.LogWarning("[ModifyTerrain] McBlockTypeManager reference not set.");
         if (particleManager == null) Debug.LogWarning("[ModifyTerrain] McParticleManager reference not set.");
 
+        _EnsurePlaceableBlockPalette();
+        _ApplySelectedPlaceableBlock(false);
+
         isInitialized = true;
 #if UNITY_EDITOR
         if (enableVerboseLogging) Debug.Log("[ModifyTerrain] Initialization Complete.");
@@ -98,6 +116,7 @@ public class ModifyTerrain : UdonSharpBehaviour
 
         // Update visuals and handle inputs
         _HandleBlockOutline();
+        _HandleBlockSelectionInput();
         _HandleBlockPlacementInput();
     }
 
@@ -115,12 +134,10 @@ public class ModifyTerrain : UdonSharpBehaviour
         // We only process breaking if the action is held and we're looking at a valid, non-air block
         if (breakActionHeld && _currentLookingAtBlock != 0)
         {
-            // TODO: In the future, get hardness from blockTypeManager based on _currentLookingAtBlock
-            int hardness = _defaultBlockHardness;
+            float breakDuration = _GetBreakDurationSeconds();
+            _currentDestructionProgress += 100f * Time.fixedDeltaTime / breakDuration;
 
-            _currentDestructionProgress += _defaultBreakIncrement;
-
-            if (_currentDestructionProgress >= hardness)
+            if (_currentDestructionProgress >= 100f)
             {
                 BreakBlock(); // This method will also reset the progress
             }
@@ -129,8 +146,17 @@ public class ModifyTerrain : UdonSharpBehaviour
         {
             // If the button is released, reset the progress.
             // Progress is also reset if the player looks at a new block (_UpdateTargetedBlock).
-            _currentDestructionProgress = 0;
+            _currentDestructionProgress = 0f;
         }
+    }
+
+    private float _GetBreakDurationSeconds()
+    {
+        if (_defaultBreakDurationSeconds > 0f) return _defaultBreakDurationSeconds;
+
+        int safeHardness = _defaultBlockHardness > 0 ? _defaultBlockHardness : 1;
+        int safeBreakIncrement = _defaultBreakIncrement > 0 ? _defaultBreakIncrement : 1;
+        return (safeHardness / (float)safeBreakIncrement) * Time.fixedDeltaTime;
     }
 
     /// <summary>
@@ -139,13 +165,33 @@ public class ModifyTerrain : UdonSharpBehaviour
     private void _UpdateInteractionRaycast()
     {
         VRCPlayerApi.TrackingData headData = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
+        Vector3 rayOrigin = headData.position;
+        Vector3 rayDirection = headData.rotation * Vector3.forward;
+
+        RaycastHit physicsHit;
         currentFrameHitValid = Physics.Raycast(
-            headData.position,
-            headData.rotation * Vector3.forward,
-            out currentFrameHitInfo,
+            rayOrigin,
+            rayDirection,
+            out physicsHit,
             blockInteractionRange,
             terrainLayerMask
         );
+
+        currentFrameHitPoint = currentFrameHitValid ? physicsHit.point : Vector3.zero;
+        currentFrameHitNormal = currentFrameHitValid ? physicsHit.normal : Vector3.zero;
+        currentFrameHitDistance = currentFrameHitValid ? physicsHit.distance : blockInteractionRange;
+
+        float maxTorchDistance = currentFrameHitValid ? physicsHit.distance : blockInteractionRange;
+        float torchHitDistance;
+        Vector3 torchHitPoint;
+        Vector3 torchHitNormal;
+        if (_TryGetTorchHit(rayOrigin, rayDirection, maxTorchDistance, out torchHitDistance, out torchHitPoint, out torchHitNormal))
+        {
+            currentFrameHitValid = true;
+            currentFrameHitPoint = torchHitPoint;
+            currentFrameHitNormal = torchHitNormal;
+            currentFrameHitDistance = torchHitDistance;
+        }
     }
 
     /// <summary>
@@ -157,7 +203,7 @@ public class ModifyTerrain : UdonSharpBehaviour
 
         if (currentFrameHitValid)
         {
-            Vector3 pointToConvert = currentFrameHitInfo.point - currentFrameHitInfo.normal * RAYCAST_OFFSET_INTO_BLOCK;
+            Vector3 pointToConvert = currentFrameHitPoint - currentFrameHitNormal * RAYCAST_OFFSET_INTO_BLOCK;
             newTargetPos = new Vector3Int(
                 Mathf.FloorToInt(pointToConvert.x),
                 Mathf.FloorToInt(pointToConvert.y),
@@ -169,7 +215,7 @@ public class ModifyTerrain : UdonSharpBehaviour
         if (newTargetPos != _currentLookingAtPos)
         {
             _currentLookingAtPos = newTargetPos;
-            _currentDestructionProgress = 0; // Reset progress when looking at a new block
+            _currentDestructionProgress = 0f; // Reset progress when looking at a new block
             if (currentFrameHitValid)
             {
                 _currentLookingAtBlock = (byte)(world.GetBlock(_currentLookingAtPos.x, _currentLookingAtPos.y, _currentLookingAtPos.z) & 0xFF);
@@ -206,12 +252,41 @@ public class ModifyTerrain : UdonSharpBehaviour
     private void _HandleBlockPlacementInput()
     {
         // Check for single-press place action
-        bool primaryAction = Input.GetMouseButtonDown(1) || Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger") > 0.5f;
+        bool placeTriggerHeld = Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger") > 0.5f;
+        bool primaryAction = Input.GetMouseButtonDown(1) || (placeTriggerHeld && !placeTriggerWasHeld);
+        placeTriggerWasHeld = placeTriggerHeld;
 
         if (primaryAction && currentFrameHitValid)
         {
             PlaceBlock();
         }
+    }
+
+    private void _HandleBlockSelectionInput()
+    {
+        if (placeableBlockPalette == null || placeableBlockPalette.Length == 0) return;
+
+        float scrollInput = Input.GetAxisRaw("Mouse ScrollWheel");
+        if (scrollInput > 0.01f)
+        {
+            _StepSelectedPlaceableBlock(1);
+            return;
+        }
+        if (scrollInput < -0.01f)
+        {
+            _StepSelectedPlaceableBlock(-1);
+            return;
+        }
+
+        if (Input.GetKeyDown(KeyCode.Alpha1)) { _SetSelectedPlaceableBlockIndex(0); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha2)) { _SetSelectedPlaceableBlockIndex(1); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha3)) { _SetSelectedPlaceableBlockIndex(2); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha4)) { _SetSelectedPlaceableBlockIndex(3); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha5)) { _SetSelectedPlaceableBlockIndex(4); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha6)) { _SetSelectedPlaceableBlockIndex(5); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha7)) { _SetSelectedPlaceableBlockIndex(6); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha8)) { _SetSelectedPlaceableBlockIndex(7); return; }
+        if (Input.GetKeyDown(KeyCode.Alpha9)) { _SetSelectedPlaceableBlockIndex(8); return; }
     }
 
     /// <summary>
@@ -226,7 +301,7 @@ public class ModifyTerrain : UdonSharpBehaviour
         int breakGlobalY = _currentLookingAtPos.y;
         int breakGlobalZ = _currentLookingAtPos.z;
 
-        world.SetBlock(breakGlobalX, breakGlobalY, breakGlobalZ, 0);
+        world.SetBlockFromInteraction(breakGlobalX, breakGlobalY, breakGlobalZ, 0);
 
         Vector3 effectPosition = new Vector3(breakGlobalX + 0.5f, breakGlobalY + 0.5f, breakGlobalZ + 0.5f);
         if (particleManager != null)
@@ -245,7 +320,7 @@ public class ModifyTerrain : UdonSharpBehaviour
 #endif
         
         // Reset progress and targeted block ID after breaking
-        _currentDestructionProgress = 0;
+        _currentDestructionProgress = 0f;
         _currentLookingAtBlock = 0; // The block is now air
     }
 
@@ -257,7 +332,7 @@ public class ModifyTerrain : UdonSharpBehaviour
     {
         if (!currentFrameHitValid) return;
 
-        Vector3 pointToConvert = currentFrameHitInfo.point + currentFrameHitInfo.normal * RAYCAST_OFFSET_ALONG_NORMAL;
+        Vector3 pointToConvert = currentFrameHitPoint + currentFrameHitNormal * RAYCAST_OFFSET_ALONG_NORMAL;
         int placeGlobalX = Mathf.FloorToInt(pointToConvert.x);
         int placeGlobalY = Mathf.FloorToInt(pointToConvert.y);
         int placeGlobalZ = Mathf.FloorToInt(pointToConvert.z);
@@ -276,7 +351,16 @@ public class ModifyTerrain : UdonSharpBehaviour
             return;
         }
 
-        world.SetBlock(placeGlobalX, placeGlobalY, placeGlobalZ, blockTypeToPlace);
+        bool placed = true;
+        if (_IsTorchBlock(blockTypeToPlace))
+        {
+            placed = world != null && world.PlaceTorchFromInteraction(placeGlobalX, placeGlobalY, placeGlobalZ, currentFrameHitNormal, blockTypeToPlace);
+        }
+        else
+        {
+            world.SetBlockFromInteraction(placeGlobalX, placeGlobalY, placeGlobalZ, blockTypeToPlace);
+        }
+        if (!placed) return;
         
         Vector3 effectPosition = new Vector3(placeGlobalX + 0.5f, placeGlobalY + 0.5f, placeGlobalZ + 0.5f);
         if (particleManager != null)
@@ -292,5 +376,263 @@ public class ModifyTerrain : UdonSharpBehaviour
             Debug.Log(logBuilder.ToString());
         }
 #endif
+    }
+
+    private bool _IsTorchBlock(byte blockType)
+    {
+        return blockType == BLOCK_TORCH || blockType == BLOCK_REDSTONE_TORCH_OFF || blockType == BLOCK_REDSTONE_TORCH_ON;
+    }
+
+    private void _EnsurePlaceableBlockPalette()
+    {
+        if (placeableBlockPalette == null || placeableBlockPalette.Length == 0)
+        {
+            placeableBlockPalette = new byte[] { 1, 2, 3, 4, 5, 20, 50, 75, 76 };
+        }
+
+        if (_selectedPlaceableBlockIndex < 0 || _selectedPlaceableBlockIndex >= placeableBlockPalette.Length)
+        {
+            _selectedPlaceableBlockIndex = 0;
+        }
+
+        int matchingIndex = _FindPlaceableBlockIndex(blockTypeToPlace);
+        if (matchingIndex >= 0)
+        {
+            _selectedPlaceableBlockIndex = matchingIndex;
+        }
+    }
+
+    private int _FindPlaceableBlockIndex(byte blockType)
+    {
+        if (placeableBlockPalette == null) return -1;
+
+        for (int i = 0; i < placeableBlockPalette.Length; i++)
+        {
+            if (placeableBlockPalette[i] == blockType)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private void _StepSelectedPlaceableBlock(int step)
+    {
+        if (placeableBlockPalette == null || placeableBlockPalette.Length == 0) return;
+
+        int nextIndex = _selectedPlaceableBlockIndex + step;
+        if (nextIndex < 0) nextIndex = placeableBlockPalette.Length - 1;
+        else if (nextIndex >= placeableBlockPalette.Length) nextIndex = 0;
+
+        _SetSelectedPlaceableBlockIndex(nextIndex);
+    }
+
+    private void _SetSelectedPlaceableBlockIndex(int nextIndex)
+    {
+        if (placeableBlockPalette == null || placeableBlockPalette.Length == 0) return;
+        if (nextIndex < 0 || nextIndex >= placeableBlockPalette.Length) return;
+        if (nextIndex == _selectedPlaceableBlockIndex && blockTypeToPlace == placeableBlockPalette[nextIndex]) return;
+
+        _selectedPlaceableBlockIndex = nextIndex;
+        _ApplySelectedPlaceableBlock(true);
+    }
+
+    private void _ApplySelectedPlaceableBlock(bool logSelection)
+    {
+        if (placeableBlockPalette == null || placeableBlockPalette.Length == 0) return;
+        if (_selectedPlaceableBlockIndex < 0 || _selectedPlaceableBlockIndex >= placeableBlockPalette.Length)
+        {
+            _selectedPlaceableBlockIndex = 0;
+        }
+
+        blockTypeToPlace = placeableBlockPalette[_selectedPlaceableBlockIndex];
+        if (!logSelection) return;
+
+#if UNITY_EDITOR
+        if (enableVerboseLogging)
+        {
+            string blockName = blockTypeManager != null ? blockTypeManager.GetBlockName(blockTypeToPlace) : "Unknown";
+            logBuilder.Clear();
+            logBuilder.AppendFormat("[ModifyTerrain] Selected place block {0}/{1}: {2} (ID {3}).",
+                _selectedPlaceableBlockIndex + 1, placeableBlockPalette.Length, blockName, blockTypeToPlace);
+            Debug.Log(logBuilder.ToString());
+        }
+#endif
+    }
+
+    private bool _TryGetTorchHit(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out float hitDistance, out Vector3 hitPoint, out Vector3 hitNormal)
+    {
+        hitDistance = 0f;
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.zero;
+
+        if (world == null || maxDistance <= 0f) return false;
+
+        Vector3 direction = rayDirection.normalized;
+        int voxelX = Mathf.FloorToInt(rayOrigin.x);
+        int voxelY = Mathf.FloorToInt(rayOrigin.y);
+        int voxelZ = Mathf.FloorToInt(rayOrigin.z);
+
+        int stepX = direction.x > 0f ? 1 : (direction.x < 0f ? -1 : 0);
+        int stepY = direction.y > 0f ? 1 : (direction.y < 0f ? -1 : 0);
+        int stepZ = direction.z > 0f ? 1 : (direction.z < 0f ? -1 : 0);
+
+        float nextBoundaryX = stepX > 0 ? voxelX + 1.0f : voxelX;
+        float nextBoundaryY = stepY > 0 ? voxelY + 1.0f : voxelY;
+        float nextBoundaryZ = stepZ > 0 ? voxelZ + 1.0f : voxelZ;
+
+        float tMaxX = stepX != 0 ? (nextBoundaryX - rayOrigin.x) / direction.x : float.PositiveInfinity;
+        float tMaxY = stepY != 0 ? (nextBoundaryY - rayOrigin.y) / direction.y : float.PositiveInfinity;
+        float tMaxZ = stepZ != 0 ? (nextBoundaryZ - rayOrigin.z) / direction.z : float.PositiveInfinity;
+        float tDeltaX = stepX != 0 ? 1.0f / Mathf.Abs(direction.x) : float.PositiveInfinity;
+        float tDeltaY = stepY != 0 ? 1.0f / Mathf.Abs(direction.y) : float.PositiveInfinity;
+        float tDeltaZ = stepZ != 0 ? 1.0f / Mathf.Abs(direction.z) : float.PositiveInfinity;
+
+        float travelDistance = 0f;
+        int stepBudget = 0;
+        while (travelDistance <= maxDistance && stepBudget < 64)
+        {
+            float voxelHitDistance;
+            Vector3 voxelHitPoint;
+            Vector3 voxelHitNormal;
+            if (_TryGetTorchHitInVoxel(voxelX, voxelY, voxelZ, rayOrigin, direction, maxDistance, out voxelHitDistance, out voxelHitPoint, out voxelHitNormal))
+            {
+                hitDistance = voxelHitDistance;
+                hitPoint = voxelHitPoint;
+                hitNormal = voxelHitNormal;
+                return true;
+            }
+
+            if (tMaxX <= tMaxY && tMaxX <= tMaxZ)
+            {
+                voxelX += stepX;
+                travelDistance = tMaxX;
+                tMaxX += tDeltaX;
+            }
+            else if (tMaxY <= tMaxZ)
+            {
+                voxelY += stepY;
+                travelDistance = tMaxY;
+                tMaxY += tDeltaY;
+            }
+            else
+            {
+                voxelZ += stepZ;
+                travelDistance = tMaxZ;
+                tMaxZ += tDeltaZ;
+            }
+
+            stepBudget++;
+        }
+
+        return false;
+    }
+
+    private bool _TryGetTorchHitInVoxel(int voxelX, int voxelY, int voxelZ, Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out float hitDistance, out Vector3 hitPoint, out Vector3 hitNormal)
+    {
+        hitDistance = 0f;
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.zero;
+
+        byte blockType = (byte)(world.GetBlock(voxelX, voxelY, voxelZ) & 0xFF);
+        if (!_IsTorchBlock(blockType)) return false;
+
+        Vector3 boundsMin;
+        Vector3 boundsMax;
+        _GetTorchBounds(voxelX, voxelY, voxelZ, world.GetTorchMount(voxelX, voxelY, voxelZ), out boundsMin, out boundsMax);
+
+        if (!_TryRayBoundsHit(rayOrigin, rayDirection, boundsMin, boundsMax, out hitDistance, out hitNormal)) return false;
+        if (hitDistance > maxDistance) return false;
+
+        hitPoint = rayOrigin + rayDirection * hitDistance;
+        return true;
+    }
+
+    private void _GetTorchBounds(int voxelX, int voxelY, int voxelZ, byte torchMount, out Vector3 boundsMin, out Vector3 boundsMax)
+    {
+        if (torchMount == TORCH_MOUNT_WEST)
+        {
+            boundsMin = new Vector3(voxelX + 0.0f, voxelY + 0.2f, voxelZ + 0.35f);
+            boundsMax = new Vector3(voxelX + 0.3f, voxelY + 0.8f, voxelZ + 0.65f);
+            return;
+        }
+        if (torchMount == TORCH_MOUNT_EAST)
+        {
+            boundsMin = new Vector3(voxelX + 0.7f, voxelY + 0.2f, voxelZ + 0.35f);
+            boundsMax = new Vector3(voxelX + 1.0f, voxelY + 0.8f, voxelZ + 0.65f);
+            return;
+        }
+        if (torchMount == TORCH_MOUNT_NORTH)
+        {
+            boundsMin = new Vector3(voxelX + 0.35f, voxelY + 0.2f, voxelZ + 0.0f);
+            boundsMax = new Vector3(voxelX + 0.65f, voxelY + 0.8f, voxelZ + 0.3f);
+            return;
+        }
+        if (torchMount == TORCH_MOUNT_SOUTH)
+        {
+            boundsMin = new Vector3(voxelX + 0.35f, voxelY + 0.2f, voxelZ + 0.7f);
+            boundsMax = new Vector3(voxelX + 0.65f, voxelY + 0.8f, voxelZ + 1.0f);
+            return;
+        }
+        if (torchMount == TORCH_MOUNT_CEILING)
+        {
+            boundsMin = new Vector3(voxelX + 0.4f, voxelY + 0.4f, voxelZ + 0.4f);
+            boundsMax = new Vector3(voxelX + 0.6f, voxelY + 1.0f, voxelZ + 0.6f);
+            return;
+        }
+
+        boundsMin = new Vector3(voxelX + 0.4f, voxelY + 0.0f, voxelZ + 0.4f);
+        boundsMax = new Vector3(voxelX + 0.6f, voxelY + 0.6f, voxelZ + 0.6f);
+    }
+
+    private bool _TryRayBoundsHit(Vector3 rayOrigin, Vector3 rayDirection, Vector3 boundsMin, Vector3 boundsMax, out float hitDistance, out Vector3 hitNormal)
+    {
+        hitDistance = 0f;
+        hitNormal = Vector3.zero;
+
+        float tMin = 0f;
+        float tMax = float.PositiveInfinity;
+
+        if (!_ClipRayToBoundsAxis(rayOrigin.x, rayDirection.x, boundsMin.x, boundsMax.x, Vector3.left, Vector3.right, ref tMin, ref tMax, ref hitNormal)) return false;
+        if (!_ClipRayToBoundsAxis(rayOrigin.y, rayDirection.y, boundsMin.y, boundsMax.y, Vector3.down, Vector3.up, ref tMin, ref tMax, ref hitNormal)) return false;
+        if (!_ClipRayToBoundsAxis(rayOrigin.z, rayDirection.z, boundsMin.z, boundsMax.z, Vector3.back, Vector3.forward, ref tMin, ref tMax, ref hitNormal)) return false;
+        if (tMax < 0f) return false;
+
+        hitDistance = tMin >= 0f ? tMin : tMax;
+        return hitDistance >= 0f;
+    }
+
+    private bool _ClipRayToBoundsAxis(float originAxis, float directionAxis, float boundsMin, float boundsMax, Vector3 minNormal, Vector3 maxNormal, ref float tMin, ref float tMax, ref Vector3 hitNormal)
+    {
+        if (Mathf.Abs(directionAxis) < 0.0001f)
+        {
+            return originAxis >= boundsMin && originAxis <= boundsMax;
+        }
+
+        float inverseDirection = 1.0f / directionAxis;
+        float nearDistance = (boundsMin - originAxis) * inverseDirection;
+        float farDistance = (boundsMax - originAxis) * inverseDirection;
+        Vector3 nearNormal = directionAxis > 0f ? minNormal : maxNormal;
+
+        if (nearDistance > farDistance)
+        {
+            float swapDistance = nearDistance;
+            nearDistance = farDistance;
+            farDistance = swapDistance;
+            nearNormal = directionAxis > 0f ? maxNormal : minNormal;
+        }
+
+        if (nearDistance > tMin)
+        {
+            tMin = nearDistance;
+            hitNormal = nearNormal;
+        }
+        if (farDistance < tMax)
+        {
+            tMax = farDistance;
+        }
+
+        return tMin <= tMax;
     }
 }

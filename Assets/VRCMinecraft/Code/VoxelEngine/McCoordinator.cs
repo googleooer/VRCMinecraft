@@ -296,6 +296,15 @@ public class McCoordinator : UdonSharpBehaviour
                     // Check if mesh building is complete
                     if (!chunk.isBuildingMesh)
                     {
+                        if (chunk.pendingChunkMeshRebuild)
+                        {
+                            chunk.pendingChunkMeshRebuild = false;
+                            worker_state[i] = STATE_WAITING_FOR_MESH;
+                            worker_skipCheckCounter[i] = 0;
+                            recheck = true;
+                            continue;
+                        }
+
                         // Mesh building is complete
                         worker_targetChunkIndex[i] = -1;
                         worker_state[i] = STATE_IDLE;
@@ -552,7 +561,18 @@ public class McCoordinator : UdonSharpBehaviour
     /// </summary>
     public void RequestChunkMeshUpdate(int chunkIndexToUpdate)
     {
-        if (chunkIndexToUpdate == -1 || chunkRebuildQueue_count >= MAX_REBUILD_QUEUE_SIZE) return;
+        if (chunkIndexToUpdate == -1) return;
+
+        ChunkData[] chunks = world != null ? world.chunks_1D : null;
+        ChunkData chunk = chunks != null && chunkIndexToUpdate >= 0 && chunkIndexToUpdate < chunks.Length ? chunks[chunkIndexToUpdate] : null;
+        bool interactionPriority = chunk != null && chunk.interactionMeshPriority;
+        if (chunk != null && chunk.isBuildingMesh)
+        {
+            chunk.pendingChunkMeshRebuild = true;
+            return;
+        }
+
+        if (chunkRebuildQueue_count >= MAX_REBUILD_QUEUE_SIZE) return;
         
         // Quick check: Avoid adding if it's already being processed by a worker
         // Only check first few workers since most of the time only 1-2 are active
@@ -569,8 +589,34 @@ public class McCoordinator : UdonSharpBehaviour
             if (chunkRebuildQueue[index] == chunkIndexToUpdate) return;
         }
 
-        chunkRebuildQueue[chunkRebuildQueue_tail] = chunkIndexToUpdate;
-        chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+        if (interactionPriority)
+        {
+            chunkRebuildQueue_head = (chunkRebuildQueue_head - 1 + MAX_REBUILD_QUEUE_SIZE) % MAX_REBUILD_QUEUE_SIZE;
+            chunkRebuildQueue[chunkRebuildQueue_head] = chunkIndexToUpdate;
+        }
+        else
+        {
+            chunkRebuildQueue[chunkRebuildQueue_tail] = chunkIndexToUpdate;
+            chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+        }
         chunkRebuildQueue_count++;
+    }
+
+    public bool IsChunkScheduledForMeshUpdate(int chunkIndexToCheck)
+    {
+        if (chunkIndexToCheck == -1) return false;
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToCheck) return true;
+        }
+
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int queueIndex = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[queueIndex] == chunkIndexToCheck) return true;
+        }
+
+        return false;
     }
 }

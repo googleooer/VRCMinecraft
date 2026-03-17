@@ -28,6 +28,8 @@ public class ChunkData
     public bool isMeshDeferred = false;
     public bool pendingColliderApply = false;
     public bool pendingColliderMeshRebuild = false;
+    public bool pendingChunkMeshRebuild = false;
+    public bool interactionMeshPriority = false;
     public bool pendingNeighborMeshRebuild = false;
     public bool pendingLightingFinalize = false;
 
@@ -43,12 +45,16 @@ public class ChunkData
     public byte[] _columnMaxY;
     public int[] _crossBlockPackedPositions;
     public int _crossBlockCount = 0;
+    public int[] _torchBlockPackedPositions;
+    public int _torchBlockCount = 0;
     public bool _isAllAir = false;
     public bool _hasWaterBlocks = false;
     public bool _hasEmissiveBlocks = false;
+    public bool _hasTorchBlocks = false;
     public byte _chunkGlobalMinY = 255, _chunkGlobalMaxY = 0;
     public byte _chunkGlobalMinX = 255, _chunkGlobalMaxX = 0;
     public byte _chunkGlobalMinZ = 255, _chunkGlobalMaxZ = 0;
+    public byte[] torchMountData;
 
     // --- GPU Face Extraction State ---
     public int _gpuFaceSlotIndex = -1;
