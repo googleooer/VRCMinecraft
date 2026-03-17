@@ -121,7 +121,9 @@ Material:
     - _StereoEnabled: 0
     - _SurfaceType: 0
     - _UVSec: 0
+    - _UseGpuExactAo: 1
     - _UseUIAlphaClip: 0
+    - _UseVertexLight: 0
     - _ZWrite: 1
     m_Colors:
     - _BiomeColor: {r: 1, g: 1, b: 1, a: 1}

@@ -13,6 +13,7 @@ Shader "Unlit/MCTerrain (Transparent)"
         _FogStart ("Fog Start Distance", Float) = 32.0
         _FogEnd ("Fog End Distance", Float) = 128.0
         _FogMode ("Fog Mode", Range(0, 2)) = 0
+        [HideInInspector] _UseGpuExactAo ("Use GPU Exact AO", Float) = 0
     }
     SubShader
     {
@@ -28,6 +29,7 @@ Shader "Unlit/MCTerrain (Transparent)"
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
+            #pragma target 3.0
             #pragma multi_compile_fog
 
             #include "UnityCG.cginc"
@@ -64,15 +66,20 @@ Shader "Unlit/MCTerrain (Transparent)"
             half _FogStart;
             half _FogEnd;
             half _FogMode;
+            float _UseGpuExactAo;
 
             // GPU LIGHT ATLAS GLOBALS
             sampler2D _UdonVRCM_GpuLightAtlas;
+            sampler2D _UdonVRCM_GpuBlockAtlas;
             sampler2D _UdonVRCM_GpuSlotLookup;
+            sampler2D _UdonVRCM_GpuBlockProps;
             float4 _UdonVRCM_GpuAtlasInfo;
             float4 _UdonVRCM_GpuWorldInfo;
             float4 _UdonVRCM_GpuChunkInfo;
             float4 _UdonVRCM_GpuVoxelOffset;
             float _UdonVRCM_GpuEnabled;
+
+            #include "MCTerrainGpuExactAo.cginc"
 
             v2f vert (appdata v)
             {
@@ -201,15 +208,23 @@ Shader "Unlit/MCTerrain (Transparent)"
                 fixed4 col = tex2D(_MainTex, round(i.uv)) * half4(_BiomeColor.rgb,1);
 
                 half minLightLevel = 0.02;
-                half gpuLightBrightness = sampleGpuLightBrightness(i.worldPos, i.normal);
                 half lightBrightness;
-                if (gpuLightBrightness >= 0.0)
+                if (_UseGpuExactAo > 0.5)
                 {
-                    lightBrightness = max(minLightLevel, gpuLightBrightness);
+                    half aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
+                    lightBrightness = max(minLightLevel, aoBrightness >= 0.0 ? aoBrightness : i.color.a);
                 }
                 else
                 {
-                    lightBrightness = max(minLightLevel, i.color.a);
+                    half gpuLightBrightness = gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
+                    if (gpuLightBrightness >= 0.0)
+                    {
+                        lightBrightness = max(minLightLevel, gpuLightBrightness);
+                    }
+                    else
+                    {
+                        lightBrightness = max(minLightLevel, i.color.a);
+                    }
                 }
 
                 half faceBrightness = calcBrightness(i.normal);

@@ -95,6 +95,8 @@ public class McWorld : UdonSharpBehaviour
     public Texture2D foliageColorTexture;
     [Tooltip("watercolor.png from Beta 1.7.3 (256x256)")]
     public Texture2D waterColorTexture;
+    [Tooltip("Minecraft Beta 1.7.3-style smooth lighting and ambient occlusion for terrain.")]
+    public bool ambientOcclusion = true;
 
     [Header("Debugging")]
     public bool enableVerboseLogging = false;
@@ -140,9 +142,11 @@ public class McWorld : UdonSharpBehaviour
     private McBlockShapeType[] shapeTypeCache; // per blockID - NEW: cache for block shape types
     private byte[] biomeTintModeCache; // 0=none, 1=grass, 2=foliage, 3=water
     private byte[] shouldDrawTable; // 256x256 lookup: self<<8 | neighbor => 0/1
+    private bool[] canBlockGrassCache; // Beta Block.canBlockGrass semantics for AO diagonal sampling
 
     // --- Lighting System (Minecraft Beta 1.7.3 style) ---
     private float[] lightBrightnessTable; // 16 values: light level 0-15 to brightness 0.0-1.0
+    private byte[] aoBrightnessAlphaTable; // 16^4 lookup: averaged corner brightness packed to 8-bit alpha
     public int skylightSubtracted = 0; // 0-11, for day/night cycle (0 = noon, 11 = midnight)
     private int[] lightOpacityCache; // per blockID
     private int[] lightEmissionCache; // per blockID
@@ -162,6 +166,34 @@ public class McWorld : UdonSharpBehaviour
     private readonly byte[] greedyMaskBlockIds = new byte[256];
     private readonly byte[] greedyMaskLightLevels = new byte[256];
     private readonly int[] greedyMaskPackedColors = new int[256];
+    private readonly int[] greedyMaskAoSignatures = new int[256];
+    private readonly int[] aoNormalX = { 0, 0, 0, 0, 1, -1 };
+    private readonly int[] aoNormalY = { 1, -1, 0, 0, 0, 0 };
+    private readonly int[] aoNormalZ = { 0, 0, 1, -1, 0, 0 };
+    private readonly int[] aoTangentUX = { 1, 1, 1, 1, 0, 0 };
+    private readonly int[] aoTangentUY = { 0, 0, 0, 0, 0, 0 };
+    private readonly int[] aoTangentUZ = { 0, 0, 0, 0, 1, 1 };
+    private readonly int[] aoTangentVX = { 0, 0, 0, 0, 0, 0 };
+    private readonly int[] aoTangentVY = { 0, 0, 1, 1, 1, 1 };
+    private readonly int[] aoTangentVZ = { 1, 1, 0, 0, 0, 0 };
+    private readonly int[] aoCornerUSigns =
+    {
+        -1, -1,  1,  1, // Up
+         1,  1, -1, -1, // Down
+         1,  1, -1, -1, // North (+Z)
+        -1, -1,  1,  1, // South (-Z)
+        -1, -1,  1,  1, // East (+X)
+         1,  1, -1, -1  // West (-X)
+    };
+    private readonly int[] aoCornerVSigns =
+    {
+        -1,  1,  1, -1,
+        -1,  1,  1, -1,
+        -1,  1,  1, -1,
+        -1,  1,  1, -1,
+        -1,  1,  1, -1,
+        -1,  1,  1, -1
+    };
     private bool stats_trackCompactEmitInternals = false;
 
     // --- OPTIMIZATION: Deferred Reconciliation System ---
@@ -180,6 +212,8 @@ public class McWorld : UdonSharpBehaviour
     private Material sharedOpaqueChunkMaterial;
     private Material sharedTransparentChunkMaterial;
     private Material sharedCutoutChunkMaterial;
+    private int terrainPropUseVertexLightId = -1;
+    private int terrainPropUseGpuExactAoId = -1;
 
     // --- GPU Voxel Backend State ---
     private bool gpuBackendReady = false;
@@ -681,6 +715,7 @@ public class McWorld : UdonSharpBehaviour
         gpuBackendReady = true;
         _GpuBuildShouldDrawTexture();
         _GpuPublishGlobals();
+        _ApplyTerrainLightingSourceToSharedMaterials();
     }
 
     private Texture2D _CreateGpuTexture2D(int width, int height)
@@ -715,12 +750,12 @@ public class McWorld : UdonSharpBehaviour
             int opacity = blockTypeManager.GetBlockLightOpacity(blockId);
             int emission = blockTypeManager.GetBlockLightEmission(blockId);
             int shape = (int)blockTypeManager.GetBlockShapeType(blockId);
-            bool isSolid = blockTypeManager.GetBlockIsSolid(blockId);
+            bool canBlockGrass = blockTypeManager.GetBlockCanBlockGrass(blockId);
             pixels[i] = new Color32(
                 (byte)Mathf.Clamp(opacity * 17, 0, 255),
                 (byte)Mathf.Clamp(emission * 17, 0, 255),
                 (byte)Mathf.Clamp(shape, 0, 255),
-                (byte)(isSolid ? 255 : 0)
+                (byte)(canBlockGrass ? 255 : 0)
             );
         }
 
@@ -1658,7 +1693,7 @@ public class McWorld : UdonSharpBehaviour
 
         _ClearAllMeshBuffers(chunk);
         _PreComputeBiomeColors(chunk);
-        if (useCompactGpuFaceExport)
+        if (useCompactGpuFaceExport || ambientOcclusion)
         {
             ChunkData[] neighbors = _GetCachedNeighbors(chunk);
             chunk.neighborPX = neighbors[0];
@@ -1668,7 +1703,7 @@ public class McWorld : UdonSharpBehaviour
             chunk.neighborPZ = neighbors[4];
             chunk.neighborNZ = neighbors[5];
             _DecompressNeighborsOnce(chunk);
-            if (!UsesGpuLightingBackend())
+            if (!_UsesGpuTerrainLightSampling())
             {
                 _PreComputeChunkBrightness(chunk);
                 if (chunk.neighborPX != null && chunk.neighborPX.isDataReady) _PreComputeChunkBrightness(chunk.neighborPX);
@@ -1678,7 +1713,25 @@ public class McWorld : UdonSharpBehaviour
                 if (chunk.neighborPZ != null && chunk.neighborPZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborPZ);
                 if (chunk.neighborNZ != null && chunk.neighborNZ.isDataReady) _PreComputeChunkBrightness(chunk.neighborNZ);
             }
+            else
+            {
+                chunk._cachedBrightness = null;
+            }
+        }
+        else
+        {
+            chunk._decompSelf = null;
+            chunk._decompNX = null;
+            chunk._decompPX = null;
+            chunk._decompNY = null;
+            chunk._decompPY = null;
+            chunk._decompNZ = null;
+            chunk._decompPZ = null;
+            chunk._cachedBrightness = null;
+        }
 
+        if (useCompactGpuFaceExport)
+        {
             if (chunk._gpuFacePixels == null || chunk._gpuFacePixels.Length != facePixels.Length)
             {
                 chunk._gpuFacePixels = new Color32[facePixels.Length];
@@ -2019,7 +2072,16 @@ public class McWorld : UdonSharpBehaviour
 
                             int maskIndex = maskRowOffset + u;
                             greedyMaskBlockIds[maskIndex] = (byte)blockID;
-                            greedyMaskLightLevels[maskIndex] = 0;
+                            if (_UsesCpuAmbientOcclusion())
+                            {
+                                greedyMaskLightLevels[maskIndex] = 0;
+                                greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, (byte)blockID, direction, x, y, z);
+                            }
+                            else
+                            {
+                                greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
+                                greedyMaskAoSignatures[maskIndex] = 0;
+                            }
                             byte tintMode = (tintModes != null && blockID < tintModes.Length) ? tintModes[blockID] : (byte)0;
                             if (tintMode == 0)
                             {
@@ -2218,6 +2280,7 @@ public class McWorld : UdonSharpBehaviour
     private void _CacheSharedChunkMaterials()
     {
         if (chunkPrefab == null) return;
+        if (terrainPropUseVertexLightId == -1) terrainPropUseVertexLightId = VRCShader.PropertyToID("_UseVertexLight");
 
         Transform opaqueTransform = chunkPrefab.transform.Find("Opaque");
         Transform transparentTransform = chunkPrefab.transform.Find("Transparent");
@@ -2234,12 +2297,49 @@ public class McWorld : UdonSharpBehaviour
         _EnableSharedChunkMaterialInstancing(sharedOpaqueChunkMaterial);
         _EnableSharedChunkMaterialInstancing(sharedTransparentChunkMaterial);
         _EnableSharedChunkMaterialInstancing(sharedCutoutChunkMaterial);
+        _ApplyTerrainLightingSourceToSharedMaterials();
     }
 
     private void _EnableSharedChunkMaterialInstancing(Material material)
     {
         if (material == null) return;
         if (!material.enableInstancing) material.enableInstancing = true;
+    }
+
+    private bool _UsesGpuTerrainLightSampling()
+    {
+        return UsesGpuLightingBackend();
+    }
+
+    private bool _UsesGpuExactAmbientOcclusion()
+    {
+        return ambientOcclusion && UsesGpuLightingBackend();
+    }
+
+    private bool _UsesCpuAmbientOcclusion()
+    {
+        return ambientOcclusion && !UsesGpuLightingBackend();
+    }
+
+    public bool RequiresCpuLightingForAmbientOcclusion()
+    {
+        return _UsesCpuAmbientOcclusion();
+    }
+
+    private void _ApplyTerrainLightingSource(Material material)
+    {
+        if (material == null) return;
+        if (terrainPropUseVertexLightId == -1) terrainPropUseVertexLightId = VRCShader.PropertyToID("_UseVertexLight");
+        if (terrainPropUseGpuExactAoId == -1) terrainPropUseGpuExactAoId = VRCShader.PropertyToID("_UseGpuExactAo");
+        material.SetFloat(terrainPropUseVertexLightId, _UsesGpuTerrainLightSampling() ? 0f : 1f);
+        material.SetFloat(terrainPropUseGpuExactAoId, _UsesGpuExactAmbientOcclusion() ? 1f : 0f);
+    }
+
+    private void _ApplyTerrainLightingSourceToSharedMaterials()
+    {
+        _ApplyTerrainLightingSource(sharedOpaqueChunkMaterial);
+        _ApplyTerrainLightingSource(sharedTransparentChunkMaterial);
+        _ApplyTerrainLightingSource(sharedCutoutChunkMaterial);
     }
 
     private void _AssignSharedChunkMaterial(Transform childTransform, Material sharedMaterial)
@@ -2781,7 +2881,7 @@ public class McWorld : UdonSharpBehaviour
             // This data will be used during meshing to apply biome tinting
             _StoreBiomeData(chunk);
 
-            if (!UsesGpuLightingBackend())
+            if (!_UsesGpuTerrainLightSampling())
             {
                 InitializeChunkLighting(chunk);
             }
@@ -2815,7 +2915,7 @@ public class McWorld : UdonSharpBehaviour
             chunk.lightingQueue = null;
         }
 
-        if (UsesGpuLightingBackend())
+        if (_UsesGpuTerrainLightSampling())
         {
             chunk.lightData = null;
             chunk.isProcessingLighting = false;
@@ -2903,7 +3003,7 @@ public class McWorld : UdonSharpBehaviour
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null || !chunk.isProcessingLighting) return;
 
-        if (UsesGpuLightingBackend())
+        if (_UsesGpuTerrainLightSampling())
         {
             chunk.isProcessingLighting = false;
             chunk.lightingPhase = 2;
@@ -3089,7 +3189,7 @@ public class McWorld : UdonSharpBehaviour
         _SetBlockLocal(chunk, localX, localY, localZ, blockType, true);
 
         // Update lighting if block changed
-        if (oldBlockType != blockType && chunk.lightData != null)
+        if (oldBlockType != blockType && chunk.lightData != null && !_UsesGpuTerrainLightSampling())
         {
             _UpdateBlockLighting(chunk, localX, localY, localZ, oldBlockType, blockType);
         }
@@ -3205,6 +3305,30 @@ public class McWorld : UdonSharpBehaviour
     public bool UsesGpuLightingBackend()
     {
         return enableGpuVoxelBackend && gpuBackendReady;
+    }
+
+    public void SetAmbientOcclusion(bool enabled)
+    {
+        if (ambientOcclusion == enabled) return;
+
+        ambientOcclusion = enabled;
+        _ApplyTerrainLightingSourceToSharedMaterials();
+
+        if (chunks_1D == null) return;
+
+        for (int i = 0; i < chunks_1D.Length; i++)
+        {
+            ChunkData chunk = chunks_1D[i];
+            if (chunk == null || !chunk.isDataReady) continue;
+
+            if (_UsesCpuAmbientOcclusion())
+            {
+                InitializeChunkLighting(chunk);
+                _PreComputeChunkBrightness(chunk);
+            }
+
+            RequestChunkMeshUpdate(i);
+        }
     }
 
     public bool HasAvailableGpuMeshReadbackSlot()
@@ -3458,7 +3582,7 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
 
-        bool useGpuLighting = UsesGpuLightingBackend();
+        bool useGpuLighting = _UsesGpuTerrainLightSampling();
 
         // OPTIMIZATION Phase 3 & 6: Pre-compute brightness and biome colors
         // This eliminates 10,000+ lighting and biome texture lookups during meshing.
@@ -4034,10 +4158,512 @@ public class McWorld : UdonSharpBehaviour
             return _GetCachedLightLevelAtBlockRaw(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
         }
 
-        // GPU lighting: shader handles brightness, use uniform placeholder
-        if (UsesGpuLightingBackend()) return 15;
+        if (_UsesGpuTerrainLightSampling()) return 15;
 
         return 0;
+    }
+
+    private int _GetAoBoundaryMask(int localX, int localY, int localZ)
+    {
+        int boundaryMask = 0;
+        if (localX < 0 || localX >= chunkSizeXZ) boundaryMask |= 1;
+        if (localY < 0 || localY >= chunkSizeY) boundaryMask |= 2;
+        if (localZ < 0 || localZ >= chunkSizeXZ) boundaryMask |= 4;
+        return boundaryMask;
+    }
+
+    private bool _TryGetAoLightLevelFast(ChunkData chunk, int localX, int localY, int localZ, byte emittedLight, out byte lightLevel)
+    {
+        lightLevel = emittedLight;
+        if (chunk == null) return false;
+
+        int boundaryMask = _GetAoBoundaryMask(localX, localY, localZ);
+        int chunkStride = chunkSizeXZ * chunkSizeXZ;
+        byte[] brightnessData = null;
+        ChunkData sampleChunk = chunk;
+        int sampleX = localX;
+        int sampleY = localY;
+        int sampleZ = localZ;
+
+        if (boundaryMask == 0)
+        {
+            if (chunk._cachedBrightness == null && !_UsesGpuTerrainLightSampling())
+            {
+                _PreComputeChunkBrightness(chunk);
+            }
+            brightnessData = chunk._cachedBrightness;
+        }
+        else if ((boundaryMask & (boundaryMask - 1)) == 0)
+        {
+            if (boundaryMask == 1)
+            {
+                sampleChunk = localX < 0 ? chunk.neighborNX : chunk.neighborPX;
+                sampleX = localX < 0 ? chunkSizeXZ - 1 : 0;
+            }
+            else if (boundaryMask == 2)
+            {
+                sampleChunk = localY < 0 ? chunk.neighborNY : chunk.neighborPY;
+                sampleY = localY < 0 ? chunkSizeY - 1 : 0;
+            }
+            else
+            {
+                sampleChunk = localZ < 0 ? chunk.neighborNZ : chunk.neighborPZ;
+                sampleZ = localZ < 0 ? chunkSizeXZ - 1 : 0;
+            }
+
+            if (sampleChunk != null && sampleChunk.isDataReady && sampleChunk._cachedBrightness == null && !_UsesGpuTerrainLightSampling())
+            {
+                _PreComputeChunkBrightness(sampleChunk);
+            }
+            brightnessData = sampleChunk != null ? sampleChunk._cachedBrightness : null;
+        }
+        else
+        {
+            return false;
+        }
+
+        if (brightnessData == null) return false;
+
+        int brightnessIndex = sampleY * chunkStride + sampleZ * chunkSizeXZ + sampleX;
+        byte sampleLight = brightnessData[brightnessIndex];
+        lightLevel = sampleLight > emittedLight ? sampleLight : emittedLight;
+        return true;
+    }
+
+    private bool _TryGetAoBlockIdFast(ChunkData chunk, int localX, int localY, int localZ, out byte blockId)
+    {
+        blockId = 0;
+        if (chunk == null) return false;
+
+        int boundaryMask = _GetAoBoundaryMask(localX, localY, localZ);
+        int chunkStride = chunkSizeXZ * chunkSizeXZ;
+        byte[] blockData = null;
+        int sampleX = localX;
+        int sampleY = localY;
+        int sampleZ = localZ;
+
+        if (boundaryMask == 0)
+        {
+            blockData = chunk._decompSelf;
+        }
+        else if ((boundaryMask & (boundaryMask - 1)) == 0)
+        {
+            if (boundaryMask == 1)
+            {
+                blockData = localX < 0 ? chunk._decompNX : chunk._decompPX;
+                sampleX = localX < 0 ? chunkSizeXZ - 1 : 0;
+            }
+            else if (boundaryMask == 2)
+            {
+                blockData = localY < 0 ? chunk._decompNY : chunk._decompPY;
+                sampleY = localY < 0 ? chunkSizeY - 1 : 0;
+            }
+            else
+            {
+                blockData = localZ < 0 ? chunk._decompNZ : chunk._decompPZ;
+                sampleZ = localZ < 0 ? chunkSizeXZ - 1 : 0;
+            }
+        }
+        else
+        {
+            return false;
+        }
+
+        if (blockData == null) return false;
+
+        int blockIndex = sampleY * chunkStride + sampleZ * chunkSizeXZ + sampleX;
+        blockId = blockData[blockIndex];
+        return true;
+    }
+
+    private ChunkData _ResolveAoSampleChunk(ChunkData chunk, ref int localX, ref int localY, ref int localZ)
+    {
+        if (chunk == null) return null;
+
+        int chunkX = chunk.chunkX_world;
+        int chunkY = chunk.chunkY_world;
+        int chunkZ = chunk.chunkZ_world;
+
+        while (localX < 0)
+        {
+            localX += chunkSizeXZ;
+            chunkX--;
+        }
+        while (localX >= chunkSizeXZ)
+        {
+            localX -= chunkSizeXZ;
+            chunkX++;
+        }
+        while (localY < 0)
+        {
+            localY += chunkSizeY;
+            chunkY--;
+        }
+        while (localY >= chunkSizeY)
+        {
+            localY -= chunkSizeY;
+            chunkY++;
+        }
+        while (localZ < 0)
+        {
+            localZ += chunkSizeXZ;
+            chunkZ--;
+        }
+        while (localZ >= chunkSizeXZ)
+        {
+            localZ -= chunkSizeXZ;
+            chunkZ++;
+        }
+
+        if (chunkX == chunk.chunkX_world && chunkY == chunk.chunkY_world && chunkZ == chunk.chunkZ_world)
+        {
+            return chunk;
+        }
+
+        if (chunkX == chunk.chunkX_world - 1 && chunkY == chunk.chunkY_world && chunkZ == chunk.chunkZ_world) return chunk.neighborNX;
+        if (chunkX == chunk.chunkX_world + 1 && chunkY == chunk.chunkY_world && chunkZ == chunk.chunkZ_world) return chunk.neighborPX;
+        if (chunkX == chunk.chunkX_world && chunkY == chunk.chunkY_world - 1 && chunkZ == chunk.chunkZ_world) return chunk.neighborNY;
+        if (chunkX == chunk.chunkX_world && chunkY == chunk.chunkY_world + 1 && chunkZ == chunk.chunkZ_world) return chunk.neighborPY;
+        if (chunkX == chunk.chunkX_world && chunkY == chunk.chunkY_world && chunkZ == chunk.chunkZ_world - 1) return chunk.neighborNZ;
+        if (chunkX == chunk.chunkX_world && chunkY == chunk.chunkY_world && chunkZ == chunk.chunkZ_world + 1) return chunk.neighborPZ;
+
+        return GetChunkAt(chunkX, chunkY, chunkZ);
+    }
+
+    private byte _GetAoLightLevelAt(ChunkData chunk, int localX, int localY, int localZ, byte emittedLight)
+    {
+        if (chunk == null) return emittedLight;
+        if (_TryGetAoLightLevelFast(chunk, localX, localY, localZ, emittedLight, out byte fastLightLevel))
+        {
+            return fastLightLevel;
+        }
+
+        int sampleX = localX;
+        int sampleY = localY;
+        int sampleZ = localZ;
+        ChunkData sampleChunk = _ResolveAoSampleChunk(chunk, ref sampleX, ref sampleY, ref sampleZ);
+        if (sampleChunk != null && sampleChunk.isDataReady && sampleChunk._cachedBrightness == null && !_UsesGpuTerrainLightSampling())
+        {
+            _PreComputeChunkBrightness(sampleChunk);
+        }
+
+        if (sampleChunk == null || !sampleChunk.isDataReady || sampleChunk._cachedBrightness == null)
+        {
+            return emittedLight;
+        }
+
+        byte sampleLight = _GetCachedLightLevelAtBlockRaw(sampleChunk, sampleX, sampleY, sampleZ);
+        return sampleLight > emittedLight ? sampleLight : emittedLight;
+    }
+
+    private byte _GetAoBlockIdAt(ChunkData chunk, int localX, int localY, int localZ)
+    {
+        if (chunk == null) return 0;
+        if (_TryGetAoBlockIdFast(chunk, localX, localY, localZ, out byte fastBlockId))
+        {
+            return fastBlockId;
+        }
+
+        int sampleX = localX;
+        int sampleY = localY;
+        int sampleZ = localZ;
+        ChunkData sampleChunk = _ResolveAoSampleChunk(chunk, ref sampleX, ref sampleY, ref sampleZ);
+        if (sampleChunk == null || !sampleChunk.isDataReady) return 0;
+        return _GetBlockLocal(sampleChunk, sampleX, sampleY, sampleZ);
+    }
+
+    private bool _GetCanBlockGrassAt(ChunkData chunk, int localX, int localY, int localZ)
+    {
+        byte blockId;
+        if (!_TryGetAoBlockIdFast(chunk, localX, localY, localZ, out blockId))
+        {
+            blockId = _GetAoBlockIdAt(chunk, localX, localY, localZ);
+        }
+        if (canBlockGrassCache != null && blockId < canBlockGrassCache.Length)
+        {
+            return canBlockGrassCache[blockId];
+        }
+        return blockId == 0;
+    }
+
+    private float _GetAoBrightnessAt(ChunkData chunk, int localX, int localY, int localZ, byte emittedLight)
+    {
+        byte lightLevel;
+        if (!_TryGetAoLightLevelFast(chunk, localX, localY, localZ, emittedLight, out lightLevel))
+        {
+            lightLevel = _GetAoLightLevelAt(chunk, localX, localY, localZ, emittedLight);
+        }
+        return lightBrightnessTable[lightLevel];
+    }
+
+    private bool _TryGetAoBrightnessAt(ChunkData chunk, int localX, int localY, int localZ, byte emittedLight, out float brightness)
+    {
+        brightness = lightBrightnessTable[emittedLight];
+        if (chunk == null) return false;
+        if (_TryGetAoLightLevelFast(chunk, localX, localY, localZ, emittedLight, out byte fastLightLevel))
+        {
+            brightness = lightBrightnessTable[fastLightLevel];
+            return true;
+        }
+
+        int sampleX = localX;
+        int sampleY = localY;
+        int sampleZ = localZ;
+        ChunkData sampleChunk = _ResolveAoSampleChunk(chunk, ref sampleX, ref sampleY, ref sampleZ);
+        if (sampleChunk != null && sampleChunk.isDataReady && sampleChunk._cachedBrightness == null && !_UsesGpuTerrainLightSampling())
+        {
+            _PreComputeChunkBrightness(sampleChunk);
+        }
+        if (sampleChunk == null || !sampleChunk.isDataReady || sampleChunk._cachedBrightness == null)
+        {
+            return false;
+        }
+
+        byte sampleLight = _GetCachedLightLevelAtBlockRaw(sampleChunk, sampleX, sampleY, sampleZ);
+        if (sampleLight < emittedLight) sampleLight = emittedLight;
+        brightness = lightBrightnessTable[sampleLight];
+        return true;
+    }
+
+    private int _PackAoBrightness(float brightness0, float brightness1, float brightness2, float brightness3)
+    {
+        int a0 = Mathf.Clamp(Mathf.RoundToInt(brightness0 * 255f), 0, 255);
+        int a1 = Mathf.Clamp(Mathf.RoundToInt(brightness1 * 255f), 0, 255);
+        int a2 = Mathf.Clamp(Mathf.RoundToInt(brightness2 * 255f), 0, 255);
+        int a3 = Mathf.Clamp(Mathf.RoundToInt(brightness3 * 255f), 0, 255);
+        return a0 | (a1 << 8) | (a2 << 16) | (a3 << 24);
+    }
+
+    private float _UnpackAoBrightness(int signature, int vertexIndex)
+    {
+        return ((signature >> (vertexIndex * 8)) & 0xFF) / 255f;
+    }
+
+    private bool _TryGetAoLightLevelAt(ChunkData chunk, int localX, int localY, int localZ, byte emittedLight, out byte lightLevel)
+    {
+        lightLevel = emittedLight;
+        if (chunk == null) return false;
+        if (_TryGetAoLightLevelFast(chunk, localX, localY, localZ, emittedLight, out lightLevel))
+        {
+            return true;
+        }
+
+        int sampleX = localX;
+        int sampleY = localY;
+        int sampleZ = localZ;
+        ChunkData sampleChunk = _ResolveAoSampleChunk(chunk, ref sampleX, ref sampleY, ref sampleZ);
+        if (sampleChunk != null && sampleChunk.isDataReady && sampleChunk._cachedBrightness == null && !_UsesGpuTerrainLightSampling())
+        {
+            _PreComputeChunkBrightness(sampleChunk);
+        }
+        if (sampleChunk == null || !sampleChunk.isDataReady || sampleChunk._cachedBrightness == null)
+        {
+            return false;
+        }
+
+        byte sampleLight = _GetCachedLightLevelAtBlockRaw(sampleChunk, sampleX, sampleY, sampleZ);
+        lightLevel = sampleLight > emittedLight ? sampleLight : emittedLight;
+        return true;
+    }
+
+    private int _BuildAoSignature(ChunkData chunk, byte blockID, int direction, int localX, int localY, int localZ)
+    {
+        if (!_UsesCpuAmbientOcclusion()) return 0;
+
+        int normalX = aoNormalX[direction];
+        int normalY = aoNormalY[direction];
+        int normalZ = aoNormalZ[direction];
+        int tangentUX = aoTangentUX[direction];
+        int tangentUY = aoTangentUY[direction];
+        int tangentUZ = aoTangentUZ[direction];
+        int tangentVX = aoTangentVX[direction];
+        int tangentVY = aoTangentVY[direction];
+        int tangentVZ = aoTangentVZ[direction];
+
+        int faceSampleX = localX + normalX;
+        int faceSampleY = localY + normalY;
+        int faceSampleZ = localZ + normalZ;
+        byte emittedLight = blockID < lightEmissionCache.Length ? (byte)lightEmissionCache[blockID] : (byte)0;
+
+        int sideUNegX = faceSampleX - tangentUX;
+        int sideUNegY = faceSampleY - tangentUY;
+        int sideUNegZ = faceSampleZ - tangentUZ;
+        int sideUPosX = faceSampleX + tangentUX;
+        int sideUPosY = faceSampleY + tangentUY;
+        int sideUPosZ = faceSampleZ + tangentUZ;
+        int sideVNegX = faceSampleX - tangentVX;
+        int sideVNegY = faceSampleY - tangentVY;
+        int sideVNegZ = faceSampleZ - tangentVZ;
+        int sideVPosX = faceSampleX + tangentVX;
+        int sideVPosY = faceSampleY + tangentVY;
+        int sideVPosZ = faceSampleZ + tangentVZ;
+
+        byte faceLightLevel;
+        byte sideUNegLightLevel;
+        byte sideUPosLightLevel;
+        byte sideVNegLightLevel;
+        byte sideVPosLightLevel;
+        bool sideUNegCanBlock;
+        bool sideUPosCanBlock;
+        bool sideVNegCanBlock;
+        bool sideVPosCanBlock;
+        byte diagonalNegNegLightLevel;
+        byte diagonalNegPosLightLevel;
+        byte diagonalPosNegLightLevel;
+        byte diagonalPosPosLightLevel;
+
+        byte[] selfBrightness = chunk != null ? chunk._cachedBrightness : null;
+        byte[] selfBlocks = chunk != null ? chunk._decompSelf : null;
+        int chunkStride = chunkSizeXZ * chunkSizeXZ;
+        int tangentSpanX = Mathf.Abs(tangentUX) + Mathf.Abs(tangentVX);
+        int tangentSpanY = Mathf.Abs(tangentUY) + Mathf.Abs(tangentVY);
+        int tangentSpanZ = Mathf.Abs(tangentUZ) + Mathf.Abs(tangentVZ);
+        bool useInteriorFastPath =
+            selfBrightness != null &&
+            selfBlocks != null &&
+            faceSampleX - tangentSpanX >= 0 && faceSampleX + tangentSpanX < chunkSizeXZ &&
+            faceSampleY - tangentSpanY >= 0 && faceSampleY + tangentSpanY < chunkSizeY &&
+            faceSampleZ - tangentSpanZ >= 0 && faceSampleZ + tangentSpanZ < chunkSizeXZ;
+
+        if (useInteriorFastPath)
+        {
+            int faceIndex = faceSampleY * chunkStride + faceSampleZ * chunkSizeXZ + faceSampleX;
+            int sideUNegIndex = sideUNegY * chunkStride + sideUNegZ * chunkSizeXZ + sideUNegX;
+            int sideUPosIndex = sideUPosY * chunkStride + sideUPosZ * chunkSizeXZ + sideUPosX;
+            int sideVNegIndex = sideVNegY * chunkStride + sideVNegZ * chunkSizeXZ + sideVNegX;
+            int sideVPosIndex = sideVPosY * chunkStride + sideVPosZ * chunkSizeXZ + sideVPosX;
+
+            faceLightLevel = selfBrightness[faceIndex];
+            if (faceLightLevel < emittedLight) faceLightLevel = emittedLight;
+            sideUNegLightLevel = selfBrightness[sideUNegIndex];
+            if (sideUNegLightLevel < emittedLight) sideUNegLightLevel = emittedLight;
+            sideUPosLightLevel = selfBrightness[sideUPosIndex];
+            if (sideUPosLightLevel < emittedLight) sideUPosLightLevel = emittedLight;
+            sideVNegLightLevel = selfBrightness[sideVNegIndex];
+            if (sideVNegLightLevel < emittedLight) sideVNegLightLevel = emittedLight;
+            sideVPosLightLevel = selfBrightness[sideVPosIndex];
+            if (sideVPosLightLevel < emittedLight) sideVPosLightLevel = emittedLight;
+
+            sideUNegCanBlock = canBlockGrassCache[selfBlocks[sideUNegIndex]];
+            sideUPosCanBlock = canBlockGrassCache[selfBlocks[sideUPosIndex]];
+            sideVNegCanBlock = canBlockGrassCache[selfBlocks[sideVNegIndex]];
+            sideVPosCanBlock = canBlockGrassCache[selfBlocks[sideVPosIndex]];
+
+            diagonalNegNegLightLevel = sideUNegLightLevel;
+            if (sideUNegCanBlock || sideVNegCanBlock)
+            {
+                int diagonalIndex = (sideUNegY - tangentVY) * chunkStride + (sideUNegZ - tangentVZ) * chunkSizeXZ + (sideUNegX - tangentVX);
+                diagonalNegNegLightLevel = selfBrightness[diagonalIndex];
+                if (diagonalNegNegLightLevel < emittedLight) diagonalNegNegLightLevel = emittedLight;
+            }
+
+            diagonalNegPosLightLevel = sideUNegLightLevel;
+            if (sideUNegCanBlock || sideVPosCanBlock)
+            {
+                int diagonalIndex = (sideUNegY + tangentVY) * chunkStride + (sideUNegZ + tangentVZ) * chunkSizeXZ + (sideUNegX + tangentVX);
+                diagonalNegPosLightLevel = selfBrightness[diagonalIndex];
+                if (diagonalNegPosLightLevel < emittedLight) diagonalNegPosLightLevel = emittedLight;
+            }
+
+            diagonalPosNegLightLevel = sideUPosLightLevel;
+            if (sideUPosCanBlock || sideVNegCanBlock)
+            {
+                int diagonalIndex = (sideUPosY - tangentVY) * chunkStride + (sideUPosZ - tangentVZ) * chunkSizeXZ + (sideUPosX - tangentVX);
+                diagonalPosNegLightLevel = selfBrightness[diagonalIndex];
+                if (diagonalPosNegLightLevel < emittedLight) diagonalPosNegLightLevel = emittedLight;
+            }
+
+            diagonalPosPosLightLevel = sideUPosLightLevel;
+            if (sideUPosCanBlock || sideVPosCanBlock)
+            {
+                int diagonalIndex = (sideUPosY + tangentVY) * chunkStride + (sideUPosZ + tangentVZ) * chunkSizeXZ + (sideUPosX + tangentVX);
+                diagonalPosPosLightLevel = selfBrightness[diagonalIndex];
+                if (diagonalPosPosLightLevel < emittedLight) diagonalPosPosLightLevel = emittedLight;
+            }
+        }
+        else
+        {
+            faceLightLevel = _GetAoLightLevelAt(chunk, faceSampleX, faceSampleY, faceSampleZ, emittedLight);
+            sideUNegLightLevel = _GetAoLightLevelAt(chunk, sideUNegX, sideUNegY, sideUNegZ, emittedLight);
+            sideUPosLightLevel = _GetAoLightLevelAt(chunk, sideUPosX, sideUPosY, sideUPosZ, emittedLight);
+            sideVNegLightLevel = _GetAoLightLevelAt(chunk, sideVNegX, sideVNegY, sideVNegZ, emittedLight);
+            sideVPosLightLevel = _GetAoLightLevelAt(chunk, sideVPosX, sideVPosY, sideVPosZ, emittedLight);
+
+            sideUNegCanBlock = _GetCanBlockGrassAt(chunk, sideUNegX, sideUNegY, sideUNegZ);
+            sideUPosCanBlock = _GetCanBlockGrassAt(chunk, sideUPosX, sideUPosY, sideUPosZ);
+            sideVNegCanBlock = _GetCanBlockGrassAt(chunk, sideVNegX, sideVNegY, sideVNegZ);
+            sideVPosCanBlock = _GetCanBlockGrassAt(chunk, sideVPosX, sideVPosY, sideVPosZ);
+
+            diagonalNegNegLightLevel = sideUNegLightLevel;
+            if (sideUNegCanBlock || sideVNegCanBlock)
+            {
+                if (!_TryGetAoLightLevelAt(chunk, sideUNegX - tangentVX, sideUNegY - tangentVY, sideUNegZ - tangentVZ, emittedLight, out diagonalNegNegLightLevel))
+                {
+                    diagonalNegNegLightLevel = sideUNegLightLevel;
+                }
+            }
+
+            diagonalNegPosLightLevel = sideUNegLightLevel;
+            if (sideUNegCanBlock || sideVPosCanBlock)
+            {
+                if (!_TryGetAoLightLevelAt(chunk, sideUNegX + tangentVX, sideUNegY + tangentVY, sideUNegZ + tangentVZ, emittedLight, out diagonalNegPosLightLevel))
+                {
+                    diagonalNegPosLightLevel = sideUNegLightLevel;
+                }
+            }
+
+            diagonalPosNegLightLevel = sideUPosLightLevel;
+            if (sideUPosCanBlock || sideVNegCanBlock)
+            {
+                if (!_TryGetAoLightLevelAt(chunk, sideUPosX - tangentVX, sideUPosY - tangentVY, sideUPosZ - tangentVZ, emittedLight, out diagonalPosNegLightLevel))
+                {
+                    diagonalPosNegLightLevel = sideUPosLightLevel;
+                }
+            }
+
+            diagonalPosPosLightLevel = sideUPosLightLevel;
+            if (sideUPosCanBlock || sideVPosCanBlock)
+            {
+                if (!_TryGetAoLightLevelAt(chunk, sideUPosX + tangentVX, sideUPosY + tangentVY, sideUPosZ + tangentVZ, emittedLight, out diagonalPosPosLightLevel))
+                {
+                    diagonalPosPosLightLevel = sideUPosLightLevel;
+                }
+            }
+        }
+
+        int signBase = direction * 4;
+        int corner0 = 0;
+        int corner1 = 0;
+        int corner2 = 0;
+        int corner3 = 0;
+        byte[] alphaTable = aoBrightnessAlphaTable;
+
+        for (int vertexIndex = 0; vertexIndex < 4; vertexIndex++)
+        {
+            int signU = aoCornerUSigns[signBase + vertexIndex];
+            int signV = aoCornerVSigns[signBase + vertexIndex];
+            int sideULightLevel = signU < 0 ? sideUNegLightLevel : sideUPosLightLevel;
+            int sideVLightLevel = signV < 0 ? sideVNegLightLevel : sideVPosLightLevel;
+            int diagonalLightLevel;
+
+            if (signU < 0)
+            {
+                diagonalLightLevel = signV < 0 ? diagonalNegNegLightLevel : diagonalNegPosLightLevel;
+            }
+            else
+            {
+                diagonalLightLevel = signV < 0 ? diagonalPosNegLightLevel : diagonalPosPosLightLevel;
+            }
+
+            int alphaIndex = faceLightLevel | (sideULightLevel << 4) | (sideVLightLevel << 8) | (diagonalLightLevel << 12);
+            int cornerAlpha = alphaTable[alphaIndex];
+            if (vertexIndex == 0) corner0 = cornerAlpha;
+            else if (vertexIndex == 1) corner1 = cornerAlpha;
+            else if (vertexIndex == 2) corner2 = cornerAlpha;
+            else corner3 = cornerAlpha;
+        }
+
+        return corner0 | (corner1 << 8) | (corner2 << 16) | (corner3 << 24);
     }
 
     private int _GetTextureSliceCached(byte blockID, int faceIndex)
@@ -4058,7 +4684,7 @@ public class McWorld : UdonSharpBehaviour
         return 0;
     }
 
-    private void _AddGreedyQuad(ChunkData chunk, int direction, int slice, int u, int v, int width, int height, byte blockID, byte lightLevel, int packedColor)
+    private void _AddGreedyQuad(ChunkData chunk, int direction, int slice, int u, int v, int width, int height, byte blockID, byte lightLevel, int packedColor, int aoSignature)
     {
         BlockVisibilityType visibility = (blockID < visibilityCache.Length) ? visibilityCache[blockID] : BlockVisibilityType.Opaque;
 
@@ -4163,17 +4789,25 @@ public class McWorld : UdonSharpBehaviour
         targetNormals[currentVertexCount + 2] = faceNormal;
         targetNormals[currentVertexCount + 3] = faceNormal;
 
-        float brightness = lightBrightnessTable[lightLevel];
-        Color biomeColor = new Color(
-            (packedColor & 0xFF) / 255f,
-            ((packedColor >> 8) & 0xFF) / 255f,
-            ((packedColor >> 16) & 0xFF) / 255f,
-            brightness
-        );
-        targetColors[currentVertexCount + 0] = biomeColor;
-        targetColors[currentVertexCount + 1] = biomeColor;
-        targetColors[currentVertexCount + 2] = biomeColor;
-        targetColors[currentVertexCount + 3] = biomeColor;
+        float colorR = (packedColor & 0xFF) / 255f;
+        float colorG = ((packedColor >> 8) & 0xFF) / 255f;
+        float colorB = ((packedColor >> 16) & 0xFF) / 255f;
+        if (_UsesCpuAmbientOcclusion())
+        {
+            targetColors[currentVertexCount + 0] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 0));
+            targetColors[currentVertexCount + 1] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 1));
+            targetColors[currentVertexCount + 2] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 2));
+            targetColors[currentVertexCount + 3] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 3));
+        }
+        else
+        {
+            float brightness = lightBrightnessTable[lightLevel];
+            Color biomeColor = new Color(colorR, colorG, colorB, brightness);
+            targetColors[currentVertexCount + 0] = biomeColor;
+            targetColors[currentVertexCount + 1] = biomeColor;
+            targetColors[currentVertexCount + 2] = biomeColor;
+            targetColors[currentVertexCount + 3] = biomeColor;
+        }
 
         float textureSlice = _GetTextureSliceCached(blockID, faceIndex);
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice);
@@ -4316,8 +4950,9 @@ public class McWorld : UdonSharpBehaviour
 
                 int maskIndex = v * width + u;
                 greedyMaskBlockIds[maskIndex] = selfID;
-                greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
+                greedyMaskLightLevels[maskIndex] = _UsesCpuAmbientOcclusion() ? (byte)0 : _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
                 greedyMaskPackedColors[maskIndex] = _GetPackedBiomeColor(chunk, selfID, x, z);
+                greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, x, y, z) : 0;
             }
         }
     }
@@ -4407,8 +5042,9 @@ public class McWorld : UdonSharpBehaviour
 
                 int maskIndex = rowOffset + u;
                 greedyMaskBlockIds[maskIndex] = selfID;
-                greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
+                greedyMaskLightLevels[maskIndex] = _UsesCpuAmbientOcclusion() ? (byte)0 : _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
                 greedyMaskPackedColors[maskIndex] = _GetPackedBiomeColor(chunk, selfID, x, z);
+                greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, x, y, z) : 0;
             }
         }
     }
@@ -4433,13 +5069,14 @@ public class McWorld : UdonSharpBehaviour
         byte[] blockIds = greedyMaskBlockIds;
         byte[] lightLevels = greedyMaskLightLevels;
         int[] packedColors = greedyMaskPackedColors;
+        bool useAo = _UsesCpuAmbientOcclusion();
         byte[] currentBrightness = chunk._cachedBrightness;
         byte[] neighborBrightness = null;
         int sizeXZ = chunkSizeXZ;
         int sizeY = chunkSizeY;
         int sliceStrideBase = slice * chunkStride;
         int sliceRowBase = slice * sizeXZ;
-        byte fallbackLight = UsesGpuLightingBackend() ? (byte)15 : (byte)0;
+        byte fallbackLight = _UsesGpuTerrainLightSampling() ? (byte)15 : (byte)0;
         int neighborAxis = slice;
 
         if (direction == 0) neighborAxis++;
@@ -4520,17 +5157,20 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (usesCurrentBrightness)
+                        if (!useAo)
                         {
-                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                        }
-                        else if (neighborBrightness != null)
-                        {
-                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                        }
-                        else
-                        {
-                            lightLevels[maskIndex] = fallbackLight;
+                            if (usesCurrentBrightness)
+                            {
+                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                            }
+                            else if (neighborBrightness != null)
+                            {
+                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                            }
+                            else
+                            {
+                                lightLevels[maskIndex] = fallbackLight;
+                            }
                         }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -4549,6 +5189,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
                             }
                         }
+                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
                         anyFace = true;
                     }
                 }
@@ -4567,17 +5208,20 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (usesCurrentBrightness)
+                        if (!useAo)
                         {
-                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                        }
-                        else if (neighborBrightness != null)
-                        {
-                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                        }
-                        else
-                        {
-                            lightLevels[maskIndex] = fallbackLight;
+                            if (usesCurrentBrightness)
+                            {
+                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                            }
+                            else if (neighborBrightness != null)
+                            {
+                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                            }
+                            else
+                            {
+                                lightLevels[maskIndex] = fallbackLight;
+                            }
                         }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -4596,6 +5240,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
                             }
                         }
+                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
                         anyFace = true;
                     }
                 }
@@ -4615,17 +5260,20 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (usesCurrentBrightness)
+                        if (!useAo)
                         {
-                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
-                        }
-                        else if (neighborBrightness != null)
-                        {
-                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
-                        }
-                        else
-                        {
-                            lightLevels[maskIndex] = fallbackLight;
+                            if (usesCurrentBrightness)
+                            {
+                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
+                            }
+                            else if (neighborBrightness != null)
+                            {
+                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
+                            }
+                            else
+                            {
+                                lightLevels[maskIndex] = fallbackLight;
+                            }
                         }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -4640,6 +5288,7 @@ public class McWorld : UdonSharpBehaviour
                         {
                             packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
                         }
+                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
                         anyFace = true;
                     }
                 }
@@ -4666,17 +5315,20 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (usesCurrentBrightness)
+                        if (!useAo)
                         {
-                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                        }
-                        else if (neighborBrightness != null)
-                        {
-                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                        }
-                        else
-                        {
-                            lightLevels[maskIndex] = fallbackLight;
+                            if (usesCurrentBrightness)
+                            {
+                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                            }
+                            else if (neighborBrightness != null)
+                            {
+                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                            }
+                            else
+                            {
+                                lightLevels[maskIndex] = fallbackLight;
+                            }
                         }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -4695,6 +5347,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
                             }
                         }
+                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
                         anyFace = true;
                     }
                 }
@@ -4713,17 +5366,20 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (usesCurrentBrightness)
+                        if (!useAo)
                         {
-                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                        }
-                        else if (neighborBrightness != null)
-                        {
-                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                        }
-                        else
-                        {
-                            lightLevels[maskIndex] = fallbackLight;
+                            if (usesCurrentBrightness)
+                            {
+                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
+                            }
+                            else if (neighborBrightness != null)
+                            {
+                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
+                            }
+                            else
+                            {
+                                lightLevels[maskIndex] = fallbackLight;
+                            }
                         }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -4742,6 +5398,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
                             }
                         }
+                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
                         anyFace = true;
                     }
                 }
@@ -4761,17 +5418,20 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (usesCurrentBrightness)
+                        if (!useAo)
                         {
-                            lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
-                        }
-                        else if (neighborBrightness != null)
-                        {
-                            lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
-                        }
-                        else
-                        {
-                            lightLevels[maskIndex] = fallbackLight;
+                            if (usesCurrentBrightness)
+                            {
+                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
+                            }
+                            else if (neighborBrightness != null)
+                            {
+                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
+                            }
+                            else
+                            {
+                                lightLevels[maskIndex] = fallbackLight;
+                            }
                         }
                         byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -4786,6 +5446,7 @@ public class McWorld : UdonSharpBehaviour
                         {
                             packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
                         }
+                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
                         anyFace = true;
                     }
                 }
@@ -4810,6 +5471,8 @@ public class McWorld : UdonSharpBehaviour
         byte[] blockIds = greedyMaskBlockIds;
         byte[] lightLevels = greedyMaskLightLevels;
         int[] packedColors = greedyMaskPackedColors;
+        int[] aoSignatures = greedyMaskAoSignatures;
+        bool useAo = _UsesCpuAmbientOcclusion();
 
         for (int v = minV; v <= maxV; v++)
         {
@@ -4826,6 +5489,7 @@ public class McWorld : UdonSharpBehaviour
 
                 byte lightLevel = lightLevels[maskIndex];
                 int packedColor = packedColors[maskIndex];
+                int aoSignature = aoSignatures[maskIndex];
 
 #if LOGGING
                 float emitScanStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
@@ -4834,7 +5498,15 @@ public class McWorld : UdonSharpBehaviour
                 while (u + quadWidth <= maxU)
                 {
                     int nextIndex = rowOffset + u + quadWidth;
-                    if (blockIds[nextIndex] != blockID || lightLevels[nextIndex] != lightLevel || packedColors[nextIndex] != packedColor) break;
+                    if (blockIds[nextIndex] != blockID || packedColors[nextIndex] != packedColor) break;
+                    if (useAo)
+                    {
+                        if (aoSignatures[nextIndex] != aoSignature) break;
+                    }
+                    else if (lightLevels[nextIndex] != lightLevel)
+                    {
+                        break;
+                    }
                     quadWidth++;
                 }
 
@@ -4846,7 +5518,20 @@ public class McWorld : UdonSharpBehaviour
                     for (int checkU = 0; checkU < quadWidth; checkU++)
                     {
                         int nextIndex = nextRowOffset + u + checkU;
-                        if (blockIds[nextIndex] != blockID || lightLevels[nextIndex] != lightLevel || packedColors[nextIndex] != packedColor)
+                        if (blockIds[nextIndex] != blockID || packedColors[nextIndex] != packedColor)
+                        {
+                            canGrow = false;
+                            break;
+                        }
+                        if (useAo)
+                        {
+                            if (aoSignatures[nextIndex] != aoSignature)
+                            {
+                                canGrow = false;
+                                break;
+                            }
+                        }
+                        else if (lightLevels[nextIndex] != lightLevel)
                         {
                             canGrow = false;
                             break;
@@ -4863,7 +5548,7 @@ public class McWorld : UdonSharpBehaviour
 
                 float emitQuadStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
 #endif
-                _AddGreedyQuad(chunk, direction, slice, u, v, quadWidth, quadHeight, blockID, lightLevel, packedColor);
+                _AddGreedyQuad(chunk, direction, slice, u, v, quadWidth, quadHeight, blockID, lightLevel, packedColor, aoSignature);
 #if LOGGING
                 if (stats_trackCompactEmitInternals)
                 {
@@ -4998,12 +5683,31 @@ public class McWorld : UdonSharpBehaviour
         // Calculate biome color for this block position
         Color biomeColor = _GetBiomeColorForBlock(chunk, blockID, (int)bx, (int)bz);
 
-        // FIXED: Apply lighting to vertex colors (alpha channel = brightness)
-        // Sample light from the neighbor block that this face is against, not the block itself
-        float brightness = _GetLightBrightnessForFace(chunk, faceNormal, (int)bx, (int)by, (int)bz);
-        biomeColor.a = brightness;
+        if (_UsesCpuAmbientOcclusion())
+        {
+            int direction;
+            if (faceNormal.y > 0.5f) direction = 0;
+            else if (faceNormal.y < -0.5f) direction = 1;
+            else if (faceNormal.z > 0.5f) direction = 2;
+            else if (faceNormal.z < -0.5f) direction = 3;
+            else if (faceNormal.x > 0.5f) direction = 4;
+            else direction = 5;
 
-        for (int i=0; i<4; i++) targetColors[currentVertexCount + i] = biomeColor;
+            int aoSignature = _BuildAoSignature(chunk, blockID, direction, (int)bx, (int)by, (int)bz);
+            targetColors[currentVertexCount + 0] = new Color(biomeColor.r, biomeColor.g, biomeColor.b, _UnpackAoBrightness(aoSignature, 0));
+            targetColors[currentVertexCount + 1] = new Color(biomeColor.r, biomeColor.g, biomeColor.b, _UnpackAoBrightness(aoSignature, 1));
+            targetColors[currentVertexCount + 2] = new Color(biomeColor.r, biomeColor.g, biomeColor.b, _UnpackAoBrightness(aoSignature, 2));
+            targetColors[currentVertexCount + 3] = new Color(biomeColor.r, biomeColor.g, biomeColor.b, _UnpackAoBrightness(aoSignature, 3));
+        }
+        else
+        {
+            // FIXED: Apply lighting to vertex colors (alpha channel = brightness)
+            // Sample light from the neighbor block that this face is against, not the block itself
+            float brightness = _GetLightBrightnessForFace(chunk, faceNormal, (int)bx, (int)by, (int)bz);
+            biomeColor.a = brightness;
+
+            for (int i=0; i<4; i++) targetColors[currentVertexCount + i] = biomeColor;
+        }
 
         float textureSlice = _GetTextureSlice(blockID, faceIndex);
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice); targetUVs[currentVertexCount + 1] = new Vector3(0, 1, textureSlice);
@@ -5729,24 +6433,44 @@ public class McWorld : UdonSharpBehaviour
             float darkness = 1.0f - lightLevel;
             lightBrightnessTable[i] = (1.0f - darkness) / (darkness * 3.0f + 1.0f) * 0.95f + 0.05f;
         }
+        aoBrightnessAlphaTable = new byte[16 * 16 * 16 * 16];
+        for (int a = 0; a < 16; a++)
+        {
+            for (int b = 0; b < 16; b++)
+            {
+                for (int c = 0; c < 16; c++)
+                {
+                    for (int d = 0; d < 16; d++)
+                    {
+                        float averageBrightness = (lightBrightnessTable[a] + lightBrightnessTable[b] + lightBrightnessTable[c] + lightBrightnessTable[d]) * 0.25f;
+                        int alphaIndex = a | (b << 4) | (c << 8) | (d << 12);
+                        aoBrightnessAlphaTable[alphaIndex] = (byte)Mathf.Clamp(Mathf.RoundToInt(averageBrightness * 255f), 0, 255);
+                    }
+                }
+            }
+        }
 
         // Build light opacity and emission caches
         int maxId = blockTypeManager.finalDataArray != null ? blockTypeManager.finalDataArray.Length : 256;
         lightOpacityCache = new int[256];
         lightEmissionCache = new int[256];
+        canBlockGrassCache = new bool[256];
         for (int i = 0; i < 256; i++)
         {
             if (i < maxId)
             {
                 lightOpacityCache[i] = blockTypeManager.GetBlockLightOpacity((byte)i);
                 lightEmissionCache[i] = blockTypeManager.GetBlockLightEmission((byte)i);
+                canBlockGrassCache[i] = blockTypeManager.GetBlockCanBlockGrass((byte)i);
             }
             else
             {
                 lightOpacityCache[i] = 15; // Default to opaque
                 lightEmissionCache[i] = 0;  // Default to no emission
+                canBlockGrassCache[i] = false;
             }
         }
+        canBlockGrassCache[0] = true;
 
         Debug.Log("[McWorld] Light brightness table and caches built successfully.");
     }
@@ -6123,7 +6847,7 @@ public class McWorld : UdonSharpBehaviour
 
     private void InitializeChunkLighting(ChunkData chunk)
     {
-        if (UsesGpuLightingBackend())
+        if (_UsesGpuTerrainLightSampling())
         {
             chunk.lightData = null;
             return;
@@ -7411,7 +8135,7 @@ public class McWorld : UdonSharpBehaviour
             return _GetLightBrightnessAtBlock(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
         }
 
-        if (UsesGpuLightingBackend())
+        if (_UsesGpuTerrainLightSampling())
         {
             return 1.0f;
         }
@@ -7657,7 +8381,7 @@ public class McWorld : UdonSharpBehaviour
             return _GetLightBrightnessAtBlockOptimized(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
         }
 
-        if (UsesGpuLightingBackend())
+        if (_UsesGpuTerrainLightSampling())
         {
             return 1.0f;
         }
@@ -7759,7 +8483,7 @@ public class McWorld : UdonSharpBehaviour
     // This eliminates 10,000+ method calls during meshing
     private void _PreComputeChunkBrightness(ChunkData chunk)
     {
-        if (UsesGpuLightingBackend())
+        if (_UsesGpuTerrainLightSampling())
         {
             chunk._cachedBrightness = null;
             return;
@@ -7900,7 +8624,7 @@ public class McWorld : UdonSharpBehaviour
             return _GetCachedBrightnessAtBlock(neighborChunk, neighborLocalX, neighborLocalY, neighborLocalZ);
         }
 
-        if (UsesGpuLightingBackend())
+        if (_UsesGpuTerrainLightSampling())
         {
             return 1.0f;
         }
