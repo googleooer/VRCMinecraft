@@ -1,102 +1,857 @@
-﻿using UdonSharp;
+using UdonSharp;
 using UnityEngine;
-using VRC.SDKBase; 
-using VRRefAssist; // If McBlockTypeManager uses [Singleton] from VRRefAssist
+using VRC.SDKBase;
 
+/// <summary>
+/// Manages all MC Beta 1.7.3 particle effects using native Unity ParticleSystems.
+/// Each particle type has its own ParticleSystem configured in the Inspector.
+/// Call SpawnParticle() to emit particles matching MC's RenderGlobal.spawnParticle dispatch.
+/// </summary>
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McParticleManager : UdonSharpBehaviour
 {
-    [Header("Particle System References (Fallback/Generic)")]
-    [Tooltip("Fallback particle system if block-specific one is not found for breaking.")]
+    // ── Particle type constants matching MC's string-based dispatch ──
+    public const int PT_BUBBLE = 0;
+    public const int PT_SMOKE = 1;
+    public const int PT_LARGESMOKE = 2;
+    public const int PT_NOTE = 3;
+    public const int PT_PORTAL = 4;
+    public const int PT_EXPLODE = 5;
+    public const int PT_FLAME = 6;
+    public const int PT_LAVA = 7;
+    public const int PT_SPLASH = 8;
+    public const int PT_REDDUST = 9;
+    public const int PT_SNOWSHOVEL = 10;
+    public const int PT_HEART = 11;
+    public const int PT_RAIN = 12;
+
+    // ── MC Particle Systems (auto-discovered from children in Start) ──
+    private ParticleSystem smokePS;
+    private ParticleSystem explodePS;
+    private ParticleSystem flamePS;
+    private ParticleSystem lavaPS;
+    private ParticleSystem bubblePS;
+    private ParticleSystem splashPS;
+    private ParticleSystem heartPS;
+    private ParticleSystem notePS;
+    private ParticleSystem portalPS;
+    private ParticleSystem reddustPS;
+    private ParticleSystem snowPS;
+
+    // ── Existing break/place/footstep systems ──
+
+    [Header("Block Break/Place")]
     public ParticleSystem genericBreakParticles;
-    [Tooltip("Fallback particle system if block-specific one is not found for placing.")]
     public ParticleSystem genericPlaceParticles;
-    // [Tooltip("GameObject Prefab with a ParticleSystem for footsteps. This will be instantiated.")]
-    // public GameObject footstepParticlePrefab; // Removed
 
-    [Header("Persistent Particle Systems")] // New Header
-    [Tooltip("Persistent ParticleSystem in the scene for footsteps. Should be configured as a one-shot effect.")]
-    public ParticleSystem persistentFootstepParticles; // New field
-
-    // Audio Clip Arrays are removed; sounds will be fetched from McBlockTypeManager
-    // Header("Audio Clip Arrays (Randomized)")
-    // public AudioClip[] breakAudioClips;
-    // public AudioClip[] placeAudioClips;
-    // public AudioClip[] footstepAudioClips;
-
-    [Header("Footstep Settings")]
+    [Header("Footstep")]
+    public ParticleSystem persistentFootstepParticles;
     public float footstepSpeedThreshold = 0.5f;
     public float footstepInterval = 0.4f;
     public float footstepVerticalOffset = -1.0f;
 
+    [Header("Particle Material")]
+    public Material particleMaterial;
+    public Material blockParticleMaterial;
+    public Texture2D blockParticleAtlas;
+
     private VRCPlayerApi localPlayer;
-    private float lastFootstepTime = 0f;
-    private bool isInitialized = false;
-    private AudioSource _audioSource; 
-    [SerializeField] private McBlockTypeManager blockTypeManager; // Reference to the singleton
-    [SerializeField]private McWorld world; // Reference to McWorld to get block ID under player
+    private float lastFootstepTime;
+    private bool isInitialized;
+    private AudioSource _audioSource;
+    [SerializeField] private McBlockTypeManager blockTypeManager;
+    [SerializeField] private McWorld world;
+
+    // MC block IDs that emit ambient particles
+    const byte BLOCK_LAVA_MOVING = 10;
+    const byte BLOCK_LAVA_STILL = 11;
+    const byte BLOCK_TORCH = 50;
+    const byte BLOCK_FIRE = 51;
+    const byte BLOCK_FURNACE_LIT = 62;
+    const byte BLOCK_REDSTONE_ORE_LIT = 74;
+    const byte BLOCK_REDSTONE_TORCH_ON = 76;
+    const byte BLOCK_PORTAL = 90;
+    const int PARTICLE_ATLAS_TILES = 16;
+    const int PARTICLE_ATLAS_FRAME_SMOKE = 7;
+    const int PARTICLE_ATLAS_FRAME_BUBBLE = 32;
+    const int PARTICLE_ATLAS_FRAME_FLAME = 48;
+    const int PARTICLE_ATLAS_FRAME_LAVA = 49;
+    const int PARTICLE_ATLAS_FRAME_NOTE = 64;
+    const int PARTICLE_ATLAS_FRAME_HEART = 80;
+    const int PARTICLE_ATLAS_FRAME_RAIN_START = 19;
+    const int PARTICLE_ATLAS_FRAME_SPLASH_START = 20;
+    const int FACE_INDEX_TOP = 2;
+    const int FACE_INDEX_BOTTOM = 3;
+    const byte TORCH_MOUNT_WEST = 1;
+    const byte TORCH_MOUNT_EAST = 2;
+    const byte TORCH_MOUNT_NORTH = 3;
+    const byte TORCH_MOUNT_SOUTH = 4;
+    const byte TORCH_MOUNT_FLOOR = 5;
+    const byte TORCH_MOUNT_CEILING = 6;
 
     void Start()
     {
         _audioSource = GetComponent<AudioSource>();
         if (_audioSource == null)
-        {
-            Debug.LogError("[McParticleManager] AudioSource component missing on this GameObject! Add an AudioSource component to enable sound effects.");
-        }
+            Debug.LogError("[McParticleManager] AudioSource missing!");
+        if (blockTypeManager == null)
+            Debug.LogError("[McParticleManager] McBlockTypeManager not assigned!");
 
-        // Get McBlockTypeManager instance
-        if (blockTypeManager == null) {
-            Debug.LogError("[McParticleManager] Could not find McBlockTypeManager instance! Block-specific sounds/particles will not work.");
-            
-        }
-#if ENABLE_LOGGING
-        if (world == null) {
-             Debug.LogWarning("[McParticleManager] McWorld instance not found. Footstep sounds based on block type will not work.");
-        }
-#endif
-
-
-#if ENABLE_LOGGING
-        if (genericBreakParticles == null) Debug.LogWarning($"[McParticleManager] GenericBreakParticles not assigned.");
-#endif
-#if ENABLE_LOGGING
-        if (genericPlaceParticles == null) Debug.LogWarning($"[McParticleManager] GenericPlaceParticles not assigned.");
-#endif
-#if ENABLE_LOGGING
-        // if (footstepParticlePrefab == null) Debug.LogWarning($"[McParticleManager] FootstepParticlePrefab not assigned."); // Removed check
-#endif
-#if ENABLE_LOGGING
-        if (persistentFootstepParticles == null) Debug.LogWarning("[McParticleManager] PersistentFootstepParticles not assigned!"); // New check
-#endif
-        else // ADDED: Set simulation space if the particle system exists
+        if (persistentFootstepParticles != null)
         {
             var mainModule = persistentFootstepParticles.main;
             mainModule.simulationSpace = ParticleSystemSimulationSpace.World;
         }
-        
+
+        // Auto-discover child ParticleSystems by name
+        smokePS = _FindChildPS("SmokePS");
+        explodePS = _FindChildPS("ExplodePS");
+        flamePS = _FindChildPS("FlamePS");
+        lavaPS = _FindChildPS("LavaPS");
+        bubblePS = _FindChildPS("BubblePS");
+        splashPS = _FindChildPS("SplashPS");
+        heartPS = _FindChildPS("HeartPS");
+        notePS = _FindChildPS("NotePS");
+        portalPS = _FindChildPS("PortalPS");
+        reddustPS = _FindChildPS("ReddustPS");
+        snowPS = _FindChildPS("SnowPS");
+
+        // Configure each PS for manual emit usage
+        _ConfigurePS(smokePS, 0.08f, 500);
+        _ConfigurePS(explodePS, 0.08f, 500);
+        _ConfigurePS(flamePS, 0f, 500);
+        _ConfigurePS(lavaPS, 0.12f, 200);
+        _ConfigurePS(bubblePS, -0.02f, 200);
+        _ConfigurePS(splashPS, 0.08f, 200);
+        _ConfigurePS(heartPS, 0.02f, 100);
+        _ConfigurePS(notePS, -0.02f, 100);
+        _ConfigurePS(portalPS, 0f, 300);
+        _ConfigurePS(reddustPS, 0.02f, 300);
+        _ConfigurePS(snowPS, 0.08f, 200);
+
+        _SetParticleAtlasFrame(smokePS, PARTICLE_ATLAS_FRAME_SMOKE);
+        _SetParticleAtlasFrame(explodePS, PARTICLE_ATLAS_FRAME_SMOKE);
+        _SetParticleAtlasFrame(flamePS, PARTICLE_ATLAS_FRAME_FLAME);
+        _SetParticleAtlasFrame(lavaPS, PARTICLE_ATLAS_FRAME_LAVA);
+        _SetParticleAtlasFrame(bubblePS, PARTICLE_ATLAS_FRAME_BUBBLE);
+        _SetParticleAtlasFrame(splashPS, PARTICLE_ATLAS_FRAME_SPLASH_START);
+        _SetParticleAtlasFrame(heartPS, PARTICLE_ATLAS_FRAME_HEART);
+        _SetParticleAtlasFrame(notePS, PARTICLE_ATLAS_FRAME_NOTE);
+        _SetParticleAtlasFrame(portalPS, 0);
+        _SetParticleAtlasFrame(reddustPS, PARTICLE_ATLAS_FRAME_SMOKE);
+        _SetParticleAtlasFrame(snowPS, PARTICLE_ATLAS_FRAME_SMOKE);
+
         isInitialized = true;
+    }
+
+    ParticleSystem _FindChildPS(string childName)
+    {
+        Transform child = transform.Find(childName);
+        if (child == null)
+        {
+            Debug.LogWarning("[McParticleManager] Child PS not found: " + childName);
+            return null;
+        }
+        return child.GetComponent<ParticleSystem>();
+    }
+
+    void _ConfigurePS(ParticleSystem ps, float gravity, int maxParticles)
+    {
+        if (ps == null) return;
+
+        var main = ps.main;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+        main.playOnAwake = false;
+        main.loop = false;
+        main.maxParticles = maxParticles;
+        main.gravityModifier = gravity;
+        main.startSpeed = 0f;
+
+        var emission = ps.emission;
+        emission.enabled = false;
+
+        var shape = ps.shape;
+        shape.enabled = false;
+
+        _AssignParticleMaterial(ps, null);
     }
 
     void Update()
     {
         if (!isInitialized) return;
-
         if (localPlayer == null)
         {
             localPlayer = Networking.LocalPlayer;
             if (localPlayer == null) return;
         }
-
         HandleFootsteps();
+        _RandomDisplayTick();
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // MC randomDisplayTick — ambient block particles
+    // ════════════════════════════════════════════════════════════════
+
+    // MC samples 1000 random blocks per tick (50 per frame at 20 TPS).
+    // We sample fewer since we run at higher FPS. Budget ~16 samples/frame at 60fps
+    // ≈ 960/sec, close to MC's 1000/sec.
+    void _RandomDisplayTick()
+    {
+        if (world == null) return;
+
+        Vector3 ppos = localPlayer.GetPosition();
+        int px = Mathf.FloorToInt(ppos.x);
+        int py = Mathf.FloorToInt(ppos.y);
+        int pz = Mathf.FloorToInt(ppos.z);
+
+        // Sample 16 random blocks within a 16-block radius each frame
+        for (int i = 0; i < 16; i++)
+        {
+            int rx = px + Random.Range(-16, 17);
+            int ry = py + Random.Range(-16, 17);
+            int rz = pz + Random.Range(-16, 17);
+
+            if (ry < 0 || ry >= 128) continue;
+
+            byte blockId = (byte)(world.GetBlock(rx, ry, rz) & 0xFF);
+            if (blockId == 0) continue;
+
+            _BlockRandomDisplayTick(blockId, rx, ry, rz);
+        }
+    }
+
+    void _BlockRandomDisplayTick(byte blockId, int x, int y, int z)
+    {
+        switch (blockId)
+        {
+            case BLOCK_TORCH:
+                _TickTorch(x, y, z);
+                break;
+            case BLOCK_FIRE:
+                _TickFire(x, y, z);
+                break;
+            case BLOCK_FURNACE_LIT:
+                _TickFurnace(x, y, z);
+                break;
+            case BLOCK_LAVA_MOVING:
+            case BLOCK_LAVA_STILL:
+                _TickLava(x, y, z);
+                break;
+            case BLOCK_PORTAL:
+                _TickPortal(x, y, z);
+                break;
+            case BLOCK_REDSTONE_TORCH_ON:
+                _TickRedstoneTorch(x, y, z);
+                break;
+        }
+    }
+
+    // MC BlockTorch.randomDisplayTick: flame + smoke at torch tip
+    void _TickTorch(int x, int y, int z)
+    {
+        Vector3 torchTip = _GetTorchTipPosition(x, y, z);
+        float tx = torchTip.x;
+        float ty = torchTip.y;
+        float tz = torchTip.z;
+
+        SpawnParticle(PT_SMOKE, tx, ty, tz, 0f, 0f, 0f);
+        SpawnParticle(PT_FLAME, tx, ty, tz, 0f, 0f, 0f);
+    }
+
+    // MC BlockFire.randomDisplayTick: largesmoke rising from fire
+    void _TickFire(int x, int y, int z)
+    {
+        float fx = x + Random.value;
+        float fy = y + Random.value + Random.value;
+        float fz = z + Random.value;
+        SpawnParticle(PT_LARGESMOKE, fx, fy, fz, 0f, 0f, 0f);
+    }
+
+    // MC BlockFurnace.randomDisplayTick: smoke + flame from front face
+    void _TickFurnace(int x, int y, int z)
+    {
+        float fx = x + 0.5f;
+        float fy = y + Random.value;
+        float fz = z + 0.5f;
+
+        // Simplified: emit from a random side. MC uses metadata for facing direction.
+        float offset = Random.value * 0.6f - 0.3f;
+        int side = Random.Range(0, 4);
+        float sx = fx, sz = fz;
+        if (side == 0) sz = z + 0.0f;
+        else if (side == 1) sz = z + 1.0f;
+        else if (side == 2) sx = x + 0.0f;
+        else sx = x + 1.0f;
+
+        SpawnParticle(PT_SMOKE, sx, fy, sz, 0f, 0f, 0f);
+        SpawnParticle(PT_FLAME, sx, fy, sz, 0f, 0f, 0f);
+    }
+
+    // MC BlockFluid.randomDisplayTick for lava: lava ember particles
+    void _TickLava(int x, int y, int z)
+    {
+        // MC spawns lava particles with ~10% chance per tick
+        if (Random.value > 0.1f) return;
+
+        // Check if block above is air
+        byte above = (byte)(world.GetBlock(x, y + 1, z) & 0xFF);
+        if (above != 0) return;
+
+        float lx = x + Random.value;
+        float ly = y + 1.02f;
+        float lz = z + Random.value;
+        SpawnParticle(PT_LAVA, lx, ly, lz, 0f, 0f, 0f);
+    }
+
+    // MC BlockPortal.randomDisplayTick: purple portal sparkles
+    void _TickPortal(int x, int y, int z)
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            float px = x + Random.value;
+            float py = y + Random.value;
+            float pz = z + Random.value;
+            float vx = (Random.value - 0.5f) * 0.5f;
+            float vy = (Random.value - 0.5f) * 0.5f;
+            float vz = (Random.value - 0.5f) * 0.5f;
+            SpawnParticle(PT_PORTAL, px, py, pz, vx, vy, vz);
+        }
+    }
+
+    // MC BlockRedstoneTorch.randomDisplayTick: reddust particles
+    void _TickRedstoneTorch(int x, int y, int z)
+    {
+        Vector3 torchTip = _GetTorchTipPosition(x, y, z);
+        float rx = torchTip.x + (Random.value - 0.5f) * 0.2f;
+        float ry = torchTip.y;
+        float rz = torchTip.z + (Random.value - 0.5f) * 0.2f;
+        SpawnParticle(PT_REDDUST, rx, ry, rz, 0f, 0f, 0f);
+    }
+
+    Vector3 _GetTorchTipPosition(int x, int y, int z)
+    {
+        byte mount = world != null ? world.GetTorchMount(x, y, z) : TORCH_MOUNT_FLOOR;
+        float tx = x + 0.5f;
+        float ty = y + 0.7f;
+        float tz = z + 0.5f;
+
+        switch (mount)
+        {
+            case TORCH_MOUNT_WEST:
+                tx -= 0.27f;
+                ty += 0.22f;
+                break;
+            case TORCH_MOUNT_EAST:
+                tx += 0.27f;
+                ty += 0.22f;
+                break;
+            case TORCH_MOUNT_NORTH:
+                tz -= 0.27f;
+                ty += 0.22f;
+                break;
+            case TORCH_MOUNT_SOUTH:
+                tz += 0.27f;
+                ty += 0.22f;
+                break;
+            case TORCH_MOUNT_CEILING:
+                ty = y + 0.28f;
+                break;
+            default:
+                break;
+        }
+
+        return new Vector3(tx, ty, tz);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // MC Particle Spawning API
+    // ════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Spawn a particle by type ID. Position in world blocks, velocity in blocks/tick (MC units).
+    /// Matches MC's RenderGlobal.spawnParticle dispatch table.
+    /// </summary>
+    public void SpawnParticle(int type, float x, float y, float z, float vx, float vy, float vz)
+    {
+        // MC skips particles > 16 blocks from camera
+        if (localPlayer != null && localPlayer.IsValid())
+        {
+            Vector3 ppos = localPlayer.GetPosition();
+            float dx = x - ppos.x, dy = y - ppos.y, dz = z - ppos.z;
+            if (dx * dx + dy * dy + dz * dz > 256f) return;
+        }
+
+        switch (type)
+        {
+            case PT_SMOKE: _EmitSmoke(x, y, z, vx, vy, vz, 1.0f); break;
+            case PT_LARGESMOKE: _EmitSmoke(x, y, z, vx, vy, vz, 2.5f); break;
+            case PT_EXPLODE: _EmitExplode(x, y, z, vx, vy, vz); break;
+            case PT_FLAME: _EmitFlame(x, y, z, vx, vy, vz); break;
+            case PT_LAVA: _EmitLava(x, y, z); break;
+            case PT_BUBBLE: _EmitBubble(x, y, z, vx, vy, vz); break;
+            case PT_SPLASH: _EmitSplash(x, y, z, vx, vy, vz); break;
+            case PT_HEART: _EmitHeart(x, y, z); break;
+            case PT_NOTE: _EmitNote(x, y, z, vx); break;
+            case PT_PORTAL: _EmitPortal(x, y, z, vx, vy, vz); break;
+            case PT_REDDUST: _EmitReddust(x, y, z, vx, vy, vz); break;
+            case PT_SNOWSHOVEL: _EmitSnowShovel(x, y, z, vx, vy, vz); break;
+            case PT_RAIN: _EmitRain(x, y, z); break;
+        }
+    }
+
+    /// <summary>
+    /// String-based spawn matching MC's world.spawnParticle(String, ...) API.
+    /// Slightly slower due to string comparison — prefer the int overload in hot paths.
+    /// </summary>
+    public void SpawnParticleByName(string name, float x, float y, float z, float vx, float vy, float vz)
+    {
+        int type = -1;
+        if (name == "smoke") type = PT_SMOKE;
+        else if (name == "largesmoke") type = PT_LARGESMOKE;
+        else if (name == "explode") type = PT_EXPLODE;
+        else if (name == "flame") type = PT_FLAME;
+        else if (name == "lava") type = PT_LAVA;
+        else if (name == "bubble") type = PT_BUBBLE;
+        else if (name == "splash") type = PT_SPLASH;
+        else if (name == "heart") type = PT_HEART;
+        else if (name == "note") type = PT_NOTE;
+        else if (name == "portal") type = PT_PORTAL;
+        else if (name == "reddust") type = PT_REDDUST;
+        else if (name == "snowshovel") type = PT_SNOWSHOVEL;
+        else if (name == "rain") type = PT_RAIN;
+
+        if (type >= 0)
+            SpawnParticle(type, x, y, z, vx, vy, vz);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Per-type emit methods — each matches its MC EntityFX subclass
+    // ════════════════════════════════════════════════════════════════
+
+    // MC motion is in blocks/tick. Unity velocity is blocks/second.
+    // Conversion: unity_vel = mc_vel * 20
+    // MC lifetime is in ticks. Unity is seconds.
+    // Conversion: unity_life = mc_ticks / 20
+    // MC particle visual size: diameter = 0.2 * particleScale
+    const float TICK_RATE = 20f;
+    const float SIZE_SCALE = 0.2f; // MC renders quads at 0.1 * particleScale half-size
+
+    void _EmitSmoke(float x, float y, float z, float vx, float vy, float vz, float scale)
+    {
+        if (smokePS == null) return;
+        // EntitySmokeFX: motionX *= 0.1; motionX += var8; (base random is negligible)
+        // Color: grey = random * 0.3
+        // Scale: (rand*0.5+0.5)*2 * 0.75 * scale
+        // MaxAge: (8/(rand*0.8+0.2)) * scale ticks
+        // Update: motionY += 0.004 (floats up), drag 0.96/tick, animated texIndex 7→0
+
+        float grey = Random.value * 0.3f;
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f * scale;
+        float maxAge = (8.0f / (Random.value * 0.8f + 0.2f)) * scale;
+        _SetParticleAtlasFrame(smokePS, PARTICLE_ATLAS_FRAME_SMOKE);
+
+        _DoEmit(smokePS,
+            x, y, z,
+            vx * TICK_RATE, vy * TICK_RATE, vz * TICK_RATE,
+            baseScale * SIZE_SCALE,
+            new Color(grey, grey, grey, 1f),
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitExplode(float x, float y, float z, float vx, float vy, float vz)
+    {
+        if (explodePS == null) return;
+        // EntityExplodeFX: motionX = var8 + rand*0.05, motionY += 0.004
+        // Color: rand 0.7–1.0 grey
+        // Scale: rand*rand*6+1
+        // MaxAge: 16/(rand*0.8+0.2)+2 ticks
+
+        float addX = (float)(Random.value * 2.0 - 1.0) * 0.05f;
+        float addZ = (float)(Random.value * 2.0 - 1.0) * 0.05f;
+        float grey = Random.value * 0.3f + 0.7f;
+        float baseScale = Random.value * Random.value * 6.0f + 1.0f;
+        float maxAge = 16.0f / (Random.value * 0.8f + 0.2f) + 2f;
+        _SetParticleAtlasFrame(explodePS, PARTICLE_ATLAS_FRAME_SMOKE);
+
+        _DoEmit(explodePS,
+            x, y, z,
+            (vx + addX) * TICK_RATE, (vy + (float)(Random.value * 2.0 - 1.0) * 0.05f) * TICK_RATE, (vz + addZ) * TICK_RATE,
+            baseScale * SIZE_SCALE,
+            new Color(grey, grey, grey, 1f),
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitFlame(float x, float y, float z, float vx, float vy, float vz)
+    {
+        if (flamePS == null) return;
+        // EntityFlameFX: motionX = motionX*0.01 + var8, noClip
+        // Scale: base, shrinks over life (1 - t²*0.5)
+        // MaxAge: 8/(rand*0.8+0.2)+4 ticks
+        // Self-lit: brightness lerps toward 1.0 as it ages
+
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f;
+        float maxAge = 8.0f / (Random.value * 0.8f + 0.2f) + 4f;
+        _SetParticleAtlasFrame(flamePS, PARTICLE_ATLAS_FRAME_FLAME);
+
+        _DoEmit(flamePS,
+            x, y, z,
+            vx * TICK_RATE, vy * TICK_RATE, vz * TICK_RATE,
+            baseScale * SIZE_SCALE,
+            Color.white,
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitLava(float x, float y, float z)
+    {
+        if (lavaPS == null) return;
+        // EntityLavaFX: motionY = rand*0.4+0.05, arcs up then falls
+        // Scale: base * (rand*2+0.2), shrinks as (1-t²)
+        // MaxAge: 16/(rand*0.8+0.2) ticks
+        // Self-lit (brightness = 1.0)
+        // Spawns smoke sub-particles during flight (handled by lavaPS sub-emitter or code)
+
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f * (Random.value * 2f + 0.2f);
+        float maxAge = 16.0f / (Random.value * 0.8f + 0.2f);
+        float vy = (Random.value * 0.4f + 0.05f) * TICK_RATE;
+        _SetParticleAtlasFrame(lavaPS, PARTICLE_ATLAS_FRAME_LAVA);
+
+        _DoEmit(lavaPS,
+            x, y, z,
+            0f, vy, 0f,
+            baseScale * SIZE_SCALE,
+            Color.white,
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitBubble(float x, float y, float z, float vx, float vy, float vz)
+    {
+        if (bubblePS == null) return;
+        // EntityBubbleFX: motionX = var8*0.2 + rand*0.02, floats up (motionY += 0.002)
+        // Scale: base * (rand*0.6+0.2)
+        // MaxAge: 8/(rand*0.8+0.2)
+
+        float scaleMul = Random.value * 0.6f + 0.2f;
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f * scaleMul;
+        float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
+
+        float ux = vx * 0.2f + (Random.value * 2f - 1f) * 0.02f;
+        float uy = vy * 0.2f + (Random.value * 2f - 1f) * 0.02f;
+        float uz = vz * 0.2f + (Random.value * 2f - 1f) * 0.02f;
+        _SetParticleAtlasFrame(bubblePS, PARTICLE_ATLAS_FRAME_BUBBLE);
+
+        _DoEmit(bubblePS,
+            x, y, z,
+            ux * TICK_RATE, uy * TICK_RATE, uz * TICK_RATE,
+            baseScale * SIZE_SCALE,
+            Color.white,
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitSplash(float x, float y, float z, float vx, float vy, float vz)
+    {
+        if (splashPS == null) return;
+        // EntitySplashFX extends EntityRainFX: gravity 0.04, small
+        // MaxAge: 8/(rand*0.8+0.2)
+
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f;
+        float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
+
+        float ux = vx, uy = vy, uz = vz;
+        if (vy == 0f && (vx != 0f || vz != 0f))
+            uy = 0.1f;
+        _SetParticleAtlasFrame(splashPS, PARTICLE_ATLAS_FRAME_SPLASH_START + Random.Range(0, 4));
+
+        _DoEmit(splashPS,
+            x, y, z,
+            ux * TICK_RATE, (uy + 0.1f) * TICK_RATE, uz * TICK_RATE,
+            baseScale * SIZE_SCALE * 0.5f,
+            Color.white,
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitRain(float x, float y, float z)
+    {
+        if (splashPS == null) return;
+        // EntityRainFX: gravity 0.06, motionY = rand*0.2+0.1
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f;
+        float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
+        float vy = (Random.value * 0.2f + 0.1f) * TICK_RATE;
+        _SetParticleAtlasFrame(splashPS, PARTICLE_ATLAS_FRAME_RAIN_START + Random.Range(0, 4));
+
+        _DoEmit(splashPS,
+            x, y, z,
+            0f, vy, 0f,
+            baseScale * SIZE_SCALE * 0.5f,
+            Color.white,
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitHeart(float x, float y, float z)
+    {
+        if (heartPS == null) return;
+        // EntityHeartFX: motionY += 0.1, drag 0.86, grows
+        // MaxAge: 16 ticks = 0.8 seconds
+
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f * 2.0f;
+        _SetParticleAtlasFrame(heartPS, PARTICLE_ATLAS_FRAME_HEART);
+
+        _DoEmit(heartPS,
+            x, y, z,
+            0f, 0.1f * TICK_RATE, 0f,
+            baseScale * SIZE_SCALE,
+            Color.white,
+            16f / TICK_RATE);
+    }
+
+    void _EmitNote(float x, float y, float z, float pitch)
+    {
+        if (notePS == null) return;
+        // EntityNoteFX: color = rainbow from pitch (0-1), motionY += 0.2, drag 0.66
+        // MaxAge: 6 ticks = 0.3 seconds
+
+        float r = Mathf.Sin((pitch + 0.0f) * Mathf.PI * 2f) * 0.65f + 0.35f;
+        float g = Mathf.Sin((pitch + 1f / 3f) * Mathf.PI * 2f) * 0.65f + 0.35f;
+        float b = Mathf.Sin((pitch + 2f / 3f) * Mathf.PI * 2f) * 0.65f + 0.35f;
+
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f * 2.0f;
+        _SetParticleAtlasFrame(notePS, PARTICLE_ATLAS_FRAME_NOTE);
+
+        _DoEmit(notePS,
+            x, y, z,
+            0f, 0.2f * TICK_RATE, 0f,
+            baseScale * SIZE_SCALE,
+            new Color(r, g, b, 1f),
+            6f / TICK_RATE);
+    }
+
+    void _EmitPortal(float x, float y, float z, float vx, float vy, float vz)
+    {
+        if (portalPS == null) return;
+        // EntityPortalFX: purple color (r*0.9, g*0.3, b=1) * (rand*0.6+0.4)
+        // motionX/Y/Z = var8/10/12 (velocity IS the offset from origin)
+        // MaxAge: rand*10+40 ticks, noClip
+        // Parametric motion converging toward origin (approximated by velocity drift)
+
+        float brightness = Random.value * 0.6f + 0.4f;
+        float r = 0.9f * brightness;
+        float g = 0.3f * brightness;
+        float b = 1.0f * brightness;
+
+        float baseScale = Random.value * 0.2f + 0.5f;
+        float maxAge = Random.value * 10f + 40f;
+        _SetParticleAtlasFrame(portalPS, Random.Range(0, 8));
+
+        // MC portal particles move FROM spawn TOWARD origin via parametric curve.
+        // Approximate: set velocity pointing back toward spawn with drift
+        _DoEmit(portalPS,
+            x, y, z,
+            vx * TICK_RATE, vy * TICK_RATE, vz * TICK_RATE,
+            baseScale * SIZE_SCALE,
+            new Color(r, g, b, 1f),
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitReddust(float x, float y, float z, float vr, float vg, float vb)
+    {
+        if (reddustPS == null) return;
+        // EntityReddustFX: color from params (vx=r, vy=g, vz=b), animated 7→0
+        // Scale: base * 0.75
+        // MaxAge: 8/(rand*0.8+0.2) ticks
+
+        // MC: if var9(green)==0, set to 1 (avoids invisible particles)
+        if (vg == 0f) vg = 1f;
+
+        float var12 = Random.value * 0.4f + 0.6f;
+        float r = (Random.value * 0.2f + 0.8f) * vr * var12;
+        float g = (Random.value * 0.2f + 0.8f) * vg * var12;
+        float b = (Random.value * 0.2f + 0.8f) * vb * var12;
+
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f;
+        float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
+        _SetParticleAtlasFrame(reddustPS, PARTICLE_ATLAS_FRAME_SMOKE);
+
+        _DoEmit(reddustPS,
+            x, y, z,
+            0f, 0f, 0f,
+            baseScale * SIZE_SCALE,
+            new Color(Mathf.Clamp01(r), Mathf.Clamp01(g), Mathf.Clamp01(b), 1f),
+            maxAge / TICK_RATE);
+    }
+
+    void _EmitSnowShovel(float x, float y, float z, float vx, float vy, float vz)
+    {
+        if (snowPS == null) return;
+        // EntitySnowShovelFX: white-ish (1 - rand*0.3), animated 7→0, falls
+        // MaxAge: 8/(rand*0.8+0.2) ticks
+
+        float white = 1.0f - Random.value * 0.3f;
+        float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f;
+        float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
+        _SetParticleAtlasFrame(snowPS, PARTICLE_ATLAS_FRAME_SMOKE);
+
+        _DoEmit(snowPS,
+            x, y, z,
+            vx * TICK_RATE, vy * TICK_RATE, vz * TICK_RATE,
+            baseScale * SIZE_SCALE,
+            new Color(white, white, white, 1f),
+            maxAge / TICK_RATE);
+    }
+
+    // ── Core emit helper ──
+
+    private bool _hasLoggedFirstEmit;
+
+    void _DoEmit(ParticleSystem ps, float x, float y, float z,
+                 float vx, float vy, float vz,
+                 float size, Color color, float lifetime)
+    {
+        if (ps == null) return;
+        if (!_hasLoggedFirstEmit)
+        {
+            Debug.Log("[McParticleManager] First particle emit: " + ps.name);
+            _hasLoggedFirstEmit = true;
+        }
+
+        ParticleSystem.EmitParams emit = new ParticleSystem.EmitParams();
+        emit.position = new Vector3(x, y, z);
+        emit.velocity = new Vector3(vx, vy, vz);
+        emit.startSize = size;
+        emit.startColor = color;
+        emit.startLifetime = lifetime;
+        emit.applyShapeToPosition = false;
+        ps.Emit(emit, 1);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Block destroy/hit effects (MC EffectRenderer equivalent)
+    // ════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// MC EffectRenderer.addBlockDestroyEffects — spawns 4x4x4 grid of block-texture particles.
+    /// Currently delegates to Unity ParticleSystem; will add terrain-atlas sampling later.
+    /// </summary>
+    public void AddBlockDestroyEffects(int bx, int by, int bz, int blockId)
+    {
+        if (blockId == 0) return;
+        Vector3 center = new Vector3(bx + 0.5f, by + 0.5f, bz + 0.5f);
+        PlayBreakEffect(center, (byte)(blockId & 0xFF));
+    }
+
+    /// <summary>
+    /// MC EffectRenderer.addBlockHitEffects — spawns a single particle on the hit face.
+    /// </summary>
+    public void AddBlockHitEffects(int bx, int by, int bz, int face)
+    {
+        if (world == null) return;
+        int blockId = world.GetBlock(bx, by, bz) & 0xFF;
+        if (blockId == 0) return;
+
+        float px = bx + Random.value * 0.8f + 0.1f;
+        float py = by + Random.value * 0.8f + 0.1f;
+        float pz = bz + Random.value * 0.8f + 0.1f;
+
+        if (face == 0) py = by - 0.1f;
+        if (face == 1) py = by + 1.1f;
+        if (face == 2) pz = bz - 0.1f;
+        if (face == 3) pz = bz + 1.1f;
+        if (face == 4) px = bx - 0.1f;
+        if (face == 5) px = bx + 1.1f;
+
+        PlayBreakEffect(new Vector3(px, py, pz), (byte)blockId);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Existing break/place/footstep (preserved from original)
+    // ════════════════════════════════════════════════════════════════
+
+    public void PlayBreakEffect(Vector3 position, byte blockID)
+    {
+        if (!isInitialized) return;
+        ParticleSystem particlesToPlay = null;
+        AudioClip soundToPlay = null;
+
+        if (blockTypeManager != null)
+        {
+            particlesToPlay = blockTypeManager.GetBreakParticlesPrefab(blockID);
+            soundToPlay = blockTypeManager.GetBreakSound(blockID);
+        }
+
+        if (particlesToPlay != null)
+        {
+            GameObject psInstance = Instantiate(particlesToPlay.gameObject);
+            if (psInstance != null)
+            {
+                psInstance.transform.position = position;
+                ParticleSystem actualPS = psInstance.GetComponent<ParticleSystem>();
+                if (actualPS != null)
+                {
+                    _PrepareInstantiatedParticleSystem(actualPS);
+                    _ConfigureBlockEffectTexture(actualPS, blockID, _PickBreakParticleFace());
+                    actualPS.Play();
+                }
+            }
+        }
+        else if (genericBreakParticles != null)
+        {
+            _PrepareReusableParticleSystem(genericBreakParticles);
+            _ConfigureBlockEffectTexture(genericBreakParticles, blockID, _PickBreakParticleFace());
+            genericBreakParticles.transform.position = position;
+            genericBreakParticles.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            genericBreakParticles.Play();
+        }
+
+        if (soundToPlay != null && _audioSource != null)
+            _audioSource.PlayOneShot(soundToPlay);
+    }
+
+    public void PlayPlaceEffect(Vector3 position, byte blockID)
+    {
+        if (!isInitialized) return;
+        ParticleSystem particlesToPlay = null;
+        AudioClip soundToPlay = null;
+
+        if (blockTypeManager != null)
+        {
+            particlesToPlay = blockTypeManager.GetPlaceParticlesPrefab(blockID);
+            soundToPlay = blockTypeManager.GetPlaceSound(blockID);
+        }
+
+        if (particlesToPlay != null)
+        {
+            GameObject psInstance = Instantiate(particlesToPlay.gameObject);
+            if (psInstance != null)
+            {
+                psInstance.transform.position = position;
+                ParticleSystem actualPS = psInstance.GetComponent<ParticleSystem>();
+                if (actualPS != null)
+                {
+                    _PrepareInstantiatedParticleSystem(actualPS);
+                    _ConfigureBlockEffectTexture(actualPS, blockID, FACE_INDEX_TOP);
+                    actualPS.Play();
+                }
+            }
+        }
+        else if (genericPlaceParticles != null)
+        {
+            _PrepareReusableParticleSystem(genericPlaceParticles);
+            _ConfigureBlockEffectTexture(genericPlaceParticles, blockID, FACE_INDEX_TOP);
+            genericPlaceParticles.transform.position = position;
+            genericPlaceParticles.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            genericPlaceParticles.Play();
+        }
+
+        if (soundToPlay != null && _audioSource != null)
+            _audioSource.PlayOneShot(soundToPlay);
     }
 
     private void HandleFootsteps()
     {
         if (persistentFootstepParticles == null || !localPlayer.IsValid() || !localPlayer.IsPlayerGrounded())
         {
-            if (persistentFootstepParticles.isPlaying) persistentFootstepParticles.Stop();
+            if (persistentFootstepParticles != null && persistentFootstepParticles.isPlaying)
+                persistentFootstepParticles.Stop();
             return;
-        };
+        }
 
         Vector3 playerVelocity = localPlayer.GetVelocity();
         Vector3 horizontalVelocity = Vector3.ProjectOnPlane(playerVelocity, Vector3.up);
@@ -105,24 +860,24 @@ public class McParticleManager : UdonSharpBehaviour
         {
             if (Time.time - lastFootstepTime > footstepInterval)
             {
-                Vector3 playerReportedPosition = localPlayer.GetPosition();
-                Vector3 footstepEffectPosition = playerReportedPosition + new Vector3(0, footstepVerticalOffset, 0);
-                
-                persistentFootstepParticles.transform.position = footstepEffectPosition;
+                Vector3 playerPos = localPlayer.GetPosition();
+                Vector3 footstepPos = playerPos + new Vector3(0, footstepVerticalOffset, 0);
 
-                if (horizontalVelocity.sqrMagnitude > 0.0001f) 
-                {
+                persistentFootstepParticles.transform.position = footstepPos;
+                if (horizontalVelocity.sqrMagnitude > 0.0001f)
                     persistentFootstepParticles.transform.rotation = Quaternion.LookRotation(horizontalVelocity);
-                }
 
                 if (!persistentFootstepParticles.isPlaying) persistentFootstepParticles.Play();
 
-                if (blockTypeManager != null && world != null && _audioSource != null) {
-                    Vector3 blockPosUnderPlayer = playerReportedPosition + new Vector3(0, footstepVerticalOffset - 0.1f, 0); 
-                    int globalX = Mathf.FloorToInt(blockPosUnderPlayer.x);
-                    int globalY = Mathf.FloorToInt(blockPosUnderPlayer.y);
-                    int globalZ = Mathf.FloorToInt(blockPosUnderPlayer.z);
-                    byte blockID = (byte)(world.GetBlock(globalX, globalY, globalZ) & 0xFF); 
+                if (blockTypeManager != null && world != null && _audioSource != null)
+                {
+                    Vector3 blockPos = playerPos + new Vector3(0, footstepVerticalOffset - 0.1f, 0);
+                    int gx = Mathf.FloorToInt(blockPos.x);
+                    int gy = Mathf.FloorToInt(blockPos.y);
+                    int gz = Mathf.FloorToInt(blockPos.z);
+                    byte blockID = (byte)(world.GetBlock(gx, gy, gz) & 0xFF);
+                    _PrepareReusableParticleSystem(persistentFootstepParticles);
+                    _ConfigureBlockEffectTexture(persistentFootstepParticles, blockID, FACE_INDEX_TOP);
                     AudioClip footstepSound = blockTypeManager.GetFootstepSound(blockID);
                     if (footstepSound != null) _audioSource.PlayOneShot(footstepSound);
                 }
@@ -135,70 +890,104 @@ public class McParticleManager : UdonSharpBehaviour
         }
     }
 
-    // MODIFIED: Method signatures now take blockID
-    public void PlayBreakEffect(Vector3 position, byte blockID)
+    void _PrepareInstantiatedParticleSystem(ParticleSystem ps)
     {
-        if (!isInitialized) return;
-        ParticleSystem particlesToPlay = null;
-        AudioClip soundToPlay = null;
+        if (ps == null) return;
 
-        if (blockTypeManager != null) {
-            particlesToPlay = blockTypeManager.GetBreakParticlesPrefab(blockID);
-            soundToPlay = blockTypeManager.GetBreakSound(blockID); // Using renamed GetBreakSound
-        }
+        ParticleSystem.MainModule main = ps.main;
+        main.stopAction = ParticleSystemStopAction.Destroy;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
 
-        if (particlesToPlay != null) {
-            // If it's a prefab, instantiate it. If it's a scene reference, teleport and play.
-            // Assuming GetBreakParticlesPrefab returns a prefab that should be instantiated.
-            GameObject psInstance = Instantiate(particlesToPlay.gameObject);
-            if(psInstance != null) {
-                psInstance.transform.position = position;
-                ParticleSystem actualPS = psInstance.GetComponent<ParticleSystem>();
-                if(actualPS != null) {
-                    ParticleSystem.MainModule main = actualPS.main;
-                    main.stopAction = ParticleSystemStopAction.Destroy;
-                    actualPS.Play();
-                }
-            }
-        } else if (genericBreakParticles != null) { // Fallback
-            genericBreakParticles.transform.position = position;
-            genericBreakParticles.Play();
-        }
-
-        if (soundToPlay != null && _audioSource != null) {
-            _audioSource.PlayOneShot(soundToPlay);
-        }
+        _AssignParticleMaterial(ps, null);
     }
 
-    public void PlayPlaceEffect(Vector3 position, byte blockID)
+    void _PrepareReusableParticleSystem(ParticleSystem ps)
     {
-        if (!isInitialized) return;
-        ParticleSystem particlesToPlay = null;
-        AudioClip soundToPlay = null;
+        if (ps == null) return;
 
-        if (blockTypeManager != null) {
-            particlesToPlay = blockTypeManager.GetPlaceParticlesPrefab(blockID);
-            soundToPlay = blockTypeManager.GetPlaceSound(blockID); // Using renamed GetPlaceSound
-        }
-        
-        if (particlesToPlay != null) {
-            GameObject psInstance = Instantiate(particlesToPlay.gameObject);
-             if(psInstance != null) {
-                psInstance.transform.position = position;
-                ParticleSystem actualPS = psInstance.GetComponent<ParticleSystem>();
-                if(actualPS != null) {
-                    ParticleSystem.MainModule main = actualPS.main;
-                    main.stopAction = ParticleSystemStopAction.Destroy;
-                    actualPS.Play();
-                }
-            }
-        } else if (genericPlaceParticles != null) { // Fallback
-            genericPlaceParticles.transform.position = position;
-            genericPlaceParticles.Play();
-        }
+        ParticleSystem.MainModule main = ps.main;
+        main.stopAction = ParticleSystemStopAction.None;
+        main.simulationSpace = ParticleSystemSimulationSpace.World;
+    }
 
-        if (soundToPlay != null && _audioSource != null) {
-            _audioSource.PlayOneShot(soundToPlay);
-        }
+    void _AssignParticleMaterial(ParticleSystem ps, Texture mainTextureOverride)
+    {
+        if (ps == null || particleMaterial == null) return;
+
+        ParticleSystemRenderer renderer = ps.GetComponent<ParticleSystemRenderer>();
+        if (renderer == null) return;
+
+        renderer.material = particleMaterial;
+        renderer.material.SetTextureScale("_MainTex", Vector2.one);
+        renderer.material.SetTextureOffset("_MainTex", Vector2.zero);
+        if (mainTextureOverride != null)
+            renderer.material.SetTexture("_MainTex", mainTextureOverride);
+    }
+
+    void _SetParticleAtlasFrame(ParticleSystem ps, int frameIndex)
+    {
+        _SetParticleAtlasFrame(ps, frameIndex, PARTICLE_ATLAS_TILES, PARTICLE_ATLAS_TILES);
+    }
+
+    void _SetParticleAtlasFrame(ParticleSystem ps, int frameIndex, int tilesX, int tilesY)
+    {
+        if (ps == null) return;
+
+        ParticleSystem.TextureSheetAnimationModule uv = ps.textureSheetAnimation;
+        uv.enabled = true;
+        uv.numTilesX = tilesX;
+        uv.numTilesY = tilesY;
+        uv.cycleCount = 1;
+        uv.startFrame = new ParticleSystem.MinMaxCurve((float)frameIndex / (tilesX * tilesY));
+        uv.frameOverTime = new ParticleSystem.MinMaxCurve(0f);
+    }
+
+    void _ConfigureBlockEffectTexture(ParticleSystem ps, byte blockID, int faceIndex)
+    {
+        if (ps == null || blockTypeManager == null || blockParticleAtlas == null) return;
+
+        int textureSlice = blockTypeManager.GetFinalBlockTextureSlice(blockID, faceIndex);
+        _AssignBlockParticleMaterial(ps);
+        _SetParticleAtlasFrame(ps, _GetBlockParticleFrame(textureSlice), 64, 64);
+    }
+
+    void _AssignBlockParticleMaterial(ParticleSystem ps)
+    {
+        if (ps == null || blockParticleAtlas == null) return;
+
+        ParticleSystemRenderer renderer = ps.GetComponent<ParticleSystemRenderer>();
+        if (renderer == null) return;
+
+        Material sourceMaterial = blockParticleMaterial != null ? blockParticleMaterial : particleMaterial;
+        if (sourceMaterial == null) return;
+
+        renderer.material = sourceMaterial;
+        renderer.material.SetTextureScale("_MainTex", Vector2.one);
+        renderer.material.SetTextureOffset("_MainTex", Vector2.zero);
+        if (blockParticleMaterial == null)
+            renderer.material.SetTexture("_MainTex", blockParticleAtlas);
+    }
+
+    int _GetBlockParticleFrame(int textureSlice)
+    {
+        const int blockFragmentTilesPerAxis = PARTICLE_ATLAS_TILES * 4;
+        int frameCount = PARTICLE_ATLAS_TILES * PARTICLE_ATLAS_TILES;
+        if (textureSlice < 0) return 0;
+
+        int clampedSlice = textureSlice % frameCount;
+        int column = clampedSlice % PARTICLE_ATLAS_TILES;
+        int row = clampedSlice / PARTICLE_ATLAS_TILES;
+        int fragmentColumn = column * 4 + Random.Range(0, 4);
+        int fragmentRow = row * 4 + Random.Range(0, 4);
+
+        // MC dig particles sample a random quarter of the source tile, not the whole tile.
+        return ((blockFragmentTilesPerAxis - 1 - fragmentRow) * blockFragmentTilesPerAxis) + fragmentColumn;
+    }
+
+    int _PickBreakParticleFace()
+    {
+        int face = Random.Range(0, 6);
+        if (face == FACE_INDEX_BOTTOM && Random.value < 0.5f) return FACE_INDEX_TOP;
+        return face;
     }
 }

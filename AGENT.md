@@ -1,8 +1,11 @@
 This is a project aiming to recreate Minecraft Beta 1.7.3 in VRChat's Udon scripting language as close as possible.
 
 When consulting the Minecraft Beta 1.7.3 source code, only check *.java files.
+You can consult Minecraft Beta 1.7.3's source code from F:\vrchat_projects\VRCMinecraft_Beta173_Deobf\RetroMCP
+You can check .unity scene files to get the structure of a scene.
 
 # UdonSharp limitations
+Always make sure to check udon_blacklisted.txt, udon_whitelisted_types.txt, and udon_whitelisted.txt
 Local method declarations are not currently supported by UdonSharp.
 Multidimensional arrays are not yet supported by UdonSharp, consider using jagged arrays instead, OR one-dimensional arrays with smart logic to distinguish each axis.
 Method is not exposed to Udon: 'new List<Vector3>()'.
@@ -30,6 +33,7 @@ The Quest 2 runs a weaker mobile SoC
 ## VRCGraphics / VRCAsyncGPUReadback / VRChat Shader Globals
 
 When working on VRChat worlds that need GPU-side logic, treat **VRCGraphics** as **Udon-controlled GPU orchestration**, not as unrestricted Unity graphics or compute access.
+When debugging systems that have both CPU and GPU options, ALWAYS assume that I'm referring to the issue happening on the GPU unless specified otherwise.
 
 ### Mental model
 

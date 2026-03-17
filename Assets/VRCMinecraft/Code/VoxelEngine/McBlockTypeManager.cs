@@ -50,6 +50,13 @@ public enum McBlockShapeType
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McBlockTypeManager : UdonSharpBehaviour
 {
+    private const byte BLOCK_TORCH = 50;
+    private const byte BLOCK_REDSTONE_TORCH_OFF = 75;
+    private const byte BLOCK_REDSTONE_TORCH_ON = 76;
+    private const int BETA_SLICE_TORCH = 96;
+    private const int BETA_SLICE_REDSTONE_TORCH_ON = 99;
+    private const int BETA_SLICE_REDSTONE_TORCH_OFF = 115;
+
     [Header("Texture Array for Editor Preview")]
     [Tooltip("Assign the Texture 2D Array used for block textures here to enable slice previews in the editor.")]
     public Texture2DArray previewTextureArray;
@@ -344,61 +351,154 @@ public class McBlockTypeManager : UdonSharpBehaviour
 
     public string GetBlockName(byte blockID)
     {
-        // Block names are editor-only, so this will only work in the editor.
-        #if UNITY_EDITOR
         if (blockNames != null && blockID >= 0 && blockID < blockNames.Length) return blockNames[blockID];
+
+        string fallbackBlockName;
+        if (_TryGetFallbackBlockName(blockID, out fallbackBlockName)) return fallbackBlockName;
+
+#if UNITY_EDITOR
         if (enableVerboseLogging) Debug.LogWarning($"[McBlockTypeManager.GetBlockName] Invalid ID {blockID}.");
         return "Unknown Block";
-        #else 
+#else
         return "N/A in build";
-        #endif
+#endif
     }
 
     public bool GetBlockIsSolid(byte blockID)
     {
-        if (finalDataArray != null && blockID < finalDataArray.Length)
+        if (_HasSerializedBlockDefinition(blockID))
             return (finalDataArray[blockID] & 1) != 0;
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return isSolid;
+
         return false;
     }
 
     public BlockVisibilityType GetBlockVisibilityType(byte blockID)
     {
-        if (finalDataArray != null && blockID < finalDataArray.Length)
+        if (_HasSerializedBlockDefinition(blockID))
             return (BlockVisibilityType)((finalDataArray[blockID] >> 1) & 0x3);
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return visibilityType;
+
         return BlockVisibilityType.Opaque;
     }
 
     public BlockCullingType GetBlockCullingType(byte blockID)
     {
-        if (finalDataArray != null && blockID < finalDataArray.Length)
+        if (_HasSerializedBlockDefinition(blockID))
             return (BlockCullingType)((finalDataArray[blockID] >> 3) & 0x7);
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return cullingType;
+
         return BlockCullingType.CullAll;
     }
 
     public McBlockShapeType GetBlockShapeType(byte blockID)
     {
-        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+        if (_HasSerializedBlockDefinition(blockID))
             return (McBlockShapeType)((finalDataArray[blockID] >> 6) & 0x3); // Bits 6-7
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return shapeType;
+
         return McBlockShapeType.Cube;
     }
     
     public int GetBlockTextureMappingTypeAsInt(byte blockID)
     {
-        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+        if (_HasSerializedBlockDefinition(blockID))
             return (finalDataArray[blockID] >> 8) & 0x3; // Bits 8-9
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return (int)mappingType;
+
         return (int)McBlockTextureMappingType.AllFacesSame;
     }
     
     public int GetBlockLightOpacity(byte blockID)
     {
-        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+        if (_HasSerializedBlockDefinition(blockID))
             return (finalDataArray[blockID] >> 10) & 0xF; // Bits 10-13
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return lightOpacity;
+
         return 0;
     }
     
     public int GetBlockLightEmission(byte blockID)
     {
-        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length)
+        if (_HasSerializedBlockDefinition(blockID))
         {
             int compressed = (finalDataArray[blockID] >> 14) & 0x3; // Bits 14-15
             // Decompress: 0=none(0), 1=weak(7), 2=medium(12), 3=full(15)
@@ -407,6 +507,21 @@ public class McBlockTypeManager : UdonSharpBehaviour
             if (compressed == 1) return 7;
             return 0;
         }
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return lightEmission;
+
         return 0;
     }
 
@@ -422,47 +537,169 @@ public class McBlockTypeManager : UdonSharpBehaviour
             return canBlockGrassData[blockID];
         }
 
-        return false;
+        return _GetDefaultCanBlockGrass(blockID);
     }
     
     public int GetBlockTextureSlice_AllFaces(byte blockID)
     {
         if (uv_allFacesData != null && blockID >= 0 && blockID < uv_allFacesData.Length) return uv_allFacesData[blockID];
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return allFacesSlice;
+
         return 0;
     }
     public int GetBlockTextureSlice_TopFace(byte blockID)
     {
         if (uv_topFaceData != null && blockID >= 0 && blockID < uv_topFaceData.Length) return uv_topFaceData[blockID];
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return topSlice;
+
         return 0;
     }
     public int GetBlockTextureSlice_BottomFace(byte blockID)
     {
         if (uv_bottomFaceData != null && blockID >= 0 && blockID < uv_bottomFaceData.Length) return uv_bottomFaceData[blockID];
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return bottomSlice;
+
         return 0;
     }
     public int GetBlockTextureSlice_SideFaces(byte blockID)
     {
         if (uv_sideFacesData != null && blockID >= 0 && blockID < uv_sideFacesData.Length) return uv_sideFacesData[blockID];
+
+        bool isSolid;
+        BlockVisibilityType visibilityType;
+        BlockCullingType cullingType;
+        McBlockShapeType shapeType;
+        McBlockTextureMappingType mappingType;
+        int lightOpacity;
+        int lightEmission;
+        int allFacesSlice;
+        int topSlice;
+        int bottomSlice;
+        int sideSlice;
+        if (_TryGetFallbackBlockDefinition(blockID, out isSolid, out visibilityType, out cullingType, out shapeType, out mappingType, out lightOpacity, out lightEmission, out allFacesSlice, out topSlice, out bottomSlice, out sideSlice))
+            return sideSlice;
+
         return 0;
     }
     
     public int GetFinalBlockTextureSlice(byte blockID, int faceIndex)
     {
-        if (finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length) 
+        McBlockTextureMappingType mappingType = (McBlockTextureMappingType)GetBlockTextureMappingTypeAsInt(blockID);
+        switch (mappingType)
         {
-            McBlockTextureMappingType mappingType = (McBlockTextureMappingType)GetBlockTextureMappingTypeAsInt(blockID);
-            switch (mappingType)
-            {
-                case McBlockTextureMappingType.AllFacesSame: return GetBlockTextureSlice_AllFaces(blockID);
-                case McBlockTextureMappingType.TopBottomSides:
-                    if (faceIndex == 2) return GetBlockTextureSlice_TopFace(blockID); 
-                    if (faceIndex == 3) return GetBlockTextureSlice_BottomFace(blockID); 
-                    return GetBlockTextureSlice_SideFaces(blockID); 
-                default:
-                    return GetBlockTextureSlice_AllFaces(blockID);
-            }
+            case McBlockTextureMappingType.AllFacesSame: return GetBlockTextureSlice_AllFaces(blockID);
+            case McBlockTextureMappingType.TopBottomSides:
+                if (faceIndex == 2) return GetBlockTextureSlice_TopFace(blockID); 
+                if (faceIndex == 3) return GetBlockTextureSlice_BottomFace(blockID); 
+                return GetBlockTextureSlice_SideFaces(blockID); 
+            default:
+                return GetBlockTextureSlice_AllFaces(blockID);
         }
-        return 0;
+    }
+
+    private bool _HasSerializedBlockDefinition(byte blockID)
+    {
+        return finalDataArray != null && blockID >= 0 && blockID < finalDataArray.Length;
+    }
+
+    private bool _TryGetFallbackBlockName(byte blockID, out string blockName)
+    {
+        switch (blockID)
+        {
+            case BLOCK_TORCH:
+                blockName = "Torch";
+                return true;
+            case BLOCK_REDSTONE_TORCH_OFF:
+                blockName = "Redstone_Torch_Off";
+                return true;
+            case BLOCK_REDSTONE_TORCH_ON:
+                blockName = "Redstone_Torch_On";
+                return true;
+        }
+
+        blockName = null;
+        return false;
+    }
+
+    private bool _TryGetFallbackBlockDefinition(byte blockID, out bool isSolid, out BlockVisibilityType visibilityType, out BlockCullingType cullingType, out McBlockShapeType shapeType, out McBlockTextureMappingType mappingType, out int lightOpacity, out int lightEmission, out int allFacesSlice, out int topSlice, out int bottomSlice, out int sideSlice)
+    {
+        isSolid = false;
+        visibilityType = BlockVisibilityType.Cutout;
+        cullingType = BlockCullingType.NoCull;
+        shapeType = McBlockShapeType.Cross;
+        mappingType = McBlockTextureMappingType.AllFacesSame;
+        lightOpacity = 0;
+        lightEmission = 0;
+        allFacesSlice = 0;
+        topSlice = 0;
+        bottomSlice = 0;
+        sideSlice = 0;
+
+        switch (blockID)
+        {
+            // Minecraft.unity currently authors block tables only up through glowstone.
+            case BLOCK_TORCH:
+                allFacesSlice = BETA_SLICE_TORCH;
+                topSlice = BETA_SLICE_TORCH;
+                bottomSlice = BETA_SLICE_TORCH;
+                sideSlice = BETA_SLICE_TORCH;
+                lightEmission = 14;
+                return true;
+            case BLOCK_REDSTONE_TORCH_OFF:
+                allFacesSlice = BETA_SLICE_REDSTONE_TORCH_OFF;
+                topSlice = BETA_SLICE_REDSTONE_TORCH_OFF;
+                bottomSlice = BETA_SLICE_REDSTONE_TORCH_OFF;
+                sideSlice = BETA_SLICE_REDSTONE_TORCH_OFF;
+                return true;
+            case BLOCK_REDSTONE_TORCH_ON:
+                allFacesSlice = BETA_SLICE_REDSTONE_TORCH_ON;
+                topSlice = BETA_SLICE_REDSTONE_TORCH_ON;
+                bottomSlice = BETA_SLICE_REDSTONE_TORCH_ON;
+                sideSlice = BETA_SLICE_REDSTONE_TORCH_ON;
+                lightEmission = 7;
+                return true;
+        }
+
+        return false;
     }
     
     private AudioClip GetRandomClip(AudioClip[] prefilteredClips)
