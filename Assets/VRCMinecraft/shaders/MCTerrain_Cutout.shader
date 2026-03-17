@@ -2,7 +2,8 @@ Shader "Unlit/MCTerrain (Cutout)"
 {
     Properties
     {
-        _MainTex ("Texture", 2D) = "white" {}
+        _MainTex ("Texture Array", 2DArray) = "white" {}
+        _TintMask ("Tint Mask Array", 2DArray) = "black" {}
         _BiomeColor ("Biome Color", Color) = (1,1,1,0)
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
@@ -23,6 +24,7 @@ Shader "Unlit/MCTerrain (Cutout)"
         Pass
         {
             Blend SrcAlpha OneMinusSrcAlpha
+            Cull Off
 
             CGPROGRAM
             #pragma vertex vert
@@ -35,14 +37,14 @@ Shader "Unlit/MCTerrain (Cutout)"
             struct appdata
             {
                 float4 vertex : POSITION;
-                float2 uv : TEXCOORD0;
+                float3 uvw : TEXCOORD0;
                 float3 normal : NORMAL;
                 float4 color : COLOR;
             };
 
             struct v2f
             {
-                float2 uv : TEXCOORD0;
+                float3 uvw : TEXCOORD0;
                 UNITY_FOG_COORDS(2)
                 float4 vertex : SV_POSITION;
                 float3 normal: TEXCOORD1;
@@ -50,8 +52,9 @@ Shader "Unlit/MCTerrain (Cutout)"
                 float3 worldPos : TEXCOORD3;
             };
 
-            sampler2D _MainTex;
+            UNITY_DECLARE_TEX2DARRAY(_MainTex);
             float4 _MainTex_ST;
+            UNITY_DECLARE_TEX2DARRAY(_TintMask);
 
             int _SkyLight;
             half _DayProgress;
@@ -84,16 +87,12 @@ Shader "Unlit/MCTerrain (Cutout)"
                 v2f o;
                 o.vertex = UnityObjectToClipPos(v.vertex);
                 o.normal = v.normal;
-                o.uv = TRANSFORM_TEX(v.uv, _MainTex);
+                o.uvw.xy = TRANSFORM_TEX(v.uvw.xy, _MainTex);
+                o.uvw.z = v.uvw.z;
                 o.color = v.color;
                 o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
                 UNITY_TRANSFER_FOG(o,o.vertex);
                 return o;
-            }
-
-            float2 round(float2 uv)
-            {
-                return float2(  (uv.x / 0.0625) * 0.0625, (uv.y / 0.0625) * 0.0625);
             }
 
             fixed calcBrightness(fixed3 normal)
@@ -208,7 +207,10 @@ Shader "Unlit/MCTerrain (Cutout)"
 
             fixed4 frag (v2f i) : SV_Target
             {
-                fixed4 col = tex2D(_MainTex, round(i.uv)) * half4(_BiomeColor.rgb,1);
+                fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
+                fixed4 tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw);
+                fixed3 tintedColor = col.r * i.color.rgb;
+                col.rgb = lerp(col.rgb, tintedColor, tintInput.a);
 
                 half minLightLevel = 0.02;
                 half lightBrightness;
@@ -233,6 +235,15 @@ Shader "Unlit/MCTerrain (Cutout)"
                 half faceBrightness = calcBrightness(i.normal);
                 half combinedBrightness = lightBrightness * faceBrightness;
                 combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
+
+                // Torch-like emissive cutout blocks in Minecraft keep a bright self-lit floor.
+                half emissionLevel = gpuVoxelSampleEmissionLevel(i.worldPos);
+                if (emissionLevel > 0.0)
+                {
+                    half emissiveFloor = 0.55 + 0.35 * saturate(emissionLevel / 14.0);
+                    combinedBrightness = max(combinedBrightness, GammaToLinearSpace(emissiveFloor.xxx).x);
+                }
+
                 col.rgb *= combinedBrightness;
 
                 clip(col.a - 0.1);

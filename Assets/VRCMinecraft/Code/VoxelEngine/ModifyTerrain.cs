@@ -216,14 +216,15 @@ public class ModifyTerrain : UdonSharpBehaviour
         {
             _currentLookingAtPos = newTargetPos;
             _currentDestructionProgress = 0f; // Reset progress when looking at a new block
-            if (currentFrameHitValid)
-            {
-                _currentLookingAtBlock = (byte)(world.GetBlock(_currentLookingAtPos.x, _currentLookingAtPos.y, _currentLookingAtPos.z) & 0xFF);
-            }
-            else
-            {
-                _currentLookingAtBlock = 0; // No block is targeted
-            }
+        }
+
+        if (currentFrameHitValid)
+        {
+            _currentLookingAtBlock = (byte)(world.GetBlock(_currentLookingAtPos.x, _currentLookingAtPos.y, _currentLookingAtPos.z) & 0xFF);
+        }
+        else
+        {
+            _currentLookingAtBlock = 0; // No block is targeted
         }
     }
 

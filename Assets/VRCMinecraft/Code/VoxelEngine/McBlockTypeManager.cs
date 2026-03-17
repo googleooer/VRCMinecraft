@@ -53,7 +53,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
     private const byte BLOCK_TORCH = 50;
     private const byte BLOCK_REDSTONE_TORCH_OFF = 75;
     private const byte BLOCK_REDSTONE_TORCH_ON = 76;
-    private const int BETA_SLICE_TORCH = 96;
+    private const int BETA_SLICE_TORCH = 80;
     private const int BETA_SLICE_REDSTONE_TORCH_ON = 99;
     private const int BETA_SLICE_REDSTONE_TORCH_OFF = 115;
 
