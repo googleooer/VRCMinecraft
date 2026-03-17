@@ -209,11 +209,34 @@ public class McWorld : UdonSharpBehaviour
     private ChunkData[] activeMeshingChunks;
     private int activeMeshingCount = 0;
     private const int COLLIDER_DEFER_FRAMES = 2;
+    private const byte BLOCK_WATER_MOVING = 8;
+    private const byte BLOCK_WATER_STILL = 9;
+    private const byte BLOCK_ICE = 79;
     private Material sharedOpaqueChunkMaterial;
     private Material sharedTransparentChunkMaterial;
     private Material sharedCutoutChunkMaterial;
     private int terrainPropUseVertexLightId = -1;
     private int terrainPropUseGpuExactAoId = -1;
+    private Texture2D betaWaterStillTexture;
+    private Texture2D betaWaterFlowTexture;
+    private Color32[] betaWaterStillPixels;
+    private Color32[] betaWaterFlowPixels;
+    private float[] betaWaterStillCurrent;
+    private float[] betaWaterStillNext;
+    private float[] betaWaterStillAccel;
+    private float[] betaWaterStillSplash;
+    private float[] betaWaterFlowCurrent;
+    private float[] betaWaterFlowNext;
+    private float[] betaWaterFlowAccel;
+    private float[] betaWaterFlowSplash;
+    private int betaWaterFlowFrame = 0;
+    private int betaWaterNoiseState = 1;
+    private int betaWaterStillSlice = -1;
+    private int betaWaterFlowSlice = -1;
+    private int terrainPropWaterStillTexId = -1;
+    private int terrainPropWaterFlowTexId = -1;
+    private int terrainPropWaterStillSliceId = -1;
+    private int terrainPropWaterFlowSliceId = -1;
 
     // --- GPU Voxel Backend State ---
     private bool gpuBackendReady = false;
@@ -496,6 +519,7 @@ public class McWorld : UdonSharpBehaviour
         uv_sideFacesCache = blockTypeManager.uv_sideFacesData;
         _BuildBlockCaches();
         _BuildLightingTables();
+        _InitializeBetaWaterRendering();
         _InitializeGpuVoxelBackend();
         _InitializeGpuDebugHud();
         _ResetAdaptiveBudgets();
@@ -2283,8 +2307,11 @@ public class McWorld : UdonSharpBehaviour
         if (terrainPropUseVertexLightId == -1) terrainPropUseVertexLightId = VRCShader.PropertyToID("_UseVertexLight");
 
         Transform opaqueTransform = chunkPrefab.transform.Find("Opaque");
+        if (opaqueTransform == null) opaqueTransform = chunkPrefab.transform;
         Transform transparentTransform = chunkPrefab.transform.Find("Transparent");
+        if (transparentTransform == null) transparentTransform = chunkPrefab.transform.Find("trans");
         Transform cutoutTransform = chunkPrefab.transform.Find("Cutout");
+        if (cutoutTransform == null) cutoutTransform = chunkPrefab.transform.Find("cutout");
 
         MeshRenderer opaqueRenderer = opaqueTransform != null ? opaqueTransform.GetComponent<MeshRenderer>() : null;
         MeshRenderer transparentRenderer = transparentTransform != null ? transparentTransform.GetComponent<MeshRenderer>() : null;
@@ -2304,6 +2331,172 @@ public class McWorld : UdonSharpBehaviour
     {
         if (material == null) return;
         if (!material.enableInstancing) material.enableInstancing = true;
+    }
+
+    private void _InitializeBetaWaterRendering()
+    {
+        betaWaterStillSlice = blockTypeManager != null ? blockTypeManager.GetFinalBlockTextureSlice(BLOCK_WATER_STILL, FACE_INDEX_TOP) : -1;
+        betaWaterFlowSlice = blockTypeManager != null ? blockTypeManager.GetFinalBlockTextureSlice(BLOCK_WATER_STILL, FACE_INDEX_SIDE) : -1;
+        if (betaWaterStillSlice < 0 || betaWaterFlowSlice < 0) return;
+
+        terrainPropWaterStillTexId = VRCShader.PropertyToID("_WaterStillTex");
+        terrainPropWaterFlowTexId = VRCShader.PropertyToID("_WaterFlowTex");
+        terrainPropWaterStillSliceId = VRCShader.PropertyToID("_WaterStillSlice");
+        terrainPropWaterFlowSliceId = VRCShader.PropertyToID("_WaterFlowSlice");
+
+        betaWaterStillTexture = new Texture2D(16, 16, TextureFormat.RGBA32, false, false);
+        betaWaterStillTexture.name = "BetaWaterStillRuntime";
+        betaWaterStillTexture.filterMode = FilterMode.Point;
+        betaWaterStillTexture.wrapMode = TextureWrapMode.Clamp;
+
+        betaWaterFlowTexture = new Texture2D(16, 16, TextureFormat.RGBA32, false, false);
+        betaWaterFlowTexture.name = "BetaWaterFlowRuntime";
+        betaWaterFlowTexture.filterMode = FilterMode.Point;
+        betaWaterFlowTexture.wrapMode = TextureWrapMode.Clamp;
+
+        betaWaterStillPixels = new Color32[256];
+        betaWaterFlowPixels = new Color32[256];
+        betaWaterStillCurrent = new float[256];
+        betaWaterStillNext = new float[256];
+        betaWaterStillAccel = new float[256];
+        betaWaterStillSplash = new float[256];
+        betaWaterFlowCurrent = new float[256];
+        betaWaterFlowNext = new float[256];
+        betaWaterFlowAccel = new float[256];
+        betaWaterFlowSplash = new float[256];
+        betaWaterFlowFrame = 0;
+        betaWaterNoiseState = 1;
+
+        _TickBetaWaterStillAnimation();
+        _TickBetaWaterFlowAnimation();
+        _ApplyBetaWaterMaterialProperties(sharedTransparentChunkMaterial);
+    }
+
+    private void _ApplyBetaWaterMaterialProperties(Material material)
+    {
+        if (material == null || betaWaterStillTexture == null || betaWaterFlowTexture == null) return;
+
+        material.SetTexture(terrainPropWaterStillTexId, betaWaterStillTexture);
+        material.SetTexture(terrainPropWaterFlowTexId, betaWaterFlowTexture);
+        material.SetFloat(terrainPropWaterStillSliceId, betaWaterStillSlice);
+        material.SetFloat(terrainPropWaterFlowSliceId, betaWaterFlowSlice);
+    }
+
+    private float _NextBetaWaterNoise()
+    {
+        long nextState = (long)betaWaterNoiseState * 1103515245L + 12345L;
+        betaWaterNoiseState = (int)(nextState & 0x7fffffffL);
+        return betaWaterNoiseState / 2147483647.0f;
+    }
+
+    private void _TickBetaWaterStillAnimation()
+    {
+        if (betaWaterStillTexture == null || betaWaterStillPixels == null) return;
+
+        for (int x = 0; x < 16; x++)
+        {
+            for (int y = 0; y < 16; y++)
+            {
+                float sampleSum = 0.0f;
+                for (int sampleX = x - 1; sampleX <= x + 1; sampleX++)
+                {
+                    sampleSum += betaWaterStillCurrent[(sampleX & 15) + (y & 15) * 16];
+                }
+
+                int index = x + y * 16;
+                betaWaterStillNext[index] = sampleSum / 3.3f + betaWaterStillAccel[index] * 0.8f;
+            }
+        }
+
+        for (int i = 0; i < 256; i++)
+        {
+            betaWaterStillAccel[i] += betaWaterStillSplash[i] * 0.05f;
+            if (betaWaterStillAccel[i] < 0.0f) betaWaterStillAccel[i] = 0.0f;
+
+            betaWaterStillSplash[i] -= 0.1f;
+            if (_NextBetaWaterNoise() < 0.05f) betaWaterStillSplash[i] = 0.5f;
+        }
+
+        float[] swap = betaWaterStillNext;
+        betaWaterStillNext = betaWaterStillCurrent;
+        betaWaterStillCurrent = swap;
+
+        for (int i = 0; i < 256; i++)
+        {
+            float height = betaWaterStillCurrent[i];
+            if (height > 1.0f) height = 1.0f;
+            if (height < 0.0f) height = 0.0f;
+
+            float heightSq = height * height;
+            betaWaterStillPixels[i] = new Color32(
+                (byte)(32.0f + heightSq * 32.0f),
+                (byte)(50.0f + heightSq * 64.0f),
+                (byte)255,
+                (byte)(146.0f + heightSq * 50.0f));
+        }
+
+        betaWaterStillTexture.SetPixels32(betaWaterStillPixels);
+        betaWaterStillTexture.Apply(false, false);
+    }
+
+    private void _TickBetaWaterFlowAnimation()
+    {
+        if (betaWaterFlowTexture == null || betaWaterFlowPixels == null) return;
+
+        betaWaterFlowFrame++;
+
+        for (int x = 0; x < 16; x++)
+        {
+            for (int y = 0; y < 16; y++)
+            {
+                float sampleSum = 0.0f;
+                for (int sampleY = y - 2; sampleY <= y; sampleY++)
+                {
+                    sampleSum += betaWaterFlowCurrent[(x & 15) + (sampleY & 15) * 16];
+                }
+
+                int index = x + y * 16;
+                betaWaterFlowNext[index] = sampleSum / 3.2f + betaWaterFlowAccel[index] * 0.8f;
+            }
+        }
+
+        for (int i = 0; i < 256; i++)
+        {
+            betaWaterFlowAccel[i] += betaWaterFlowSplash[i] * 0.05f;
+            if (betaWaterFlowAccel[i] < 0.0f) betaWaterFlowAccel[i] = 0.0f;
+
+            betaWaterFlowSplash[i] -= 0.3f;
+            if (_NextBetaWaterNoise() < 0.2f) betaWaterFlowSplash[i] = 0.5f;
+        }
+
+        float[] swap = betaWaterFlowNext;
+        betaWaterFlowNext = betaWaterFlowCurrent;
+        betaWaterFlowCurrent = swap;
+
+        for (int i = 0; i < 256; i++)
+        {
+            float height = betaWaterFlowCurrent[(i - betaWaterFlowFrame * 16) & 255];
+            if (height > 1.0f) height = 1.0f;
+            if (height < 0.0f) height = 0.0f;
+
+            float heightSq = height * height;
+            betaWaterFlowPixels[i] = new Color32(
+                (byte)(32.0f + heightSq * 32.0f),
+                (byte)(50.0f + heightSq * 64.0f),
+                (byte)255,
+                (byte)(146.0f + heightSq * 50.0f));
+        }
+
+        betaWaterFlowTexture.SetPixels32(betaWaterFlowPixels);
+        betaWaterFlowTexture.Apply(false, false);
+    }
+
+    private void _UpdateBetaWaterAnimation()
+    {
+        if (betaWaterStillTexture == null || betaWaterFlowTexture == null) return;
+
+        _TickBetaWaterStillAnimation();
+        _TickBetaWaterFlowAnimation();
     }
 
     private bool _UsesGpuTerrainLightSampling()
@@ -2340,6 +2533,7 @@ public class McWorld : UdonSharpBehaviour
         _ApplyTerrainLightingSource(sharedOpaqueChunkMaterial);
         _ApplyTerrainLightingSource(sharedTransparentChunkMaterial);
         _ApplyTerrainLightingSource(sharedCutoutChunkMaterial);
+        _ApplyBetaWaterMaterialProperties(sharedTransparentChunkMaterial);
     }
 
     private void _AssignSharedChunkMaterial(Transform childTransform, Material sharedMaterial)
@@ -2379,8 +2573,11 @@ public class McWorld : UdonSharpBehaviour
         // This is a bit fragile, relies on child object names. A more robust solution
         // would be a simple script on the prefab to hold the references.
         Transform opaqueTransform = newChunkGO.transform.Find("Opaque");
+        if (opaqueTransform == null) opaqueTransform = newChunkGO.transform;
         Transform transparentTransform = newChunkGO.transform.Find("Transparent");
+        if (transparentTransform == null) transparentTransform = newChunkGO.transform.Find("trans");
         Transform cutoutTransform = newChunkGO.transform.Find("Cutout");
+        if (cutoutTransform == null) cutoutTransform = newChunkGO.transform.Find("cutout");
 
         _AssignSharedChunkMaterial(opaqueTransform, sharedOpaqueChunkMaterial);
         _AssignSharedChunkMaterial(transparentTransform, sharedTransparentChunkMaterial);
@@ -2427,6 +2624,7 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
 
+        _UpdateBetaWaterAnimation();
         ProcessActiveChunks();
         _UpdateGpuDebugHud();
 
@@ -3522,7 +3720,7 @@ public class McWorld : UdonSharpBehaviour
         }
 
         // GPU face extraction path: trigger Blit + async readback, mesh will be built in _ProcessGpuFaceReadback
-        if (_GpuFaceExtractionReady())
+        if (_GpuFaceExtractionReady() && !chunk._hasWaterBlocks)
         {
             if (_GpuHasAvailableReadbackBuffer())
             {
@@ -3771,6 +3969,7 @@ public class McWorld : UdonSharpBehaviour
         {
             // After all boundary processing, add cross-shaped blocks
             _AddCrossShapedBlocks(chunk);
+            _AddWaterBlocks(chunk);
 
             _ApplyAllMeshData(chunk);
 #if LOGGING
@@ -5481,7 +5680,7 @@ public class McWorld : UdonSharpBehaviour
             {
                 int maskIndex = rowOffset + u;
                 byte blockID = blockIds[maskIndex];
-                if (blockID == 0)
+                if (blockID == 0 || _IsWaterBlock(blockID))
                 {
                     u++;
                     continue;
@@ -5895,6 +6094,393 @@ public class McWorld : UdonSharpBehaviour
             else chunk.facesCutout += 2;
         }
 #endif
+    }
+
+    private bool _IsWaterBlock(byte blockID)
+    {
+        return blockID == BLOCK_WATER_MOVING || blockID == BLOCK_WATER_STILL;
+    }
+
+    private byte _GetFluidRenderBlock(ChunkData originChunk, int localX, int localY, int localZ)
+    {
+        if (originChunk == null) return 0;
+
+        int sampleChunkX = originChunk.chunkX_world;
+        int sampleChunkY = originChunk.chunkY_world;
+        int sampleChunkZ = originChunk.chunkZ_world;
+
+        while (localX < 0)
+        {
+            localX += chunkSizeXZ;
+            sampleChunkX--;
+        }
+        while (localX >= chunkSizeXZ)
+        {
+            localX -= chunkSizeXZ;
+            sampleChunkX++;
+        }
+        while (localY < 0)
+        {
+            localY += chunkSizeY;
+            sampleChunkY--;
+        }
+        while (localY >= chunkSizeY)
+        {
+            localY -= chunkSizeY;
+            sampleChunkY++;
+        }
+        while (localZ < 0)
+        {
+            localZ += chunkSizeXZ;
+            sampleChunkZ--;
+        }
+        while (localZ >= chunkSizeXZ)
+        {
+            localZ -= chunkSizeXZ;
+            sampleChunkZ++;
+        }
+
+        if (sampleChunkX == originChunk.chunkX_world &&
+            sampleChunkY == originChunk.chunkY_world &&
+            sampleChunkZ == originChunk.chunkZ_world &&
+            originChunk._decompSelf != null)
+        {
+            int stride = chunkSizeXZ * chunkSizeXZ;
+            return originChunk._decompSelf[localY * stride + localZ * chunkSizeXZ + localX];
+        }
+
+        ChunkData sampleChunk = GetChunkAt(sampleChunkX, sampleChunkY, sampleChunkZ);
+        if (sampleChunk == null || !sampleChunk.isDataReady) return 0;
+        return _GetBlockLocal(sampleChunk, localX, localY, localZ);
+    }
+
+    private bool _IsOpaqueCubeForWater(byte blockID)
+    {
+        return blockID != 0 && _GetVisibilityType(blockID) == BlockVisibilityType.Opaque;
+    }
+
+    private bool _ShouldRenderWaterFace(ChunkData chunk, int neighborX, int neighborY, int neighborZ, int side)
+    {
+        byte neighborBlock = _GetFluidRenderBlock(chunk, neighborX, neighborY, neighborZ);
+        if (_IsWaterBlock(neighborBlock) || neighborBlock == BLOCK_ICE) return false;
+        if (side == 1) return true;
+        return !_IsOpaqueCubeForWater(neighborBlock);
+    }
+
+    private float _GetWaterPercentAir(int level)
+    {
+        if (level >= 8) level = 0;
+        return (level + 1) / 9.0f;
+    }
+
+    private int _GetWaterFlowDecay(ChunkData chunk, int localX, int localY, int localZ)
+    {
+        return _IsWaterBlock(_GetFluidRenderBlock(chunk, localX, localY, localZ)) ? 0 : -1;
+    }
+
+    private float _GetWaterCornerHeight(ChunkData chunk, int cornerX, int localY, int cornerZ)
+    {
+        int sampleCount = 0;
+        float sampleSum = 0.0f;
+
+        for (int i = 0; i < 4; i++)
+        {
+            int sampleX = cornerX - (i & 1);
+            int sampleZ = cornerZ - ((i >> 1) & 1);
+
+            if (_IsWaterBlock(_GetFluidRenderBlock(chunk, sampleX, localY + 1, sampleZ)))
+            {
+                return 1.0f;
+            }
+
+            byte sampleBlock = _GetFluidRenderBlock(chunk, sampleX, localY, sampleZ);
+            if (!_IsWaterBlock(sampleBlock))
+            {
+                if (!_IsBlockSolid(sampleBlock))
+                {
+                    sampleSum += 1.0f;
+                    sampleCount++;
+                }
+            }
+            else
+            {
+                // Water metadata does not exist in this voxel format yet, so every fluid
+                // sample is treated as level 0. That matches Beta still-water pools exactly.
+                float percentAir = _GetWaterPercentAir(0);
+                sampleSum += percentAir * 10.0f;
+                sampleCount += 10;
+                sampleSum += percentAir;
+                sampleCount++;
+            }
+        }
+
+        if (sampleCount == 0) return 0.0f;
+        return 1.0f - sampleSum / sampleCount;
+    }
+
+    private float _GetWaterFlowAngle(ChunkData chunk, int localX, int localY, int localZ)
+    {
+        int flowDecay = _GetWaterFlowDecay(chunk, localX, localY, localZ);
+        if (flowDecay < 0) return -1000.0f;
+
+        float flowX = 0.0f;
+        float flowZ = 0.0f;
+
+        for (int side = 0; side < 4; side++)
+        {
+            int sampleX = localX;
+            int sampleZ = localZ;
+            if (side == 0) sampleX--;
+            else if (side == 1) sampleZ--;
+            else if (side == 2) sampleX++;
+            else sampleZ++;
+
+            int neighborDecay = _GetWaterFlowDecay(chunk, sampleX, localY, sampleZ);
+            if (neighborDecay < 0)
+            {
+                byte neighborBlock = _GetFluidRenderBlock(chunk, sampleX, localY, sampleZ);
+                if (!_IsBlockSolid(neighborBlock))
+                {
+                    neighborDecay = _GetWaterFlowDecay(chunk, sampleX, localY - 1, sampleZ);
+                    if (neighborDecay >= 0)
+                    {
+                        int decayDelta = neighborDecay - (flowDecay - 8);
+                        flowX += (sampleX - localX) * decayDelta;
+                        flowZ += (sampleZ - localZ) * decayDelta;
+                    }
+                }
+            }
+            else
+            {
+                int decayDelta = neighborDecay - flowDecay;
+                flowX += (sampleX - localX) * decayDelta;
+                flowZ += (sampleZ - localZ) * decayDelta;
+            }
+        }
+
+        float magnitude = Mathf.Sqrt(flowX * flowX + flowZ * flowZ);
+        if (magnitude < 0.0001f) return -1000.0f;
+
+        flowX /= magnitude;
+        flowZ /= magnitude;
+        return Mathf.Atan2(flowZ, flowX) - Mathf.PI * 0.5f;
+    }
+
+    private float _GetWaterBlockBrightness(ChunkData chunk, int localX, int localY, int localZ)
+    {
+        float currentBrightness = _GetLightBrightnessAtBlock(chunk, localX, localY, localZ);
+        float aboveBrightness = _GetLightBrightnessAtBlock(chunk, localX, localY + 1, localZ);
+        return currentBrightness > aboveBrightness ? currentBrightness : aboveBrightness;
+    }
+
+    private void _AddWaterQuad(
+        ChunkData chunk,
+        Vector3 vertex0, Vector3 vertex1, Vector3 vertex2, Vector3 vertex3,
+        Vector3 faceNormal,
+        Vector2 uv0, Vector2 uv1, Vector2 uv2, Vector2 uv3,
+        float textureSlice,
+        float brightness)
+    {
+        if (chunk == null || chunk._transparentVertexCount + 4 > MAX_VERTS) return;
+
+        int vertexIndex = chunk._transparentVertexCount;
+        int triangleIndex = chunk._transparentTriangleCount;
+        chunk._transparentVertices[vertexIndex + 0] = vertex0;
+        chunk._transparentVertices[vertexIndex + 1] = vertex1;
+        chunk._transparentVertices[vertexIndex + 2] = vertex2;
+        chunk._transparentVertices[vertexIndex + 3] = vertex3;
+
+        chunk._transparentNormals[vertexIndex + 0] = faceNormal;
+        chunk._transparentNormals[vertexIndex + 1] = faceNormal;
+        chunk._transparentNormals[vertexIndex + 2] = faceNormal;
+        chunk._transparentNormals[vertexIndex + 3] = faceNormal;
+
+        Color waterVertexColor = new Color(1.0f, 1.0f, 1.0f, brightness);
+        chunk._transparentColors[vertexIndex + 0] = waterVertexColor;
+        chunk._transparentColors[vertexIndex + 1] = waterVertexColor;
+        chunk._transparentColors[vertexIndex + 2] = waterVertexColor;
+        chunk._transparentColors[vertexIndex + 3] = waterVertexColor;
+
+        chunk._transparentUVs[vertexIndex + 0] = new Vector3(uv0.x, uv0.y, textureSlice);
+        chunk._transparentUVs[vertexIndex + 1] = new Vector3(uv1.x, uv1.y, textureSlice);
+        chunk._transparentUVs[vertexIndex + 2] = new Vector3(uv2.x, uv2.y, textureSlice);
+        chunk._transparentUVs[vertexIndex + 3] = new Vector3(uv3.x, uv3.y, textureSlice);
+
+        chunk._transparentTriangles[triangleIndex + 0] = vertexIndex;
+        chunk._transparentTriangles[triangleIndex + 1] = vertexIndex + 1;
+        chunk._transparentTriangles[triangleIndex + 2] = vertexIndex + 2;
+        chunk._transparentTriangles[triangleIndex + 3] = vertexIndex;
+        chunk._transparentTriangles[triangleIndex + 4] = vertexIndex + 2;
+        chunk._transparentTriangles[triangleIndex + 5] = vertexIndex + 3;
+
+        chunk._transparentVertexCount += 4;
+        chunk._transparentTriangleCount += 6;
+
+#if LOGGING
+        if (enableVerboseLogging)
+        {
+            chunk.facesTotal++;
+            chunk.facesTransparent++;
+        }
+#endif
+    }
+
+    private void _AddWaterBlock(ChunkData chunk, int localX, int localY, int localZ, byte blockID)
+    {
+        bool renderTop = _ShouldRenderWaterFace(chunk, localX, localY + 1, localZ, 1);
+        bool renderBottom = _ShouldRenderWaterFace(chunk, localX, localY - 1, localZ, 0);
+        bool renderSouth = _ShouldRenderWaterFace(chunk, localX, localY, localZ - 1, 2);
+        bool renderNorth = _ShouldRenderWaterFace(chunk, localX, localY, localZ + 1, 3);
+        bool renderWest = _ShouldRenderWaterFace(chunk, localX - 1, localY, localZ, 4);
+        bool renderEast = _ShouldRenderWaterFace(chunk, localX + 1, localY, localZ, 5);
+        if (!renderTop && !renderBottom && !renderSouth && !renderNorth && !renderWest && !renderEast) return;
+
+        float stillSlice = betaWaterStillSlice >= 0 ? betaWaterStillSlice : _GetTextureSlice(blockID, FACE_INDEX_TOP);
+        float flowSlice = betaWaterFlowSlice >= 0 ? betaWaterFlowSlice : _GetTextureSlice(blockID, FACE_INDEX_SIDE);
+
+        float heightNW = _GetWaterCornerHeight(chunk, localX, localY, localZ);
+        float heightSW = _GetWaterCornerHeight(chunk, localX, localY, localZ + 1);
+        float heightSE = _GetWaterCornerHeight(chunk, localX + 1, localY, localZ + 1);
+        float heightNE = _GetWaterCornerHeight(chunk, localX + 1, localY, localZ);
+
+        if (renderTop)
+        {
+            float flowAngle = _GetWaterFlowAngle(chunk, localX, localY, localZ);
+            float sinOffset = 0.0f;
+            float cosOffset = 0.5f;
+            float topSlice = stillSlice;
+            if (flowAngle > -999.0f)
+            {
+                sinOffset = Mathf.Sin(flowAngle) * 0.5f;
+                cosOffset = Mathf.Cos(flowAngle) * 0.5f;
+                topSlice = flowSlice;
+            }
+
+            _AddWaterQuad(
+                chunk,
+                new Vector3(localX, localY + heightNW, localZ),
+                new Vector3(localX, localY + heightSW, localZ + 1),
+                new Vector3(localX + 1, localY + heightSE, localZ + 1),
+                new Vector3(localX + 1, localY + heightNE, localZ),
+                Normal_Up,
+                new Vector2(0.5f - cosOffset - sinOffset, 0.5f - cosOffset + sinOffset),
+                new Vector2(0.5f - cosOffset + sinOffset, 0.5f + cosOffset + sinOffset),
+                new Vector2(0.5f + cosOffset + sinOffset, 0.5f + cosOffset - sinOffset),
+                new Vector2(0.5f + cosOffset - sinOffset, 0.5f - cosOffset - sinOffset),
+                topSlice,
+                _GetWaterBlockBrightness(chunk, localX, localY, localZ));
+        }
+
+        if (renderBottom)
+        {
+            _AddWaterQuad(
+                chunk,
+                new Vector3(localX + 1, localY, localZ),
+                new Vector3(localX + 1, localY, localZ + 1),
+                new Vector3(localX, localY, localZ + 1),
+                new Vector3(localX, localY, localZ),
+                Normal_Down,
+                new Vector2(0.0f, 0.0f),
+                new Vector2(0.0f, 1.0f),
+                new Vector2(1.0f, 1.0f),
+                new Vector2(1.0f, 0.0f),
+                stillSlice,
+                _GetWaterBlockBrightness(chunk, localX, localY - 1, localZ));
+        }
+
+        const float sideMaxV = 0.999375f;
+
+        if (renderSouth)
+        {
+            _AddWaterQuad(
+                chunk,
+                new Vector3(localX, localY + heightNW, localZ),
+                new Vector3(localX + 1, localY + heightNE, localZ),
+                new Vector3(localX + 1, localY, localZ),
+                new Vector3(localX, localY, localZ),
+                Normal_South,
+                new Vector2(0.0f, 1.0f - heightNW),
+                new Vector2(sideMaxV, 1.0f - heightNE),
+                new Vector2(sideMaxV, sideMaxV),
+                new Vector2(0.0f, sideMaxV),
+                flowSlice,
+                _GetWaterBlockBrightness(chunk, localX, localY, localZ - 1));
+        }
+
+        if (renderNorth)
+        {
+            _AddWaterQuad(
+                chunk,
+                new Vector3(localX + 1, localY + heightSE, localZ + 1),
+                new Vector3(localX, localY + heightSW, localZ + 1),
+                new Vector3(localX, localY, localZ + 1),
+                new Vector3(localX + 1, localY, localZ + 1),
+                Normal_North,
+                new Vector2(0.0f, 1.0f - heightSE),
+                new Vector2(sideMaxV, 1.0f - heightSW),
+                new Vector2(sideMaxV, sideMaxV),
+                new Vector2(0.0f, sideMaxV),
+                flowSlice,
+                _GetWaterBlockBrightness(chunk, localX, localY, localZ + 1));
+        }
+
+        if (renderWest)
+        {
+            _AddWaterQuad(
+                chunk,
+                new Vector3(localX, localY + heightSW, localZ + 1),
+                new Vector3(localX, localY + heightNW, localZ),
+                new Vector3(localX, localY, localZ),
+                new Vector3(localX, localY, localZ + 1),
+                Normal_West,
+                new Vector2(0.0f, 1.0f - heightSW),
+                new Vector2(sideMaxV, 1.0f - heightNW),
+                new Vector2(sideMaxV, sideMaxV),
+                new Vector2(0.0f, sideMaxV),
+                flowSlice,
+                _GetWaterBlockBrightness(chunk, localX - 1, localY, localZ));
+        }
+
+        if (renderEast)
+        {
+            _AddWaterQuad(
+                chunk,
+                new Vector3(localX + 1, localY + heightNE, localZ),
+                new Vector3(localX + 1, localY + heightSE, localZ + 1),
+                new Vector3(localX + 1, localY, localZ + 1),
+                new Vector3(localX + 1, localY, localZ),
+                Normal_East,
+                new Vector2(0.0f, 1.0f - heightNE),
+                new Vector2(sideMaxV, 1.0f - heightSE),
+                new Vector2(sideMaxV, sideMaxV),
+                new Vector2(0.0f, sideMaxV),
+                flowSlice,
+                _GetWaterBlockBrightness(chunk, localX + 1, localY, localZ));
+        }
+    }
+
+    private void _AddWaterBlocks(ChunkData chunk)
+    {
+        if (chunk == null || !chunk._hasWaterBlocks || chunk._decompSelf == null) return;
+
+        int stride = chunkSizeXZ * chunkSizeXZ;
+        for (int z = 0; z < chunkSizeXZ; z++)
+        {
+            for (int x = 0; x < chunkSizeXZ; x++)
+            {
+                int columnIndex = z * chunkSizeXZ + x;
+                byte minY = chunk._columnMinY != null ? chunk._columnMinY[columnIndex] : (byte)255;
+                byte maxY = chunk._columnMaxY != null ? chunk._columnMaxY[columnIndex] : (byte)255;
+                if (minY == 255 || maxY == 255) continue;
+
+                for (int y = minY; y <= maxY; y++)
+                {
+                    byte blockID = chunk._decompSelf[y * stride + columnIndex];
+                    if (!_IsWaterBlock(blockID)) continue;
+                    _AddWaterBlock(chunk, x, y, z, blockID);
+                }
+            }
+        }
     }
 
     private void _ApplyEmptyMesh(ChunkData chunk)
@@ -8217,6 +8803,7 @@ public class McWorld : UdonSharpBehaviour
 
         chunk._crossBlockCount = 0;
         chunk._isAllAir = true;
+        chunk._hasWaterBlocks = false;
         chunk._hasEmissiveBlocks = false;
         chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
         chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
@@ -8242,6 +8829,10 @@ public class McWorld : UdonSharpBehaviour
                     if (blockID == 0) continue;
 
                     chunk._isAllAir = false;
+                    if (!chunk._hasWaterBlocks && _IsWaterBlock(blockID))
+                    {
+                        chunk._hasWaterBlocks = true;
+                    }
                     int columnIndex = z * chunkSizeXZ + x;
                     if (chunk._columnMinY[columnIndex] == 255) chunk._columnMinY[columnIndex] = (byte)y;
                     chunk._columnMaxY[columnIndex] = (byte)y;

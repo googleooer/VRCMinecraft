@@ -44,6 +44,7 @@ public class ChunkData
     public int[] _crossBlockPackedPositions;
     public int _crossBlockCount = 0;
     public bool _isAllAir = false;
+    public bool _hasWaterBlocks = false;
     public bool _hasEmissiveBlocks = false;
     public byte _chunkGlobalMinY = 255, _chunkGlobalMaxY = 0;
     public byte _chunkGlobalMinX = 255, _chunkGlobalMaxX = 0;

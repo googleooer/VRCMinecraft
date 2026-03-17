@@ -5,6 +5,10 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
         [KeywordEnum(Opaque, Cutout, Transparent)] _SurfaceType ("Surface Type", Float) = 0 // ADDED: Surface type dropdown
         _MainTex ("Texture Array", 2DArray) = "white" {} // MODIFIED: Changed to 2DArray
         _TintMask ("Tint Mask Array", 2DArray) = "black" {} // MODIFIED: Changed to 2DArray
+        [HideInInspector] _WaterStillTex ("Water Still Texture", 2D) = "white" {}
+        [HideInInspector] _WaterFlowTex ("Water Flow Texture", 2D) = "white" {}
+        [HideInInspector] _WaterStillSlice ("Water Still Slice", Float) = -1
+        [HideInInspector] _WaterFlowSlice ("Water Flow Slice", Float) = -1
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
         _Cutoff ("Alpha Cutoff", Range(0.0, 1.0)) = 0.5 // ADDED: Alpha cutoff for Cutout mode
@@ -81,6 +85,10 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             float4 _MainTex_ST;
 
             UNITY_DECLARE_TEX2DARRAY(_TintMask); // MODIFIED: Declared as Texture2DArray
+            sampler2D _WaterStillTex;
+            sampler2D _WaterFlowTex;
+            float _WaterStillSlice;
+            float _WaterFlowSlice;
 
             #if defined(_SURFACETYPE_CUTOUT) // ADDED: Conditional declaration
             float _Cutoff; // ADDED: Declaration for Alpha Cutoff
@@ -195,14 +203,21 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             fixed4 frag (v2f i) : SV_Target
             {
                 fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
-                fixed4 tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw); // Sample tint mask
+                fixed4 tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw);
+                fixed4 waterStill = tex2D(_WaterStillTex, i.uvw.xy).rgba;
+                fixed4 waterFlow = tex2D(_WaterFlowTex, i.uvw.xy).rgba;
+                fixed stillWeight = saturate(1.0 - abs(i.uvw.z - _WaterStillSlice) * 4.0);
+                fixed flowWeight = saturate(1.0 - abs(i.uvw.z - _WaterFlowSlice) * 4.0) * (1.0 - stillWeight);
+                fixed waterWeight = saturate(stillWeight + flowWeight);
+                fixed4 waterCol = lerp(waterFlow, waterStill, stillWeight);
+                col = lerp(col, waterCol, waterWeight);
 
                 // Apply biome-specific tinting (Corrected Method):
                 // The tint mask's ALPHA controls WHERE the tint is applied.
                 // The texture's brightness (col.r) scales the pure biome color (i.color.rgb).
                 // This prevents desaturation by preserving the biome color's hue and saturation.
-                fixed3 tintedColor = col.r * i.color.rgb; 
-                col.rgb = lerp(col.rgb, tintedColor, tintInput.a);
+                fixed3 tintedColor = col.r * i.color.rgb;
+                col.rgb = lerp(col.rgb, tintedColor, tintInput.a * (1.0 - waterWeight));
                 
                 // Apply lighting from vertex color alpha (calculated by lighting system)
                 // MINECRAFT LIGHTING: Both light brightness and face shading are in gamma space
