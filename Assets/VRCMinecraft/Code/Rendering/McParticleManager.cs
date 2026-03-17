@@ -338,23 +338,23 @@ public class McParticleManager : UdonSharpBehaviour
         switch (mount)
         {
             case TORCH_MOUNT_WEST:
-                tx -= 0.27f;
-                ty += 0.22f;
+                tx -= 0.15f;
+                ty += 0.12f;
                 break;
             case TORCH_MOUNT_EAST:
-                tx += 0.27f;
-                ty += 0.22f;
+                tx += 0.15f;
+                ty += 0.12f;
                 break;
             case TORCH_MOUNT_NORTH:
-                tz -= 0.27f;
-                ty += 0.22f;
+                tz -= 0.15f;
+                ty += 0.12f;
                 break;
             case TORCH_MOUNT_SOUTH:
-                tz += 0.27f;
-                ty += 0.22f;
+                tz += 0.15f;
+                ty += 0.12f;
                 break;
             case TORCH_MOUNT_CEILING:
-                ty = y + 0.28f;
+                ty = y + 0.4f;
                 break;
             default:
                 break;

@@ -783,13 +783,15 @@ public class McWorld : UdonSharpBehaviour
             byte blockId = (byte)i;
             int opacity = blockTypeManager.GetBlockLightOpacity(blockId);
             int emission = blockTypeManager.GetBlockLightEmission(blockId);
-            int shape = (int)blockTypeManager.GetBlockShapeType(blockId);
-            bool canBlockGrass = blockTypeManager.GetBlockCanBlockGrass(blockId);
+            int shape = _UsesCustomBlockMesh(blockId, null, 0) ? (int)McBlockShapeType.Cross : (int)blockTypeManager.GetBlockShapeType(blockId);
+            bool opaqueCube = blockId != 0
+                && blockTypeManager.GetBlockVisibilityType(blockId) == BlockVisibilityType.Opaque
+                && shape == (int)McBlockShapeType.Cube;
             pixels[i] = new Color32(
                 (byte)Mathf.Clamp(opacity * 17, 0, 255),
                 (byte)Mathf.Clamp(emission * 17, 0, 255),
                 (byte)Mathf.Clamp(shape, 0, 255),
-                (byte)(canBlockGrass ? 255 : 0)
+                (byte)(opaqueCube ? 255 : 0)
             );
         }
 
@@ -2202,8 +2204,10 @@ public class McWorld : UdonSharpBehaviour
 
             if (chunk._gpuFaceBuildStage == 2)
             {
+                bool interactionPriority = chunk.interactionMeshPriority;
                 _ApplyAllMeshData(chunk);
                 if (chunk._collisionVertexCount == 0) _DisableChunkCollider(chunk, false);
+                else if (interactionPriority) _ApplyDataToCollider(chunk);
                 else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
                 else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
                 else _ApplyDataToCollider(chunk);
@@ -2730,10 +2734,25 @@ public class McWorld : UdonSharpBehaviour
             ChunkData chunk = activeMeshingChunks[i];
             if (chunk == null || !chunk.isBuildingMesh)
             {
+                bool needsFollowupMeshBuild = false;
+                int followupChunkIndex = -1;
+                if (chunk != null && chunk.pendingChunkMeshRebuild)
+                {
+                    chunk.pendingChunkMeshRebuild = false;
+                    chunk.interactionMeshPriority = true;
+                    followupChunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+                    needsFollowupMeshBuild = followupChunkIndex != -1;
+                }
+
                 // Remove from active list
                 activeMeshingChunks[i] = activeMeshingChunks[activeMeshingCount - 1];
                 activeMeshingCount--;
                 i--; // Re-check this index
+
+                if (needsFollowupMeshBuild)
+                {
+                    RequestChunkMeshUpdate(followupChunkIndex);
+                }
                 continue;
             }
 
@@ -3935,6 +3954,14 @@ public class McWorld : UdonSharpBehaviour
         chunk.isMeshDeferred = false;
         chunk.pendingColliderApply = false;
         chunk.pendingColliderMeshRebuild = !_ShouldEnableChunkCollider(chunk);
+        if (interactionPriority)
+        {
+            chunk._gpuMeshPending = false;
+            if (chunk._gpuFaceBuildActive)
+            {
+                _ReleaseGpuFaceBuildBuffer(chunk);
+            }
+        }
 
 #if LOGGING
         chunk.meshBuildStartTime = Time.realtimeSinceStartup;
@@ -4012,8 +4039,10 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
-        // GPU face extraction path: trigger Blit + async readback, mesh will be built in _ProcessGpuFaceReadback
-        if (_GpuFaceExtractionReady() && !chunk._hasWaterBlocks && !chunk._hasTorchBlocks)
+        // Player edits should stay on the synchronous CPU mesh path so block changes
+        // are visible immediately instead of waiting on async GPU face readback.
+        // Keep GPU extraction for background worldgen where throughput matters more.
+        if (!interactionPriority && _GpuFaceExtractionReady() && !chunk._hasWaterBlocks && !chunk._hasTorchBlocks)
         {
             if (_GpuHasAvailableReadbackBuffer())
             {
@@ -4101,6 +4130,20 @@ public class McWorld : UdonSharpBehaviour
         if (!interactionPriority)
         {
             _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+        }
+
+        if (interactionPriority)
+        {
+            int immediateStepBudget = 256;
+            while (chunk.isBuildingMesh && immediateStepBudget-- > 0)
+            {
+                _BuildChunkMeshStep(chunk);
+            }
+
+            if (!chunk.isBuildingMesh)
+            {
+                return;
+            }
         }
 
         if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
@@ -4266,6 +4309,7 @@ public class McWorld : UdonSharpBehaviour
 
         if (chunk._greedyAxis > 5)
         {
+            bool interactionPriority = chunk.interactionMeshPriority;
             // After all boundary processing, add cross-shaped blocks
             _AddCrossShapedBlocks(chunk);
             _AddTorchBlocks(chunk);
@@ -4301,6 +4345,7 @@ public class McWorld : UdonSharpBehaviour
             // so we'll just apply the collider directly after a few frames in the main loop.
             // A more robust solution might involve another queue. For now, this is simpler.
             if (chunk._collisionVertexCount == 0) _DisableChunkCollider(chunk, false);
+            else if (interactionPriority) _ApplyDataToCollider(chunk);
             else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
             else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
             else _ApplyDataToCollider(chunk);
@@ -6426,7 +6471,7 @@ public class McWorld : UdonSharpBehaviour
 
     private void _AddTorchBlock(ChunkData chunk, int x, int y, int z, byte blockID)
     {
-        if (chunk == null || chunk._cutoutVertexCount + 20 > MAX_VERTS) return;
+        if (chunk == null || chunk._cutoutVertexCount + 24 > MAX_VERTS) return;
 
         float brightness = (blockID < lightEmissionCache.Length && lightEmissionCache[blockID] > 0)
             ? 1.0f
@@ -6435,113 +6480,141 @@ public class McWorld : UdonSharpBehaviour
         float textureSlice = _GetTextureSlice(blockID, FACE_INDEX_SIDE);
         byte torchMount = _GetTorchMountLocal(chunk, x, y, z);
 
-        float baseX = x;
-        float baseY = y;
-        float baseZ = z;
-        float leanX = 0.0f;
-        float leanZ = 0.0f;
-        bool upsideDown = false;
+        float halfThickness = 1.0f / 16.0f;
+        Vector3 topCenter = new Vector3(x + 0.5f, y + 0.625f, z + 0.5f);
+        Vector3 bottomCenter = new Vector3(x + 0.5f, y + 0.0f, z + 0.5f);
+        bool capFacesDown = false;
 
         switch (torchMount)
         {
             case TORCH_MOUNT_WEST:
-                baseX -= 0.1f;
-                baseY += 0.2f;
-                leanX = -0.4f;
+                topCenter = new Vector3(x + 0.35f, y + 0.8f, z + 0.5f);
+                bottomCenter = new Vector3(x + 0.15f, y + 0.2f, z + 0.5f);
                 break;
             case TORCH_MOUNT_EAST:
-                baseX += 0.1f;
-                baseY += 0.2f;
-                leanX = 0.4f;
+                topCenter = new Vector3(x + 0.65f, y + 0.8f, z + 0.5f);
+                bottomCenter = new Vector3(x + 0.85f, y + 0.2f, z + 0.5f);
                 break;
             case TORCH_MOUNT_NORTH:
-                baseY += 0.2f;
-                baseZ -= 0.1f;
-                leanZ = -0.4f;
+                topCenter = new Vector3(x + 0.5f, y + 0.8f, z + 0.35f);
+                bottomCenter = new Vector3(x + 0.5f, y + 0.2f, z + 0.15f);
                 break;
             case TORCH_MOUNT_SOUTH:
-                baseY += 0.2f;
-                baseZ += 0.1f;
-                leanZ = 0.4f;
+                topCenter = new Vector3(x + 0.5f, y + 0.8f, z + 0.65f);
+                bottomCenter = new Vector3(x + 0.5f, y + 0.2f, z + 0.85f);
                 break;
             case TORCH_MOUNT_CEILING:
-                upsideDown = true;
+                topCenter = new Vector3(x + 0.5f, y + 1.0f, z + 0.5f);
+                bottomCenter = new Vector3(x + 0.5f, y + 0.375f, z + 0.5f);
+                capFacesDown = true;
                 break;
         }
 
-        float centerX = baseX + 0.5f;
-        float centerZ = baseZ + 0.5f;
-        float minX = centerX - 0.5f;
-        float maxX = centerX + 0.5f;
-        float minZ = centerZ - 0.5f;
-        float maxZ = centerZ + 0.5f;
-        float halfThickness = 1.0f / 16.0f;
-        float torchPivotY = 0.625f;
-        float capMin = 7.0f / 16.0f;
-        float capMax = 9.0f / 16.0f;
+        float topMinX = topCenter.x - halfThickness;
+        float topMaxX = topCenter.x + halfThickness;
+        float topMinZ = topCenter.z - halfThickness;
+        float topMaxZ = topCenter.z + halfThickness;
+        float bottomMinX = bottomCenter.x - halfThickness;
+        float bottomMaxX = bottomCenter.x + halfThickness;
+        float bottomMinZ = bottomCenter.z - halfThickness;
+        float bottomMaxZ = bottomCenter.z + halfThickness;
+
+        float shaftMinU = 7.0f / 16.0f;
+        float shaftMaxU = 9.0f / 16.0f;
+        float shaftMaxV = 10.0f / 16.0f;
+        if (blockID == BLOCK_REDSTONE_TORCH_ON)
+        {
+            shaftMinU = 6.0f / 16.0f;
+            shaftMaxU = 10.0f / 16.0f;
+            shaftMaxV = 11.0f / 16.0f;
+        }
+        float capMinU = shaftMinU;
+        float capMaxU = shaftMaxU;
+        float capMaxV = shaftMaxV;
+        float capMinV = capMaxV - (capMaxU - capMinU);
+
+        if (capFacesDown)
+        {
+            _AppendTorchQuad(chunk, torchColor, textureSlice,
+                new Vector3(bottomMinX, bottomCenter.y, bottomMinZ),
+                new Vector3(bottomMaxX, bottomCenter.y, bottomMinZ),
+                new Vector3(bottomMaxX, bottomCenter.y, bottomMaxZ),
+                new Vector3(bottomMinX, bottomCenter.y, bottomMaxZ),
+                new Vector2(capMinU, capMinV),
+                new Vector2(capMaxU, capMinV),
+                new Vector2(capMaxU, capMaxV),
+                new Vector2(capMinU, capMaxV));
+        }
+        else
+        {
+            _AppendTorchQuad(chunk, torchColor, textureSlice,
+                new Vector3(topMinX, topCenter.y, topMinZ),
+                new Vector3(topMinX, topCenter.y, topMaxZ),
+                new Vector3(topMaxX, topCenter.y, topMaxZ),
+                new Vector3(topMaxX, topCenter.y, topMinZ),
+                new Vector2(capMinU, capMinV),
+                new Vector2(capMinU, capMaxV),
+                new Vector2(capMaxU, capMaxV),
+                new Vector2(capMaxU, capMinV));
+
+            _AppendTorchQuad(chunk, torchColor, textureSlice,
+                new Vector3(bottomMinX, bottomCenter.y, bottomMaxZ),
+                new Vector3(bottomMaxX, bottomCenter.y, bottomMaxZ),
+                new Vector3(bottomMaxX, bottomCenter.y, bottomMinZ),
+                new Vector3(bottomMinX, bottomCenter.y, bottomMinZ),
+                new Vector2(capMinU, capMinV),
+                new Vector2(capMaxU, capMinV),
+                new Vector2(capMaxU, capMaxV),
+                new Vector2(capMinU, capMaxV));
+        }
 
         _AppendTorchQuad(chunk, torchColor, textureSlice,
-            new Vector3(centerX + leanX * (1.0f - torchPivotY) - halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) - halfThickness),
-            new Vector3(centerX + leanX * (1.0f - torchPivotY) - halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) + halfThickness),
-            new Vector3(centerX + leanX * (1.0f - torchPivotY) + halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) + halfThickness),
-            new Vector3(centerX + leanX * (1.0f - torchPivotY) + halfThickness, baseY + _GetTorchLocalY(torchPivotY, upsideDown), centerZ + leanZ * (1.0f - torchPivotY) - halfThickness),
-            new Vector2(capMin, capMin),
-            new Vector2(capMin, capMax),
-            new Vector2(capMax, capMax),
-            new Vector2(capMax, capMin));
+            new Vector3(bottomMinX, bottomCenter.y, bottomMinZ),
+            new Vector3(bottomMinX, bottomCenter.y, bottomMaxZ),
+            new Vector3(topMinX, topCenter.y, topMaxZ),
+            new Vector3(topMinX, topCenter.y, topMinZ),
+            new Vector2(shaftMinU, 0.0f),
+            new Vector2(shaftMaxU, 0.0f),
+            new Vector2(shaftMaxU, shaftMaxV),
+            new Vector2(shaftMinU, shaftMaxV));
 
         _AppendTorchQuad(chunk, torchColor, textureSlice,
-            new Vector3(centerX - halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), minZ),
-            new Vector3(centerX - halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), minZ + leanZ),
-            new Vector3(centerX - halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), maxZ + leanZ),
-            new Vector3(centerX - halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), maxZ),
-            new Vector2(0.0f, 0.0f),
-            new Vector2(0.0f, 1.0f),
-            new Vector2(1.0f, 1.0f),
-            new Vector2(1.0f, 0.0f));
+            new Vector3(bottomMaxX, bottomCenter.y, bottomMaxZ),
+            new Vector3(bottomMaxX, bottomCenter.y, bottomMinZ),
+            new Vector3(topMaxX, topCenter.y, topMinZ),
+            new Vector3(topMaxX, topCenter.y, topMaxZ),
+            new Vector2(shaftMinU, 0.0f),
+            new Vector2(shaftMaxU, 0.0f),
+            new Vector2(shaftMaxU, shaftMaxV),
+            new Vector2(shaftMinU, shaftMaxV));
 
         _AppendTorchQuad(chunk, torchColor, textureSlice,
-            new Vector3(centerX + halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), maxZ),
-            new Vector3(centerX + halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), maxZ + leanZ),
-            new Vector3(centerX + halfThickness + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), minZ + leanZ),
-            new Vector3(centerX + halfThickness, baseY + _GetTorchLocalY(1.0f, upsideDown), minZ),
-            new Vector2(0.0f, 0.0f),
-            new Vector2(0.0f, 1.0f),
-            new Vector2(1.0f, 1.0f),
-            new Vector2(1.0f, 0.0f));
+            new Vector3(bottomMaxX, bottomCenter.y, bottomMinZ),
+            new Vector3(bottomMinX, bottomCenter.y, bottomMinZ),
+            new Vector3(topMinX, topCenter.y, topMinZ),
+            new Vector3(topMaxX, topCenter.y, topMinZ),
+            new Vector2(shaftMinU, 0.0f),
+            new Vector2(shaftMaxU, 0.0f),
+            new Vector2(shaftMaxU, shaftMaxV),
+            new Vector2(shaftMinU, shaftMaxV));
 
         _AppendTorchQuad(chunk, torchColor, textureSlice,
-            new Vector3(minX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ + halfThickness),
-            new Vector3(minX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ + halfThickness + leanZ),
-            new Vector3(maxX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ + halfThickness + leanZ),
-            new Vector3(maxX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ + halfThickness),
-            new Vector2(0.0f, 0.0f),
-            new Vector2(0.0f, 1.0f),
-            new Vector2(1.0f, 1.0f),
-            new Vector2(1.0f, 0.0f));
-
-        _AppendTorchQuad(chunk, torchColor, textureSlice,
-            new Vector3(maxX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ - halfThickness),
-            new Vector3(maxX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ - halfThickness + leanZ),
-            new Vector3(minX + leanX, baseY + _GetTorchLocalY(0.0f, upsideDown), centerZ - halfThickness + leanZ),
-            new Vector3(minX, baseY + _GetTorchLocalY(1.0f, upsideDown), centerZ - halfThickness),
-            new Vector2(0.0f, 0.0f),
-            new Vector2(0.0f, 1.0f),
-            new Vector2(1.0f, 1.0f),
-            new Vector2(1.0f, 0.0f));
+            new Vector3(bottomMinX, bottomCenter.y, bottomMaxZ),
+            new Vector3(bottomMaxX, bottomCenter.y, bottomMaxZ),
+            new Vector3(topMaxX, topCenter.y, topMaxZ),
+            new Vector3(topMinX, topCenter.y, topMaxZ),
+            new Vector2(shaftMinU, 0.0f),
+            new Vector2(shaftMaxU, 0.0f),
+            new Vector2(shaftMaxU, shaftMaxV),
+            new Vector2(shaftMinU, shaftMaxV));
 
 #if LOGGING
         if (enableDetailedTimings)
         {
-            chunk.facesTotal += 5;
-            chunk.facesCutout += 5;
+            chunk.facesTotal += 6;
+            chunk.facesCutout += 6;
         }
 #endif
-    }
-
-    private float _GetTorchLocalY(float localY, bool upsideDown)
-    {
-        return upsideDown ? 1.0f - localY : localY;
     }
 
     private void _AppendTorchQuad(ChunkData chunk, Color torchColor, float textureSlice, Vector3 v0, Vector3 v1, Vector3 v2, Vector3 v3, Vector2 uv0, Vector2 uv1, Vector2 uv2, Vector2 uv3)
@@ -7495,7 +7568,10 @@ public class McWorld : UdonSharpBehaviour
             {
                 BlockVisibilityType visB = b < maxId ? visibilityCache[b] : BlockVisibilityType.Opaque;
                 bool draw;
-                if (b == 0) draw = true; // air
+                bool customMeshA = _UsesCustomBlockMesh((byte)a, shapeTypeCache, maxId);
+                bool customMeshB = _UsesCustomBlockMesh((byte)b, shapeTypeCache, maxId);
+                if (customMeshA) draw = false;
+                else if (b == 0 || customMeshB) draw = true; // air or non-cube custom mesh
                 else if (visA == BlockVisibilityType.Invisible) draw = false;
                 else
                 {
