@@ -69,6 +69,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
     public int[] textureMappingTypeData;
     public int[] lightOpacityData; // NEW: 0=air/tallgrass, 1=leaves, 3=water, 15=solid blocks
     public int[] lightEmissionData; // NEW: Light emission 0-15 (0=none, 7=redstone torch, 14=torch, 15=glowstone/lava)
+    public bool[] canBlockGrassData; // Beta 1.7.3 Block.canBlockGrass semantics for AO diagonal sampling
 
     [Header("UV Data (Runtime)")]
     public int[] uv_allFacesData;
@@ -113,6 +114,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
         // In the editor, validate the source arrays to help with configuration.
         bool arraysValid = true;
         if (numberOfBlockTypes < 0) numberOfBlockTypes = 0;
+        _EnsureCanBlockGrassData();
 
         string errorFormat = "[McBlockTypeManager.Start] '{0}' array size mismatch. Expected {1}, got {2}.";
         if (blockNames == null || blockNames.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockNames", numberOfBlockTypes, (blockNames != null ? blockNames.Length : -1))); arraysValid = false; }
@@ -122,6 +124,7 @@ public class McBlockTypeManager : UdonSharpBehaviour
         if (blockShapeTypeData == null || blockShapeTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "blockShapeTypeData", numberOfBlockTypes, (blockShapeTypeData != null ? blockShapeTypeData.Length : -1))); arraysValid = false; }
         if (textureMappingTypeData == null || textureMappingTypeData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "textureMappingTypeData", numberOfBlockTypes, (textureMappingTypeData != null ? textureMappingTypeData.Length : -1))); arraysValid = false; }
         if (lightOpacityData == null || lightOpacityData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "lightOpacityData", numberOfBlockTypes, (lightOpacityData != null ? lightOpacityData.Length : -1))); arraysValid = false; }
+        if (canBlockGrassData == null || canBlockGrassData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "canBlockGrassData", numberOfBlockTypes, (canBlockGrassData != null ? canBlockGrassData.Length : -1))); arraysValid = false; }
         if (uv_allFacesData == null || uv_allFacesData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_allFacesData", numberOfBlockTypes, (uv_allFacesData != null ? uv_allFacesData.Length : -1))); arraysValid = false; }
         if (uv_topFaceData == null || uv_topFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_topFaceData", numberOfBlockTypes, (uv_topFaceData != null ? uv_topFaceData.Length : -1))); arraysValid = false; }
         if (uv_bottomFaceData == null || uv_bottomFaceData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "uv_bottomFaceData", numberOfBlockTypes, (uv_bottomFaceData != null ? uv_bottomFaceData.Length : -1))); arraysValid = false; }
@@ -133,6 +136,10 @@ public class McBlockTypeManager : UdonSharpBehaviour
         
         if (breakParticlesPrefabData == null || breakParticlesPrefabData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "breakParticlesPrefabData", numberOfBlockTypes, (breakParticlesPrefabData != null ? breakParticlesPrefabData.Length : -1))); arraysValid = false; }
         if (placeParticlesPrefabData == null || placeParticlesPrefabData.Length != numberOfBlockTypes) { Debug.LogError(string.Format(errorFormat, "placeParticlesPrefabData", numberOfBlockTypes, (placeParticlesPrefabData != null ? placeParticlesPrefabData.Length : -1))); arraysValid = false; }
+        #endif
+
+        #if !UNITY_EDITOR
+        _EnsureCanBlockGrassData();
         #endif
 
         // Pre-filtering sounds is always needed for runtime.
@@ -158,6 +165,78 @@ public class McBlockTypeManager : UdonSharpBehaviour
         textureMappingTypeData = null;
         blockNames = null;
         #endif
+    }
+
+    private void _EnsureCanBlockGrassData()
+    {
+        if (numberOfBlockTypes < 0) numberOfBlockTypes = 0;
+        if (canBlockGrassData != null && canBlockGrassData.Length == numberOfBlockTypes) return;
+
+        bool[] defaults = new bool[numberOfBlockTypes];
+        for (int i = 0; i < numberOfBlockTypes; i++)
+        {
+            defaults[i] = _GetDefaultCanBlockGrass((byte)i);
+        }
+        canBlockGrassData = defaults;
+    }
+
+    private bool _GetDefaultCanBlockGrass(byte blockID)
+    {
+        if (blockID == 0) return true;
+
+        switch (blockID)
+        {
+            case 6:  // sapling
+            case 27: // powered rail
+            case 28: // detector rail
+            case 31: // tall grass
+            case 32: // dead bush
+            case 37: // dandelion
+            case 38: // rose
+            case 39: // brown mushroom
+            case 40: // red mushroom
+            case 50: // torch
+            case 51: // fire
+            case 55: // redstone wire
+            case 59: // crops
+            case 65: // ladder
+            case 66: // rail
+            case 69: // lever
+            case 75: // redstone torch off
+            case 76: // redstone torch on
+            case 77: // stone button
+            case 78: // snow layer
+            case 83: // reeds
+            case 90: // portal
+            case 93: // repeater off
+            case 94: // repeater on
+                return true;
+        }
+
+        if (blockShapeTypeData != null && blockID < blockShapeTypeData.Length && blockShapeTypeData[blockID] == (int)McBlockShapeType.Cross)
+        {
+            return true;
+        }
+
+        if (isSolidData != null && blockID < isSolidData.Length && !isSolidData[blockID])
+        {
+            switch (blockID)
+            {
+                case 8:  // flowing water
+                case 9:  // still water
+                case 10: // flowing lava
+                case 11: // still lava
+                case 18: // leaves
+                case 20: // glass
+                case 79: // ice
+                case 81: // cactus
+                    return false;
+                default:
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     // NEW: Build the three lookup tables so hot paths are constant-time array reads.
@@ -329,6 +408,21 @@ public class McBlockTypeManager : UdonSharpBehaviour
             return 0;
         }
         return 0;
+    }
+
+    public bool GetBlockCanBlockGrass(byte blockID)
+    {
+        if (canBlockGrassData == null || canBlockGrassData.Length == 0)
+        {
+            return _GetDefaultCanBlockGrass(blockID);
+        }
+
+        if (blockID < canBlockGrassData.Length)
+        {
+            return canBlockGrassData[blockID];
+        }
+
+        return false;
     }
     
     public int GetBlockTextureSlice_AllFaces(byte blockID)

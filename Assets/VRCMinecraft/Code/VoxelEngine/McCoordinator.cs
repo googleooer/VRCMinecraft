@@ -213,7 +213,7 @@ public class McCoordinator : UdonSharpBehaviour
                             worker_usesExclusiveGenerator[i] = false;
                         }
 
-                        if (world.UsesGpuLightingBackend())
+                        if (world.UsesGpuLightingBackend() && !world.RequiresCpuLightingForAmbientOcclusion())
                         {
                             worker_state[i] = STATE_WAITING_FOR_MESH;
                             worker_skipCheckCounter[i] = 0;
@@ -236,7 +236,7 @@ public class McCoordinator : UdonSharpBehaviour
                 }
                 else if (state == STATE_LIGHTING)
                 {
-                    if (world.UsesGpuLightingBackend())
+                    if (world.UsesGpuLightingBackend() && !world.RequiresCpuLightingForAmbientOcclusion())
                     {
                         worker_state[i] = STATE_WAITING_FOR_MESH;
                         worker_skipCheckCounter[i] = 0;
@@ -397,7 +397,7 @@ public class McCoordinator : UdonSharpBehaviour
 
                             if (!assignedChunk.isGeneratingData)
                             {
-                                if (world.UsesGpuLightingBackend())
+                                if (world.UsesGpuLightingBackend() && !world.RequiresCpuLightingForAmbientOcclusion())
                                 {
                                     worker_state[i] = STATE_WAITING_FOR_MESH;
                                     worker_skipCheckCounter[i] = 0;
