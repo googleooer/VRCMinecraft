@@ -76,6 +76,14 @@ Material:
         m_Texture: {fileID: 18700000, guid: 2cb9c6cdaef0afe4e972f504944edec0, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _WaterFlowTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _WaterStillTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     m_Ints:
     - _SkyLight: 15
     m_Floats:
@@ -124,6 +132,8 @@ Material:
     - _UseGpuExactAo: 1
     - _UseUIAlphaClip: 0
     - _UseVertexLight: 0
+    - _WaterFlowSlice: -1
+    - _WaterStillSlice: -1
     - _ZWrite: 1
     m_Colors:
     - _BiomeColor: {r: 1, g: 1, b: 1, a: 1}
