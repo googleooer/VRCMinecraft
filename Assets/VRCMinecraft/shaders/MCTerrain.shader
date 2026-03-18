@@ -202,39 +202,6 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
 
             fixed4 frag (v2f i) : SV_Target
             {
-                // Instant block-interaction feedback using the GPU block atlas
-                // (updated synchronously in _SetBlockLocal, before mesh rebuild).
-                // 1) Block behind this face is now air → face has no block → discard (breaking)
-                // 2) Block in front of this face is now an opaque cube → face is obstructed → discard (placing)
-                if (_UdonVRCM_GpuEnabled > 0.5)
-                {
-                    float3 faceNormal = normalize(i.normal);
-                    float3 blockPos = floor(i.worldPos - faceNormal * 0.501);
-                    float2 atlasUv;
-                    if (gpuVoxelTryLookupAtlasUv(blockPos, atlasUv) > 0.5)
-                    {
-                        float4 blockSample = tex2D(_UdonVRCM_GpuBlockAtlas, atlasUv);
-                        float blockId = floor(blockSample.r * 255.0 + 0.5);
-                        if (blockId < 0.5) discard; // Block broken → air
-                    }
-
-                    // Check the block this face is pointing toward (in front)
-                    float3 frontPos = floor(i.worldPos + faceNormal * 0.501);
-                    float2 frontUv;
-                    if (gpuVoxelTryLookupAtlasUv(frontPos, frontUv) > 0.5)
-                    {
-                        float4 frontSample = tex2D(_UdonVRCM_GpuBlockAtlas, frontUv);
-                        float frontId = floor(frontSample.r * 255.0 + 0.5);
-                        if (frontId > 0.5)
-                        {
-                            float4 frontProps = tex2D(_UdonVRCM_GpuBlockProps, float2((frontId + 0.5) / 256.0, 0.5));
-                            float frontShape = floor(frontProps.b * 255.0 + 0.5);
-                            // Opaque cube in front → this face is obstructed
-                            if (frontShape < 0.5 && frontProps.a >= 0.5) discard;
-                        }
-                    }
-                }
-
                 fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
                 fixed4 tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw);
                 fixed4 waterStill = tex2D(_WaterStillTex, i.uvw.xy).rgba;

@@ -6488,20 +6488,20 @@ public class McWorld : UdonSharpBehaviour
         switch (torchMount)
         {
             case TORCH_MOUNT_WEST:
-                topCenter = new Vector3(x + 0.35f, y + 0.8f, z + 0.5f);
-                bottomCenter = new Vector3(x + 0.15f, y + 0.2f, z + 0.5f);
+                topCenter = new Vector3(x + 0.25f, y + 0.825f, z + 0.5f);
+                bottomCenter = new Vector3(x + 0.0f, y + 0.2f, z + 0.5f);
                 break;
             case TORCH_MOUNT_EAST:
-                topCenter = new Vector3(x + 0.65f, y + 0.8f, z + 0.5f);
-                bottomCenter = new Vector3(x + 0.85f, y + 0.2f, z + 0.5f);
+                topCenter = new Vector3(x + 0.75f, y + 0.825f, z + 0.5f);
+                bottomCenter = new Vector3(x + 1.0f, y + 0.2f, z + 0.5f);
                 break;
             case TORCH_MOUNT_NORTH:
-                topCenter = new Vector3(x + 0.5f, y + 0.8f, z + 0.35f);
-                bottomCenter = new Vector3(x + 0.5f, y + 0.2f, z + 0.15f);
+                topCenter = new Vector3(x + 0.5f, y + 0.825f, z + 0.25f);
+                bottomCenter = new Vector3(x + 0.5f, y + 0.2f, z + 0.0f);
                 break;
             case TORCH_MOUNT_SOUTH:
-                topCenter = new Vector3(x + 0.5f, y + 0.8f, z + 0.65f);
-                bottomCenter = new Vector3(x + 0.5f, y + 0.2f, z + 0.85f);
+                topCenter = new Vector3(x + 0.5f, y + 0.825f, z + 0.75f);
+                bottomCenter = new Vector3(x + 0.5f, y + 0.2f, z + 1.0f);
                 break;
             case TORCH_MOUNT_CEILING:
                 topCenter = new Vector3(x + 0.5f, y + 1.0f, z + 0.5f);
@@ -6532,6 +6532,10 @@ public class McWorld : UdonSharpBehaviour
         float capMaxU = shaftMaxU;
         float capMaxV = shaftMaxV;
         float capMinV = capMaxV - (capMaxU - capMinU);
+        float bottomCapMinU = shaftMinU;
+        float bottomCapMaxU = shaftMaxU;
+        float bottomCapMinV = 0.0f;
+        float bottomCapMaxV = shaftMaxU - shaftMinU;
 
         if (capFacesDown)
         {
@@ -6562,10 +6566,10 @@ public class McWorld : UdonSharpBehaviour
                 new Vector3(bottomMaxX, bottomCenter.y, bottomMaxZ),
                 new Vector3(bottomMaxX, bottomCenter.y, bottomMinZ),
                 new Vector3(bottomMinX, bottomCenter.y, bottomMinZ),
-                new Vector2(capMinU, capMinV),
-                new Vector2(capMaxU, capMinV),
-                new Vector2(capMaxU, capMaxV),
-                new Vector2(capMinU, capMaxV));
+                new Vector2(bottomCapMinU, bottomCapMinV),
+                new Vector2(bottomCapMaxU, bottomCapMinV),
+                new Vector2(bottomCapMaxU, bottomCapMaxV),
+                new Vector2(bottomCapMinU, bottomCapMaxV));
         }
 
         _AppendTorchQuad(chunk, torchColor, textureSlice,
