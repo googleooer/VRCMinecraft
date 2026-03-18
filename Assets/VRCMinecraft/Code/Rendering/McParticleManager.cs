@@ -116,21 +116,48 @@ public class McParticleManager : UdonSharpBehaviour
         reddustPS = _FindChildPS("ReddustPS");
         snowPS = _FindChildPS("SnowPS");
 
-        // Configure each PS for manual emit usage
-        _ConfigurePS(smokePS, 0.08f, 500);
-        _ConfigurePS(explodePS, 0.08f, 500);
-        _ConfigurePS(flamePS, 0f, 500);
-        _ConfigurePS(lavaPS, 0.12f, 200);
-        _ConfigurePS(bubblePS, -0.02f, 200);
-        _ConfigurePS(splashPS, 0.08f, 200);
-        _ConfigurePS(heartPS, 0.02f, 100);
-        _ConfigurePS(notePS, -0.02f, 100);
-        _ConfigurePS(portalPS, 0f, 300);
-        _ConfigurePS(reddustPS, 0.02f, 300);
-        _ConfigurePS(snowPS, 0.08f, 200);
+        // All gravity=0: MC uses per-tick discrete push, NOT continuous acceleration.
+        // Upward/downward forces baked into initial velocity in emit methods.
 
-        _SetParticleAtlasFrame(smokePS, PARTICLE_ATLAS_FRAME_SMOKE);
-        _SetParticleAtlasFrame(explodePS, PARTICLE_ATLAS_FRAME_SMOKE);
+        _ConfigurePSBase(smokePS, 500);
+        _SetDrag(smokePS, 0.96f);
+
+        _ConfigurePSBase(explodePS, 500);
+        _SetDrag(explodePS, 0.9f);
+
+        _ConfigurePSBase(flamePS, 500);
+        _SetSizeOverLife(flamePS, AnimationCurve.Linear(0f, 1f, 1f, 0.5f));
+        _SetDrag(flamePS, 0.96f);
+
+        _ConfigurePSBase(lavaPS, 200);
+        _SetSizeOverLife(lavaPS, AnimationCurve.Linear(0f, 1f, 1f, 0f));
+        _SetDrag(lavaPS, 0.999f);
+        _SetGravity(lavaPS, 0.03f); // lava has genuine downward pull
+
+        _ConfigurePSBase(bubblePS, 200);
+        _SetDrag(bubblePS, 0.85f);
+
+        _ConfigurePSBase(splashPS, 200);
+        _SetDrag(splashPS, 0.98f);
+
+        _ConfigurePSBase(heartPS, 100);
+        _SetDrag(heartPS, 0.86f);
+
+        _ConfigurePSBase(notePS, 100);
+        _SetDrag(notePS, 0.66f);
+
+        _ConfigurePSBase(portalPS, 300);
+        _SetSizeOverLife(portalPS, AnimationCurve.Linear(0f, 0f, 1f, 1f));
+
+        _ConfigurePSBase(reddustPS, 300);
+        _SetDrag(reddustPS, 0.96f);
+
+        _ConfigurePSBase(snowPS, 200);
+        _SetDrag(snowPS, 0.98f);
+
+        // Animated: smoke/explode/reddust/snow cycle texIndex 7→0 over lifetime
+        _SetParticleAtlasAnimated(smokePS, 0, 7);
+        _SetParticleAtlasAnimated(explodePS, 0, 7);
         _SetParticleAtlasFrame(flamePS, PARTICLE_ATLAS_FRAME_FLAME);
         _SetParticleAtlasFrame(lavaPS, PARTICLE_ATLAS_FRAME_LAVA);
         _SetParticleAtlasFrame(bubblePS, PARTICLE_ATLAS_FRAME_BUBBLE);
@@ -138,8 +165,8 @@ public class McParticleManager : UdonSharpBehaviour
         _SetParticleAtlasFrame(heartPS, PARTICLE_ATLAS_FRAME_HEART);
         _SetParticleAtlasFrame(notePS, PARTICLE_ATLAS_FRAME_NOTE);
         _SetParticleAtlasFrame(portalPS, 0);
-        _SetParticleAtlasFrame(reddustPS, PARTICLE_ATLAS_FRAME_SMOKE);
-        _SetParticleAtlasFrame(snowPS, PARTICLE_ATLAS_FRAME_SMOKE);
+        _SetParticleAtlasAnimated(reddustPS, 0, 7);
+        _SetParticleAtlasAnimated(snowPS, 0, 7);
 
         isInitialized = true;
     }
@@ -155,25 +182,59 @@ public class McParticleManager : UdonSharpBehaviour
         return child.GetComponent<ParticleSystem>();
     }
 
-    void _ConfigurePS(ParticleSystem ps, float gravity, int maxParticles)
+    void _ConfigurePSBase(ParticleSystem ps, int maxParticles)
     {
         if (ps == null) return;
-
         var main = ps.main;
         main.simulationSpace = ParticleSystemSimulationSpace.World;
         main.playOnAwake = false;
         main.loop = false;
         main.maxParticles = maxParticles;
-        main.gravityModifier = gravity;
+        main.gravityModifier = 0f;
         main.startSpeed = 0f;
-
         var emission = ps.emission;
         emission.enabled = false;
-
         var shape = ps.shape;
         shape.enabled = false;
-
         _AssignParticleMaterial(ps, null);
+    }
+
+    // Only used for lava which has a genuine downward pull (motionY -= 0.03 per tick)
+    void _SetGravity(ParticleSystem ps, float mcGravPerTick)
+    {
+        if (ps == null) return;
+        var main = ps.main;
+        // MC: motionY -= mcGravPerTick each tick. Convert to Unity gravity modifier.
+        // MC accel in blocks/s² = mcGravPerTick * 400. Unity: 9.81 * modifier.
+        main.gravityModifier = mcGravPerTick * 400f / 9.81f;
+    }
+
+    void _SetDrag(ParticleSystem ps, float mcDragPerTick)
+    {
+        if (ps == null) return;
+        // MC multiplies velocity by mcDragPerTick each tick (20 TPS).
+        // Unity's LimitVelocityOverLifetime dampen removes a fraction per second.
+        // Approximate: Unity dampen ≈ 1 - mcDragPerTick (applied differently but close)
+        // More accurate: per-frame drag factor = mcDragPerTick^(20*dt).
+        // Unity dampen = 1-drag^20 gives the per-second retention fraction.
+        // Since Unity applies dampen as vel *= (1-dampen*dt) which isn't quite right,
+        // use the LimitVelocityOverLifetime with a high speed limit and dampen factor.
+        var lvol = ps.limitVelocityOverLifetime;
+        lvol.enabled = true;
+        lvol.separateAxes = false;
+        lvol.limit = 100f;
+        // dampen: fraction of excess speed removed per second
+        // MC drag^20 = fraction retained per second. We want 1 - retained = removed.
+        float retainedPerSec = Mathf.Pow(mcDragPerTick, TICK_RATE);
+        lvol.dampen = 1f - retainedPerSec;
+    }
+
+    void _SetSizeOverLife(ParticleSystem ps, AnimationCurve curve)
+    {
+        if (ps == null) return;
+        var sol = ps.sizeOverLifetime;
+        sol.enabled = true;
+        sol.size = new ParticleSystem.MinMaxCurve(1f, curve);
     }
 
     void Update()
@@ -192,9 +253,9 @@ public class McParticleManager : UdonSharpBehaviour
     // MC randomDisplayTick — ambient block particles
     // ════════════════════════════════════════════════════════════════
 
-    // MC samples 1000 random blocks per tick (50 per frame at 20 TPS).
-    // We sample fewer since we run at higher FPS. Budget ~16 samples/frame at 60fps
-    // ≈ 960/sec, close to MC's 1000/sec.
+    // MC World.randomDisplayUpdates runs 1000 samples per FRAME (called from
+    // the render loop, not the tick loop) using a triangular distribution that
+    // concentrates sampling near the player.
     void _RandomDisplayTick()
     {
         if (world == null) return;
@@ -204,12 +265,12 @@ public class McParticleManager : UdonSharpBehaviour
         int py = Mathf.FloorToInt(ppos.y);
         int pz = Mathf.FloorToInt(ppos.z);
 
-        // Sample 16 random blocks within a 16-block radius each frame
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < 1000; i++)
         {
-            int rx = px + Random.Range(-16, 17);
-            int ry = py + Random.Range(-16, 17);
-            int rz = pz + Random.Range(-16, 17);
+            // Triangular distribution matching MC's rand.nextInt(16) - rand.nextInt(16)
+            int rx = px + Random.Range(0, 16) - Random.Range(0, 16);
+            int ry = py + Random.Range(0, 16) - Random.Range(0, 16);
+            int rz = pz + Random.Range(0, 16) - Random.Range(0, 16);
 
             if (ry < 0 || ry >= 128) continue;
 
@@ -331,32 +392,35 @@ public class McParticleManager : UdonSharpBehaviour
     Vector3 _GetTorchTipPosition(int x, int y, int z)
     {
         byte mount = world != null ? world.GetTorchMount(x, y, z) : TORCH_MOUNT_FLOOR;
+        // BlockTorch.randomDisplayTick: base = (x+0.5, y+0.7, z+0.5)
+        // var13 = 0.22 (vertical offset for wall torches)
+        // var15 = 0.27 (horizontal offset for wall torches)
         float tx = x + 0.5f;
         float ty = y + 0.7f;
         float tz = z + 0.5f;
 
         switch (mount)
         {
-            case TORCH_MOUNT_WEST:
-                tx -= 0.15f;
-                ty += 0.12f;
+            case TORCH_MOUNT_WEST:  // metadata 1: -X wall
+                tx -= 0.27f;
+                ty += 0.22f;
                 break;
-            case TORCH_MOUNT_EAST:
-                tx += 0.15f;
-                ty += 0.12f;
+            case TORCH_MOUNT_EAST:  // metadata 2: +X wall
+                tx += 0.27f;
+                ty += 0.22f;
                 break;
-            case TORCH_MOUNT_NORTH:
-                tz -= 0.15f;
-                ty += 0.12f;
+            case TORCH_MOUNT_NORTH: // metadata 3: -Z wall
+                tz -= 0.27f;
+                ty += 0.22f;
                 break;
-            case TORCH_MOUNT_SOUTH:
-                tz += 0.15f;
-                ty += 0.12f;
+            case TORCH_MOUNT_SOUTH: // metadata 4: +Z wall
+                tz += 0.27f;
+                ty += 0.22f;
                 break;
             case TORCH_MOUNT_CEILING:
                 ty = y + 0.4f;
                 break;
-            default:
+            default: // metadata 5: floor torch — no offset
                 break;
         }
 
@@ -439,20 +503,26 @@ public class McParticleManager : UdonSharpBehaviour
     void _EmitSmoke(float x, float y, float z, float vx, float vy, float vz, float scale)
     {
         if (smokePS == null) return;
-        // EntitySmokeFX: motionX *= 0.1; motionX += var8; (base random is negligible)
-        // Color: grey = random * 0.3
-        // Scale: (rand*0.5+0.5)*2 * 0.75 * scale
-        // MaxAge: (8/(rand*0.8+0.2)) * scale ticks
-        // Update: motionY += 0.004 (floats up), drag 0.96/tick, animated texIndex 7→0
+        // EntitySmokeFX: base motion * 0.1 then += var8.
+        // Per-tick: motionY += 0.004 (floats up), drag 0.96.
+        // Terminal upward vel ≈ 0.004/(1-0.96) = 0.1 blocks/tick.
+        // Average over typical lifetime ≈ 0.03 blocks/tick = 0.6 blocks/sec.
 
         float grey = Random.value * 0.3f;
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f * scale;
         float maxAge = (8.0f / (Random.value * 0.8f + 0.2f)) * scale;
-        _SetParticleAtlasFrame(smokePS, PARTICLE_ATLAS_FRAME_SMOKE);
+
+        // MC base motion: random ~±0.06 blocks/tick, then *0.1 = ~±0.006
+        float bmx = (Random.value * 2f - 1f) * 0.006f;
+        float bmy = 0.01f; // base EntityFX adds 0.1 to motionY, then *0.1
+        float bmz = (Random.value * 2f - 1f) * 0.006f;
+
+        // Add the per-tick push as avg initial velocity (0.03 blocks/tick upward)
+        float pushY = 0.03f;
 
         _DoEmit(smokePS,
             x, y, z,
-            vx * TICK_RATE, vy * TICK_RATE, vz * TICK_RATE,
+            (bmx + vx) * TICK_RATE, (bmy + pushY + vy) * TICK_RATE, (bmz + vz) * TICK_RATE,
             baseScale * SIZE_SCALE,
             new Color(grey, grey, grey, 1f),
             maxAge / TICK_RATE);
@@ -461,21 +531,20 @@ public class McParticleManager : UdonSharpBehaviour
     void _EmitExplode(float x, float y, float z, float vx, float vy, float vz)
     {
         if (explodePS == null) return;
-        // EntityExplodeFX: motionX = var8 + rand*0.05, motionY += 0.004
-        // Color: rand 0.7–1.0 grey
-        // Scale: rand*rand*6+1
-        // MaxAge: 16/(rand*0.8+0.2)+2 ticks
+        // EntityExplodeFX: per-tick motionY += 0.004, drag 0.9.
 
-        float addX = (float)(Random.value * 2.0 - 1.0) * 0.05f;
-        float addZ = (float)(Random.value * 2.0 - 1.0) * 0.05f;
+        float addX = (Random.value * 2f - 1f) * 0.05f;
+        float addZ = (Random.value * 2f - 1f) * 0.05f;
         float grey = Random.value * 0.3f + 0.7f;
         float baseScale = Random.value * Random.value * 6.0f + 1.0f;
         float maxAge = 16.0f / (Random.value * 0.8f + 0.2f) + 2f;
-        _SetParticleAtlasFrame(explodePS, PARTICLE_ATLAS_FRAME_SMOKE);
+
+        // Per-tick push 0.004 up, avg ≈ 0.02 blocks/tick with 0.9 drag
+        float pushY = 0.02f;
 
         _DoEmit(explodePS,
             x, y, z,
-            (vx + addX) * TICK_RATE, (vy + (float)(Random.value * 2.0 - 1.0) * 0.05f) * TICK_RATE, (vz + addZ) * TICK_RATE,
+            (vx + addX) * TICK_RATE, (vy + pushY + (Random.value * 2f - 1f) * 0.05f) * TICK_RATE, (vz + addZ) * TICK_RATE,
             baseScale * SIZE_SCALE,
             new Color(grey, grey, grey, 1f),
             maxAge / TICK_RATE);
@@ -484,15 +553,12 @@ public class McParticleManager : UdonSharpBehaviour
     void _EmitFlame(float x, float y, float z, float vx, float vy, float vz)
     {
         if (flamePS == null) return;
-        // EntityFlameFX: motionX = motionX*0.01 + var8, noClip
-        // Scale: base, shrinks over life (1 - t²*0.5)
-        // MaxAge: 8/(rand*0.8+0.2)+4 ticks
-        // Self-lit: brightness lerps toward 1.0 as it ages
+        // EntityFlameFX: motionX = motionX*0.01 + var8, no gravity, drag 0.96
 
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f;
         float maxAge = 8.0f / (Random.value * 0.8f + 0.2f) + 4f;
-        _SetParticleAtlasFrame(flamePS, PARTICLE_ATLAS_FRAME_FLAME);
 
+        // MC base: random motion * 0.01 is negligible
         _DoEmit(flamePS,
             x, y, z,
             vx * TICK_RATE, vy * TICK_RATE, vz * TICK_RATE,
@@ -513,7 +579,6 @@ public class McParticleManager : UdonSharpBehaviour
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f * (Random.value * 2f + 0.2f);
         float maxAge = 16.0f / (Random.value * 0.8f + 0.2f);
         float vy = (Random.value * 0.4f + 0.05f) * TICK_RATE;
-        _SetParticleAtlasFrame(lavaPS, PARTICLE_ATLAS_FRAME_LAVA);
 
         _DoEmit(lavaPS,
             x, y, z,
@@ -526,9 +591,7 @@ public class McParticleManager : UdonSharpBehaviour
     void _EmitBubble(float x, float y, float z, float vx, float vy, float vz)
     {
         if (bubblePS == null) return;
-        // EntityBubbleFX: motionX = var8*0.2 + rand*0.02, floats up (motionY += 0.002)
-        // Scale: base * (rand*0.6+0.2)
-        // MaxAge: 8/(rand*0.8+0.2)
+        // EntityBubbleFX: per-tick motionY += 0.002, drag 0.85
 
         float scaleMul = Random.value * 0.6f + 0.2f;
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f * scaleMul;
@@ -537,11 +600,13 @@ public class McParticleManager : UdonSharpBehaviour
         float ux = vx * 0.2f + (Random.value * 2f - 1f) * 0.02f;
         float uy = vy * 0.2f + (Random.value * 2f - 1f) * 0.02f;
         float uz = vz * 0.2f + (Random.value * 2f - 1f) * 0.02f;
-        _SetParticleAtlasFrame(bubblePS, PARTICLE_ATLAS_FRAME_BUBBLE);
+
+        // Per-tick push 0.002 up, avg ≈ 0.013 blocks/tick with 0.85 drag
+        float pushY = 0.013f;
 
         _DoEmit(bubblePS,
             x, y, z,
-            ux * TICK_RATE, uy * TICK_RATE, uz * TICK_RATE,
+            ux * TICK_RATE, (uy + pushY) * TICK_RATE, uz * TICK_RATE,
             baseScale * SIZE_SCALE,
             Color.white,
             maxAge / TICK_RATE);
@@ -559,7 +624,6 @@ public class McParticleManager : UdonSharpBehaviour
         float ux = vx, uy = vy, uz = vz;
         if (vy == 0f && (vx != 0f || vz != 0f))
             uy = 0.1f;
-        _SetParticleAtlasFrame(splashPS, PARTICLE_ATLAS_FRAME_SPLASH_START + Random.Range(0, 4));
 
         _DoEmit(splashPS,
             x, y, z,
@@ -576,7 +640,6 @@ public class McParticleManager : UdonSharpBehaviour
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f;
         float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
         float vy = (Random.value * 0.2f + 0.1f) * TICK_RATE;
-        _SetParticleAtlasFrame(splashPS, PARTICLE_ATLAS_FRAME_RAIN_START + Random.Range(0, 4));
 
         _DoEmit(splashPS,
             x, y, z,
@@ -593,7 +656,6 @@ public class McParticleManager : UdonSharpBehaviour
         // MaxAge: 16 ticks = 0.8 seconds
 
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f * 2.0f;
-        _SetParticleAtlasFrame(heartPS, PARTICLE_ATLAS_FRAME_HEART);
 
         _DoEmit(heartPS,
             x, y, z,
@@ -614,7 +676,6 @@ public class McParticleManager : UdonSharpBehaviour
         float b = Mathf.Sin((pitch + 2f / 3f) * Mathf.PI * 2f) * 0.65f + 0.35f;
 
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f * 2.0f;
-        _SetParticleAtlasFrame(notePS, PARTICLE_ATLAS_FRAME_NOTE);
 
         _DoEmit(notePS,
             x, y, z,
@@ -639,7 +700,6 @@ public class McParticleManager : UdonSharpBehaviour
 
         float baseScale = Random.value * 0.2f + 0.5f;
         float maxAge = Random.value * 10f + 40f;
-        _SetParticleAtlasFrame(portalPS, Random.Range(0, 8));
 
         // MC portal particles move FROM spawn TOWARD origin via parametric curve.
         // Approximate: set velocity pointing back toward spawn with drift
@@ -668,7 +728,6 @@ public class McParticleManager : UdonSharpBehaviour
 
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f;
         float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
-        _SetParticleAtlasFrame(reddustPS, PARTICLE_ATLAS_FRAME_SMOKE);
 
         _DoEmit(reddustPS,
             x, y, z,
@@ -687,7 +746,6 @@ public class McParticleManager : UdonSharpBehaviour
         float white = 1.0f - Random.value * 0.3f;
         float baseScale = (Random.value * 0.5f + 0.5f) * 2f * 0.75f;
         float maxAge = 8.0f / (Random.value * 0.8f + 0.2f);
-        _SetParticleAtlasFrame(snowPS, PARTICLE_ATLAS_FRAME_SMOKE);
 
         _DoEmit(snowPS,
             x, y, z,
@@ -940,6 +998,24 @@ public class McParticleManager : UdonSharpBehaviour
         uv.cycleCount = 1;
         uv.startFrame = new ParticleSystem.MinMaxCurve((float)frameIndex / (tilesX * tilesY));
         uv.frameOverTime = new ParticleSystem.MinMaxCurve(0f);
+    }
+
+    // MC animated particles cycle from startFrame down to endFrame over lifetime.
+    // e.g., smoke cycles texIndex 7→0 (8 frames)
+    void _SetParticleAtlasAnimated(ParticleSystem ps, int endFrame, int startFrame)
+    {
+        if (ps == null) return;
+        ParticleSystem.TextureSheetAnimationModule uv = ps.textureSheetAnimation;
+        uv.enabled = true;
+        uv.numTilesX = PARTICLE_ATLAS_TILES;
+        uv.numTilesY = PARTICLE_ATLAS_TILES;
+        uv.cycleCount = 1;
+        int totalFrames = PARTICLE_ATLAS_TILES * PARTICLE_ATLAS_TILES;
+        float startNorm = (float)startFrame / totalFrames;
+        float endNorm = (float)endFrame / totalFrames;
+        // startFrame is the FIRST frame shown, endFrame is the LAST frame shown
+        uv.startFrame = new ParticleSystem.MinMaxCurve(startNorm);
+        uv.frameOverTime = new ParticleSystem.MinMaxCurve(1f, AnimationCurve.Linear(0f, 0f, 1f, (endNorm - startNorm)));
     }
 
     void _ConfigureBlockEffectTexture(ParticleSystem ps, byte blockID, int faceIndex)

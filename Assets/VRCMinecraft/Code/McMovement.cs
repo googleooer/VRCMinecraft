@@ -358,6 +358,8 @@ public class McMovement : NUMovement
             InspectBlock(new Vector3(basePos.x, y, basePos.z + radius));
             InspectBlock(new Vector3(basePos.x, y, basePos.z - radius));
         }
+
+        PushOutOfSolidBlock(basePos, halfHeight);
     }
 
     private void InspectBlock(Vector3 sample)
@@ -384,6 +386,66 @@ public class McMovement : NUMovement
         {
             inWeb = true;
         }
+    }
+
+    private void PushOutOfSolidBlock(Vector3 bodyCenter, float halfHeight)
+    {
+        float feetSampleY = bodyCenter.y - halfHeight + 0.1f;
+
+        // If completely below the world, scan from a reasonable height to find ground
+        if (transform.position.y < -1f)
+        {
+            _RecoverFromVoidFall(bodyCenter);
+            return;
+        }
+
+        Vector3 feetSample = new Vector3(bodyCenter.x, feetSampleY, bodyCenter.z);
+        Vector3 bodySample = bodyCenter;
+
+        byte feetBlock = SampleBlock(feetSample);
+        byte bodyBlock = SampleBlock(bodySample);
+
+        if (!IsSolidBlock(feetBlock) && !IsSolidBlock(bodyBlock)) return;
+
+        int baseVoxelY = Mathf.FloorToInt(feetSampleY);
+
+        for (int dy = 1; dy <= 10; dy++)
+        {
+            Vector3 lowerProbe = new Vector3(bodyCenter.x, baseVoxelY + dy, bodyCenter.z);
+            Vector3 upperProbe = new Vector3(bodyCenter.x, baseVoxelY + dy + 1, bodyCenter.z);
+            if (!IsSolidBlock(SampleBlock(lowerProbe)) && !IsSolidBlock(SampleBlock(upperProbe)))
+            {
+                _TeleportToSafety(baseVoxelY + dy + 0.01f);
+                return;
+            }
+        }
+    }
+
+    private void _RecoverFromVoidFall(Vector3 bodyCenter)
+    {
+        for (int y = 255; y >= 0; y--)
+        {
+            Vector3 probe = new Vector3(bodyCenter.x, y, bodyCenter.z);
+            if (IsSolidBlock(SampleBlock(probe)))
+            {
+                Vector3 aboveA = new Vector3(bodyCenter.x, y + 1, bodyCenter.z);
+                Vector3 aboveB = new Vector3(bodyCenter.x, y + 2, bodyCenter.z);
+                if (!IsSolidBlock(SampleBlock(aboveA)) && !IsSolidBlock(SampleBlock(aboveB)))
+                {
+                    _TeleportToSafety(y + 1.01f);
+                    return;
+                }
+            }
+        }
+    }
+
+    private void _TeleportToSafety(float safeY)
+    {
+        Vector3 safePos = new Vector3(transform.position.x, safeY, transform.position.z);
+        _SetPosition(safePos);
+        mcVelocity = Vector3.zero;
+        Velocity = Vector3.zero;
+        fallDistance = 0f;
     }
 
     private byte SampleBlock(Vector3 worldPos)
