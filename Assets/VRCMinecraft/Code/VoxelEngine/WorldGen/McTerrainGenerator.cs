@@ -341,9 +341,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Texture2D gpuClimateOffsetTextureRain;
     private Texture2D gpuClimateOffsetTextureModifier;
     private Texture2D gpuClimateBiomeLookupTexture;
-    private Texture2D gpuCoordXTexture;
+    private Texture2D gpuCoordXZTexture; // X in RG, Z in BA
     private Texture2D gpuCoordYTexture;
-    private Texture2D gpuCoordZTexture;
     private Texture2D gpuTemperatureTexture;
     private Texture2D gpuRainfallTexture;
     private Texture2D gpuSurfaceParamsTextureA;
@@ -379,9 +378,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Color[] gpuClimateOffsetPixels;
     private Color[] gpuClimateBiomeLookupPixels;
     private Color[] gpuPermutationPixels; // 256 * MAX_OCTAVES for batched upload
-    private Color[] gpuCoordXPixels;
+    private Color[] gpuCoordXZPixels; // X in RG, Z in BA
     private Color[] gpuCoordYPixels;
-    private Color[] gpuCoordZPixels;
     private const int GPU_MAX_OCTAVES = 16;
     private Color[] gpuSurfaceParamPixelsA;
     private Color[] gpuSurfaceParamPixelsB;
@@ -482,9 +480,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuPropPermIdxYId, gpuPropFracYId;
     private int gpuPropPermIdxZId, gpuPropFracZId;
     private int gpuPropGradFracYId;
-    private int gpuPropCoordXTexId;
+    private int gpuPropCoordXZTexId;
     private int gpuPropCoordYTexId;
-    private int gpuPropCoordZTexId;
     private double[] gpuDiagCpuNoise1;
     private double[] gpuDiagCpuNoise2;
     private double[] gpuDiagCpuNoise3;
@@ -1113,9 +1110,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         // These tables carry the lattice indices and fractional coordinates that drive
         // the entire Perlin lookup. Keep them at full float precision to minimize
         // CPU-vs-GPU drift before considering software-emulated doubles.
-        gpuCoordXTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuCoordXZTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
         gpuCoordYTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_YSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
-        gpuCoordZTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
         gpuTemperatureTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuRainfallTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuSurfaceParamsTextureA = _CreateGpuColorTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
@@ -1155,9 +1151,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuClimateOffsetPixels = new Color[4];
         gpuClimateBiomeLookupPixels = new Color[64 * 64];
         gpuPermutationPixels = new Color[512 * GPU_MAX_OCTAVES]; // 512 entries per octave (Perlin double-table)
-        gpuCoordXPixels = new Color[GPU_MAX_XZSIZE * GPU_MAX_OCTAVES];
+        gpuCoordXZPixels = new Color[GPU_MAX_XZSIZE * GPU_MAX_OCTAVES];
         gpuCoordYPixels = new Color[GPU_MAX_YSIZE * GPU_MAX_OCTAVES];
-        gpuCoordZPixels = new Color[GPU_MAX_XZSIZE * GPU_MAX_OCTAVES];
+        // Pre-fill with (0,0,0,1) so per-upload zero-fill is unnecessary
+        for (int i = 0; i < gpuCoordXZPixels.Length; i++)
+            gpuCoordXZPixels[i] = new Color(0f, 0f, 0f, 1f);
+        for (int i = 0; i < gpuCoordYPixels.Length; i++)
+            gpuCoordYPixels[i] = new Color(0f, 0f, 0f, 1f);
         gpuSurfaceParamPixelsA = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuSurfaceParamPixelsB = new Color[world.chunkSizeXZ * world.chunkSizeXZ];
         gpuBedrockMaskPixels = new Color[world.chunkSizeXZ * 5 * world.chunkSizeXZ];
@@ -1258,9 +1258,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuPropGradFracYId = VRCShader.PropertyToID("_GradFracY");
         gpuPropPermIdxZId = VRCShader.PropertyToID("_PermIdxZ");
         gpuPropFracZId = VRCShader.PropertyToID("_FracZ");
-        gpuPropCoordXTexId = VRCShader.PropertyToID("_CoordXTex");
+        gpuPropCoordXZTexId = VRCShader.PropertyToID("_CoordXZTex");
         gpuPropCoordYTexId = VRCShader.PropertyToID("_CoordYTex");
-        gpuPropCoordZTexId = VRCShader.PropertyToID("_CoordZTex");
 
         // Allocate precompute arrays
         gpuPrePermX = new float[GPU_MAX_XZSIZE];
@@ -1631,7 +1630,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private void _UploadGpuNoiseCoordTextures(NoiseGeneratorOctaves3D source, int octaveCount, int xSize, int ySize, int zSize, int xPos, int yPos, int zPos, double gridX, double gridY, double gridZ, bool is2D)
     {
-        if (gpuCoordXTexture == null || gpuCoordYTexture == null || gpuCoordZTexture == null) return;
+        if (gpuCoordXZTexture == null || gpuCoordYTexture == null) return;
         if (gpuLastCoordUploadSource == source &&
             gpuLastCoordUploadXPos == xPos &&
             gpuLastCoordUploadYPos == yPos &&
@@ -1650,19 +1649,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
         float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
-        for (int i = 0; i < gpuCoordXPixels.Length; i++)
-        {
-            gpuCoordXPixels[i] = new Color(0f, 0f, 0f, 1f);
-        }
-        for (int i = 0; i < gpuCoordYPixels.Length; i++)
-        {
-            gpuCoordYPixels[i] = new Color(0f, 0f, 0f, 1f);
-        }
-        for (int i = 0; i < gpuCoordZPixels.Length; i++)
-        {
-            gpuCoordZPixels[i] = new Color(0f, 0f, 0f, 1f);
-        }
-
         for (int octave = 0; octave < octaveCount; octave++)
         {
             NoiseGenerator3dPerlin generator = source.GetGenerator(octave);
@@ -1680,15 +1666,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
             }
             _PrecomputeNoiseCoords(gpuPrePermZ, gpuPreFracZ, zSize, (double)zPos, scaledGridZ, generator.zCoord);
 
-            int xRowOffset = octave * GPU_MAX_XZSIZE;
+            int xzRowOffset = octave * GPU_MAX_XZSIZE;
             for (int i = 0; i < GPU_MAX_XZSIZE; i++)
             {
-                gpuCoordXPixels[xRowOffset + i] = i < xSize
-                    ? new Color(gpuPrePermX[i] / 255.0f, gpuPreFracX[i], 0f, 1f)
-                    : new Color(0f, 0f, 0f, 1f);
-                gpuCoordZPixels[xRowOffset + i] = i < zSize
-                    ? new Color(gpuPrePermZ[i] / 255.0f, gpuPreFracZ[i], 0f, 1f)
-                    : new Color(0f, 0f, 0f, 1f);
+                float xPerm = i < xSize ? gpuPrePermX[i] / 255.0f : 0f;
+                float xFrac = i < xSize ? gpuPreFracX[i] : 0f;
+                float zPerm = i < zSize ? gpuPrePermZ[i] / 255.0f : 0f;
+                float zFrac = i < zSize ? gpuPreFracZ[i] : 0f;
+                gpuCoordXZPixels[xzRowOffset + i] = new Color(xPerm, xFrac, zPerm, zFrac);
             }
 
             int yRowOffset = octave * GPU_MAX_YSIZE;
@@ -1705,12 +1690,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
             }
         }
 
-        gpuCoordXTexture.SetPixels(gpuCoordXPixels);
-        gpuCoordXTexture.Apply(false, false);
+        gpuCoordXZTexture.SetPixels(gpuCoordXZPixels);
+        gpuCoordXZTexture.Apply(false, false);
         gpuCoordYTexture.SetPixels(gpuCoordYPixels);
         gpuCoordYTexture.Apply(false, false);
-        gpuCoordZTexture.SetPixels(gpuCoordZPixels);
-        gpuCoordZTexture.Apply(false, false);
         gpuLastCoordUploadSource = source;
         gpuLastCoordUploadXPos = xPos;
         gpuLastCoordUploadYPos = yPos;
@@ -1725,7 +1708,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
         if (enableDetailedTimings)
         {
-            int bytes = gpuCoordXPixels.Length * 16 + gpuCoordYPixels.Length * 16 + gpuCoordZPixels.Length * 16;
+            int bytes = gpuCoordXZPixels.Length * 16 + gpuCoordYPixels.Length * 16;
             _RecordGpuNoiseInputUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, bytes);
         }
 #endif
@@ -1753,9 +1736,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         _UploadGpuNoiseCoordTextures(source, octaveCount, xSize, ySize, zSize, xPos, yPos, zPos, gridX, gridY, gridZ, is2D);
 
         gpuNoiseOctaveMaterial.SetTexture(gpuPropPermTexId, permutationTexture);
-        gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordXTexId, gpuCoordXTexture);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordXZTexId, gpuCoordXZTexture);
         gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordYTexId, gpuCoordYTexture);
-        gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordZTexId, gpuCoordZTexture);
         gpuNoiseOctaveMaterial.SetInt(gpuPropOctaveId, octaveCount);
         gpuNoiseOctaveMaterial.SetInt(gpuPropXSizeId, xSize);
         gpuNoiseOctaveMaterial.SetInt(gpuPropYSizeId, ySize);

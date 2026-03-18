@@ -78,7 +78,7 @@ public class McWorld : UdonSharpBehaviour
     [Tooltip("Rate used to shrink adaptive budgets on over-budget frames.")]
     public float adaptiveBudgetBackoffRate = 0.20f;
     [Tooltip("Minimum fraction of the configured GPU budgets that adaptive throttling will allow.")]
-    public float adaptiveBudgetMinScale = 0.45f;
+    public float adaptiveBudgetMinScale = 0.65f;
 
     [Header("System References")]
     [SerializeField, FindObjectOfType(true)]
@@ -106,7 +106,7 @@ public class McWorld : UdonSharpBehaviour
     public bool enableGpuVoxelBackend = true;
     public int gpuChunkSlotCapacity = 1023;
     public int gpuLightingIterationsPerUpdate = 64;
-    public int gpuLightingTotalIterations = 384;
+    public int gpuLightingTotalIterations = 128;
     public int gpuResidentRadiusXZ = 6;
     public int gpuResidentRadiusY = 2;
     public int gpuResidentSyncsPerFrame = 32;
@@ -272,6 +272,7 @@ public class McWorld : UdonSharpBehaviour
     private Color32[] gpuSlotLookupPixels;
     private Color32[] gpuSlotMetaPixels;
     private Color32[] gpuUploadBlockPixels;
+    private Color32[] gpuBlockIdToColor32;
     private RenderTexture gpuBlockAtlas;
     private RenderTexture gpuBlockAtlasScratch;
     private RenderTexture gpuLightAtlas;
@@ -281,8 +282,8 @@ public class McWorld : UdonSharpBehaviour
     private int gpuLightingFrameCursor = 0;
 
     // --- GPU Face Extraction State ---
-    private const int GPU_FACE_READBACK_BUFFER_COUNT = 2;
-    private const int GPU_FACE_READBACKS_PER_FRAME = 1;
+    private const int GPU_FACE_READBACK_BUFFER_COUNT = 4;
+    private const int GPU_FACE_READBACKS_PER_FRAME = 2;
     private const int GPU_FACE_COMPACT_DIRECTIONS = 6;
     private Texture2D gpuShouldDrawTexture;
     private RenderTexture gpuFaceAtlas;
@@ -674,6 +675,9 @@ public class McWorld : UdonSharpBehaviour
         gpuSlotLookupPixels = new Color32[worldDimensionX * worldDimensionY * worldDimensionZ];
         gpuSlotMetaPixels = new Color32[gpuChunkSlotCapacity];
         gpuUploadBlockPixels = new Color32[gpuTileWidth * gpuTileHeight];
+        gpuBlockIdToColor32 = new Color32[256];
+        for (int i = 0; i < 256; i++)
+            gpuBlockIdToColor32[i] = new Color32((byte)i, 0, 0, 255);
 
         gpuSlotLookupTexture = _CreateGpuTexture2D(worldDimensionX, worldDimensionY * worldDimensionZ);
         gpuSlotMetaTexture = _CreateGpuTexture2D(gpuChunkSlotCapacity, 1);
@@ -1180,8 +1184,7 @@ public class McWorld : UdonSharpBehaviour
                 int zBase = yBase + z * chunkSizeXZ;
                 for (int x = 0; x < chunkSizeXZ; x++)
                 {
-                    byte blockId = blockData[zBase + x];
-                    gpuUploadBlockPixels[rowBase + x] = new Color32(blockId, 0, 0, 255);
+                    gpuUploadBlockPixels[rowBase + x] = gpuBlockIdToColor32[blockData[zBase + x]];
                 }
             }
         }
@@ -1361,11 +1364,43 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
-        for (int i = 0; i < iterations && gpuLightingIterationsRemaining > 0; i++)
+        if (iterations > 0 && gpuLightingIterationsRemaining > 0 && gpuLightingPropagateMaterial != null)
         {
-            if (i >= guaranteedIterations && Time.realtimeSinceStartup - frameStart > frameBudget) break;
-            _GpuRunLightingPropagationPass();
-            gpuLightingIterationsRemaining--;
+            // Set material properties once — they don't change between iterations
+            gpuLightingPropagateMaterial.SetTexture(gpuPropBlockAtlasId, gpuBlockAtlas);
+            gpuLightingPropagateMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
+            gpuLightingPropagateMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
+            gpuLightingPropagateMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
+            gpuLightingPropagateMaterial.SetVector(gpuPropAtlasInfoId, new Vector4(gpuAtlasWidth, gpuAtlasHeight, gpuAtlasSlotsX, gpuAtlasSlotsY));
+            gpuLightingPropagateMaterial.SetVector(gpuPropWorldInfoId, new Vector4(worldDimensionX, worldDimensionY, worldDimensionZ, worldDimensionY * worldDimensionZ));
+            gpuLightingPropagateMaterial.SetVector(gpuPropChunkInfoId, new Vector4(chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ));
+            gpuLightingPropagateMaterial.SetVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
+            gpuLightingPropagateMaterial.SetFloat(gpuPropTopSkyLightId, 15f);
+
+            for (int i = 0; i < iterations && gpuLightingIterationsRemaining > 0; i++)
+            {
+                if (i >= guaranteedIterations && Time.realtimeSinceStartup - frameStart > frameBudget) break;
+                gpuLightingPropagateMaterial.SetInt("_FrameJitter", gpuLightingFrameCursor++);
+#if LOGGING
+                float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+                VRCGraphics.Blit(gpuLightAtlas, gpuLightAtlasScratch, gpuLightingPropagateMaterial);
+#if LOGGING
+                if (enableDetailedTimings)
+                {
+                    stats_gpuLightingPropagateBlits++;
+                    stats_gpuLightingPropagateBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+                }
+#endif
+                RenderTexture temp = gpuLightAtlas;
+                gpuLightAtlas = gpuLightAtlasScratch;
+                gpuLightAtlasScratch = temp;
+                gpuLightingIterationsRemaining--;
+            }
+
+            // Publish globals once after all iterations — intermediate RT swaps
+            // are invisible to the terrain shader since it only reads at render time
+            _GpuPublishGlobals();
         }
     }
 
@@ -1392,38 +1427,6 @@ public class McWorld : UdonSharpBehaviour
         {
             stats_gpuLightingSeedBlits++;
             stats_gpuLightingSeedBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
-        }
-#endif
-        RenderTexture temp = gpuLightAtlas;
-        gpuLightAtlas = gpuLightAtlasScratch;
-        gpuLightAtlasScratch = temp;
-        _GpuPublishGlobals();
-    }
-
-    private void _GpuRunLightingPropagationPass()
-    {
-        if (!gpuBackendReady || gpuLightingPropagateMaterial == null) return;
-
-        gpuLightingPropagateMaterial.SetTexture(gpuPropBlockAtlasId, gpuBlockAtlas);
-        gpuLightingPropagateMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
-        gpuLightingPropagateMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
-        gpuLightingPropagateMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
-        gpuLightingPropagateMaterial.SetVector(gpuPropAtlasInfoId, new Vector4(gpuAtlasWidth, gpuAtlasHeight, gpuAtlasSlotsX, gpuAtlasSlotsY));
-        gpuLightingPropagateMaterial.SetVector(gpuPropWorldInfoId, new Vector4(worldDimensionX, worldDimensionY, worldDimensionZ, worldDimensionY * worldDimensionZ));
-        gpuLightingPropagateMaterial.SetVector(gpuPropChunkInfoId, new Vector4(chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ));
-        gpuLightingPropagateMaterial.SetVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
-        gpuLightingPropagateMaterial.SetFloat(gpuPropTopSkyLightId, 15f);
-        gpuLightingPropagateMaterial.SetInt("_FrameJitter", gpuLightingFrameCursor++);
-
-#if LOGGING
-        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
-#endif
-        VRCGraphics.Blit(gpuLightAtlas, gpuLightAtlasScratch, gpuLightingPropagateMaterial);
-#if LOGGING
-        if (enableDetailedTimings)
-        {
-            stats_gpuLightingPropagateBlits++;
-            stats_gpuLightingPropagateBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
         }
 #endif
         RenderTexture temp = gpuLightAtlas;
@@ -2193,6 +2196,10 @@ public class McWorld : UdonSharpBehaviour
 
                 if (chunk._gpuFaceCrossIndex >= crossCount)
                 {
+                    // Torch and water blocks are not extracted by the GPU face shader —
+                    // add them as CPU fixup, same pattern as cross blocks above.
+                    _AddTorchBlocks(chunk);
+                    _AddWaterBlocks(chunk);
                     chunk._gpuFaceBuildStage = 2;
                 }
                 if (enableDetailedTimings && useSummary)
@@ -2702,10 +2709,10 @@ public class McWorld : UdonSharpBehaviour
         // without enough passes to converge.
         _ProcessGpuLighting(frameStart, frameBudget);
 
-        // Process a small number of completed GPU face readbacks. Draining the whole
-        // queue in one frame causes large hitches when multiple async requests complete
-        // together, so keep this budget-aware.
-        _ProcessGpuFaceReadback(frameStart, frameBudget);
+        // Process completed GPU face readbacks. Guarantee at least 1ms of budget so
+        // readbacks aren't completely starved on over-budget frames.
+        float readbackBudget = Mathf.Max(frameBudget, Time.realtimeSinceStartup - frameStart + 0.001f);
+        _ProcessGpuFaceReadback(frameStart, readbackBudget);
 
         // --- Process Data Generation ---
         for (int i = 0; i < activeDataGenCount; i++)
@@ -4042,7 +4049,7 @@ public class McWorld : UdonSharpBehaviour
         // Player edits should stay on the synchronous CPU mesh path so block changes
         // are visible immediately instead of waiting on async GPU face readback.
         // Keep GPU extraction for background worldgen where throughput matters more.
-        if (!interactionPriority && _GpuFaceExtractionReady() && !chunk._hasWaterBlocks && !chunk._hasTorchBlocks)
+        if (!interactionPriority && _GpuFaceExtractionReady())
         {
             if (_GpuHasAvailableReadbackBuffer())
             {

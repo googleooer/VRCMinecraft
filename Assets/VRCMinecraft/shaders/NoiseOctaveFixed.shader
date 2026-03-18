@@ -99,9 +99,8 @@ Shader "VRCM/NoiseOctaveFixed"
             
             sampler2D _AccumulationTex;
             sampler2D _PermTex;
-            sampler2D _CoordXTex;
+            sampler2D _CoordXZTex; // X in RG, Z in BA
             sampler2D _CoordYTex;
-            sampler2D _CoordZTex;
             int _XSize;
             int _YSize;
             int _ZSize;
@@ -116,10 +115,10 @@ Shader "VRCM/NoiseOctaveFixed"
                 return round(tex2Dlod(_PermTex, float4(((float)index + 0.5) / 512.0, rowV, 0, 0)).r * 255.0);
             }
 
-            float4 sampleCoordX(int octave, int index)
+            float2 sampleCoordX(int octave, int index)
             {
                 float rowV = ((float)octave + 0.5) / 16.0;
-                return tex2Dlod(_CoordXTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0));
+                return tex2Dlod(_CoordXZTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0)).rg;
             }
 
             float4 sampleCoordY(int octave, int index)
@@ -128,10 +127,10 @@ Shader "VRCM/NoiseOctaveFixed"
                 return tex2Dlod(_CoordYTex, float4(((float)index + 0.5) / 65.0, rowV, 0, 0));
             }
 
-            float4 sampleCoordZ(int octave, int index)
+            float2 sampleCoordZ(int octave, int index)
             {
                 float rowV = ((float)octave + 0.5) / 16.0;
-                return tex2Dlod(_CoordZTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0));
+                return tex2Dlod(_CoordXZTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0)).ba;
             }
 
             static const float3 GRADIENTS[16] = {
@@ -173,8 +172,8 @@ Shader "VRCM/NoiseOctaveFixed"
                     {
                         if (octave >= _OctaveCount) break;
 
-                        float4 coordX = sampleCoordX(octave, xIndex);
-                        float4 coordZ = sampleCoordZ(octave, zIndex);
+                        float2 coordX = sampleCoordX(octave, xIndex);
+                        float2 coordZ = sampleCoordZ(octave, zIndex);
 
                         int p1 = (int)round(coordX.r * 255.0);
                         float relX = coordX.g;
@@ -227,9 +226,9 @@ Shader "VRCM/NoiseOctaveFixed"
                     {
                         if (octave >= _OctaveCount) break;
 
-                        float4 coordX = sampleCoordX(octave, xIndex);
+                        float2 coordX = sampleCoordX(octave, xIndex);
                         float4 coordY = sampleCoordY(octave, yIndex);
-                        float4 coordZ = sampleCoordZ(octave, zIndex);
+                        float2 coordZ = sampleCoordZ(octave, zIndex);
 
                         int p1 = (int)round(coordX.r * 255.0);
                         float relX = coordX.g;
