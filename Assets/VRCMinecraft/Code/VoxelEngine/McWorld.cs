@@ -2094,6 +2094,9 @@ public class McWorld : UdonSharpBehaviour
                     }
                     int[] packedGrassColors = chunk._cachedPackedGrassBiomeColors;
                     byte[] tintModes = biomeTintModeCache;
+                    bool nsUseAo = _UsesCpuAmbientOcclusion();
+                    bool nsHasTintModes = tintModes != null;
+                    bool nsHasGrassColors = packedGrassColors != null;
 
                     for (int v = minV; v <= maxV; v++)
                     {
@@ -2120,7 +2123,7 @@ public class McWorld : UdonSharpBehaviour
 
                             int maskIndex = maskRowOffset + u;
                             greedyMaskBlockIds[maskIndex] = (byte)blockID;
-                            if (_UsesCpuAmbientOcclusion())
+                            if (nsUseAo)
                             {
                                 greedyMaskLightLevels[maskIndex] = 0;
                                 greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, (byte)blockID, direction, x, y, z);
@@ -2130,7 +2133,7 @@ public class McWorld : UdonSharpBehaviour
                                 greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
                                 greedyMaskAoSignatures[maskIndex] = 0;
                             }
-                            byte tintMode = (tintModes != null && blockID < tintModes.Length) ? tintModes[blockID] : (byte)0;
+                            byte tintMode = (nsHasTintModes && blockID < tintModes.Length) ? tintModes[blockID] : (byte)0;
                             if (tintMode == 0)
                             {
                                 greedyMaskPackedColors[maskIndex] = PACKED_WHITE_RGB;
@@ -2138,7 +2141,7 @@ public class McWorld : UdonSharpBehaviour
                             else
                             {
                                 int biomeIndex = z * sizeXZ + x;
-                                if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                                if (tintMode == 1 && nsHasGrassColors && biomeIndex < packedGrassColors.Length)
                                 {
                                     greedyMaskPackedColors[maskIndex] = packedGrassColors[biomeIndex];
                                 }
@@ -5650,6 +5653,8 @@ public class McWorld : UdonSharpBehaviour
         bool anyFace = false;
         int[] packedGrassColors = chunk._cachedPackedGrassBiomeColors;
         byte[] tintModes = biomeTintModeCache;
+        bool hasTintModes = tintModes != null;
+        bool hasGrassColors = packedGrassColors != null;
         byte[] blockIds = greedyMaskBlockIds;
         byte[] lightLevels = greedyMaskLightLevels;
         int[] packedColors = greedyMaskPackedColors;
@@ -5712,6 +5717,8 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
+        byte[] lightSource = usesCurrentBrightness ? currentBrightness : (neighborBrightness != null ? neighborBrightness : null);
+
         for (int rowPair = 0; rowPair < rowPairs; rowPair++)
         {
             int pixelIndex = rowBase + rowPair;
@@ -5743,20 +5750,9 @@ public class McWorld : UdonSharpBehaviour
                         blockIds[maskIndex] = selfID;
                         if (!useAo)
                         {
-                            if (usesCurrentBrightness)
-                            {
-                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                            }
-                            else if (neighborBrightness != null)
-                            {
-                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                            }
-                            else
-                            {
-                                lightLevels[maskIndex] = fallbackLight;
-                            }
+                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
                         }
-                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
                             packedColors[maskIndex] = PACKED_WHITE_RGB;
@@ -5764,7 +5760,7 @@ public class McWorld : UdonSharpBehaviour
                         else
                         {
                             int biomeIndex = biomeRowBase + u;
-                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            if (tintMode == 1 && hasGrassColors && biomeIndex < packedGrassColors.Length)
                             {
                                 packedColors[maskIndex] = packedGrassColors[biomeIndex];
                             }
@@ -5773,7 +5769,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
+                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
                         anyFace = true;
                     }
                 }
@@ -5794,20 +5790,9 @@ public class McWorld : UdonSharpBehaviour
                         blockIds[maskIndex] = selfID;
                         if (!useAo)
                         {
-                            if (usesCurrentBrightness)
-                            {
-                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                            }
-                            else if (neighborBrightness != null)
-                            {
-                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                            }
-                            else
-                            {
-                                lightLevels[maskIndex] = fallbackLight;
-                            }
+                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
                         }
-                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
                             packedColors[maskIndex] = PACKED_WHITE_RGB;
@@ -5815,7 +5800,7 @@ public class McWorld : UdonSharpBehaviour
                         else
                         {
                             int biomeIndex = sliceRowBase + u;
-                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            if (tintMode == 1 && hasGrassColors && biomeIndex < packedGrassColors.Length)
                             {
                                 packedColors[maskIndex] = packedGrassColors[biomeIndex];
                             }
@@ -5824,7 +5809,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
+                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
                         anyFace = true;
                     }
                 }
@@ -5846,25 +5831,14 @@ public class McWorld : UdonSharpBehaviour
                         blockIds[maskIndex] = selfID;
                         if (!useAo)
                         {
-                            if (usesCurrentBrightness)
-                            {
-                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
-                            }
-                            else if (neighborBrightness != null)
-                            {
-                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
-                            }
-                            else
-                            {
-                                lightLevels[maskIndex] = fallbackLight;
-                            }
+                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u * sizeXZ] : fallbackLight;
                         }
-                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
                             packedColors[maskIndex] = PACKED_WHITE_RGB;
                         }
-                        else if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                        else if (tintMode == 1 && hasGrassColors && biomeIndex < packedGrassColors.Length)
                         {
                             packedColors[maskIndex] = packedGrassColors[biomeIndex];
                         }
@@ -5872,7 +5846,7 @@ public class McWorld : UdonSharpBehaviour
                         {
                             packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
                         }
-                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
+                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
                         anyFace = true;
                     }
                 }
@@ -5901,20 +5875,9 @@ public class McWorld : UdonSharpBehaviour
                         blockIds[maskIndex] = selfID;
                         if (!useAo)
                         {
-                            if (usesCurrentBrightness)
-                            {
-                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                            }
-                            else if (neighborBrightness != null)
-                            {
-                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                            }
-                            else
-                            {
-                                lightLevels[maskIndex] = fallbackLight;
-                            }
+                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
                         }
-                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
                             packedColors[maskIndex] = PACKED_WHITE_RGB;
@@ -5922,7 +5885,7 @@ public class McWorld : UdonSharpBehaviour
                         else
                         {
                             int biomeIndex = biomeRowBase + u;
-                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            if (tintMode == 1 && hasGrassColors && biomeIndex < packedGrassColors.Length)
                             {
                                 packedColors[maskIndex] = packedGrassColors[biomeIndex];
                             }
@@ -5931,7 +5894,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
+                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
                         anyFace = true;
                     }
                 }
@@ -5952,20 +5915,9 @@ public class McWorld : UdonSharpBehaviour
                         blockIds[maskIndex] = selfID;
                         if (!useAo)
                         {
-                            if (usesCurrentBrightness)
-                            {
-                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u];
-                            }
-                            else if (neighborBrightness != null)
-                            {
-                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u];
-                            }
-                            else
-                            {
-                                lightLevels[maskIndex] = fallbackLight;
-                            }
+                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
                         }
-                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
                             packedColors[maskIndex] = PACKED_WHITE_RGB;
@@ -5973,7 +5925,7 @@ public class McWorld : UdonSharpBehaviour
                         else
                         {
                             int biomeIndex = sliceRowBase + u;
-                            if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                            if (tintMode == 1 && hasGrassColors && biomeIndex < packedGrassColors.Length)
                             {
                                 packedColors[maskIndex] = packedGrassColors[biomeIndex];
                             }
@@ -5982,7 +5934,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
+                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
                         anyFace = true;
                     }
                 }
@@ -6004,25 +5956,14 @@ public class McWorld : UdonSharpBehaviour
                         blockIds[maskIndex] = selfID;
                         if (!useAo)
                         {
-                            if (usesCurrentBrightness)
-                            {
-                                lightLevels[maskIndex] = currentBrightness[lightRowBase + u * sizeXZ];
-                            }
-                            else if (neighborBrightness != null)
-                            {
-                                lightLevels[maskIndex] = neighborBrightness[lightRowBase + u * sizeXZ];
-                            }
-                            else
-                            {
-                                lightLevels[maskIndex] = fallbackLight;
-                            }
+                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u * sizeXZ] : fallbackLight;
                         }
-                        byte tintMode = (tintModes != null && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
+                        byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
                         {
                             packedColors[maskIndex] = PACKED_WHITE_RGB;
                         }
-                        else if (tintMode == 1 && packedGrassColors != null && biomeIndex < packedGrassColors.Length)
+                        else if (tintMode == 1 && hasGrassColors && biomeIndex < packedGrassColors.Length)
                         {
                             packedColors[maskIndex] = packedGrassColors[biomeIndex];
                         }
@@ -6030,7 +5971,7 @@ public class McWorld : UdonSharpBehaviour
                         {
                             packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
                         }
-                        greedyMaskAoSignatures[maskIndex] = _UsesCpuAmbientOcclusion() ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
+                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
                         anyFace = true;
                     }
                 }
@@ -6065,7 +6006,7 @@ public class McWorld : UdonSharpBehaviour
             {
                 int maskIndex = rowOffset + u;
                 byte blockID = blockIds[maskIndex];
-                if (blockID == 0 || _IsWaterBlock(blockID))
+                if (blockID == 0 || blockID == BLOCK_WATER_MOVING || blockID == BLOCK_WATER_STILL)
                 {
                     u++;
                     continue;

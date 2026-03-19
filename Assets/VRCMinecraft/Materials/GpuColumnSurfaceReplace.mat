@@ -63,6 +63,7 @@ Material:
     m_Floats:
     - _BedrockBlockId: 7
     - _ChunkSizeXZ: 16
+    - _FlipXAxis: 1
     - _GravelBlockId: 13
     - _SandBlockId: 12
     - _SandstoneBlockId: 24
