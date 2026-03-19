@@ -70,11 +70,12 @@ Material:
     m_Ints: []
     m_Floats:
     - _Amplitude: 10000
-    - _ChunkX: 0
-    - _ChunkZ: 32
+    - _ChunkX: -48
+    - _ChunkZ: -48
     - _ClimateOctaveCount0: 4
     - _ClimateOctaveCount1: 4
     - _ClimateOctaveCount2: 2
+    - _CoordTexHeight: 80
     - _Frequency: 0.000030517578
     - _GridX: 0.0061035156
     - _GridY: 0.000030517578
@@ -83,6 +84,7 @@ Material:
     - _Octave: 15
     - _OctaveCount: 16
     - _OctaveRow: 15
+    - _OctaveRowOffset: 64
     - _XCoord: 135.346
     - _XPos: -4
     - _XSize: 5
