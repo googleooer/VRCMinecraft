@@ -19,6 +19,8 @@ Shader "VRCM/NoiseOctaveFixed"
         _Is2D ("Is 2D", Int) = 0
         _OctaveCount ("Octave Count", Int) = 16
         _OctaveRow ("Octave Row", Int) = 0
+        _OctaveRowOffset ("Octave Row Offset", Int) = 0
+        _CoordTexHeight ("Coord Tex Height", Int) = 16
         _ChunkX ("Chunk X", Int) = 0
         _ChunkZ ("Chunk Z", Int) = 0
         _ClimateOctaveCount0 ("Climate Octave Count 0", Int) = 4
@@ -106,6 +108,8 @@ Shader "VRCM/NoiseOctaveFixed"
             int _ZSize;
             int _Is2D;
             int _OctaveCount;
+            int _OctaveRowOffset;
+            int _CoordTexHeight;
 
             float samplePerm(int octave, int index)
             {
@@ -117,19 +121,19 @@ Shader "VRCM/NoiseOctaveFixed"
 
             float2 sampleCoordX(int octave, int index)
             {
-                float rowV = ((float)octave + 0.5) / 16.0;
+                float rowV = ((float)(octave + _OctaveRowOffset) + 0.5) / (float)_CoordTexHeight;
                 return tex2Dlod(_CoordXZTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0)).rg;
             }
 
             float4 sampleCoordY(int octave, int index)
             {
-                float rowV = ((float)octave + 0.5) / 16.0;
+                float rowV = ((float)(octave + _OctaveRowOffset) + 0.5) / (float)_CoordTexHeight;
                 return tex2Dlod(_CoordYTex, float4(((float)index + 0.5) / 65.0, rowV, 0, 0));
             }
 
             float2 sampleCoordZ(int octave, int index)
             {
-                float rowV = ((float)octave + 0.5) / 16.0;
+                float rowV = ((float)(octave + _OctaveRowOffset) + 0.5) / (float)_CoordTexHeight;
                 return tex2Dlod(_CoordXZTex, float4(((float)index + 0.5) / 16.0, rowV, 0, 0)).ba;
             }
 

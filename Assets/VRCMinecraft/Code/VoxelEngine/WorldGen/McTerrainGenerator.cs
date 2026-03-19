@@ -383,6 +383,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Color[] gpuCoordXZPixels; // X in RG, Z in BA
     private Color[] gpuCoordYPixels;
     private const int GPU_MAX_OCTAVES = 16;
+    private const int GPU_DENSITY_GENERATORS = 5;
+    private const int GPU_COORD_TEX_HEIGHT = GPU_MAX_OCTAVES * GPU_DENSITY_GENERATORS;
     private Color[] gpuSurfaceParamPixelsA;
     private Color[] gpuSurfaceParamPixelsB;
     private Color[] gpuBedrockMaskPixels;
@@ -394,17 +396,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private bool gpuClimateUploadValid = false;
     private int gpuClimateUploadChunkX = int.MaxValue;
     private int gpuClimateUploadChunkZ = int.MaxValue;
-    private NoiseGeneratorOctaves3D gpuLastCoordUploadSource;
-    private int gpuLastCoordUploadXPos = int.MinValue;
-    private int gpuLastCoordUploadYPos = int.MinValue;
-    private int gpuLastCoordUploadZPos = int.MinValue;
-    private int gpuLastCoordUploadXSize = -1;
-    private int gpuLastCoordUploadYSize = -1;
-    private int gpuLastCoordUploadZSize = -1;
-    private double gpuLastCoordUploadGridX = double.NaN;
-    private double gpuLastCoordUploadGridY = double.NaN;
-    private double gpuLastCoordUploadGridZ = double.NaN;
-    private bool gpuLastCoordUploadIs2D = false;
     private int gpuPropPermTexId;
     private int gpuPropAccumulationTexId;
     private int gpuPropOctaveId;
@@ -423,6 +414,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuPropYSizeId;
     private int gpuPropZSizeId;
     private int gpuPropIs2DId;
+    private int gpuPropOctaveRowOffsetId;
+    private int gpuPropCoordTexHeightId;
     private int gpuPropNoise1TexId;
     private int gpuPropNoise2TexId;
     private int gpuPropNoise3TexId;
@@ -1078,7 +1071,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuClimateUploadValid = false;
         gpuClimateUploadChunkX = int.MaxValue;
         gpuClimateUploadChunkZ = int.MaxValue;
-        gpuLastCoordUploadSource = null;
         gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
         if (!enableGpuWorldgen) return;
         if (world == null || gpuNoiseOctaveMaterial == null || gpuNoiseCombineMaterial == null || gpuColumnBaseFillMaterial == null || gpuColumnSurfaceInfoMaterial == null || gpuColumnSurfaceReplaceMaterial == null) return;
@@ -1112,8 +1104,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         // These tables carry the lattice indices and fractional coordinates that drive
         // the entire Perlin lookup. Keep them at full float precision to minimize
         // CPU-vs-GPU drift before considering software-emulated doubles.
-        gpuCoordXZTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
-        gpuCoordYTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_YSIZE, GPU_MAX_OCTAVES, TextureWrapMode.Clamp);
+        gpuCoordXZTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_COORD_TEX_HEIGHT, TextureWrapMode.Clamp);
+        gpuCoordYTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_YSIZE, GPU_COORD_TEX_HEIGHT, TextureWrapMode.Clamp);
         gpuTemperatureTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuRainfallTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuSurfaceParamsTextureA = _CreateGpuColorTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
@@ -1156,8 +1148,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuClimateOffsetPixels = new Color[4];
         gpuClimateBiomeLookupPixels = new Color[64 * 64];
         gpuPermutationPixels = new Color[512 * GPU_MAX_OCTAVES]; // 512 entries per octave (Perlin double-table)
-        gpuCoordXZPixels = new Color[GPU_MAX_XZSIZE * GPU_MAX_OCTAVES];
-        gpuCoordYPixels = new Color[GPU_MAX_YSIZE * GPU_MAX_OCTAVES];
+        gpuCoordXZPixels = new Color[GPU_MAX_XZSIZE * GPU_COORD_TEX_HEIGHT];
+        gpuCoordYPixels = new Color[GPU_MAX_YSIZE * GPU_COORD_TEX_HEIGHT];
         // Pre-fill with (0,0,0,1) so per-upload zero-fill is unnecessary
         for (int i = 0; i < gpuCoordXZPixels.Length; i++)
             gpuCoordXZPixels[i] = new Color(0f, 0f, 0f, 1f);
@@ -1213,6 +1205,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuPropYSizeId = VRCShader.PropertyToID("_YSize");
         gpuPropZSizeId = VRCShader.PropertyToID("_ZSize");
         gpuPropIs2DId = VRCShader.PropertyToID("_Is2D");
+        gpuPropOctaveRowOffsetId = VRCShader.PropertyToID("_OctaveRowOffset");
+        gpuPropCoordTexHeightId = VRCShader.PropertyToID("_CoordTexHeight");
         gpuPropNoise1TexId = VRCShader.PropertyToID("_Noise1Tex");
         gpuPropNoise2TexId = VRCShader.PropertyToID("_Noise2Tex");
         gpuPropNoise3TexId = VRCShader.PropertyToID("_Noise3Tex");
@@ -1633,27 +1627,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
     }
 
-    private void _UploadGpuNoiseCoordTextures(NoiseGeneratorOctaves3D source, int octaveCount, int xSize, int ySize, int zSize, int xPos, int yPos, int zPos, double gridX, double gridY, double gridZ, bool is2D)
+    /// <summary>
+    /// Write one generator's precomputed coordinates into a 16-row block of the batched
+    /// coord pixel arrays. Does NOT call SetPixels/Apply — call _FlushBatchedNoiseCoords after
+    /// all generators have been written.
+    /// </summary>
+    private void _WriteNoiseCoordBlock(NoiseGeneratorOctaves3D source, int octaveCount,
+        int xSize, int ySize, int zSize, int xPos, int yPos, int zPos,
+        double gridX, double gridY, double gridZ, bool is2D, int generatorIndex)
     {
-        if (gpuCoordXZTexture == null || gpuCoordYTexture == null) return;
-        if (gpuLastCoordUploadSource == source &&
-            gpuLastCoordUploadXPos == xPos &&
-            gpuLastCoordUploadYPos == yPos &&
-            gpuLastCoordUploadZPos == zPos &&
-            gpuLastCoordUploadXSize == xSize &&
-            gpuLastCoordUploadYSize == ySize &&
-            gpuLastCoordUploadZSize == zSize &&
-            gpuLastCoordUploadGridX == gridX &&
-            gpuLastCoordUploadGridY == gridY &&
-            gpuLastCoordUploadGridZ == gridZ &&
-            gpuLastCoordUploadIs2D == is2D)
-        {
-            return;
-        }
-
-#if LOGGING
-        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
-#endif
+        int baseRow = generatorIndex * GPU_MAX_OCTAVES;
         for (int octave = 0; octave < octaveCount; octave++)
         {
             NoiseGenerator3dPerlin generator = source.GetGenerator(octave);
@@ -1671,7 +1654,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
             }
             _PrecomputeNoiseCoords(gpuPrePermZ, gpuPreFracZ, zSize, (double)zPos, scaledGridZ, generator.zCoord);
 
-            int xzRowOffset = octave * GPU_MAX_XZSIZE;
+            int xzRowOffset = (baseRow + octave) * GPU_MAX_XZSIZE;
             for (int i = 0; i < GPU_MAX_XZSIZE; i++)
             {
                 float xPerm = i < xSize ? gpuPrePermX[i] / 255.0f : 0f;
@@ -1681,35 +1664,44 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 gpuCoordXZPixels[xzRowOffset + i] = new Color(xPerm, xFrac, zPerm, zFrac);
             }
 
-            int yRowOffset = octave * GPU_MAX_YSIZE;
+            int yRowOff = (baseRow + octave) * GPU_MAX_YSIZE;
             for (int i = 0; i < GPU_MAX_YSIZE; i++)
             {
                 if (!is2D && i < ySize)
                 {
-                    gpuCoordYPixels[yRowOffset + i] = new Color(gpuPrePermY[i] / 255.0f, gpuPreFracY[i], gpuPreGradFracY[i], 1f);
+                    gpuCoordYPixels[yRowOff + i] = new Color(gpuPrePermY[i] / 255.0f, gpuPreFracY[i], gpuPreGradFracY[i], 1f);
                 }
                 else
                 {
-                    gpuCoordYPixels[yRowOffset + i] = new Color(0f, 0f, 0f, 1f);
+                    gpuCoordYPixels[yRowOff + i] = new Color(0f, 0f, 0f, 1f);
                 }
             }
         }
+        // Zero any unused octave rows for this generator
+        for (int octave = octaveCount; octave < GPU_MAX_OCTAVES; octave++)
+        {
+            int xzRowOffset = (baseRow + octave) * GPU_MAX_XZSIZE;
+            for (int i = 0; i < GPU_MAX_XZSIZE; i++)
+                gpuCoordXZPixels[xzRowOffset + i] = new Color(0f, 0f, 0f, 0f);
+            int yRowOff = (baseRow + octave) * GPU_MAX_YSIZE;
+            for (int i = 0; i < GPU_MAX_YSIZE; i++)
+                gpuCoordYPixels[yRowOff + i] = new Color(0f, 0f, 0f, 1f);
+        }
+    }
 
+    /// <summary>
+    /// Flush the batched coord pixel arrays to the GPU. Call once after all
+    /// _WriteNoiseCoordBlock calls are done.
+    /// </summary>
+    private void _FlushBatchedNoiseCoords()
+    {
+#if LOGGING
+        float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         gpuCoordXZTexture.SetPixels(gpuCoordXZPixels);
         gpuCoordXZTexture.Apply(false, false);
         gpuCoordYTexture.SetPixels(gpuCoordYPixels);
         gpuCoordYTexture.Apply(false, false);
-        gpuLastCoordUploadSource = source;
-        gpuLastCoordUploadXPos = xPos;
-        gpuLastCoordUploadYPos = yPos;
-        gpuLastCoordUploadZPos = zPos;
-        gpuLastCoordUploadXSize = xSize;
-        gpuLastCoordUploadYSize = ySize;
-        gpuLastCoordUploadZSize = zSize;
-        gpuLastCoordUploadGridX = gridX;
-        gpuLastCoordUploadGridY = gridY;
-        gpuLastCoordUploadGridZ = gridZ;
-        gpuLastCoordUploadIs2D = is2D;
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -1719,7 +1711,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
     }
 
-    private void _RunGpuNoiseOctaves(NoiseGeneratorOctaves3D source, int octaveCount, RenderTexture resultTexture, int xPos, int yPos, int zPos, int xSize, int ySize, int zSize, double gridX, double gridY, double gridZ, bool is2D)
+    private void _RunGpuNoiseOctaves(NoiseGeneratorOctaves3D source, int octaveCount, RenderTexture resultTexture, int xPos, int yPos, int zPos, int xSize, int ySize, int zSize, double gridX, double gridY, double gridZ, bool is2D, int octaveRowOffset)
     {
         if (!gpuWorldgenReady || source == null || resultTexture == null) return;
         Texture2D permutationTexture = _ResolveGpuPermutationTexture(source);
@@ -1738,7 +1730,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
             }
 #endif
         }
-        _UploadGpuNoiseCoordTextures(source, octaveCount, xSize, ySize, zSize, xPos, yPos, zPos, gridX, gridY, gridZ, is2D);
 
         gpuNoiseOctaveMaterial.SetTexture(gpuPropPermTexId, permutationTexture);
         gpuNoiseOctaveMaterial.SetTexture(gpuPropCoordXZTexId, gpuCoordXZTexture);
@@ -1748,6 +1739,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuNoiseOctaveMaterial.SetInt(gpuPropYSizeId, ySize);
         gpuNoiseOctaveMaterial.SetInt(gpuPropZSizeId, zSize);
         gpuNoiseOctaveMaterial.SetInt(gpuPropIs2DId, is2D ? 1 : 0);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropOctaveRowOffsetId, octaveRowOffset);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropCoordTexHeightId, GPU_COORD_TEX_HEIGHT);
 
 #if LOGGING
         float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -2163,25 +2156,35 @@ public class McTerrainGenerator : UdonSharpBehaviour
         double d0 = 684.412D;
         double d1 = 684.412D;
 
-        // GPU noise: precompute coordinates on CPU (double precision), run shader per octave.
-        // This eliminates the ~600ms CPU noise bottleneck while maintaining 1:1 accuracy
-        // via CPU-precomputed permutation indices and fractional parts.
+        // Batch all 5 density generators' coords into a single texture upload (2 Apply calls
+        // instead of 10), then run each noise blit reading from its own row block.
+        _WriteNoiseCoordBlock(noiseGen1, 16, densityXSize, densityYSize, densityZSize,
+            densityXPos, 0, densityZPos, d0, d1, d0, false, 0);
+        _WriteNoiseCoordBlock(noiseGen2, 16, densityXSize, densityYSize, densityZSize,
+            densityXPos, 0, densityZPos, d0, d1, d0, false, 1);
+        _WriteNoiseCoordBlock(noiseGen3, 8, densityXSize, densityYSize, densityZSize,
+            densityXPos, 0, densityZPos, d0 / 80.0D, d1 / 160.0D, d0 / 80.0D, false, 2);
+        _WriteNoiseCoordBlock(noiseGen6, 10, densityXSize, 1, densityZSize,
+            densityXPos, 10, densityZPos, 1.121D, 1.0D, 1.121D, true, 3);
+        _WriteNoiseCoordBlock(noiseGen7, 16, densityXSize, 1, densityZSize,
+            densityXPos, 10, densityZPos, 200.0D, 1.0D, 200.0D, true, 4);
+        _FlushBatchedNoiseCoords();
+
         _RunGpuNoiseOctaves(noiseGen1, 16, gpuNoise1Texture,
             densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize,
-            d0, d1, d0, false);
+            d0, d1, d0, false, 0 * GPU_MAX_OCTAVES);
         _RunGpuNoiseOctaves(noiseGen2, 16, gpuNoise2Texture,
             densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize,
-            d0, d1, d0, false);
+            d0, d1, d0, false, 1 * GPU_MAX_OCTAVES);
         _RunGpuNoiseOctaves(noiseGen3, 8, gpuNoise3Texture,
             densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize,
-            d0 / 80.0D, d1 / 160.0D, d0 / 80.0D, false);
-        // 2D noise: generateNoiseArray internally calls generateNoiseOctaves(ad, x, 10.0, z, xSize, 1, zSize, gridX, 1.0, gridZ)
+            d0 / 80.0D, d1 / 160.0D, d0 / 80.0D, false, 2 * GPU_MAX_OCTAVES);
         _RunGpuNoiseOctaves(noiseGen6, 10, gpuNoise6Texture,
             densityXPos, 10, densityZPos, densityXSize, 1, densityZSize,
-            1.121D, 1.0D, 1.121D, true);
+            1.121D, 1.0D, 1.121D, true, 3 * GPU_MAX_OCTAVES);
         _RunGpuNoiseOctaves(noiseGen7, 16, gpuNoise7Texture,
             densityXPos, 10, densityZPos, densityXSize, 1, densityZSize,
-            200.0D, 1.0D, 200.0D, true);
+            200.0D, 1.0D, 200.0D, true, 4 * GPU_MAX_OCTAVES);
 
 
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise1TexId, gpuNoise1Texture);

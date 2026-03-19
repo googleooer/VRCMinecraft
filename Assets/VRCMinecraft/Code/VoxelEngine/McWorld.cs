@@ -1789,6 +1789,7 @@ public class McWorld : UdonSharpBehaviour
             chunk._gpuFaceDirection = 0;
             chunk._gpuFaceSlice = 0;
             chunk._gpuFaceCrossIndex = 0;
+            chunk._gpuFaceWaterColumnIndex = 0;
             chunk._gpuFaceSummaryIndex = 0;
         }
         else
@@ -1801,6 +1802,7 @@ public class McWorld : UdonSharpBehaviour
             chunk._gpuFaceDirection = 0;
             chunk._gpuFaceSlice = 0;
             chunk._gpuFaceCrossIndex = 0;
+            chunk._gpuFaceWaterColumnIndex = 0;
             chunk._gpuFaceSummaryIndex = 0;
         }
 
@@ -1967,6 +1969,7 @@ public class McWorld : UdonSharpBehaviour
                     chunk._gpuFaceDirection = 0;
                     chunk._gpuFaceSlice = 0;
                     chunk._gpuFaceCrossIndex = 0;
+                    chunk._gpuFaceWaterColumnIndex = 0;
                     continue;
                 }
 
@@ -2026,6 +2029,7 @@ public class McWorld : UdonSharpBehaviour
                     chunk._gpuFaceDirection = 0;
                     chunk._gpuFaceSlice = 0;
                     chunk._gpuFaceCrossIndex = 0;
+                    chunk._gpuFaceWaterColumnIndex = 0;
                 }
                 continue;
             }
@@ -2202,11 +2206,11 @@ public class McWorld : UdonSharpBehaviour
 
                 if (chunk._gpuFaceCrossIndex >= crossCount)
                 {
-                    // Torch and water blocks are not extracted by the GPU face shader —
-                    // add them as CPU fixup, same pattern as cross blocks above.
+                    // Torches are few per chunk — process them unbounded.
                     _AddTorchBlocks(chunk);
-                    _AddWaterBlocks(chunk);
-                    chunk._gpuFaceBuildStage = 2;
+                    // Water gets its own budget-gated stage to avoid 50-100ms spikes
+                    // on chunks with large water bodies.
+                    chunk._gpuFaceBuildStage = chunk._hasWaterBlocks ? 2 : 3;
                 }
                 if (enableDetailedTimings && useSummary)
                 {
@@ -2215,7 +2219,52 @@ public class McWorld : UdonSharpBehaviour
                 continue;
             }
 
+            // Stage 2: budget-gated water block fixup (column by column)
             if (chunk._gpuFaceBuildStage == 2)
+            {
+                if (chunk._decompSelf != null && chunk._columnMinY != null)
+                {
+                    int waterStride = chunkSizeXZ * chunkSizeXZ;
+                    int totalColumns = waterStride;
+                    int waterBudgetCountdown = 4;
+                    int colMinLen = chunk._columnMinY.Length;
+                    int decompLen = chunk._decompSelf.Length;
+                    while (chunk._gpuFaceWaterColumnIndex < totalColumns)
+                    {
+                        int col = chunk._gpuFaceWaterColumnIndex++;
+                        if (col >= colMinLen) break;
+                        int z = col / chunkSizeXZ;
+                        int x = col % chunkSizeXZ;
+                        byte minY = chunk._columnMinY[col];
+                        byte maxY = chunk._columnMaxY[col];
+                        if (minY == 255 || maxY == 255) continue;
+                        for (int y = minY; y <= maxY; y++)
+                        {
+                            int idx = y * waterStride + col;
+                            if (idx >= decompLen) break;
+                            byte blockID = chunk._decompSelf[idx];
+                            if (!_IsWaterBlock(blockID)) continue;
+                            _AddWaterBlock(chunk, x, y, z, blockID);
+                        }
+                        if (--waterBudgetCountdown <= 0)
+                        {
+                            waterBudgetCountdown = 4;
+                            if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
+                        }
+                    }
+                    if (chunk._gpuFaceWaterColumnIndex >= totalColumns)
+                    {
+                        chunk._gpuFaceBuildStage = 3;
+                    }
+                }
+                else
+                {
+                    chunk._gpuFaceBuildStage = 3;
+                }
+                continue;
+            }
+
+            if (chunk._gpuFaceBuildStage == 3)
             {
                 bool interactionPriority = chunk.interactionMeshPriority;
                 _ApplyAllMeshData(chunk);
@@ -3151,6 +3200,7 @@ public class McWorld : UdonSharpBehaviour
             chunk._cachedDecompressedData = generatedData;
             chunk._decompCacheValid = true;
             chunk._cachedDataVersion++;
+            _RefreshChunkDerivedData(chunk, generatedData);
 
             _GpuSyncChunkBlocks(chunk, generatedData);
 
@@ -4045,29 +4095,17 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
-        // OPTIMIZATION: Skip all-air chunks that are fully surrounded by air or out-of-bounds
-        // These chunks have zero blocks and all neighbors are also empty, so zero faces
+        // All-air chunks have zero blocks and can never produce interior faces.
+        // Boundary faces are handled by the neighboring solid chunk's mesh.
         if (chunk._isAllAir)
         {
-            bool hasNonAirNeighbor = false;
-            for (int i = 0; i < 6; i++)
-            {
-                ChunkData neighbor = GetChunkAt(chunk.chunkX_world + neighbor_dx_offsets[i], chunk.chunkY_world + neighbor_dy_offsets[i], chunk.chunkZ_world + neighbor_dz_offsets[i]);
-                if (neighbor != null && neighbor.isDataReady && !neighbor._isAllAir)
-                {
-                    hasNonAirNeighbor = true; break;
-                }
-            }
-            if (!hasNonAirNeighbor)
-            {
-                _ApplyEmptyMesh(chunk);
+            _ApplyEmptyMesh(chunk);
 #if LOGGING
-                _RecordMeshBuildCompletion(chunk, false, true);
+            _RecordMeshBuildCompletion(chunk, false, true);
 #endif
-                chunk.isBuildingMesh = false;
-                chunk.interactionMeshPriority = false;
-                return;
-            }
+            chunk.isBuildingMesh = false;
+            chunk.interactionMeshPriority = false;
+            return;
         }
 
         _EnsureMeshBuffers(chunk);

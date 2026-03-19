@@ -61,10 +61,11 @@ public class ChunkData
     public int _gpuFaceReadbackQueueSlot = -1;
     public bool _gpuMeshPending = false;
     public bool _gpuFaceBuildActive = false;
-    public int _gpuFaceBuildStage = 0; // -1=summary prep, 0=greedy faces, 1=cross blocks, 2=apply
+    public int _gpuFaceBuildStage = 0; // -1=summary prep, 0=greedy faces, 1=cross+torch, 2=water, 3=apply
     public int _gpuFaceDirection = 0;
     public int _gpuFaceSlice = 0;
     public int _gpuFaceCrossIndex = 0;
+    public int _gpuFaceWaterColumnIndex = 0;
     public int _gpuFaceSummaryIndex = 0;
     public bool _gpuFaceBuildUsesSummary = false;
     public Color32[] _gpuFacePixels;
