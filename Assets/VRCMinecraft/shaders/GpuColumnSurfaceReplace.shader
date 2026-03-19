@@ -18,6 +18,7 @@ Shader "VRCM/GpuColumnSurfaceReplace"
         _GravelBlockId ("Gravel Block ID", Int) = 13
         _WaterBlockId ("Water Block ID", Int) = 9
         _SandstoneBlockId ("Sandstone Block ID", Int) = 24
+        _FlipXAxis ("Flip X Axis", Int) = 0
     }
 
     SubShader
@@ -66,6 +67,7 @@ Shader "VRCM/GpuColumnSurfaceReplace"
             int _GravelBlockId;
             int _WaterBlockId;
             int _SandstoneBlockId;
+            int _FlipXAxis;
 
             v2f vert(appdata v)
             {
@@ -103,7 +105,8 @@ Shader "VRCM/GpuColumnSurfaceReplace"
 
             float readNoiseValue(sampler2D noiseTex, int x, int z)
             {
-                float2 uv = float2((x + 0.5) / (float)_ChunkSizeXZ, (z + 0.5) / (float)_ChunkSizeXZ);
+                int noiseX = _FlipXAxis == 1 ? (_ChunkSizeXZ - 1 - x) : x;
+                float2 uv = float2((noiseX + 0.5) / (float)_ChunkSizeXZ, (z + 0.5) / (float)_ChunkSizeXZ);
                 return tex2Dlod(noiseTex, float4(uv, 0, 0)).r;
             }
 

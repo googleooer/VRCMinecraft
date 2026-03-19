@@ -355,8 +355,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // CPU noise upload textures (reusable, pre-allocated)
     private Texture2D gpuNoiseUpload3D;
     private Texture2D gpuNoiseUpload2D;
+    private Texture2D gpuSurfaceNoiseUpload;
     private Color[] gpuNoiseUpload3DPixels;
     private Color[] gpuNoiseUpload2DPixels;
+    private Color[] gpuSurfaceNoiseUploadPixels;
     private RenderTexture gpuNoise1Texture;
     private RenderTexture gpuNoise2Texture;
     private RenderTexture gpuNoise3Texture;
@@ -1130,6 +1132,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuNoiseUpload2D = _CreateGpuFloatTexture(densityXSize, densityZSize, TextureWrapMode.Clamp);
         gpuNoiseUpload3DPixels = new Color[densityPackedWidth * densityYSize];
         gpuNoiseUpload2DPixels = new Color[densityXSize * densityZSize];
+        int surfNoiseSize = world.chunkSizeXZ;
+        gpuSurfaceNoiseUpload = _CreateGpuPreciseFloatTexture(surfNoiseSize, surfNoiseSize, TextureWrapMode.Clamp);
+        gpuSurfaceNoiseUploadPixels = new Color[surfNoiseSize * surfNoiseSize];
         gpuNoise1Texture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Noise1");
         gpuNoise2Texture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Noise2");
         gpuNoise3Texture = _CreateGpuFloatRenderTexture(densityPackedWidth, densityYSize, "GPU_Noise3");
@@ -1797,6 +1802,26 @@ public class McTerrainGenerator : UdonSharpBehaviour
         VRCGraphics.Blit(gpuNoiseUpload2D, target);
     }
 
+    /// <summary>
+    /// Upload CPU-computed surface noise (sand/gravel/stone) to a GPU RenderTexture.
+    /// CPU array order: [x][z] = array[x * size + z]
+    /// Texture layout: pixel(x, z) = pixels[z * size + x]
+    /// Uses the dedicated 16x16 gpuSurfaceNoiseUpload texture.
+    /// </summary>
+    private void _UploadCpuSurfaceNoise(double[] cpuNoise, int size, RenderTexture target)
+    {
+        for (int nx = 0; nx < size; nx++)
+            for (int nz = 0; nz < size; nz++)
+            {
+                int cpuIdx = nx * size + nz;
+                int texIdx = nz * size + nx;
+                gpuSurfaceNoiseUploadPixels[texIdx] = new Color((float)cpuNoise[cpuIdx], 0f, 0f, 1f);
+            }
+        gpuSurfaceNoiseUpload.SetPixels(gpuSurfaceNoiseUploadPixels);
+        gpuSurfaceNoiseUpload.Apply(false, false);
+        VRCGraphics.Blit(gpuSurfaceNoiseUpload, target);
+    }
+
     private bool _ShouldRunGpuNoiseDiagnosticsForCurrentChunk()
     {
         if (!enableGpuNoiseDiagnostics) return false;
@@ -2330,15 +2355,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int noiseX = _GetTerrainBlockStartX(currentChunkX);
         int noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
 
-        _RunGpuNoiseOctaves(noiseGen4, 16, gpuSandNoiseTexture,
-            noiseX, noiseZ, 0, sizeXZ, sizeXZ, 1,
-            0.03125D, 0.03125D, 1.0D, false);
-        _RunGpuNoiseOctaves(noiseGen4, 16, gpuGravelNoiseTexture,
-            noiseX, 109, noiseZ, sizeXZ, 1, sizeXZ,
-            0.03125D, 1.0D, 0.03125D, true);
-        _RunGpuNoiseOctaves(noiseGen5, 16, gpuStoneNoiseTexture,
-            noiseX, noiseZ, 0, sizeXZ, sizeXZ, 1,
-            0.0625D, 0.0625D, 0.0625D, false);
+        // Sand/gravel/stone noise: computed on CPU because the GPU noise shader produces
+        // incorrect values for these 16x16 surface noise textures (confirmed against vanilla MC).
+        // Cost is negligible — three 256-element arrays per chunk.
+        double[] cpuSandN = noiseGen4.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.03125D, 0.03125D, 1.0D);
+        _UploadCpuSurfaceNoise(cpuSandN, sizeXZ, gpuSandNoiseTexture);
+
+        double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
+        _UploadCpuSurfaceNoise(cpuGravelN, sizeXZ, gpuGravelNoiseTexture);
+
+        double[] cpuStoneN = noiseGen5.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.0625D, 0.0625D, 0.0625D);
+        _UploadCpuSurfaceNoise(cpuStoneN, sizeXZ, gpuStoneNoiseTexture);
 
         _BuildGpuSurfaceParamsFromSurfaceInfo();
 
@@ -2358,6 +2385,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropGravelBlockId, (int)BlockMaterial.GRAVEL);
         gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropWaterBlockId, waterBlockID);
         gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropSandstoneBlockId, sandStoneBlockID);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
 
 #if LOGGING
         float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
