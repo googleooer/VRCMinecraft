@@ -2631,10 +2631,9 @@ public class McWorld : UdonSharpBehaviour
         newChunkData._chunkDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
         newChunkData._cachedNeighbors = new ChunkData[6];
 
-        newChunkData._opaqueVertices = new Vector3[MAX_VERTS]; newChunkData._opaqueTriangles = new int[MAX_TRIS]; newChunkData._opaqueUVs = new Vector3[MAX_VERTS]; newChunkData._opaqueNormals = new Vector3[MAX_VERTS]; newChunkData._opaqueColors = new Color[MAX_VERTS];
-        newChunkData._transparentVertices = new Vector3[MAX_VERTS]; newChunkData._transparentTriangles = new int[MAX_TRIS]; newChunkData._transparentUVs = new Vector3[MAX_VERTS]; newChunkData._transparentNormals = new Vector3[MAX_VERTS]; newChunkData._transparentColors = new Color[MAX_VERTS];
-        newChunkData._cutoutVertices = new Vector3[MAX_VERTS]; newChunkData._cutoutTriangles = new int[MAX_TRIS]; newChunkData._cutoutUVs = new Vector3[MAX_VERTS]; newChunkData._cutoutNormals = new Vector3[MAX_VERTS]; newChunkData._cutoutColors = new Color[MAX_VERTS];
-        newChunkData._collisionVertices = new Vector3[MAX_VERTS * 3]; newChunkData._collisionTriangles = new int[MAX_TRIS * 3];
+        // Mesh buffers are allocated lazily in _EnsureMeshBuffers, called by BuildChunkMesh.
+        // This avoids ~2.7MB of allocation per chunk at creation time and means
+        // air-only/occluded chunks that skip meshing never allocate buffers at all.
 
         // Initialize biome data arrays (16x16 per chunk)
         newChunkData._biomeTemperatures = new double[chunkSizeXZ * chunkSizeXZ];
@@ -4006,7 +4005,7 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
 
-        _ClearAllMeshBuffers(chunk);
+
 
 #if LOGGING
         if (enableDetailedTimings)
@@ -4067,6 +4066,9 @@ public class McWorld : UdonSharpBehaviour
                 return;
             }
         }
+
+        _EnsureMeshBuffers(chunk);
+        _ClearAllMeshBuffers(chunk);
 
         // Player edits should stay on the synchronous CPU mesh path so block changes
         // are visible immediately instead of waiting on async GPU face readback.
@@ -7106,6 +7108,15 @@ public class McWorld : UdonSharpBehaviour
         chunk._decompCacheValid = true;
         _RefreshChunkDerivedData(chunk, decompressed);
         return decompressed;
+    }
+
+    private void _EnsureMeshBuffers(ChunkData chunk)
+    {
+        if (chunk._opaqueVertices != null) return;
+        chunk._opaqueVertices = new Vector3[MAX_VERTS]; chunk._opaqueTriangles = new int[MAX_TRIS]; chunk._opaqueUVs = new Vector3[MAX_VERTS]; chunk._opaqueNormals = new Vector3[MAX_VERTS]; chunk._opaqueColors = new Color[MAX_VERTS];
+        chunk._transparentVertices = new Vector3[MAX_VERTS]; chunk._transparentTriangles = new int[MAX_TRIS]; chunk._transparentUVs = new Vector3[MAX_VERTS]; chunk._transparentNormals = new Vector3[MAX_VERTS]; chunk._transparentColors = new Color[MAX_VERTS];
+        chunk._cutoutVertices = new Vector3[MAX_VERTS]; chunk._cutoutTriangles = new int[MAX_TRIS]; chunk._cutoutUVs = new Vector3[MAX_VERTS]; chunk._cutoutNormals = new Vector3[MAX_VERTS]; chunk._cutoutColors = new Color[MAX_VERTS];
+        chunk._collisionVertices = new Vector3[MAX_VERTS * 3]; chunk._collisionTriangles = new int[MAX_TRIS * 3];
     }
 
     private void _ClearAllMeshBuffers(ChunkData chunk)
