@@ -462,6 +462,9 @@ public class McWorld : UdonSharpBehaviour
     private int stats_rleTotalBytesOut = 0;
     private int stats_rleHomogeneousChunks = 0;
 
+    // RLE scratch buffer — avoid per-column List<ushort> alloc during compression
+    private ushort[] rleScratchBuffer;
+
     // --- Block Operation Stats ---
     private int stats_getBlockCalls = 0;
     private int stats_setBlockCalls = 0;
@@ -3121,11 +3124,30 @@ public class McWorld : UdonSharpBehaviour
 
         if (isComplete)
         {
-            bool isHomogeneous;
-            chunk._chunkData = _CompressChunkColumnRLE(generatedData, out isHomogeneous);
-            
-            // OPTIMIZATION: Invalidate chunk-owned caches since we have new data
-            chunk._decompCacheValid = false;
+            // Check homogeneous cheaply — full RLE is deferred
+            bool isHomogeneous = true;
+            byte firstBlock = generatedData[0];
+            for (int ci = 1; ci < generatedData.Length; ci++) {
+                if (generatedData[ci] != firstBlock) { isHomogeneous = false; break; }
+            }
+
+            if (isHomogeneous)
+            {
+                chunk._chunkData = firstBlock;
+            }
+            else
+            {
+                // Clone the buffer — the terrain generator reuses it for the next chunk.
+                // Array.Copy of ~16KB is still much cheaper than 4ms RLE compression.
+                byte[] chunkRawData = new byte[generatedData.Length];
+                System.Array.Copy(generatedData, 0, chunkRawData, 0, generatedData.Length);
+                chunk._chunkData = chunkRawData;
+                generatedData = chunkRawData; // update ref so GPU sync and cache use the clone
+            }
+
+            // Populate decompressed cache so meshing never needs to decompress
+            chunk._cachedDecompressedData = generatedData;
+            chunk._decompCacheValid = true;
             chunk._cachedDataVersion++;
 
             _GpuSyncChunkBlocks(chunk, generatedData);
@@ -7186,19 +7208,27 @@ public class McWorld : UdonSharpBehaviour
 
         System.Type dataType = chunk._chunkData.GetType();
 
-        // Case 1: Homogeneous chunk, data is a single ushort
+        // Case 1: Homogeneous chunk, data is a single byte
         if (dataType == typeof(byte))
         {
             return (byte)chunk._chunkData;
         }
 
-        // Case 2: Column RLE chunk, data is ushort[][]
+        // Case 2: Raw uncompressed byte[] (deferred compression)
+        if (dataType == typeof(byte[]))
+        {
+            byte[] rawData = (byte[])chunk._chunkData;
+            int directIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
+            return directIndex >= 0 && directIndex < rawData.Length ? rawData[directIndex] : (byte)0;
+        }
+
+        // Case 3: Column RLE chunk, data is ushort[][]
         if (dataType == typeof(ushort[][]))
         {
             ushort[][] columnData = (ushort[][])chunk._chunkData;
             int columnIndex = z * chunkSizeXZ + x;
 
-            if (columnIndex < 0 || columnIndex >= columnData.Length) return 0; // Should not happen
+            if (columnIndex < 0 || columnIndex >= columnData.Length) return 0;
 
             ushort[] rlePairs = columnData[columnIndex];
             if (rlePairs == null) return 0;
@@ -7265,33 +7295,35 @@ public class McWorld : UdonSharpBehaviour
         _InvalidateNeighborCache(chunk);
 
         // --- New Optimized Set-Block Logic ---
-        if (chunk._chunkData.GetType() == typeof(ushort[][])) // Case 1: Standard Column RLE chunk
+        System.Type setBlockDataType = chunk._chunkData.GetType();
+        if (setBlockDataType == typeof(byte[])) // Case 1: Raw uncompressed byte[]
+        {
+            byte[] rawData = (byte[])chunk._chunkData;
+            int localIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
+            rawData[localIndex] = blockType;
+            // Stay as raw byte[] — no need to compress
+        }
+        else if (setBlockDataType == typeof(ushort[][])) // Case 2: Column RLE chunk
         {
             ushort[][] columnData = (ushort[][])chunk._chunkData;
             int columnIndex = z * chunkSizeXZ + x;
 
-            if (columnIndex < 0 || columnIndex >= columnData.Length) return; // Should not happen
+            if (columnIndex < 0 || columnIndex >= columnData.Length) return;
 
-            // Decompress the single column, modify it, and re-compress it.
             byte[] decompressedColumn = _DecompressSingleColumn(columnData[columnIndex]);
             decompressedColumn[y] = blockType;
             columnData[columnIndex] = _CompressSingleColumn(decompressedColumn);
-
-            // Since the chunk was already heterogeneous, isSingleOpaqueSolid must be false.
         }
-        else if (chunk._chunkData.GetType() == typeof(byte)) // Case 2: Homogeneous chunk being modified
+        else if (setBlockDataType == typeof(byte)) // Case 3: Homogeneous chunk being modified
         {
-            // The chunk is no longer homogeneous. Decompress the whole thing once.
             byte[] fullData = _GetDecompressedData(chunk);
             if (fullData == null) return;
 
-            // Modify the block
             int localIndex = y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x;
             fullData[localIndex] = blockType;
 
-            // Re-compress into the new Column RLE format.
-            bool isHomogeneous; // Will be false
-            chunk._chunkData = _CompressChunkColumnRLE(fullData, out isHomogeneous);
+            // Store as raw byte[] instead of re-compressing
+            chunk._chunkData = fullData;
             chunk.isSingleOpaqueSolid = false;
         }
 
@@ -7400,12 +7432,14 @@ public class McWorld : UdonSharpBehaviour
         int columnCount = chunkSizeXZ * chunkSizeXZ;
         ushort[][] columnRLEData = new ushort[columnCount][];
 
+        // Lazy-init scratch buffer (max pairs = chunkSizeY, 2 ushorts each)
+        if (rleScratchBuffer == null || rleScratchBuffer.Length < chunkSizeY * 2)
+            rleScratchBuffer = new ushort[chunkSizeY * 2];
+
         for (int x = 0; x < chunkSizeXZ; x++) {
             for (int z = 0; z < chunkSizeXZ; z++) {
                 int columnIndex = z * chunkSizeXZ + x;
-
-                // Using a list here because we don't know the final size. This is fine as it's a one-off operation.
-                var columnRuns = new System.Collections.Generic.List<ushort>();
+                int writePos = 0;
 
                 for (int y = 0; y < chunkSizeY; ) {
                     byte currentBlock = fullChunkData[y * columnCount + columnIndex];
@@ -7413,11 +7447,14 @@ public class McWorld : UdonSharpBehaviour
                     while (y + runLength < chunkSizeY && fullChunkData[(y + runLength) * columnCount + columnIndex] == currentBlock && runLength < ushort.MaxValue) {
                         runLength++;
                     }
-                    columnRuns.Add(currentBlock);
-                    columnRuns.Add(runLength);
+                    rleScratchBuffer[writePos++] = currentBlock;
+                    rleScratchBuffer[writePos++] = runLength;
                     y += runLength;
                 }
-                columnRLEData[columnIndex] = columnRuns.ToArray();
+
+                ushort[] column = new ushort[writePos];
+                System.Array.Copy(rleScratchBuffer, 0, column, 0, writePos);
+                columnRLEData[columnIndex] = column;
             }
         }
 
@@ -7451,6 +7488,19 @@ public class McWorld : UdonSharpBehaviour
         if (chunk._chunkData == null) return fullData;
 
         System.Type dataType = chunk._chunkData.GetType();
+
+        // Case 0: Raw uncompressed byte[] — just copy it
+        if (dataType == typeof(byte[])) {
+            byte[] rawData = (byte[])chunk._chunkData;
+            System.Array.Copy(rawData, 0, fullData, 0, Mathf.Min(rawData.Length, fullData.Length));
+#if LOGGING
+            if (enableDetailedTimings)
+            {
+                stats_rleDecompressionTime += (Time.realtimeSinceStartup - decompressStartTime) * 1000f;
+            }
+#endif
+            return fullData;
+        }
 
         // Case 1: Homogeneous chunk (optimized with Array.Fill equivalent)
         if (dataType == typeof(byte)) {
