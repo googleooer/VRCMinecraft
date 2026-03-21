@@ -344,7 +344,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private Texture2D gpuCoordXZTexture; // X in RG, Z in BA
     private Texture2D gpuCoordYTexture;
     private Texture2D gpuTemperatureTexture;
-    private Texture2D gpuRainfallTexture;
+
     private Texture2D gpuSurfaceParamsTextureA;
     private Texture2D gpuSurfaceParamsTextureB;
     private Texture2D gpuBedrockMaskTexture;
@@ -1107,7 +1107,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuCoordXZTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_XZSIZE, GPU_COORD_TEX_HEIGHT, TextureWrapMode.Clamp);
         gpuCoordYTexture = _CreateGpuPreciseFloatTexture(GPU_MAX_YSIZE, GPU_COORD_TEX_HEIGHT, TextureWrapMode.Clamp);
         gpuTemperatureTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
-        gpuRainfallTexture = _CreateGpuFloatTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuSurfaceParamsTextureA = _CreateGpuColorTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuSurfaceParamsTextureB = _CreateGpuColorTexture(world.chunkSizeXZ, world.chunkSizeXZ, TextureWrapMode.Clamp);
         gpuBedrockMaskTexture = _CreateGpuColorTexture(world.chunkSizeXZ, 5 * world.chunkSizeXZ, TextureWrapMode.Clamp);
@@ -1510,7 +1509,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     private void _UploadGpuClimateTextures()
     {
-        if (gpuTemperatureTexture == null || gpuRainfallTexture == null || wcm == null || wcm.temperatures == null || wcm.rainfall == null) return;
+        if (gpuTemperatureTexture == null || wcm == null || wcm.temperatures == null || wcm.rainfall == null) return;
         if (gpuClimateUploadValid && gpuClimateUploadChunkX == currentChunkX && gpuClimateUploadChunkZ == currentChunkZ) return;
 
 #if LOGGING
@@ -1524,31 +1523,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
             {
                 int sourceIndex = xBase + z;
                 int packedIndex = z * sizeXZ + x;
-                gpuClimatePixels[packedIndex] = new Color((float)wcm.temperatures[sourceIndex], 0f, 0f, 1f);
+                gpuClimatePixels[packedIndex] = new Color((float)wcm.temperatures[sourceIndex], (float)wcm.rainfall[sourceIndex], 0f, 1f);
             }
         }
         gpuTemperatureTexture.SetPixels(gpuClimatePixels);
         gpuTemperatureTexture.Apply(false, false);
 
-        for (int x = 0; x < sizeXZ; x++)
-        {
-            int xBase = x * sizeXZ;
-            for (int z = 0; z < sizeXZ; z++)
-            {
-                int sourceIndex = xBase + z;
-                int packedIndex = z * sizeXZ + x;
-                gpuClimatePixels[packedIndex] = new Color((float)wcm.rainfall[sourceIndex], 0f, 0f, 1f);
-            }
-        }
-        gpuRainfallTexture.SetPixels(gpuClimatePixels);
-        gpuRainfallTexture.Apply(false, false);
         gpuClimateUploadValid = true;
         gpuClimateUploadChunkX = currentChunkX;
         gpuClimateUploadChunkZ = currentChunkZ;
 #if LOGGING
         if (enableDetailedTimings)
         {
-            int bytes = sizeXZ * sizeXZ * 8 * 2;
+            int bytes = sizeXZ * sizeXZ * 8;
             _RecordGpuClimateUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, bytes);
         }
 #endif
@@ -2193,7 +2180,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise6TexId, gpuNoise6Texture);
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise7TexId, gpuNoise7Texture);
         gpuNoiseCombineMaterial.SetTexture(gpuPropTemperatureTexId, gpuTemperatureTexture);
-        gpuNoiseCombineMaterial.SetTexture(gpuPropRainfallTexId, gpuRainfallTexture);
         gpuNoiseCombineMaterial.SetInt(gpuPropXSizeId, densityXSize);
         gpuNoiseCombineMaterial.SetInt(gpuPropYSizeId, densityYSize);
         gpuNoiseCombineMaterial.SetInt(gpuPropZSizeId, densityZSize);

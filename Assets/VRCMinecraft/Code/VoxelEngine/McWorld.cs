@@ -272,7 +272,7 @@ public class McWorld : UdonSharpBehaviour
     private Color32[] gpuSlotLookupPixels;
     private Color32[] gpuSlotMetaPixels;
     private Color32[] gpuUploadBlockPixels;
-    private Color32[] gpuBlockIdToColor32;
+
     private RenderTexture gpuBlockAtlas;
     private RenderTexture gpuBlockAtlasScratch;
     private RenderTexture gpuLightAtlas;
@@ -322,6 +322,7 @@ public class McWorld : UdonSharpBehaviour
     private int gpuPropSlotMetaId;
     private int gpuPropOverlayTexId;
     private int gpuPropOverlayRectId;
+    private int gpuPropOverlayPackedWidthId;
     private int gpuPropTopSkyLightId;
     private GameObject gpuDebugHudRoot;
     private RectTransform gpuDebugHudRect;
@@ -536,6 +537,7 @@ public class McWorld : UdonSharpBehaviour
         _InitializeBetaWaterRendering();
         _InitializeGpuVoxelBackend();
         _InitializeGpuDebugHud();
+        _InitializeMeshPool();
         // Runtime override: VRChat rendering, physics, and internal overhead alone
         // consume ~12-14ms per frame. With our subsystems adding ~5-8ms the total
         // naturally runs 17-22ms. A budget below 22ms permanently pins the adaptive
@@ -567,10 +569,12 @@ public class McWorld : UdonSharpBehaviour
 
     private void _UpdateAdaptiveBudgets(float updateTimeMs)
     {
-        // Smooth the input with an EMA so single-frame spikes (GC, VRC internals)
-        // don't whipsaw the budgets between unlocked and floor.
+        // Clamp input before EMA — a single 300ms+ GC/VRC spike would poison
+        // the smoothed value for 40+ frames, collapsing budgets to the floor.
+        // Capping at 1.5× budget limits the damage to ~5 frames of recovery.
+        float clampedMs = updateTimeMs < updateTimeBudgetMs * 1.5f ? updateTimeMs : updateTimeBudgetMs * 1.5f;
         const float alpha = 0.15f;
-        lastUpdateDurationMs = lastUpdateDurationMs + alpha * (updateTimeMs - lastUpdateDurationMs);
+        lastUpdateDurationMs = lastUpdateDurationMs + alpha * (clampedMs - lastUpdateDurationMs);
 
         if (!enableAdaptiveBudgets)
         {
@@ -686,15 +690,12 @@ public class McWorld : UdonSharpBehaviour
 
         gpuSlotLookupPixels = new Color32[worldDimensionX * worldDimensionY * worldDimensionZ];
         gpuSlotMetaPixels = new Color32[gpuChunkSlotCapacity];
-        gpuUploadBlockPixels = new Color32[gpuTileWidth * gpuTileHeight];
-        gpuBlockIdToColor32 = new Color32[256];
-        for (int i = 0; i < 256; i++)
-            gpuBlockIdToColor32[i] = new Color32((byte)i, 0, 0, 255);
+        gpuUploadBlockPixels = new Color32[(gpuTileWidth / 4) * gpuTileHeight];
 
         gpuSlotLookupTexture = _CreateGpuTexture2D(worldDimensionX, worldDimensionY * worldDimensionZ);
         gpuSlotMetaTexture = _CreateGpuTexture2D(gpuChunkSlotCapacity, 1);
         gpuBlockPropertyTexture = _CreateGpuTexture2D(256, 1);
-        gpuUploadBlockTexture = _CreateGpuTexture2D(gpuTileWidth, gpuTileHeight);
+        gpuUploadBlockTexture = _CreateGpuTexture2D(gpuTileWidth / 4, gpuTileHeight);
         gpuClearTexture = _CreateGpuTexture2D(1, 1);
 
         gpuClearTexture.SetPixel(0, 0, new Color(0f, 0f, 0f, 0f));
@@ -733,6 +734,7 @@ public class McWorld : UdonSharpBehaviour
         gpuPropSlotMetaId = VRCShader.PropertyToID("_SlotMetaTex");
         gpuPropOverlayTexId = VRCShader.PropertyToID("_OverlayTex");
         gpuPropOverlayRectId = VRCShader.PropertyToID("_OverlayRect");
+        gpuPropOverlayPackedWidthId = VRCShader.PropertyToID("_OverlayPackedWidth");
         gpuPropTopSkyLightId = VRCShader.PropertyToID("_TopSkyLight");
         gpuPropDrawTableTexId = VRCShader.PropertyToID("_DrawTableTex");
         gpuPropFaceModeId = VRCShader.PropertyToID("_Mode");
@@ -1157,6 +1159,7 @@ public class McWorld : UdonSharpBehaviour
     {
         if (!gpuBackendReady || slotIndex < 0 || slotIndex >= gpuChunkSlotCapacity) return;
         gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetSlotRect(slotIndex));
+        gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayPackedWidthId, 0f);
         _GpuOverlayTextureIntoAtlas(gpuClearTexture, ref gpuLightAtlas, ref gpuLightAtlasScratch);
     }
 
@@ -1186,17 +1189,24 @@ public class McWorld : UdonSharpBehaviour
         _GpuClearSlotLight(slotIndex);
 
         int stride = chunkSizeXZ * chunkSizeXZ;
+        int packedWidth = chunkSizeXZ / 4;
         for (int y = 0; y < chunkSizeY; y++)
         {
             int yBase = y * stride;
             for (int z = 0; z < chunkSizeXZ; z++)
             {
                 int row = y * chunkSizeXZ + z;
-                int rowBase = row * chunkSizeXZ;
+                int packedRowBase = row * packedWidth;
                 int zBase = yBase + z * chunkSizeXZ;
-                for (int x = 0; x < chunkSizeXZ; x++)
+                for (int px = 0; px < packedWidth; px++)
                 {
-                    gpuUploadBlockPixels[rowBase + x] = gpuBlockIdToColor32[blockData[zBase + x]];
+                    int x = px * 4;
+                    gpuUploadBlockPixels[packedRowBase + px] = new Color32(
+                        blockData[zBase + x],
+                        blockData[zBase + x + 1],
+                        blockData[zBase + x + 2],
+                        blockData[zBase + x + 3]
+                    );
                 }
             }
         }
@@ -1216,7 +1226,9 @@ public class McWorld : UdonSharpBehaviour
 #endif
 
         gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetSlotRect(slotIndex));
+        gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayPackedWidthId, (float)(chunkSizeXZ / 4));
         _GpuOverlayTextureIntoAtlas(gpuUploadBlockTexture, ref gpuBlockAtlas, ref gpuBlockAtlasScratch);
+        gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayPackedWidthId, 0f);
         gpuChunkSyncedDataVersion[chunkIndex] = chunk._cachedDataVersion;
         _GpuRequestLightingRebuild();
         _GpuPublishGlobals();
@@ -1639,6 +1651,19 @@ public class McWorld : UdonSharpBehaviour
             if (processedThisFrame >= GPU_FACE_READBACKS_PER_FRAME) break;
             if (Time.realtimeSinceStartup - frameStart > frameBudget) break;
 
+            // Check pool availability BEFORE dequeuing — if no slot is free,
+            // leave the readback queued and retry next frame.
+            ChunkData peekChunk = gpuFaceReadbackChunks[gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyHead]];
+            if (peekChunk != null && peekChunk._meshPoolSlot < 0)
+            {
+                bool hasSlot = false;
+                for (int s = 0; s < MESH_POOL_SIZE; s++)
+                {
+                    if (meshPoolFree[s]) { hasSlot = true; break; }
+                }
+                if (!hasSlot) break;
+            }
+
             int bufferIndex = gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyHead];
             gpuFaceReadbackReadyHead = (gpuFaceReadbackReadyHead + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
             gpuFaceReadbackReadyCount--;
@@ -1741,6 +1766,7 @@ public class McWorld : UdonSharpBehaviour
     private void _StartGpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels, int bufferIndex)
     {
         if (chunk == null || facePixels == null) return;
+        if (!_AcquireMeshPool(chunk)) return;
 
         _ClearAllMeshBuffers(chunk);
         _PreComputeBiomeColors(chunk);
@@ -2288,6 +2314,7 @@ public class McWorld : UdonSharpBehaviour
                 else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
                 else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
                 else _ApplyDataToCollider(chunk);
+                _ReleaseMeshPool(chunk);
 #if LOGGING
                 _RecordMeshBuildCompletion(chunk, true, false);
 #endif
@@ -2698,7 +2725,7 @@ public class McWorld : UdonSharpBehaviour
         newChunkData._chunkDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
         newChunkData._cachedNeighbors = new ChunkData[6];
 
-        // Mesh buffers are allocated lazily in _EnsureMeshBuffers, called by BuildChunkMesh.
+        // Mesh buffers are pooled — acquired in _AcquireMeshPool, released in _ReleaseMeshPool.
         // This avoids ~2.7MB of allocation per chunk at creation time and means
         // air-only/occluded chunks that skip meshing never allocate buffers at all.
 
@@ -3027,6 +3054,8 @@ public class McWorld : UdonSharpBehaviour
 
                     chunk.pendingColliderApply = false;
                     _ApplyDataToCollider(chunk);
+                    chunk._collisionVertices = null;
+                    chunk._collisionTriangles = null;
                     completedTasks++;
                     if (completedTasks >= taskLimit) return completedTasks;
                 }
@@ -3116,6 +3145,8 @@ public class McWorld : UdonSharpBehaviour
                 if (!_ShouldEnableChunkCollider(chunk)) continue;
                 chunk.pendingColliderApply = false;
                 _ApplyDataToCollider(chunk);
+                chunk._collisionVertices = null;
+                chunk._collisionTriangles = null;
                 completedTasks++;
             }
 
@@ -4155,7 +4186,12 @@ public class McWorld : UdonSharpBehaviour
             return;
         }
 
-        _EnsureMeshBuffers(chunk);
+        if (!_AcquireMeshPool(chunk))
+        {
+            chunk.isBuildingMesh = false;
+            chunk.pendingChunkMeshRebuild = true;
+            return;
+        }
         _ClearAllMeshBuffers(chunk);
 
         byte[] chunkData = _GetDecompressedData(chunk);
@@ -4478,6 +4514,7 @@ public class McWorld : UdonSharpBehaviour
             else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
             else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
             else _ApplyDataToCollider(chunk);
+            _ReleaseMeshPool(chunk);
 
         }
     }
@@ -7161,13 +7198,127 @@ public class McWorld : UdonSharpBehaviour
         return decompressed;
     }
 
-    private void _EnsureMeshBuffers(ChunkData chunk)
+    // --- Mesh Buffer Pool ---
+    // 8 reusable buffer sets shared across all chunks (2x peak active meshers).
+    // Without pooling, 8192 chunks × ~2.6MB = 21GB — instant OOM on Quest 2.
+    // With pooling, 8 × ~2.6MB = ~21MB total.
+    private const int MESH_POOL_SIZE = 8;
+    private bool[] meshPoolFree;
+    private Vector3[][] meshPool_opaqueVerts, meshPool_transparentVerts, meshPool_cutoutVerts;
+    private int[][] meshPool_opaqueTris, meshPool_transparentTris, meshPool_cutoutTris;
+    private Vector3[][] meshPool_opaqueUVs, meshPool_transparentUVs, meshPool_cutoutUVs;
+    private Vector3[][] meshPool_opaqueNormals, meshPool_transparentNormals, meshPool_cutoutNormals;
+    private Color[][] meshPool_opaqueColors, meshPool_transparentColors, meshPool_cutoutColors;
+    private Vector3[][] meshPool_collisionVerts;
+    private int[][] meshPool_collisionTris;
+
+    private void _InitializeMeshPool()
     {
-        if (chunk._opaqueVertices != null) return;
-        chunk._opaqueVertices = new Vector3[MAX_VERTS]; chunk._opaqueTriangles = new int[MAX_TRIS]; chunk._opaqueUVs = new Vector3[MAX_VERTS]; chunk._opaqueNormals = new Vector3[MAX_VERTS]; chunk._opaqueColors = new Color[MAX_VERTS];
-        chunk._transparentVertices = new Vector3[MAX_VERTS]; chunk._transparentTriangles = new int[MAX_TRIS]; chunk._transparentUVs = new Vector3[MAX_VERTS]; chunk._transparentNormals = new Vector3[MAX_VERTS]; chunk._transparentColors = new Color[MAX_VERTS];
-        chunk._cutoutVertices = new Vector3[MAX_VERTS]; chunk._cutoutTriangles = new int[MAX_TRIS]; chunk._cutoutUVs = new Vector3[MAX_VERTS]; chunk._cutoutNormals = new Vector3[MAX_VERTS]; chunk._cutoutColors = new Color[MAX_VERTS];
-        chunk._collisionVertices = new Vector3[MAX_VERTS * 3]; chunk._collisionTriangles = new int[MAX_TRIS * 3];
+        meshPoolFree = new bool[MESH_POOL_SIZE];
+        meshPool_opaqueVerts = new Vector3[MESH_POOL_SIZE][];
+        meshPool_transparentVerts = new Vector3[MESH_POOL_SIZE][];
+        meshPool_cutoutVerts = new Vector3[MESH_POOL_SIZE][];
+        meshPool_opaqueTris = new int[MESH_POOL_SIZE][];
+        meshPool_transparentTris = new int[MESH_POOL_SIZE][];
+        meshPool_cutoutTris = new int[MESH_POOL_SIZE][];
+        meshPool_opaqueUVs = new Vector3[MESH_POOL_SIZE][];
+        meshPool_transparentUVs = new Vector3[MESH_POOL_SIZE][];
+        meshPool_cutoutUVs = new Vector3[MESH_POOL_SIZE][];
+        meshPool_opaqueNormals = new Vector3[MESH_POOL_SIZE][];
+        meshPool_transparentNormals = new Vector3[MESH_POOL_SIZE][];
+        meshPool_cutoutNormals = new Vector3[MESH_POOL_SIZE][];
+        meshPool_opaqueColors = new Color[MESH_POOL_SIZE][];
+        meshPool_transparentColors = new Color[MESH_POOL_SIZE][];
+        meshPool_cutoutColors = new Color[MESH_POOL_SIZE][];
+        meshPool_collisionVerts = new Vector3[MESH_POOL_SIZE][];
+        meshPool_collisionTris = new int[MESH_POOL_SIZE][];
+        for (int i = 0; i < MESH_POOL_SIZE; i++)
+        {
+            meshPoolFree[i] = true;
+            meshPool_opaqueVerts[i] = new Vector3[MAX_VERTS];
+            meshPool_opaqueTris[i] = new int[MAX_TRIS];
+            meshPool_opaqueUVs[i] = new Vector3[MAX_VERTS];
+            meshPool_opaqueNormals[i] = new Vector3[MAX_VERTS];
+            meshPool_opaqueColors[i] = new Color[MAX_VERTS];
+            meshPool_transparentVerts[i] = new Vector3[MAX_VERTS];
+            meshPool_transparentTris[i] = new int[MAX_TRIS];
+            meshPool_transparentUVs[i] = new Vector3[MAX_VERTS];
+            meshPool_transparentNormals[i] = new Vector3[MAX_VERTS];
+            meshPool_transparentColors[i] = new Color[MAX_VERTS];
+            meshPool_cutoutVerts[i] = new Vector3[MAX_VERTS];
+            meshPool_cutoutTris[i] = new int[MAX_TRIS];
+            meshPool_cutoutUVs[i] = new Vector3[MAX_VERTS];
+            meshPool_cutoutNormals[i] = new Vector3[MAX_VERTS];
+            meshPool_cutoutColors[i] = new Color[MAX_VERTS];
+            meshPool_collisionVerts[i] = new Vector3[MAX_VERTS * 3];
+            meshPool_collisionTris[i] = new int[MAX_TRIS * 3];
+        }
+    }
+
+    private bool _AcquireMeshPool(ChunkData chunk)
+    {
+        if (chunk._meshPoolSlot >= 0) return true; // already acquired
+        for (int i = 0; i < MESH_POOL_SIZE; i++)
+        {
+            if (!meshPoolFree[i]) continue;
+            meshPoolFree[i] = false;
+            chunk._meshPoolSlot = i;
+            chunk._opaqueVertices = meshPool_opaqueVerts[i];
+            chunk._opaqueTriangles = meshPool_opaqueTris[i];
+            chunk._opaqueUVs = meshPool_opaqueUVs[i];
+            chunk._opaqueNormals = meshPool_opaqueNormals[i];
+            chunk._opaqueColors = meshPool_opaqueColors[i];
+            chunk._transparentVertices = meshPool_transparentVerts[i];
+            chunk._transparentTriangles = meshPool_transparentTris[i];
+            chunk._transparentUVs = meshPool_transparentUVs[i];
+            chunk._transparentNormals = meshPool_transparentNormals[i];
+            chunk._transparentColors = meshPool_transparentColors[i];
+            chunk._cutoutVertices = meshPool_cutoutVerts[i];
+            chunk._cutoutTriangles = meshPool_cutoutTris[i];
+            chunk._cutoutUVs = meshPool_cutoutUVs[i];
+            chunk._cutoutNormals = meshPool_cutoutNormals[i];
+            chunk._cutoutColors = meshPool_cutoutColors[i];
+            chunk._collisionVertices = meshPool_collisionVerts[i];
+            chunk._collisionTriangles = meshPool_collisionTris[i];
+            return true;
+        }
+        return false; // pool exhausted — caller should defer
+    }
+
+    private void _ReleaseMeshPool(ChunkData chunk)
+    {
+        int slot = chunk._meshPoolSlot;
+        if (slot < 0) return;
+
+        // Compact-copy collision data if deferred apply is pending.
+        // The pooled collision arrays are about to be reused by the next chunk,
+        // so the chunk needs its own right-sized copy.
+        if (chunk.pendingColliderApply && chunk._collisionVertexCount > 0)
+        {
+            int vc = chunk._collisionVertexCount;
+            int tc = chunk._collisionTriangleCount;
+            Vector3[] compactVerts = new Vector3[vc];
+            int[] compactTris = new int[tc];
+            System.Array.Copy(chunk._collisionVertices, 0, compactVerts, 0, vc);
+            System.Array.Copy(chunk._collisionTriangles, 0, compactTris, 0, tc);
+            chunk._collisionVertices = compactVerts;
+            chunk._collisionTriangles = compactTris;
+        }
+        else
+        {
+            chunk._collisionVertices = null;
+            chunk._collisionTriangles = null;
+        }
+
+        chunk._opaqueVertices = null; chunk._opaqueTriangles = null;
+        chunk._opaqueUVs = null; chunk._opaqueNormals = null; chunk._opaqueColors = null;
+        chunk._transparentVertices = null; chunk._transparentTriangles = null;
+        chunk._transparentUVs = null; chunk._transparentNormals = null; chunk._transparentColors = null;
+        chunk._cutoutVertices = null; chunk._cutoutTriangles = null;
+        chunk._cutoutUVs = null; chunk._cutoutNormals = null; chunk._cutoutColors = null;
+
+        chunk._meshPoolSlot = -1;
+        meshPoolFree[slot] = true;
     }
 
     private void _ClearAllMeshBuffers(ChunkData chunk)
@@ -7237,7 +7388,7 @@ public class McWorld : UdonSharpBehaviour
         if (colMesh == null) { colMesh = new Mesh(); colMesh.name = $"ChunkCollisionMesh_{chunk.gameObject.name}"; colMesh.MarkDynamic(); }
 
         colMesh.Clear();
-        if (chunk._collisionVertexCount == 0) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; return; }
+        if (chunk._collisionVertexCount == 0 || chunk._collisionVertices == null || chunk._collisionVertices.Length < chunk._collisionVertexCount) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; return; }
 
         chunk.meshCollider.enabled = true;
         colMesh.SetVertices(chunk._collisionVertices, 0, chunk._collisionVertexCount);

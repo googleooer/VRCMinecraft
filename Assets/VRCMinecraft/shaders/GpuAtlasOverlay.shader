@@ -5,6 +5,7 @@ Shader "VRCM/GpuAtlasOverlay"
         _MainTex ("Source Atlas", 2D) = "black" {}
         _OverlayTex ("Overlay", 2D) = "black" {}
         _OverlayRect ("Overlay Rect", Vector) = (0,0,1,1)
+        _OverlayPackedWidth ("Packed Width (px)", Float) = 0
     }
 
     SubShader
@@ -40,6 +41,7 @@ Shader "VRCM/GpuAtlasOverlay"
             sampler2D _MainTex;
             sampler2D _OverlayTex;
             float4 _OverlayRect;
+            float _OverlayPackedWidth;
 
             v2f vert(appdata v)
             {
@@ -51,15 +53,41 @@ Shader "VRCM/GpuAtlasOverlay"
 
             fixed4 frag(v2f i) : SV_Target
             {
-                fixed4 atlasColor = tex2D(_MainTex, i.uv);
                 float2 minUv = _OverlayRect.xy;
                 float2 maxUv = _OverlayRect.xy + _OverlayRect.zw;
-                if (i.uv.x >= minUv.x && i.uv.x < maxUv.x && i.uv.y >= minUv.y && i.uv.y < maxUv.y)
+                if (i.uv.x < minUv.x || i.uv.x >= maxUv.x || i.uv.y < minUv.y || i.uv.y >= maxUv.y)
+                    return tex2D(_MainTex, i.uv);
+
+                // Local UV within the overlay rect (0..1)
+                float2 localUv = (i.uv - minUv) / _OverlayRect.zw;
+
+                if (_OverlayPackedWidth > 0.5)
                 {
-                    float2 overlayUv = (i.uv - minUv) / _OverlayRect.zw;
-                    return tex2D(_OverlayTex, overlayUv);
+                    // Packed block upload: 4 block IDs per RGBA pixel.
+                    // localUv.x spans the full tile width (e.g. 16 voxels).
+                    // The packed texture is 1/4 that width.
+                    float fullWidth = _OverlayPackedWidth * 4.0;
+                    float pixelX = floor(localUv.x * fullWidth);
+                    float packedX = floor(pixelX * 0.25);
+                    float channel = pixelX - packedX * 4.0;
+
+                    float2 packedUv = float2(
+                        (packedX + 0.5) / _OverlayPackedWidth,
+                        localUv.y
+                    );
+                    fixed4 packed = tex2D(_OverlayTex, packedUv);
+
+                    float blockId = 0.0;
+                    if (channel < 0.5) blockId = packed.r;
+                    else if (channel < 1.5) blockId = packed.g;
+                    else if (channel < 2.5) blockId = packed.b;
+                    else blockId = packed.a;
+
+                    return fixed4(blockId, 0.0, 0.0, 1.0);
                 }
-                return atlasColor;
+
+                // Non-packed path (used for other overlays like the clear texture)
+                return tex2D(_OverlayTex, localUv);
             }
             ENDCG
         }
