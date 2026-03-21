@@ -80,8 +80,8 @@ public class ChunkData
     public int _greedyU, _greedyV;
     public int _lastMeshStepFrame = 0;
 
-    // --- Meshing Buffers ---
-    // These could be pooled by McWorld to reduce allocations
+    // --- Meshing Buffers (pooled by McWorld — only valid while isBuildingMesh) ---
+    public int _meshPoolSlot = -1;
     public Vector3[] _opaqueVertices; public int[] _opaqueTriangles; public Vector3[] _opaqueUVs; public Vector3[] _opaqueNormals;
     public int _opaqueVertexCount; public int _opaqueTriangleCount;
     public Vector3[] _transparentVertices; public int[] _transparentTriangles; public Vector3[] _transparentUVs; public Vector3[] _transparentNormals;

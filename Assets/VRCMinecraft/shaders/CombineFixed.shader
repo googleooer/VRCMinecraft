@@ -141,8 +141,9 @@ Shader "VRCM/CombineFixed"
                 
                 // Sample temperature and rainfall
                 float2 biomeUV = float2(((float)k2 + 0.5) / 16.0, ((float)i3 + 0.5) / 16.0);
-                float temp = tex2Dlod(_TemperatureTex, float4(biomeUV, 0, 0)).r;
-                float rain = tex2Dlod(_RainfallTex, float4(biomeUV, 0, 0)).r;
+                float4 climateSample = tex2Dlod(_TemperatureTex, float4(biomeUV, 0, 0));
+                float temp = climateSample.r;
+                float rain = climateSample.g;
                 
                 // Calculate biome influence (exact CPU logic)
                 float d3 = rain * temp;
