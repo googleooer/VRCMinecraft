@@ -20,6 +20,17 @@ Base Unity Threading is not exposed to Udon.
 Base Unity Yield is not exposed to Udon.
 UdonSharp does not currently support node type 'YieldBreakStatement'
 
+# Udon VM Quirks
+Never use post-increment/decrement on an object field as an expression (e.g. `int x = obj.field++;`). The Udon VM does not return the pre-increment value correctly — it silently returns field+1 instead of field, skipping the first value. Always split into a read then a separate assignment:
+```csharp
+// BAD — Udon returns wrong value for first iteration:
+int col = chunk._index++;
+
+// GOOD — unambiguous across all runtimes:
+int col = chunk._index;
+chunk._index = col + 1;
+```
+
 # Chunk-related information
 We are using individual materials for blocks
 Chunks are 16x64x16
