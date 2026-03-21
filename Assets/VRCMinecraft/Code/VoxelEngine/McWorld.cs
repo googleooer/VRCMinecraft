@@ -32,7 +32,7 @@ public class McWorld : UdonSharpBehaviour
     [Tooltip("Approximate time budget per mesh step in milliseconds. OPTIMIZATION Phase 4: Increased from 1.5ms to 8.0ms to reduce loop overhead (fewer, larger steps).")]
     public float meshStepTimeBudgetMs = 8.0f;
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
-    public float updateTimeBudgetMs = 12.0f;
+    public float updateTimeBudgetMs = 16.0f;
     [Tooltip("Budget per incremental GPU mesh decode step in milliseconds. Lower values reduce hitches from GPU mesh completion.")]
     public float gpuMeshDecodeStepBudgetMs = 2.5f;
     [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame.")]
@@ -536,6 +536,11 @@ public class McWorld : UdonSharpBehaviour
         _InitializeBetaWaterRendering();
         _InitializeGpuVoxelBackend();
         _InitializeGpuDebugHud();
+        // Runtime override: Inspector may have a stale 12ms value from before the
+        // coordinator was moved to its own Update(). McWorld.Update measures its own
+        // time which naturally runs 14-16ms; a budget below that permanently pins
+        // the adaptive decode budget to its floor.
+        if (updateTimeBudgetMs < 16f) updateTimeBudgetMs = 16f;
         _ResetAdaptiveBudgets();
         
         terrainGenerator.init(McUtils.GetMinecraftSeed(worldSeedString));
@@ -3794,6 +3799,38 @@ public class McWorld : UdonSharpBehaviour
 
             RequestChunkMeshUpdate(neighborIndex);
         }
+
+        // Water corner heights sample diagonal XZ columns, so a chunk can need one more
+        // rebuild when a diagonal chunk finishes publishing any occupancy change there.
+        int diagonalChunkY = chunk.chunkY_world;
+
+        ChunkData diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world - 1);
+        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        {
+            if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
+            RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
+        }
+
+        diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world + 1);
+        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        {
+            if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
+            RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
+        }
+
+        diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world - 1);
+        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        {
+            if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
+            RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
+        }
+
+        diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world + 1);
+        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        {
+            if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
+            RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
+        }
     }
 
     public ChunkData GetChunkAt(int centered_cx, int cy, int centered_cz)
@@ -4111,14 +4148,24 @@ public class McWorld : UdonSharpBehaviour
         _EnsureMeshBuffers(chunk);
         _ClearAllMeshBuffers(chunk);
 
+        byte[] chunkData = _GetDecompressedData(chunk);
+        if (chunkData == null)
+        {
+            chunk.isBuildingMesh = false;
+            chunk.interactionMeshPriority = false;
+            return;
+        }
+
         // Player edits should stay on the synchronous CPU mesh path so block changes
         // are visible immediately instead of waiting on async GPU face readback.
         // Keep GPU extraction for background worldgen where throughput matters more.
-        if (!interactionPriority && _GpuFaceExtractionReady())
+        // Water stays on the CPU path because the dedicated water mesher handles
+        // border samples and corner heights that the GPU face extractor does not.
+        if (!interactionPriority && !chunk._hasWaterBlocks && _GpuFaceExtractionReady())
         {
             if (_GpuHasAvailableReadbackBuffer())
             {
-                _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+                _GpuSyncChunkBlocks(chunk, chunkData);
                 _PreComputeBiomeColors(chunk);
                 if (_GpuRequestChunkFaceReadback(chunk))
                 {
@@ -5679,15 +5726,30 @@ public class McWorld : UdonSharpBehaviour
         width = chunkSizeXZ;
         height = (direction <= 1) ? chunkSizeXZ : chunkSizeY;
 
-        int maskCount = width * height;
-        System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
-
         Color32[] compactPixels = chunk._gpuFacePixels;
         if (compactPixels == null || compactPixels.Length == 0) return false;
 
         int compactWidth = gpuFaceSummaryWidth > 0 ? gpuFaceSummaryWidth : Mathf.Max(1, chunkSizeXZ / 2);
         int rowPairs = (height + 1) >> 1;
         int rowBase = (direction * chunkSizeY + slice) * compactWidth;
+
+        // Fast pre-scan: bail if no row-pair bitmask has any set bits.
+        // Skips Array.Clear + variable setup for the ~90% of slices that are empty.
+        {
+            bool anyBit = false;
+            for (int rp = 0; rp < rowPairs; rp++)
+            {
+                int pi = rowBase + rp;
+                if (pi < 0 || pi >= compactPixels.Length) break;
+                Color32 p = compactPixels[pi];
+                if ((p.r | p.g | p.b | p.a) != 0) { anyBit = true; break; }
+            }
+            if (!anyBit) return false;
+        }
+
+        int maskCount = width * height;
+        System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
+
         bool anyFace = false;
         int[] packedGrassColors = chunk._cachedPackedGrassBiomeColors;
         byte[] tintModes = biomeTintModeCache;
