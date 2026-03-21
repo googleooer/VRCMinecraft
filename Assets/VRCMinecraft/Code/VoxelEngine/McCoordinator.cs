@@ -346,6 +346,7 @@ public class McCoordinator : UdonSharpBehaviour
         // --- 2. Assign new work to idle workers ---
         // OPTIMIZED: Allow multiple workers to be assigned in one cycle
         int assignedThisCycle = 0;
+        int chunkInstantiationsThisFrame = 0;
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
             if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break; // Don't exceed budget
@@ -372,8 +373,10 @@ public class McCoordinator : UdonSharpBehaviour
 #endif
                 }
             }
-            // Priority 2: Initial world generation (only one data gen at a time)
-            else if (nextChunkIndexToAssign < totalWorldChunks && (!isGeneratorBusy || world.CanStartChunkDataGenerationWithoutExclusiveGenerator(radialChunkOrder[nextChunkIndexToAssign])))
+            // Priority 2: Initial world generation
+            // Limit to 1 InstantiateAndConfigureChunk per frame — the Unity API calls
+            // (Instantiate, Find, GetComponent ×4) cost ~0.8ms each and stack badly.
+            else if (chunkInstantiationsThisFrame < 1 && nextChunkIndexToAssign < totalWorldChunks && (!isGeneratorBusy || world.CanStartChunkDataGenerationWithoutExclusiveGenerator(radialChunkOrder[nextChunkIndexToAssign])))
             {
                 int chunk1DIndex = radialChunkOrder[nextChunkIndexToAssign];
                 nextChunkIndexToAssign++;
@@ -381,6 +384,7 @@ public class McCoordinator : UdonSharpBehaviour
                 world.Chunk1DToArrrayCoords(chunk1DIndex, out int array_cx, out int array_cy, out int array_cz);
 
                 int newChunkIndex = world.InstantiateAndConfigureChunk(array_cx, array_cy, array_cz);
+                chunkInstantiationsThisFrame++;
 
                 if (newChunkIndex != -1)
                 {

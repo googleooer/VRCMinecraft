@@ -34,11 +34,11 @@ public class McWorld : UdonSharpBehaviour
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
     public float updateTimeBudgetMs = 22.0f;
     [Tooltip("Budget per incremental GPU mesh decode step in milliseconds. Lower values reduce hitches from GPU mesh completion.")]
-    public float gpuMeshDecodeStepBudgetMs = 2.5f;
+    public float gpuMeshDecodeStepBudgetMs = 1.5f;
     [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame.")]
     public int gpuMeshDecodeStepsPerFrame = 2;
     [Tooltip("Total GPU mesh decode budget per frame in milliseconds. Caps aggregate decode work across all chunks.")]
-    public float gpuMeshDecodeFrameBudgetMs = 3.5f;
+    public float gpuMeshDecodeFrameBudgetMs = 2.5f;
     [Tooltip("Budget per GPU worldgen step in milliseconds. Lower values reduce frame spikes during terrain generation.")]
     public float gpuWorldgenStepBudgetMs = 3.0f;
     [Tooltip("Maximum GPU worldgen steps per chunk each frame.")]
@@ -195,6 +195,7 @@ public class McWorld : UdonSharpBehaviour
         -1,  1,  1, -1
     };
     private bool stats_trackCompactEmitInternals = false;
+    private bool _greedyConstantLight = false;
 
     // --- OPTIMIZATION: Deferred Reconciliation System ---
     private readonly System.Collections.Generic.Queue<ChunkData> deferredReconciliationQueue = new System.Collections.Generic.Queue<ChunkData>();
@@ -538,11 +539,9 @@ public class McWorld : UdonSharpBehaviour
         _InitializeGpuVoxelBackend();
         _InitializeGpuDebugHud();
         _InitializeMeshPool();
-        // Runtime override: VRChat rendering, physics, and internal overhead alone
-        // consume ~12-14ms per frame. With our subsystems adding ~5-8ms the total
-        // naturally runs 17-22ms. A budget below 22ms permanently pins the adaptive
-        // decode budgets to their floor, starving GPU mesh throughput.
-        if (updateTimeBudgetMs < 22f) updateTimeBudgetMs = 22f;
+        // Runtime override: keep the update budget above the irreducible baseline
+        // so the adaptive system has room to scale decode budgets.
+        if (updateTimeBudgetMs < 16f) updateTimeBudgetMs = 16f;
         _ResetAdaptiveBudgets();
         
         terrainGenerator.init(McUtils.GetMinecraftSeed(worldSeedString));
@@ -2093,6 +2092,21 @@ public class McWorld : UdonSharpBehaviour
                 }
 
                 int slice = chunk._gpuFaceSlice;
+
+                // Skip slices outside the chunk's occupied block region.
+                // The face bitmask can't have set bits for slices with no self-blocks.
+                {
+                    bool canSkip = false;
+                    if (direction <= 1) canSkip = slice < chunk._chunkGlobalMinY || slice > chunk._chunkGlobalMaxY;
+                    else if (direction <= 3) canSkip = slice < chunk._chunkGlobalMinZ || slice > chunk._chunkGlobalMaxZ;
+                    else canSkip = slice < chunk._chunkGlobalMinX || slice > chunk._chunkGlobalMaxX;
+                    if (canSkip)
+                    {
+                        chunk._gpuFaceSlice++;
+                        continue;
+                    }
+                }
+
                 if (useSummary)
                 {
                     float compactMaskStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -2137,6 +2151,8 @@ public class McWorld : UdonSharpBehaviour
                     bool nsUseAo = _UsesCpuAmbientOcclusion();
                     bool nsHasTintModes = tintModes != null;
                     bool nsHasGrassColors = packedGrassColors != null;
+                    bool nsConstantLight = !nsUseAo && _UsesGpuTerrainLightSampling();
+                    _greedyConstantLight = nsConstantLight;
 
                     for (int v = minV; v <= maxV; v++)
                     {
@@ -2168,10 +2184,9 @@ public class McWorld : UdonSharpBehaviour
                                 greedyMaskLightLevels[maskIndex] = 0;
                                 greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, (byte)blockID, direction, x, y, z);
                             }
-                            else
+                            else if (!nsConstantLight)
                             {
                                 greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
-                                greedyMaskAoSignatures[maskIndex] = 0;
                             }
                             byte tintMode = (nsHasTintModes && blockID < tintModes.Length) ? tintModes[blockID] : (byte)0;
                             if (tintMode == 0)
@@ -3836,6 +3851,9 @@ public class McWorld : UdonSharpBehaviour
 
             ChunkData neighborChunk = GetChunkAt(neighborX, neighborY, neighborZ);
             if (neighborChunk == null || !neighborChunk.isDataReady) continue;
+            // During worldgen, skip neighbors that haven't been meshed yet —
+            // they'll get their own mesh build when promoted from deferred.
+            if (!interactionPriority && (neighborChunk.isMeshDeferred || neighborChunk.isBuildingMesh)) continue;
             if (interactionPriority) neighborChunk.interactionMeshPriority = true;
 
             RequestChunkMeshUpdate(neighborIndex);
@@ -3846,28 +3864,28 @@ public class McWorld : UdonSharpBehaviour
         int diagonalChunkY = chunk.chunkY_world;
 
         ChunkData diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world - 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world + 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world - 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world + 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady)
+        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
@@ -5403,7 +5421,7 @@ public class McWorld : UdonSharpBehaviour
         return 0;
     }
 
-    private void _AddGreedyQuad(ChunkData chunk, int direction, int slice, int u, int v, int width, int height, byte blockID, byte lightLevel, int packedColor, int aoSignature)
+    private void _AddGreedyQuad(ChunkData chunk, int direction, int slice, int u, int v, int width, int height, byte blockID, byte lightLevel, int packedColor, int aoSignature, bool useAo)
     {
         BlockVisibilityType visibility = (blockID < visibilityCache.Length) ? visibilityCache[blockID] : BlockVisibilityType.Opaque;
 
@@ -5511,7 +5529,7 @@ public class McWorld : UdonSharpBehaviour
         float colorR = (packedColor & 0xFF) / 255f;
         float colorG = ((packedColor >> 8) & 0xFF) / 255f;
         float colorB = ((packedColor >> 16) & 0xFF) / 255f;
-        if (_UsesCpuAmbientOcclusion())
+        if (useAo)
         {
             targetColors[currentVertexCount + 0] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 0));
             targetColors[currentVertexCount + 1] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 1));
@@ -5528,7 +5546,19 @@ public class McWorld : UdonSharpBehaviour
             targetColors[currentVertexCount + 3] = biomeColor;
         }
 
-        float textureSlice = _GetTextureSliceCached(blockID, faceIndex);
+        float textureSlice = 0;
+        if (blockDataCache != null && blockID < blockDataCache.Length)
+        {
+            int mappingType = (blockDataCache[blockID] >> 8) & 0x3;
+            if (mappingType == 0) textureSlice = uv_allFacesCache[blockID];
+            else if (mappingType == 1)
+            {
+                if (faceIndex == FACE_INDEX_TOP) textureSlice = uv_topFaceCache[blockID];
+                else if (faceIndex == FACE_INDEX_BOTTOM) textureSlice = uv_bottomFaceCache[blockID];
+                else textureSlice = uv_sideFacesCache[blockID];
+            }
+            else textureSlice = uv_allFacesCache[blockID];
+        }
         targetUVs[currentVertexCount + 0] = new Vector3(0, 0, textureSlice);
         targetUVs[currentVertexCount + 1] = new Vector3(0, height, textureSlice);
         targetUVs[currentVertexCount + 2] = new Vector3(width, height, textureSlice);
@@ -5865,6 +5895,8 @@ public class McWorld : UdonSharpBehaviour
         }
 
         byte[] lightSource = usesCurrentBrightness ? currentBrightness : (neighborBrightness != null ? neighborBrightness : null);
+        bool constantLight = !useAo && lightSource == null;
+        _greedyConstantLight = constantLight;
 
         for (int rowPair = 0; rowPair < rowPairs; rowPair++)
         {
@@ -5895,9 +5927,9 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (!useAo)
+                        if (!constantLight && !useAo)
                         {
-                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
+                            lightLevels[maskIndex] = lightSource[lightRowBase + u];
                         }
                         byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -5916,7 +5948,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
+                        if (useAo) greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, selfID, direction, u, slice, v);
                         anyFace = true;
                     }
                 }
@@ -5935,9 +5967,9 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (!useAo)
+                        if (!constantLight && !useAo)
                         {
-                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
+                            lightLevels[maskIndex] = lightSource[lightRowBase + u];
                         }
                         byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -5956,7 +5988,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
+                        if (useAo) greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, selfID, direction, u, v, slice);
                         anyFace = true;
                     }
                 }
@@ -5976,9 +6008,9 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (!useAo)
+                        if (!constantLight && !useAo)
                         {
-                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u * sizeXZ] : fallbackLight;
+                            lightLevels[maskIndex] = lightSource[lightRowBase + u * sizeXZ];
                         }
                         byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -5993,7 +6025,7 @@ public class McWorld : UdonSharpBehaviour
                         {
                             packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
                         }
-                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
+                        if (useAo) greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, selfID, direction, slice, v, u);
                         anyFace = true;
                     }
                 }
@@ -6020,9 +6052,9 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (!useAo)
+                        if (!constantLight && !useAo)
                         {
-                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
+                            lightLevels[maskIndex] = lightSource[lightRowBase + u];
                         }
                         byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -6041,7 +6073,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, v));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, slice, v) : 0;
+                        if (useAo) greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, selfID, direction, u, slice, v);
                         anyFace = true;
                     }
                 }
@@ -6060,9 +6092,9 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (!useAo)
+                        if (!constantLight && !useAo)
                         {
-                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u] : fallbackLight;
+                            lightLevels[maskIndex] = lightSource[lightRowBase + u];
                         }
                         byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -6081,7 +6113,7 @@ public class McWorld : UdonSharpBehaviour
                                 packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, u, slice));
                             }
                         }
-                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, u, v, slice) : 0;
+                        if (useAo) greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, selfID, direction, u, v, slice);
                         anyFace = true;
                     }
                 }
@@ -6101,9 +6133,9 @@ public class McWorld : UdonSharpBehaviour
 
                         int maskIndex = rowOffset + u;
                         blockIds[maskIndex] = selfID;
-                        if (!useAo)
+                        if (!constantLight && !useAo)
                         {
-                            lightLevels[maskIndex] = lightSource != null ? lightSource[lightRowBase + u * sizeXZ] : fallbackLight;
+                            lightLevels[maskIndex] = lightSource[lightRowBase + u * sizeXZ];
                         }
                         byte tintMode = (hasTintModes && selfID < tintModes.Length) ? tintModes[selfID] : (byte)0;
                         if (tintMode == 0)
@@ -6118,7 +6150,7 @@ public class McWorld : UdonSharpBehaviour
                         {
                             packedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, selfID, slice, u));
                         }
-                        greedyMaskAoSignatures[maskIndex] = useAo ? _BuildAoSignature(chunk, selfID, direction, slice, v, u) : 0;
+                        if (useAo) greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, selfID, direction, slice, v, u);
                         anyFace = true;
                     }
                 }
@@ -6145,6 +6177,7 @@ public class McWorld : UdonSharpBehaviour
         int[] packedColors = greedyMaskPackedColors;
         int[] aoSignatures = greedyMaskAoSignatures;
         bool useAo = _UsesCpuAmbientOcclusion();
+        bool constantLight = _greedyConstantLight;
 
         for (int v = minV; v <= maxV; v++)
         {
@@ -6159,9 +6192,9 @@ public class McWorld : UdonSharpBehaviour
                     continue;
                 }
 
-                byte lightLevel = lightLevels[maskIndex];
+                byte lightLevel = constantLight ? (byte)15 : lightLevels[maskIndex];
                 int packedColor = packedColors[maskIndex];
-                int aoSignature = aoSignatures[maskIndex];
+                int aoSignature = useAo ? aoSignatures[maskIndex] : 0;
 
 #if LOGGING
                 float emitScanStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
@@ -6175,7 +6208,7 @@ public class McWorld : UdonSharpBehaviour
                     {
                         if (aoSignatures[nextIndex] != aoSignature) break;
                     }
-                    else if (lightLevels[nextIndex] != lightLevel)
+                    else if (!constantLight && lightLevels[nextIndex] != lightLevel)
                     {
                         break;
                     }
@@ -6203,7 +6236,7 @@ public class McWorld : UdonSharpBehaviour
                                 break;
                             }
                         }
-                        else if (lightLevels[nextIndex] != lightLevel)
+                        else if (!constantLight && lightLevels[nextIndex] != lightLevel)
                         {
                             canGrow = false;
                             break;
@@ -6220,7 +6253,7 @@ public class McWorld : UdonSharpBehaviour
 
                 float emitQuadStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
 #endif
-                _AddGreedyQuad(chunk, direction, slice, u, v, quadWidth, quadHeight, blockID, lightLevel, packedColor, aoSignature);
+                _AddGreedyQuad(chunk, direction, slice, u, v, quadWidth, quadHeight, blockID, lightLevel, packedColor, aoSignature, useAo);
 #if LOGGING
                 if (stats_trackCompactEmitInternals)
                 {
