@@ -32,7 +32,7 @@ public class McWorld : UdonSharpBehaviour
     [Tooltip("Approximate time budget per mesh step in milliseconds. OPTIMIZATION Phase 4: Increased from 1.5ms to 8.0ms to reduce loop overhead (fewer, larger steps).")]
     public float meshStepTimeBudgetMs = 8.0f;
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
-    public float updateTimeBudgetMs = 16.0f;
+    public float updateTimeBudgetMs = 22.0f;
     [Tooltip("Budget per incremental GPU mesh decode step in milliseconds. Lower values reduce hitches from GPU mesh completion.")]
     public float gpuMeshDecodeStepBudgetMs = 2.5f;
     [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame.")]
@@ -78,7 +78,7 @@ public class McWorld : UdonSharpBehaviour
     [Tooltip("Rate used to shrink adaptive budgets on over-budget frames.")]
     public float adaptiveBudgetBackoffRate = 0.20f;
     [Tooltip("Minimum fraction of the configured GPU budgets that adaptive throttling will allow.")]
-    public float adaptiveBudgetMinScale = 0.65f;
+    public float adaptiveBudgetMinScale = 0.80f;
 
     [Header("System References")]
     [SerializeField, FindObjectOfType(true)]
@@ -536,11 +536,11 @@ public class McWorld : UdonSharpBehaviour
         _InitializeBetaWaterRendering();
         _InitializeGpuVoxelBackend();
         _InitializeGpuDebugHud();
-        // Runtime override: Inspector may have a stale 12ms value from before the
-        // coordinator was moved to its own Update(). McWorld.Update measures its own
-        // time which naturally runs 14-16ms; a budget below that permanently pins
-        // the adaptive decode budget to its floor.
-        if (updateTimeBudgetMs < 16f) updateTimeBudgetMs = 16f;
+        // Runtime override: VRChat rendering, physics, and internal overhead alone
+        // consume ~12-14ms per frame. With our subsystems adding ~5-8ms the total
+        // naturally runs 17-22ms. A budget below 22ms permanently pins the adaptive
+        // decode budgets to their floor, starving GPU mesh throughput.
+        if (updateTimeBudgetMs < 22f) updateTimeBudgetMs = 22f;
         _ResetAdaptiveBudgets();
         
         terrainGenerator.init(McUtils.GetMinecraftSeed(worldSeedString));
@@ -567,7 +567,10 @@ public class McWorld : UdonSharpBehaviour
 
     private void _UpdateAdaptiveBudgets(float updateTimeMs)
     {
-        lastUpdateDurationMs = updateTimeMs;
+        // Smooth the input with an EMA so single-frame spikes (GC, VRC internals)
+        // don't whipsaw the budgets between unlocked and floor.
+        const float alpha = 0.15f;
+        lastUpdateDurationMs = lastUpdateDurationMs + alpha * (updateTimeMs - lastUpdateDurationMs);
 
         if (!enableAdaptiveBudgets)
         {
@@ -576,29 +579,30 @@ public class McWorld : UdonSharpBehaviour
             return;
         }
 
+        float smoothedMs = lastUpdateDurationMs;
         float minScale = Mathf.Clamp01(adaptiveBudgetMinScale);
         float growFactor = 1f + Mathf.Max(0f, adaptiveBudgetRecoverRate);
         float shrinkFactor = 1f - Mathf.Clamp01(adaptiveBudgetBackoffRate);
         float targetWithHeadroom = Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
 
-        if (updateTimeMs > updateTimeBudgetMs)
+        if (smoothedMs > updateTimeBudgetMs)
         {
             adaptiveGpuMeshDecodeStepBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeStepBudgetMs * shrinkFactor, gpuMeshDecodeStepBudgetMs * minScale, gpuMeshDecodeStepBudgetMs);
             adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeFrameBudgetMs * shrinkFactor, gpuMeshDecodeFrameBudgetMs * minScale, gpuMeshDecodeFrameBudgetMs);
             adaptiveGpuWorldgenStepBudgetMs = Mathf.Clamp(adaptiveGpuWorldgenStepBudgetMs * shrinkFactor, gpuWorldgenStepBudgetMs * minScale, gpuWorldgenStepBudgetMs);
 
-            if (adaptiveGpuMeshDecodeStepsPerFrame > 1 && updateTimeMs > updateTimeBudgetMs + 1f)
+            if (adaptiveGpuMeshDecodeStepsPerFrame > 1 && smoothedMs > updateTimeBudgetMs + 1f)
             {
                 adaptiveGpuMeshDecodeStepsPerFrame--;
             }
-            if (adaptiveGpuWorldgenStepsPerFrame > 1 && updateTimeMs > updateTimeBudgetMs + 1f)
+            if (adaptiveGpuWorldgenStepsPerFrame > 1 && smoothedMs > updateTimeBudgetMs + 1f)
             {
                 adaptiveGpuWorldgenStepsPerFrame--;
             }
             return;
         }
 
-        if (updateTimeMs >= targetWithHeadroom)
+        if (smoothedMs >= targetWithHeadroom)
         {
             return;
         }
@@ -607,11 +611,11 @@ public class McWorld : UdonSharpBehaviour
         adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeFrameBudgetMs * growFactor, gpuMeshDecodeFrameBudgetMs * minScale, gpuMeshDecodeFrameBudgetMs);
         adaptiveGpuWorldgenStepBudgetMs = Mathf.Clamp(adaptiveGpuWorldgenStepBudgetMs * growFactor, gpuWorldgenStepBudgetMs * minScale, gpuWorldgenStepBudgetMs);
 
-        if (adaptiveGpuMeshDecodeStepsPerFrame < Mathf.Max(1, gpuMeshDecodeStepsPerFrame) && updateTimeMs < targetWithHeadroom - 1f)
+        if (adaptiveGpuMeshDecodeStepsPerFrame < Mathf.Max(1, gpuMeshDecodeStepsPerFrame) && smoothedMs < targetWithHeadroom - 1f)
         {
             adaptiveGpuMeshDecodeStepsPerFrame++;
         }
-        if (adaptiveGpuWorldgenStepsPerFrame < Mathf.Max(1, gpuWorldgenStepsPerFrame) && updateTimeMs < targetWithHeadroom - 1f)
+        if (adaptiveGpuWorldgenStepsPerFrame < Mathf.Max(1, gpuWorldgenStepsPerFrame) && smoothedMs < targetWithHeadroom - 1f)
         {
             adaptiveGpuWorldgenStepsPerFrame++;
         }
@@ -1985,7 +1989,8 @@ public class McWorld : UdonSharpBehaviour
 
                 while (chunk._gpuFaceSummaryIndex < totalPixels)
                 {
-                    int pixelIndex = chunk._gpuFaceSummaryIndex++;
+                    int pixelIndex = chunk._gpuFaceSummaryIndex;
+                    chunk._gpuFaceSummaryIndex = pixelIndex + 1;
                     if (pixelIndex >= facePixels.Length) break;
 
                     Color32 pixel = facePixels[pixelIndex];
@@ -2173,7 +2178,9 @@ public class McWorld : UdonSharpBehaviour
                 int crossCount = chunk._crossBlockPackedPositions != null ? chunk._crossBlockCount : 0;
                 while (chunk._gpuFaceCrossIndex < crossCount)
                 {
-                    int packed = chunk._crossBlockPackedPositions[chunk._gpuFaceCrossIndex++];
+                    int crossIdx = chunk._gpuFaceCrossIndex;
+                    chunk._gpuFaceCrossIndex = crossIdx + 1;
+                    int packed = chunk._crossBlockPackedPositions[crossIdx];
                     int x = (packed >> 16) & 0xFF;
                     int y = (packed >> 8) & 0xFF;
                     int z = packed & 0xFF;
@@ -2236,7 +2243,10 @@ public class McWorld : UdonSharpBehaviour
                     int decompLen = chunk._decompSelf.Length;
                     while (chunk._gpuFaceWaterColumnIndex < totalColumns)
                     {
-                        int col = chunk._gpuFaceWaterColumnIndex++;
+                        // Read field into local THEN advance — avoids Udon post-increment
+                        // field-access quirk where col=0 was silently skipped.
+                        int col = chunk._gpuFaceWaterColumnIndex;
+                        chunk._gpuFaceWaterColumnIndex = col + 1;
                         if (col >= colMinLen) break;
                         int z = col / chunkSizeXZ;
                         int x = col % chunkSizeXZ;
@@ -4159,9 +4169,9 @@ public class McWorld : UdonSharpBehaviour
         // Player edits should stay on the synchronous CPU mesh path so block changes
         // are visible immediately instead of waiting on async GPU face readback.
         // Keep GPU extraction for background worldgen where throughput matters more.
-        // Water stays on the CPU path because the dedicated water mesher handles
-        // border samples and corner heights that the GPU face extractor does not.
-        if (!interactionPriority && !chunk._hasWaterBlocks && _GpuFaceExtractionReady())
+        // Water faces are added by the budget-gated GPU decode stage 2 via _AddWaterBlock,
+        // which handles border samples and corner heights correctly.
+        if (!interactionPriority && _GpuFaceExtractionReady())
         {
             if (_GpuHasAvailableReadbackBuffer())
             {

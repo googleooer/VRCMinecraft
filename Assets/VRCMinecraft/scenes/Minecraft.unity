@@ -54561,8 +54561,8 @@ MonoBehaviour:
   enableGenerationTimings: 1
   enableGpuVoxelBackend: 1
   gpuChunkSlotCapacity: 1023
-  gpuLightingIterationsPerUpdate: 128
-  gpuLightingTotalIterations: 128
+  gpuLightingIterationsPerUpdate: 15
+  gpuLightingTotalIterations: 15
   gpuResidentRadiusXZ: 6
   gpuResidentRadiusY: 2
   gpuResidentSyncsPerFrame: 32
