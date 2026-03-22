@@ -237,7 +237,6 @@ public class McWorld : UdonSharpBehaviour
     private RenderTexture betaWaterFlowColor;
     private int betaWaterFlowFrame = 0;
     private int betaWaterStillSlice = -1;
-    private int betaWaterAnimFrameCounter = 0;
     private int betaWaterFlowSlice = -1;
     private bool gpuSlotLookupDirty = false;
     private int terrainPropWaterStillTexId = -1;
