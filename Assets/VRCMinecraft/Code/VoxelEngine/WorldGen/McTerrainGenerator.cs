@@ -165,6 +165,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private float agg_time_NoiseCombine;
     private float agg_time_GeneratingTerrain;
     private float agg_time_ReplacingBiomes;
+    private float agg_time_Decoration;
+    private int agg_decorationColumns;
+    private int agg_treesPlaced;
+    private int agg_tallGrassPlaced;
+    private int agg_flowersPlaced;
     private float agg_time_ActualChunkWork;
     private float agg_time_WallClock;
     private int agg_totalSteps;
@@ -668,6 +673,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
             sb.AppendFormat("  Surface assignments: top {0}, filler {1}, bedrock {2}, water {3}, gravel {4}, sand {5}, sandstone {6}\n",
                 agg_biomeTopAssignments, agg_biomeFillerAssignments, agg_biomeBedrockAssignments,
                 agg_biomeWaterAssignments, agg_biomeGravelAssignments, agg_biomeSandAssignments, agg_biomeSandstoneAssignments);
+            if (agg_decorationColumns > 0)
+            {
+                sb.AppendFormat("  Decoration: {0} columns, {1:F3}ms total, trees {2}, grass {3}, flowers {4}\n",
+                    agg_decorationColumns, agg_time_Decoration, agg_treesPlaced, agg_tallGrassPlaced, agg_flowersPlaced);
+            }
         }
 
         bool hasGpuStats =
@@ -764,6 +774,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_biomeGravelAssignments = 0;
         agg_biomeSandAssignments = 0;
         agg_biomeSandstoneAssignments = 0;
+        agg_time_Decoration = 0f;
+        agg_decorationColumns = 0;
+        agg_treesPlaced = 0;
+        agg_tallGrassPlaced = 0;
+        agg_flowersPlaced = 0;
         agg_gpuColumnsStarted = 0;
         agg_gpuColumnsFinalized = 0;
         agg_gpuFallbacks = 0;
@@ -3971,6 +3986,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 {
                     // BETA 1.7.3 DECORATION: Trees, tall grass, and flowers
                     // This runs ONLY for the top chunk in each column
+#if LOGGING
+                    float decorStepStart = Time.realtimeSinceStartup;
+#endif
                     
                     if (decoration_step == 0)
                     {
@@ -4016,6 +4034,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             if (treeY > 0 && treeY < world.worldDimensionY * world.chunkSizeY - 7)
                             {
                                 GenerateTree(treeX, treeY, treeZ);
+#if LOGGING
+                                if (enableDetailedTimings) agg_treesPlaced++;
+#endif
                             }
                             
                             decoration_feature_index++;
@@ -4047,6 +4068,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             int flowerY = rand.NextInt(world.worldDimensionY * world.chunkSizeY);
                             
                             GenerateFlower(flowerX, flowerY, flowerZ, flowerYellowBlockID);
+#if LOGGING
+                            if (enableDetailedTimings) agg_flowersPlaced++;
+#endif
                             decoration_feature_index++;
                         }
                         else
@@ -4076,6 +4100,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             int grassY = rand.NextInt(world.worldDimensionY * world.chunkSizeY);
                             
                             GenerateTallGrass(grassX, grassY, grassZ);
+#if LOGGING
+                            if (enableDetailedTimings) agg_tallGrassPlaced++;
+#endif
                             decoration_feature_index++;
                         }
                         else
@@ -4095,14 +4122,26 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             int flowerY = rand.NextInt(world.worldDimensionY * world.chunkSizeY);
                             
                             GenerateFlower(flowerX, flowerY, flowerZ, flowerRedBlockID);
+#if LOGGING
+                            if (enableDetailedTimings) agg_flowersPlaced++;
+#endif
                         }
                         decoration_step++;
                     }
                     else
                     {
                         // Decoration complete
-                currentState = GenerationState.Complete;
+#if LOGGING
+                        if (enableDetailedTimings) agg_decorationColumns++;
+#endif
+                        currentState = GenerationState.Complete;
                     }
+#if LOGGING
+                    if (enableDetailedTimings)
+                    {
+                        agg_time_Decoration += (Time.realtimeSinceStartup - decorStepStart) * 1000f;
+                    }
+#endif
                 }
                 break;
 
