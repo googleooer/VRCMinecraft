@@ -2133,7 +2133,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
         if (enableDetailedTimings) agg_gpuColumnsStarted++;
 #endif
-        _UploadGpuClimateTextures();
+        // Climate data already lives in gpuClimateTexture from _StartGpuClimateGeneration.
+        // No need to round-trip through CPU and re-upload.
 
         int densityXSize = 5;
         int densityYSize = gpuWorldHeightBlocks / 8 + 1;
@@ -2179,7 +2180,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise3TexId, gpuNoise3Texture);
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise6TexId, gpuNoise6Texture);
         gpuNoiseCombineMaterial.SetTexture(gpuPropNoise7TexId, gpuNoise7Texture);
-        gpuNoiseCombineMaterial.SetTexture(gpuPropTemperatureTexId, gpuTemperatureTexture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropTemperatureTexId, gpuClimateTexture);
         gpuNoiseCombineMaterial.SetInt(gpuPropXSizeId, densityXSize);
         gpuNoiseCombineMaterial.SetInt(gpuPropYSizeId, densityYSize);
         gpuNoiseCombineMaterial.SetInt(gpuPropZSizeId, densityZSize);
@@ -2201,7 +2202,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
 
         gpuColumnBaseFillMaterial.SetTexture(gpuPropDensityTexId, gpuDensityTexture);
-        gpuColumnBaseFillMaterial.SetTexture(gpuPropTemperatureTexId, gpuTemperatureTexture);
+        gpuColumnBaseFillMaterial.SetTexture(gpuPropTemperatureTexId, gpuClimateTexture);
         gpuColumnBaseFillMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
         gpuColumnBaseFillMaterial.SetInt(gpuPropChunkSizeXZId, world.chunkSizeXZ);
         gpuColumnBaseFillMaterial.SetInt(gpuPropOceanHeightId, 64);
