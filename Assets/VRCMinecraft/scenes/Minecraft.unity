@@ -56975,6 +56975,8 @@ MonoBehaviour:
     type: 2}
   gpuFaceExtractMaterial: {fileID: 2100000, guid: 4a8a87df0f0b44742bd09b9aa5ff46f4,
     type: 2}
+  gpuWaterAnimMaterial: {fileID: 2100000, guid: c3949f59cf9acdf47a86ffee19df46fb,
+    type: 2}
   enableGpuDebugHud: 1
   showGpuDebugHudOnStart: 1
   gpuDebugHudDistance: 0.85
