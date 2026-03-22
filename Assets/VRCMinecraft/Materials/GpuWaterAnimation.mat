@@ -7,8 +7,8 @@ Material:
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_Name: GpuVoxelFaceExtract
-  m_Shader: {fileID: 4800000, guid: 6eae1de8fa829104cbc2103c5f9dca9e, type: 3}
+  m_Name: GpuWaterAnimation
+  m_Shader: {fileID: 4800000, guid: 89ac76afc90c66a438e47c3da992b0b5, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords: []
@@ -77,9 +77,15 @@ Material:
     - _BuiltinOffsetZ: 0
     - _ChunkX: -1
     - _ChunkZ: 1
+    - _DivisorInv: 0.3125
     - _FlipXAxis: 1
+    - _FlowScroll: 116.625
+    - _IsFlowMode: 1
     - _Mode: 2
-    - _ReadSlotIndex: 87
+    - _ReadSlotIndex: 197
+    - _SplashChance: 0.2
+    - _SplashDecay: 0.3
+    - _Time2: 5379.4473
     - _XSize: 5
     - _YSize: 17
     - _ZSize: 5

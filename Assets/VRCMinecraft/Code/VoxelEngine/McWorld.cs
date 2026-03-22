@@ -116,6 +116,7 @@ public class McWorld : UdonSharpBehaviour
     public Material gpuLightingSeedMaterial;
     public Material gpuLightingPropagateMaterial;
     public Material gpuFaceExtractMaterial;
+    public Material gpuWaterAnimMaterial;
 
     [Header("GPU Debug HUD")]
     public bool enableGpuDebugHud = true;
@@ -228,22 +229,17 @@ public class McWorld : UdonSharpBehaviour
     private Material sharedCutoutChunkMaterial;
     private int terrainPropUseVertexLightId = -1;
     private int terrainPropUseGpuExactAoId = -1;
-    private Texture2D betaWaterStillTexture;
-    private Texture2D betaWaterFlowTexture;
-    private Color32[] betaWaterStillPixels;
-    private Color32[] betaWaterFlowPixels;
-    private float[] betaWaterStillCurrent;
-    private float[] betaWaterStillNext;
-    private float[] betaWaterStillAccel;
-    private float[] betaWaterStillSplash;
-    private float[] betaWaterFlowCurrent;
-    private float[] betaWaterFlowNext;
-    private float[] betaWaterFlowAccel;
-    private float[] betaWaterFlowSplash;
+    private RenderTexture betaWaterStillStateA;
+    private RenderTexture betaWaterStillStateB;
+    private RenderTexture betaWaterStillColor;
+    private RenderTexture betaWaterFlowStateA;
+    private RenderTexture betaWaterFlowStateB;
+    private RenderTexture betaWaterFlowColor;
     private int betaWaterFlowFrame = 0;
-    private int betaWaterNoiseState = 1;
     private int betaWaterStillSlice = -1;
+    private int betaWaterAnimFrameCounter = 0;
     private int betaWaterFlowSlice = -1;
+    private bool gpuSlotLookupDirty = false;
     private int terrainPropWaterStillTexId = -1;
     private int terrainPropWaterFlowTexId = -1;
     private int terrainPropWaterStillSliceId = -1;
@@ -1109,7 +1105,7 @@ public class McWorld : UdonSharpBehaviour
         gpuSlotUseStamp[targetSlot] = gpuSlotUseCounter++;
         gpuSlotMetaPixels[targetSlot] = new Color32((byte)arrayX, (byte)arrayY, (byte)arrayZ, 255);
         _GpuSetSlotLookupPixel(arrayX, arrayY, arrayZ, targetSlot, true);
-        _GpuApplyLookupTextures();
+        gpuSlotLookupDirty = true;
         return targetSlot;
     }
 
@@ -2481,170 +2477,86 @@ public class McWorld : UdonSharpBehaviour
         if (!material.enableInstancing) material.enableInstancing = true;
     }
 
+    private RenderTexture _CreateWaterRT(string name, bool isStateTexture)
+    {
+        RenderTextureFormat fmt = isStateTexture ? RenderTextureFormat.ARGBHalf : RenderTextureFormat.ARGB32;
+        RenderTexture rt = new RenderTexture(16, 16, 0, fmt, RenderTextureReadWrite.Linear);
+        rt.name = name;
+        rt.filterMode = FilterMode.Point;
+        rt.wrapMode = TextureWrapMode.Repeat;
+        rt.Create();
+        return rt;
+    }
+
     private void _InitializeBetaWaterRendering()
     {
         betaWaterStillSlice = blockTypeManager != null ? blockTypeManager.GetFinalBlockTextureSlice(BLOCK_WATER_STILL, FACE_INDEX_TOP) : -1;
         betaWaterFlowSlice = blockTypeManager != null ? blockTypeManager.GetFinalBlockTextureSlice(BLOCK_WATER_STILL, FACE_INDEX_SIDE) : -1;
         if (betaWaterStillSlice < 0 || betaWaterFlowSlice < 0) return;
+        if (gpuWaterAnimMaterial == null) return;
 
         terrainPropWaterStillTexId = VRCShader.PropertyToID("_WaterStillTex");
         terrainPropWaterFlowTexId = VRCShader.PropertyToID("_WaterFlowTex");
         terrainPropWaterStillSliceId = VRCShader.PropertyToID("_WaterStillSlice");
         terrainPropWaterFlowSliceId = VRCShader.PropertyToID("_WaterFlowSlice");
 
-        betaWaterStillTexture = new Texture2D(16, 16, TextureFormat.RGBA32, false, false);
-        betaWaterStillTexture.name = "BetaWaterStillRuntime";
-        betaWaterStillTexture.filterMode = FilterMode.Point;
-        betaWaterStillTexture.wrapMode = TextureWrapMode.Clamp;
-
-        betaWaterFlowTexture = new Texture2D(16, 16, TextureFormat.RGBA32, false, false);
-        betaWaterFlowTexture.name = "BetaWaterFlowRuntime";
-        betaWaterFlowTexture.filterMode = FilterMode.Point;
-        betaWaterFlowTexture.wrapMode = TextureWrapMode.Clamp;
-
-        betaWaterStillPixels = new Color32[256];
-        betaWaterFlowPixels = new Color32[256];
-        betaWaterStillCurrent = new float[256];
-        betaWaterStillNext = new float[256];
-        betaWaterStillAccel = new float[256];
-        betaWaterStillSplash = new float[256];
-        betaWaterFlowCurrent = new float[256];
-        betaWaterFlowNext = new float[256];
-        betaWaterFlowAccel = new float[256];
-        betaWaterFlowSplash = new float[256];
+        betaWaterStillStateA = _CreateWaterRT("WaterStillState_A", true);
+        betaWaterStillStateB = _CreateWaterRT("WaterStillState_B", true);
+        betaWaterStillColor = _CreateWaterRT("WaterStillColor", false);
+        betaWaterFlowStateA = _CreateWaterRT("WaterFlowState_A", true);
+        betaWaterFlowStateB = _CreateWaterRT("WaterFlowState_B", true);
+        betaWaterFlowColor = _CreateWaterRT("WaterFlowColor", false);
         betaWaterFlowFrame = 0;
-        betaWaterNoiseState = 1;
 
-        _TickBetaWaterStillAnimation();
-        _TickBetaWaterFlowAnimation();
         _ApplyBetaWaterMaterialProperties(sharedTransparentChunkMaterial);
     }
 
     private void _ApplyBetaWaterMaterialProperties(Material material)
     {
-        if (material == null || betaWaterStillTexture == null || betaWaterFlowTexture == null) return;
+        if (material == null || betaWaterStillColor == null || betaWaterFlowColor == null) return;
 
-        material.SetTexture(terrainPropWaterStillTexId, betaWaterStillTexture);
-        material.SetTexture(terrainPropWaterFlowTexId, betaWaterFlowTexture);
+        material.SetTexture(terrainPropWaterStillTexId, betaWaterStillColor);
+        material.SetTexture(terrainPropWaterFlowTexId, betaWaterFlowColor);
         material.SetFloat(terrainPropWaterStillSliceId, betaWaterStillSlice);
         material.SetFloat(terrainPropWaterFlowSliceId, betaWaterFlowSlice);
     }
 
-    private float _NextBetaWaterNoise()
-    {
-        long nextState = (long)betaWaterNoiseState * 1103515245L + 12345L;
-        betaWaterNoiseState = (int)(nextState & 0x7fffffffL);
-        return betaWaterNoiseState / 2147483647.0f;
-    }
 
-    private void _TickBetaWaterStillAnimation()
-    {
-        if (betaWaterStillTexture == null || betaWaterStillPixels == null) return;
-
-        for (int x = 0; x < 16; x++)
-        {
-            for (int y = 0; y < 16; y++)
-            {
-                float sampleSum = 0.0f;
-                for (int sampleX = x - 1; sampleX <= x + 1; sampleX++)
-                {
-                    sampleSum += betaWaterStillCurrent[(sampleX & 15) + (y & 15) * 16];
-                }
-
-                int index = x + y * 16;
-                betaWaterStillNext[index] = sampleSum / 3.3f + betaWaterStillAccel[index] * 0.8f;
-            }
-        }
-
-        for (int i = 0; i < 256; i++)
-        {
-            betaWaterStillAccel[i] += betaWaterStillSplash[i] * 0.05f;
-            if (betaWaterStillAccel[i] < 0.0f) betaWaterStillAccel[i] = 0.0f;
-
-            betaWaterStillSplash[i] -= 0.1f;
-            if (_NextBetaWaterNoise() < 0.05f) betaWaterStillSplash[i] = 0.5f;
-        }
-
-        float[] swap = betaWaterStillNext;
-        betaWaterStillNext = betaWaterStillCurrent;
-        betaWaterStillCurrent = swap;
-
-        for (int i = 0; i < 256; i++)
-        {
-            float height = betaWaterStillCurrent[i];
-            if (height > 1.0f) height = 1.0f;
-            if (height < 0.0f) height = 0.0f;
-
-            float heightSq = height * height;
-            betaWaterStillPixels[i] = new Color32(
-                (byte)(32.0f + heightSq * 32.0f),
-                (byte)(50.0f + heightSq * 64.0f),
-                (byte)255,
-                (byte)(146.0f + heightSq * 50.0f));
-        }
-
-        betaWaterStillTexture.SetPixels32(betaWaterStillPixels);
-        betaWaterStillTexture.Apply(false, false);
-    }
-
-    private void _TickBetaWaterFlowAnimation()
-    {
-        if (betaWaterFlowTexture == null || betaWaterFlowPixels == null) return;
-
-        betaWaterFlowFrame++;
-
-        for (int x = 0; x < 16; x++)
-        {
-            for (int y = 0; y < 16; y++)
-            {
-                float sampleSum = 0.0f;
-                for (int sampleY = y - 2; sampleY <= y; sampleY++)
-                {
-                    sampleSum += betaWaterFlowCurrent[(x & 15) + (sampleY & 15) * 16];
-                }
-
-                int index = x + y * 16;
-                betaWaterFlowNext[index] = sampleSum / 3.2f + betaWaterFlowAccel[index] * 0.8f;
-            }
-        }
-
-        for (int i = 0; i < 256; i++)
-        {
-            betaWaterFlowAccel[i] += betaWaterFlowSplash[i] * 0.05f;
-            if (betaWaterFlowAccel[i] < 0.0f) betaWaterFlowAccel[i] = 0.0f;
-
-            betaWaterFlowSplash[i] -= 0.3f;
-            if (_NextBetaWaterNoise() < 0.2f) betaWaterFlowSplash[i] = 0.5f;
-        }
-
-        float[] swap = betaWaterFlowNext;
-        betaWaterFlowNext = betaWaterFlowCurrent;
-        betaWaterFlowCurrent = swap;
-
-        for (int i = 0; i < 256; i++)
-        {
-            float height = betaWaterFlowCurrent[(i - betaWaterFlowFrame * 16) & 255];
-            if (height > 1.0f) height = 1.0f;
-            if (height < 0.0f) height = 0.0f;
-
-            float heightSq = height * height;
-            betaWaterFlowPixels[i] = new Color32(
-                (byte)(32.0f + heightSq * 32.0f),
-                (byte)(50.0f + heightSq * 64.0f),
-                (byte)255,
-                (byte)(146.0f + heightSq * 50.0f));
-        }
-
-        betaWaterFlowTexture.SetPixels32(betaWaterFlowPixels);
-        betaWaterFlowTexture.Apply(false, false);
-    }
 
     private void _UpdateBetaWaterAnimation()
     {
-        if (betaWaterStillTexture == null || betaWaterFlowTexture == null) return;
+        if (betaWaterStillStateA == null || gpuWaterAnimMaterial == null) return;
 
-        _TickBetaWaterStillAnimation();
-        _TickBetaWaterFlowAnimation();
+        float t = Time.time * 73.1f;
+
+        // Still water: evolve state then convert to color
+        gpuWaterAnimMaterial.SetFloat("_Time2", t);
+        gpuWaterAnimMaterial.SetFloat("_SplashChance", 0.05f);
+        gpuWaterAnimMaterial.SetFloat("_SplashDecay", 0.1f);
+        gpuWaterAnimMaterial.SetFloat("_DivisorInv", 1.0f / 3.3f);
+        gpuWaterAnimMaterial.SetFloat("_IsFlowMode", 0f);
+        VRCGraphics.Blit(betaWaterStillStateA, betaWaterStillStateB, gpuWaterAnimMaterial, 0);
+        RenderTexture tempStill = betaWaterStillStateA;
+        betaWaterStillStateA = betaWaterStillStateB;
+        betaWaterStillStateB = tempStill;
+
+        gpuWaterAnimMaterial.SetFloat("_FlowScroll", 0f);
+        VRCGraphics.Blit(betaWaterStillStateA, betaWaterStillColor, gpuWaterAnimMaterial, 1);
+
+        // Flow water: evolve state then convert to color with scroll
+        betaWaterFlowFrame++;
+        gpuWaterAnimMaterial.SetFloat("_SplashChance", 0.2f);
+        gpuWaterAnimMaterial.SetFloat("_SplashDecay", 0.3f);
+        gpuWaterAnimMaterial.SetFloat("_DivisorInv", 1.0f / 3.2f);
+        gpuWaterAnimMaterial.SetFloat("_IsFlowMode", 1f);
+        gpuWaterAnimMaterial.SetFloat("_Time2", t + 17.3f);
+        VRCGraphics.Blit(betaWaterFlowStateA, betaWaterFlowStateB, gpuWaterAnimMaterial, 0);
+        RenderTexture tempFlow = betaWaterFlowStateA;
+        betaWaterFlowStateA = betaWaterFlowStateB;
+        betaWaterFlowStateB = tempFlow;
+
+        gpuWaterAnimMaterial.SetFloat("_FlowScroll", (float)betaWaterFlowFrame / 16.0f);
+        VRCGraphics.Blit(betaWaterFlowStateA, betaWaterFlowColor, gpuWaterAnimMaterial, 1);
     }
 
     private bool _UsesGpuTerrainLightSampling()
@@ -2810,10 +2722,24 @@ public class McWorld : UdonSharpBehaviour
         float processStartTime = frameStart;
 #endif
 
+        // Flush any batched slot lookup changes from this or previous frames
+        if (gpuSlotLookupDirty)
+        {
+            _GpuApplyLookupTextures();
+            gpuSlotLookupDirty = false;
+        }
+
         // Keep nearby chunks resident in the GPU atlases before running lighting.
         // Otherwise visible chunks can be evicted by distant worldgen and slowly fall
         // back to stale mesh lighting.
         _GpuMaintainResidentChunks(frameStart, frameBudget);
+
+        // Flush again if maintain created new slot assignments
+        if (gpuSlotLookupDirty)
+        {
+            _GpuApplyLookupTextures();
+            gpuSlotLookupDirty = false;
+        }
 
         // Run GPU lighting first so atlas propagation still gets time while worldgen and
         // meshing are busy. Otherwise repeated chunk uploads can keep reseeding lighting
