@@ -7,8 +7,8 @@ Material:
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
-  m_Name: GpuColumnSurfaceReplace
-  m_Shader: {fileID: 4800000, guid: 22c2d7da6054467799ad37d46fb1bc6f, type: 3}
+  m_Name: GpuColumnDecoration
+  m_Shader: {fileID: 4800000, guid: 9638a05545f8f014ab37a41ab8a2d8e3, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords: []
@@ -27,11 +27,15 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _BedrockMaskTex:
+    - _BlockPropsTex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _GravelNoiseTex:
+    - _CandidateTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _DrawTableTex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
@@ -39,39 +43,63 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _SandNoiseTex:
+    - _Noise1Tex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _StoneNoiseTex:
+    - _Noise2Tex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _SurfaceInfoTex:
+    - _Noise3Tex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _SurfaceParamsTexA:
+    - _Noise6Tex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
-    - _SurfaceParamsTexB:
+    - _Noise7Tex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _RainfallTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _SlotLookupTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _SlotMetaTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _TemperatureTex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
     m_Ints: []
     m_Floats:
-    - _BedrockBlockId: 7
+    - _AirBlockId: 0
+    - _BuiltinOffsetX: -16
+    - _BuiltinOffsetZ: 0
+    - _CandidateCount: 114
+    - _CandidateTexHeight: 32
+    - _CandidateTexWidth: 256
     - _ChunkSizeXZ: 16
-    - _ColumnBorder: 0
+    - _ChunkX: -1
+    - _ChunkZ: 1
+    - _DirtBlockId: 3
     - _FlipXAxis: 1
-    - _GravelBlockId: 13
-    - _InnerChunkSize: 16
-    - _SandBlockId: 12
-    - _SandstoneBlockId: 24
-    - _StoneBlockId: 1
-    - _WaterBlockId: 9
+    - _GrassBlockId: 2
+    - _LeavesBlockId: 18
+    - _Mode: 2
+    - _ReadSlotIndex: 263
     - _WorldHeight: 128
+    - _XSize: 5
+    - _YSize: 17
+    - _ZSize: 5
     m_Colors:
     - _Color: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []

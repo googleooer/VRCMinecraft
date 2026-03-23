@@ -14467,6 +14467,10 @@ MonoBehaviour:
     type: 2}
   gpuColumnSurfaceReplaceMaterial: {fileID: 2100000, guid: 9acee80b4e0949dbb16aa48e5dd64dfd,
     type: 2}
+  gpuColumnDecorationMaterial: {fileID: 2100000, guid: 1e33f5601a273e74ab22fb70bfa24874,
+    type: 2}
+  gpuColumnTreeDecorationMaterial: {fileID: 2100000, guid: a504715080318d644805ba910cd65d74,
+    type: 2}
   enableGpuNoiseDiagnostics: 0
   gpuNoiseDiagnosticDumpAllCells: 0
   gpuNoiseDiagnosticChunkX: 0

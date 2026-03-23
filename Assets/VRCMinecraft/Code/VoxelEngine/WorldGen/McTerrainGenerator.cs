@@ -105,6 +105,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public Material gpuColumnBaseFillMaterial;
     public Material gpuColumnSurfaceInfoMaterial;
     public Material gpuColumnSurfaceReplaceMaterial;
+    public Material gpuColumnDecorationMaterial;
+    public Material gpuColumnTreeDecorationMaterial;
 
     [Header("GPU Noise Diagnostics")]
     public bool enableGpuNoiseDiagnostics = false;
@@ -457,6 +459,35 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuPropSandNoiseTexId;
     private int gpuPropStoneNoiseTexId;
 
+    // GPU decoration property IDs
+    private int gpuPropCandidateTexId;
+    private int gpuPropCandidateCountId;
+    private int gpuPropCandidateTexWidthId;
+    private int gpuPropAirBlockIdDecor;
+    private int gpuPropGrassBlockIdDecor;
+    private int gpuPropDirtBlockIdDecor;
+    private int gpuPropLeavesBlockIdDecor;
+
+    // GPU decoration textures
+    private const int GPU_DECORATION_TEX_WIDTH = 256;
+    private const int GPU_DECORATION_TEX_HEIGHT = 32;
+    private Texture2D gpuDecorationCandidateTexture;
+    private Color[] gpuDecorationCandidatePixels;
+    private RenderTexture gpuDecorationWorkTexture;
+    private int gpuPropCandidateTexHeightId;
+
+    // GPU tree decoration
+    private const int GPU_TREE_TEX_WIDTH = 64;
+    private Texture2D gpuTreeInfoTexture;
+    private Color[] gpuTreeInfoPixels;
+    private RenderTexture gpuTreeWorkTexture;
+    private RenderTexture[] gpuTreeAnchorChunkTextures;
+    private int[] gpuTreeAnchorChunkTexIds;
+    private BetaBiomeEnum[] gpuTreeAnchorBiomeBuffer;
+    private int gpuPropTreeInfoTexId;
+    private int gpuPropTreeCountId;
+    private int gpuPropLogBlockIdDecor;
+
     // Precomputed coordinate data for double-precision noise on GPU.
     // CPU computes floor() & 0xFF and fractional parts in double,
     // then uploads as float arrays so the GPU never does precision-sensitive coord math.
@@ -510,7 +541,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // Decoration state variables
     private int decoration_step;
     private int decoration_feature_count;
-    private int decoration_feature_index; 
+    private int decoration_feature_index;
+    // Direct column buffer for decoration — avoids world.GetBlock/SetBlock overhead
+    private byte[] decoration_columnBuffer; // flat 16×worldHeight×16
+    private bool[] decoration_columnDirtySlice; // which chunk slices were modified
+    private int decoration_columnOriginX; // world-space block X of column origin
+    private int decoration_columnOriginZ; // world-space block Z of column origin
+    private int decoration_columnHeight; // total Y blocks in column
+    private int decoration_sizeXZ; // chunk XZ size (16) 
 
 #if LOGGING
     private StringBuilder logBuilder;
@@ -1170,6 +1208,30 @@ public class McTerrainGenerator : UdonSharpBehaviour
             gpuCachedChunkSlices[chunkY] = new byte[chunkSize];
         }
 
+        // GPU decoration texture (candidate positions uploaded from CPU)
+        gpuDecorationCandidateTexture = new Texture2D(GPU_DECORATION_TEX_WIDTH, GPU_DECORATION_TEX_HEIGHT, TextureFormat.RGBA32, false, true);
+        gpuDecorationCandidateTexture.filterMode = FilterMode.Point;
+        gpuDecorationCandidateTexture.wrapMode = TextureWrapMode.Clamp;
+        gpuDecorationCandidatePixels = new Color[GPU_DECORATION_TEX_WIDTH * GPU_DECORATION_TEX_HEIGHT];
+        gpuDecorationWorkTexture = _CreateGpuBlockIdRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_DecorationWork");
+
+        // GPU tree decoration texture (one pixel per tree candidate)
+        gpuTreeInfoTexture = new Texture2D(GPU_TREE_TEX_WIDTH, 1, TextureFormat.RGBA32, false, true);
+        gpuTreeInfoTexture.filterMode = FilterMode.Point;
+        gpuTreeInfoTexture.wrapMode = TextureWrapMode.Clamp;
+        gpuTreeInfoPixels = new Color[GPU_TREE_TEX_WIDTH];
+        gpuTreeWorkTexture = _CreateGpuBlockIdRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_TreeWork");
+        gpuTreeAnchorChunkTextures = new RenderTexture[9];
+        for (int treeChunkSlot = 0; treeChunkSlot < gpuTreeAnchorChunkTextures.Length; treeChunkSlot++)
+        {
+            gpuTreeAnchorChunkTextures[treeChunkSlot] = _CreateGpuBlockIdRenderTexture(
+                world.chunkSizeXZ,
+                gpuWorldHeightBlocks * world.chunkSizeXZ,
+                "GPU_TreeAnchorChunk_" + treeChunkSlot
+            );
+        }
+        gpuTreeAnchorBiomeBuffer = new BetaBiomeEnum[world.chunkSizeXZ * world.chunkSizeXZ];
+
         _UploadGpuPermutationTable(gpuPermTextureNoise1, noiseGen1, 16);
         _UploadGpuPermutationTable(gpuPermTextureNoise2, noiseGen2, 16);
         _UploadGpuPermutationTable(gpuPermTextureNoise3, noiseGen3, 8);
@@ -1246,6 +1308,29 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuPropSandNoiseTexId = VRCShader.PropertyToID("_SandNoiseTex");
         gpuPropGravelNoiseTexId = VRCShader.PropertyToID("_GravelNoiseTex");
         gpuPropStoneNoiseTexId = VRCShader.PropertyToID("_StoneNoiseTex");
+
+        // GPU decoration property IDs
+        gpuPropCandidateTexId = VRCShader.PropertyToID("_CandidateTex");
+        gpuPropCandidateCountId = VRCShader.PropertyToID("_CandidateCount");
+        gpuPropCandidateTexWidthId = VRCShader.PropertyToID("_CandidateTexWidth");
+        gpuPropCandidateTexHeightId = VRCShader.PropertyToID("_CandidateTexHeight");
+        gpuPropAirBlockIdDecor = VRCShader.PropertyToID("_AirBlockId");
+        gpuPropGrassBlockIdDecor = VRCShader.PropertyToID("_GrassBlockId");
+        gpuPropDirtBlockIdDecor = VRCShader.PropertyToID("_DirtBlockId");
+        gpuPropLeavesBlockIdDecor = VRCShader.PropertyToID("_LeavesBlockId");
+        gpuPropTreeInfoTexId = VRCShader.PropertyToID("_TreeInfoTex");
+        gpuPropTreeCountId = VRCShader.PropertyToID("_TreeCount");
+        gpuPropLogBlockIdDecor = VRCShader.PropertyToID("_LogBlockId");
+        gpuTreeAnchorChunkTexIds = new int[9];
+        gpuTreeAnchorChunkTexIds[0] = VRCShader.PropertyToID("_TreeChunkTex0");
+        gpuTreeAnchorChunkTexIds[1] = VRCShader.PropertyToID("_TreeChunkTex1");
+        gpuTreeAnchorChunkTexIds[2] = VRCShader.PropertyToID("_TreeChunkTex2");
+        gpuTreeAnchorChunkTexIds[3] = VRCShader.PropertyToID("_TreeChunkTex3");
+        gpuTreeAnchorChunkTexIds[4] = VRCShader.PropertyToID("_TreeChunkTex4");
+        gpuTreeAnchorChunkTexIds[5] = VRCShader.PropertyToID("_TreeChunkTex5");
+        gpuTreeAnchorChunkTexIds[6] = VRCShader.PropertyToID("_TreeChunkTex6");
+        gpuTreeAnchorChunkTexIds[7] = VRCShader.PropertyToID("_TreeChunkTex7");
+        gpuTreeAnchorChunkTexIds[8] = VRCShader.PropertyToID("_TreeChunkTex8");
 
         // Precomputed coordinate property IDs
         gpuPropPermIdxXId = VRCShader.PropertyToID("_PermIdxX");
@@ -2370,11 +2455,446 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
 #endif
 
+        // GPU decoration pass — stamp grass/flowers directly on the column texture
+        RenderTexture readbackSource = gpuColumnFinalTexture;
+        if (!match1to1TerrainBaseline && gpuColumnDecorationMaterial != null && currentChunkBiomes != null)
+        {
+            readbackSource = _BlitGpuDecoration(gpuColumnFinalTexture, sizeXZ);
+        }
+
         gpuCachedColumnX = gpuPendingColumnX;
         gpuCachedColumnZ = gpuPendingColumnZ;
         gpuCachedChunkSlicesReady = false;
         gpuFinalColumnSliceCachePending = false;
-        return _BeginGpuBaseColumnReadback(gpuColumnFinalTexture, true);
+        return _BeginGpuBaseColumnReadback(readbackSource, true);
+    }
+
+    private RenderTexture _BlitGpuDecoration(RenderTexture columnTex, int sizeXZ)
+    {
+        int worldHeight = gpuWorldHeightBlocks;
+        int colOriginX = currentChunkX * sizeXZ;
+        int colOriginZ = currentChunkZ * sizeXZ;
+
+        int candidateCount = 0;
+        int maxCandidates = GPU_DECORATION_TEX_WIDTH * GPU_DECORATION_TEX_HEIGHT;
+        int treeCount = 0;
+        int maxTrees = GPU_TREE_TEX_WIDTH;
+        int requiredTreeAnchorMask = 1 << 4;
+
+        // Collect candidates from 4 contributing chunks.
+        // With BUILTIN_OFFSET_X=-16, trees from chunk cx land at world X = (cx-1)*16+8..23
+        //   cx=currentChunkX   -> localX -8..+7,  cx=currentChunkX+1 -> localX +8..+23
+        // With BUILTIN_OFFSET_Z=0,  trees from chunk cz land at world Z = cz*16+8..23
+        //   cz=currentChunkZ-1 -> localZ -8..+7,  cz=currentChunkZ   -> localZ +8..+23
+        int[] neighborOffsetX = new int[] { 0, 1, 0, 1 };
+        int[] neighborOffsetZ = new int[] { -1, -1, 0, 0 };
+
+        for (int ni = 0; ni < 4; ni++)
+        {
+            int ncx = currentChunkX + neighborOffsetX[ni];
+            int ncz = currentChunkZ + neighborOffsetZ[ni];
+
+            _GpuDecorationCollectFromChunk(ncx, ncz, colOriginX, colOriginZ,
+                sizeXZ, worldHeight,
+                ref treeCount, maxTrees,
+                ref candidateCount, maxCandidates,
+                ref requiredTreeAnchorMask);
+        }
+
+        RenderTexture currentTex = columnTex;
+
+        // Pass 1: Tree decoration
+        if (treeCount > 0 && gpuColumnTreeDecorationMaterial != null)
+        {
+            VRCGraphics.Blit(columnTex, gpuTreeAnchorChunkTextures[4]);
+            currentTex = gpuTreeAnchorChunkTextures[4];
+            _PrepareGpuTreeAnchorChunks(requiredTreeAnchorMask, sizeXZ);
+
+            gpuTreeInfoTexture.SetPixels(gpuTreeInfoPixels);
+            gpuTreeInfoTexture.Apply(false, false);
+
+            gpuColumnTreeDecorationMaterial.SetTexture(gpuPropBaseColumnTexId, currentTex);
+            gpuColumnTreeDecorationMaterial.SetTexture(gpuPropTreeInfoTexId, gpuTreeInfoTexture);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropTreeCountId, treeCount);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropWorldHeightId, worldHeight);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropChunkSizeXZId, sizeXZ);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropAirBlockIdDecor, airBlockID);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropGrassBlockIdDecor, grassBlockID);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropDirtBlockIdDecor, dirtBlockID);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropLogBlockIdDecor, logBlockID);
+            gpuColumnTreeDecorationMaterial.SetInt(gpuPropLeavesBlockIdDecor, leavesBlockID);
+            for (int treeChunkSlot = 0; treeChunkSlot < gpuTreeAnchorChunkTextures.Length; treeChunkSlot++)
+            {
+                gpuColumnTreeDecorationMaterial.SetTexture(gpuTreeAnchorChunkTexIds[treeChunkSlot], gpuTreeAnchorChunkTextures[treeChunkSlot]);
+            }
+
+            VRCGraphics.Blit(currentTex, gpuTreeWorkTexture, gpuColumnTreeDecorationMaterial);
+            currentTex = gpuTreeWorkTexture;
+        }
+
+        // Pass 2: Flower/grass decoration
+        if (candidateCount > 0)
+        {
+            gpuDecorationCandidateTexture.SetPixels(gpuDecorationCandidatePixels);
+            gpuDecorationCandidateTexture.Apply(false, false);
+
+            gpuColumnDecorationMaterial.SetTexture(gpuPropBaseColumnTexId, currentTex);
+            gpuColumnDecorationMaterial.SetTexture(gpuPropCandidateTexId, gpuDecorationCandidateTexture);
+            gpuColumnDecorationMaterial.SetInt(gpuPropCandidateCountId, candidateCount);
+            gpuColumnDecorationMaterial.SetInt(gpuPropCandidateTexWidthId, GPU_DECORATION_TEX_WIDTH);
+            gpuColumnDecorationMaterial.SetInt(gpuPropCandidateTexHeightId, GPU_DECORATION_TEX_HEIGHT);
+            gpuColumnDecorationMaterial.SetInt(gpuPropWorldHeightId, worldHeight);
+            gpuColumnDecorationMaterial.SetInt(gpuPropChunkSizeXZId, sizeXZ);
+            gpuColumnDecorationMaterial.SetInt(gpuPropAirBlockIdDecor, airBlockID);
+            gpuColumnDecorationMaterial.SetInt(gpuPropGrassBlockIdDecor, grassBlockID);
+            gpuColumnDecorationMaterial.SetInt(gpuPropDirtBlockIdDecor, dirtBlockID);
+            gpuColumnDecorationMaterial.SetInt(gpuPropLeavesBlockIdDecor, leavesBlockID);
+
+            VRCGraphics.Blit(currentTex, gpuDecorationWorkTexture, gpuColumnDecorationMaterial);
+            currentTex = gpuDecorationWorkTexture;
+        }
+
+        return currentTex;
+    }
+
+    private int _GetTreeAnchorChunkSlot(int localX, int localZ, int sizeXZ)
+    {
+        int chunkOffsetX = localX < 0 ? -1 : (localX >= sizeXZ ? 1 : 0);
+        int chunkOffsetZ = localZ < 0 ? -1 : (localZ >= sizeXZ ? 1 : 0);
+        return (chunkOffsetZ + 1) * 3 + (chunkOffsetX + 1);
+    }
+
+    private void _PrepareGpuTreeAnchorChunks(int requiredTreeAnchorMask, int sizeXZ)
+    {
+        if (gpuTreeAnchorChunkTextures == null || gpuTreeAnchorBiomeBuffer == null) return;
+
+        for (int treeChunkSlot = 0; treeChunkSlot < 9; treeChunkSlot++)
+        {
+            if (treeChunkSlot == 4) continue;
+            if ((requiredTreeAnchorMask & (1 << treeChunkSlot)) == 0) continue;
+
+            int chunkOffsetX = (treeChunkSlot % 3) - 1;
+            int chunkOffsetZ = (treeChunkSlot / 3) - 1;
+            int chunkX = currentChunkX + chunkOffsetX;
+            int chunkZ = currentChunkZ + chunkOffsetZ;
+
+            if (!_FillGpuTreeAnchorBiomes(chunkX, chunkZ))
+            {
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
+                continue;
+            }
+            if (!_RenderGpuTreeAnchorChunk(chunkX, chunkZ, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorChunkTextures[treeChunkSlot], sizeXZ))
+            {
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
+            }
+        }
+    }
+
+    private bool _FillGpuTreeAnchorBiomes(int chunkX, int chunkZ)
+    {
+        if (gpuTreeAnchorBiomeBuffer == null) return false;
+
+        if (chunkX == currentChunkX && chunkZ == currentChunkZ && currentChunkBiomes != null &&
+            currentChunkBiomes.Length == gpuTreeAnchorBiomeBuffer.Length)
+        {
+            System.Array.Copy(currentChunkBiomes, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorBiomeBuffer.Length);
+            return true;
+        }
+
+        int blockX = _GetTerrainBlockStartX(chunkX);
+        int blockZ = _GetTerrainBlockStartZ(chunkZ);
+        if (biomeQueryWcm == null)
+        {
+            biomeQueryWcm = new WorldChunkManagerOld(generatorSeed);
+        }
+
+        BetaBiomeEnum[] result = biomeQueryWcm.getBiomeBlock(null, blockX, blockZ, world.chunkSizeXZ, world.chunkSizeXZ);
+        if (result == null || result.Length < gpuTreeAnchorBiomeBuffer.Length) return false;
+
+        System.Array.Copy(result, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorBiomeBuffer.Length);
+        return true;
+    }
+
+    private bool _RenderGpuTreeAnchorChunk(int chunkX, int chunkZ, BetaBiomeEnum[] chunkBiomes, RenderTexture targetTexture, int sizeXZ)
+    {
+        if (!gpuWorldgenReady || targetTexture == null || chunkBiomes == null || chunkBiomes.Length != sizeXZ * sizeXZ) return false;
+
+        int savedChunkX = currentChunkX;
+        int savedChunkZ = currentChunkZ;
+        BetaBiomeEnum[] savedChunkBiomes = currentChunkBiomes;
+
+        currentChunkX = chunkX;
+        currentChunkZ = chunkZ;
+        currentChunkBiomes = chunkBiomes;
+
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropClimatePermTex0Id, gpuClimatePermTextureTemp);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropClimatePermTex1Id, gpuClimatePermTextureRain);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropClimatePermTex2Id, gpuClimatePermTextureModifier);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropClimateOffsetTex0Id, gpuClimateOffsetTextureTemp);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropClimateOffsetTex1Id, gpuClimateOffsetTextureRain);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropClimateOffsetTex2Id, gpuClimateOffsetTextureModifier);
+        gpuNoiseOctaveMaterial.SetTexture(gpuPropClimateBiomeLookupTexId, gpuClimateBiomeLookupTexture);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropClimateOctaveCount0Id, biomeTempNoiseGen.GetOctaveCount());
+        gpuNoiseOctaveMaterial.SetInt(gpuPropClimateOctaveCount1Id, biomeRainNoiseGen.GetOctaveCount());
+        gpuNoiseOctaveMaterial.SetInt(gpuPropClimateOctaveCount2Id, biomeModifierNoiseGen.GetOctaveCount());
+        gpuNoiseOctaveMaterial.SetInt(gpuPropChunkXId, _GetTerrainBlockStartX(currentChunkX));
+        gpuNoiseOctaveMaterial.SetInt(gpuPropChunkZId, _GetTerrainBlockStartZ(currentChunkZ));
+        gpuNoiseOctaveMaterial.SetInt(gpuPropXSizeId, sizeXZ);
+        gpuNoiseOctaveMaterial.SetInt(gpuPropZSizeId, sizeXZ);
+        VRCGraphics.Blit(gpuClearTexture, gpuClimateTexture, gpuNoiseOctaveMaterial, 2);
+
+        int densityXSize = 5;
+        int densityYSize = gpuWorldHeightBlocks / 8 + 1;
+        int densityZSize = 5;
+        int densityXPos = _GetTerrainNoiseStartX(currentChunkX, 4);
+        int densityZPos = _GetTerrainNoiseStartZ(currentChunkZ, 4);
+        double d0 = 684.412D;
+        double d1 = 684.412D;
+
+        _WriteNoiseCoordBlock(noiseGen1, 16, densityXSize, densityYSize, densityZSize, densityXPos, 0, densityZPos, d0, d1, d0, false, 0);
+        _WriteNoiseCoordBlock(noiseGen2, 16, densityXSize, densityYSize, densityZSize, densityXPos, 0, densityZPos, d0, d1, d0, false, 1);
+        _WriteNoiseCoordBlock(noiseGen3, 8, densityXSize, densityYSize, densityZSize, densityXPos, 0, densityZPos, d0 / 80.0D, d1 / 160.0D, d0 / 80.0D, false, 2);
+        _WriteNoiseCoordBlock(noiseGen6, 10, densityXSize, 1, densityZSize, densityXPos, 10, densityZPos, 1.121D, 1.0D, 1.121D, true, 3);
+        _WriteNoiseCoordBlock(noiseGen7, 16, densityXSize, 1, densityZSize, densityXPos, 10, densityZPos, 200.0D, 1.0D, 200.0D, true, 4);
+        _FlushBatchedNoiseCoords();
+
+        _RunGpuNoiseOctaves(noiseGen1, 16, gpuNoise1Texture, densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize, d0, d1, d0, false, 0 * GPU_MAX_OCTAVES);
+        _RunGpuNoiseOctaves(noiseGen2, 16, gpuNoise2Texture, densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize, d0, d1, d0, false, 1 * GPU_MAX_OCTAVES);
+        _RunGpuNoiseOctaves(noiseGen3, 8, gpuNoise3Texture, densityXPos, 0, densityZPos, densityXSize, densityYSize, densityZSize, d0 / 80.0D, d1 / 160.0D, d0 / 80.0D, false, 2 * GPU_MAX_OCTAVES);
+        _RunGpuNoiseOctaves(noiseGen6, 10, gpuNoise6Texture, densityXPos, 10, densityZPos, densityXSize, 1, densityZSize, 1.121D, 1.0D, 1.121D, true, 3 * GPU_MAX_OCTAVES);
+        _RunGpuNoiseOctaves(noiseGen7, 16, gpuNoise7Texture, densityXPos, 10, densityZPos, densityXSize, 1, densityZSize, 200.0D, 1.0D, 200.0D, true, 4 * GPU_MAX_OCTAVES);
+
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise1TexId, gpuNoise1Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise2TexId, gpuNoise2Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise3TexId, gpuNoise3Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise6TexId, gpuNoise6Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropNoise7TexId, gpuNoise7Texture);
+        gpuNoiseCombineMaterial.SetTexture(gpuPropTemperatureTexId, gpuClimateTexture);
+        gpuNoiseCombineMaterial.SetInt(gpuPropXSizeId, densityXSize);
+        gpuNoiseCombineMaterial.SetInt(gpuPropYSizeId, densityYSize);
+        gpuNoiseCombineMaterial.SetInt(gpuPropZSizeId, densityZSize);
+        gpuNoiseCombineMaterial.SetInt(gpuPropChunkXId, currentChunkX);
+        gpuNoiseCombineMaterial.SetInt(gpuPropChunkZId, currentChunkZ);
+        gpuNoiseCombineMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
+        gpuNoiseCombineMaterial.SetInt(gpuPropBuiltinOffsetXId, BUILTIN_OFFSET_X);
+        gpuNoiseCombineMaterial.SetInt(gpuPropBuiltinOffsetZId, BUILTIN_OFFSET_Z);
+        VRCGraphics.Blit(gpuNoise1Texture, gpuDensityTexture, gpuNoiseCombineMaterial, 1);
+
+        gpuColumnBaseFillMaterial.SetTexture(gpuPropDensityTexId, gpuDensityTexture);
+        gpuColumnBaseFillMaterial.SetTexture(gpuPropTemperatureTexId, gpuClimateTexture);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropChunkSizeXZId, sizeXZ);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropOceanHeightId, 64);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
+        gpuColumnBaseFillMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropWaterBlockId, waterBlockID);
+        gpuColumnBaseFillMaterial.SetInt(gpuPropIceBlockId, (int)BlockMaterial.ICE);
+        VRCGraphics.Blit(gpuDensityTexture, gpuColumnBaseTexture, gpuColumnBaseFillMaterial);
+
+        gpuColumnSurfaceInfoMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnBaseTexture);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropChunkSizeXZId, sizeXZ);
+        gpuColumnSurfaceInfoMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+        VRCGraphics.Blit(gpuColumnBaseTexture, gpuColumnSurfaceInfoTexture, gpuColumnSurfaceInfoMaterial);
+
+        int noiseX = _GetTerrainBlockStartX(currentChunkX);
+        int noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
+        double[] cpuSandN = noiseGen4.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.03125D, 0.03125D, 1.0D);
+        _UploadCpuSurfaceNoise(cpuSandN, sizeXZ, gpuSandNoiseTexture);
+        double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
+        _UploadCpuSurfaceNoise(cpuGravelN, sizeXZ, gpuGravelNoiseTexture);
+        double[] cpuStoneN = noiseGen5.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.0625D, 0.0625D, 0.0625D);
+        _UploadCpuSurfaceNoise(cpuStoneN, sizeXZ, gpuStoneNoiseTexture);
+
+        _BuildGpuSurfaceParamsFromSurfaceInfo();
+
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnBaseTexture);
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceInfoTexId, gpuColumnSurfaceInfoTexture);
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceParamsTexAId, gpuSurfaceParamsTextureA);
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceParamsTexBId, gpuSurfaceParamsTextureB);
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropBedrockMaskTexId, gpuBedrockMaskTexture);
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSandNoiseTexId, gpuSandNoiseTexture);
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropGravelNoiseTexId, gpuGravelNoiseTexture);
+        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropStoneNoiseTexId, gpuStoneNoiseTexture);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropChunkSizeXZId, sizeXZ);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropBedrockBlockId, bedrockBlockID);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropSandBlockId, sandBlockID);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropGravelBlockId, (int)BlockMaterial.GRAVEL);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropWaterBlockId, waterBlockID);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropSandstoneBlockId, sandStoneBlockID);
+        gpuColumnSurfaceReplaceMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
+        VRCGraphics.Blit(gpuColumnBaseTexture, gpuColumnFinalTexture, gpuColumnSurfaceReplaceMaterial);
+
+        VRCGraphics.Blit(gpuColumnFinalTexture, targetTexture);
+
+        currentChunkX = savedChunkX;
+        currentChunkZ = savedChunkZ;
+        currentChunkBiomes = savedChunkBiomes;
+        return true;
+    }
+
+    // Collect tree + flower/grass candidates from one chunk into the current column
+    private void _GpuDecorationCollectFromChunk(int chunkX, int chunkZ,
+        int colOriginX, int colOriginZ, int sizeXZ, int worldHeight,
+        ref int treeCount, int maxTrees,
+        ref int candidateCount, int maxCandidates,
+        ref int requiredTreeAnchorMask)
+    {
+        int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+        long decorSeed = (long)chunkX * 1364927L + (long)chunkZ * 7420851L ^ (long)worldSeed;
+        JavaRandom dRand = new JavaRandom(decorSeed);
+
+        BetaBiomeEnum centerBiome;
+        if (chunkX == currentChunkX && chunkZ == currentChunkZ && currentChunkBiomes != null)
+        {
+            centerBiome = currentChunkBiomes[8 * 16 + 8];
+        }
+        else
+        {
+            centerBiome = _QueryBiomeAtChunkCenter(chunkX, chunkZ);
+        }
+
+        // Trees: compute count, then generate tree info
+        int numTrees = BetaBiome.getTreesPerChunk(dRand, treeNoise, chunkX, chunkZ, centerBiome);
+        for (int ti = 0; ti < numTrees && treeCount < maxTrees; ti++)
+        {
+            int treeX = chunkX * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
+            int treeZ = chunkZ * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+
+            int treeHeight = dRand.NextInt(3) + 4;
+
+            // Pre-compute leaf corner skip decisions (always consume PRNG, even if tree fails validation)
+            int cornerBits = 0;
+            int cornerIndex = 0;
+            for (int leafY = -3 + treeHeight; leafY <= treeHeight; leafY++)
+            {
+                int yOff = leafY - treeHeight;
+                int leafR = 1 - yOff / 2;
+                for (int lx = -leafR; lx <= leafR; lx++)
+                {
+                    for (int lz = -leafR; lz <= leafR; lz++)
+                    {
+                        if (System.Math.Abs(lx) == leafR && System.Math.Abs(lz) == leafR)
+                        {
+                            if (dRand.NextInt(2) == 0)
+                            {
+                                cornerBits |= (1 << (cornerIndex & 7));
+                            }
+                            cornerIndex++;
+                        }
+                    }
+                }
+            }
+
+            // Accept trees within ±2 of column (max leaf radius) so cross-boundary leaves work
+            int localX = treeX - colOriginX;
+            int localZ = treeZ - colOriginZ;
+            if (localX >= -2 && localX < sizeXZ + 2 && localZ >= -2 && localZ < sizeXZ + 2)
+            {
+                requiredTreeAnchorMask |= 1 << _GetTreeAnchorChunkSlot(localX, localZ, sizeXZ);
+                gpuTreeInfoPixels[treeCount] = new Color(
+                    (localX + 128) / 255f,
+                    (localZ + 128) / 255f,
+                    treeHeight / 255f,
+                    cornerBits / 255f
+                );
+                treeCount++;
+            }
+        }
+
+        // Yellow flowers
+        int yellowFlowerCount = BetaBiome.getFlowersPerChunk(centerBiome);
+        for (int fi = 0; fi < yellowFlowerCount; fi++)
+        {
+            _GpuDecorationAddFlowerCandidates(dRand, chunkX, chunkZ, colOriginX, colOriginZ,
+                sizeXZ, worldHeight, flowerYellowBlockID, ref candidateCount, maxCandidates);
+        }
+
+        // Tall grass
+        int grassCount = BetaBiome.getGrassPerChunk(centerBiome);
+        for (int gi = 0; gi < grassCount; gi++)
+        {
+            _GpuDecorationAddGrassCandidates(dRand, chunkX, chunkZ, colOriginX, colOriginZ,
+                sizeXZ, worldHeight, tallGrassBlockID, ref candidateCount, maxCandidates);
+        }
+
+        // Red flower (50% chance)
+        if (dRand.NextInt(2) == 0)
+        {
+            _GpuDecorationAddFlowerCandidates(dRand, chunkX, chunkZ, colOriginX, colOriginZ,
+                sizeXZ, worldHeight, flowerRedBlockID, ref candidateCount, maxCandidates);
+        }
+    }
+
+    private BetaBiomeEnum _QueryBiomeAtChunkCenter(int chunkX, int chunkZ)
+    {
+        int blockX = _GetTerrainBlockStartX(chunkX) + 8;
+        int blockZ = _GetTerrainBlockStartZ(chunkZ) + 8;
+        if (biomeQueryWcm == null)
+        {
+            biomeQueryWcm = new WorldChunkManagerOld(generatorSeed);
+        }
+        BetaBiomeEnum[] result = biomeQueryWcm.getBiomeBlock(null, blockX, blockZ, 1, 1);
+        if (result != null && result.Length > 0) return result[0];
+        return BetaBiomeEnum.PLAINS;
+    }
+
+    // Flower: 64 scatter attempts from a source chunk, filtered to current column
+    private void _GpuDecorationAddFlowerCandidates(JavaRandom dRand, int srcChunkX, int srcChunkZ,
+        int colOriginX, int colOriginZ,
+        int sizeXZ, int worldHeight, byte blockType, ref int candidateCount, int maxCandidates)
+    {
+        int baseX = srcChunkX * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
+        int baseY = dRand.NextInt(worldHeight);
+        int baseZ = srcChunkZ * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+
+        for (int attempt = 0; attempt < 64; attempt++)
+        {
+            int fx = baseX + dRand.NextInt(8) - dRand.NextInt(8);
+            int fy = baseY + dRand.NextInt(4) - dRand.NextInt(4);
+            int fz = baseZ + dRand.NextInt(8) - dRand.NextInt(8);
+
+            int localX = fx - colOriginX;
+            int localZ = fz - colOriginZ;
+            if (localX >= 0 && localX < sizeXZ && localZ >= 0 && localZ < sizeXZ
+                && fy >= 0 && fy < worldHeight && candidateCount < maxCandidates)
+            {
+                gpuDecorationCandidatePixels[candidateCount] = new Color(
+                    ((localX << 4) | localZ) / 255f, fy / 255f, blockType / 255f, 1f / 255f
+                );
+                candidateCount++;
+            }
+        }
+    }
+
+    // Tall grass: 128 scatter attempts from a source chunk, filtered to current column
+    private void _GpuDecorationAddGrassCandidates(JavaRandom dRand, int srcChunkX, int srcChunkZ,
+        int colOriginX, int colOriginZ,
+        int sizeXZ, int worldHeight, byte blockType, ref int candidateCount, int maxCandidates)
+    {
+        int baseX = srcChunkX * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
+        dRand.NextInt(worldHeight); // consume baseY from PRNG (GPU finds surface instead)
+        int baseZ = srcChunkZ * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+
+        for (int attempt = 0; attempt < 128; attempt++)
+        {
+            int gx = baseX + dRand.NextInt(8) - dRand.NextInt(8);
+            int dY = dRand.NextInt(4) - dRand.NextInt(4);
+            int gz = baseZ + dRand.NextInt(8) - dRand.NextInt(8);
+
+            int localX = gx - colOriginX;
+            int localZ = gz - colOriginZ;
+            if (localX >= 0 && localX < sizeXZ && localZ >= 0 && localZ < sizeXZ
+                && candidateCount < maxCandidates)
+            {
+                gpuDecorationCandidatePixels[candidateCount] = new Color(
+                    ((localX << 4) | localZ) / 255f, (dY + 128) / 255f, blockType / 255f, 0f
+                );
+                candidateCount++;
+            }
+        }
     }
 
     private void _BuildGpuChunkSliceCache()
@@ -3992,15 +4512,22 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     
                     if (decoration_step == 0)
                     {
-                        // Step 0: Initialize decoration random seed (EXACTLY like Beta 1.7.3)
-                        // From ChunkProviderGenerate.java line 315-318
-                        // Use the world seed to initialize a temporary random for decoration
-                        int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
-                        JavaRandom seedRand = new JavaRandom(worldSeed);
-                        long var7 = seedRand.NextLong() / 2L * 2L + 1L;
-                        long var9 = seedRand.NextLong() / 2L * 2L + 1L;
-                        rand.SetSeed((long)currentChunkX * var7 + (long)currentChunkZ * var9 ^ (long)worldSeed);
-                        decoration_step++;
+                        // If GPU decoration handles everything, skip straight to completion
+                        if (gpuColumnDecorationMaterial != null && gpuColumnTreeDecorationMaterial != null)
+                        {
+                            decoration_step = 8;
+                        }
+                        else
+                        {
+                            // CPU fallback: initialize decoration random seed + build column buffer
+                            int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+                            JavaRandom seedRand = new JavaRandom(worldSeed);
+                            long var7 = seedRand.NextLong() / 2L * 2L + 1L;
+                            long var9 = seedRand.NextLong() / 2L * 2L + 1L;
+                            rand.SetSeed((long)currentChunkX * var7 + (long)currentChunkZ * var9 ^ (long)worldSeed);
+                            _DecorationBuildColumnBuffer();
+                            decoration_step++;
+                        }
                     }
                     else if (decoration_step == 1)
                     {
@@ -4048,17 +4575,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                     else if (decoration_step == 3)
                     {
-                        // Step 3: Generate yellow flowers
-                        int centerBiomeIndex = 8 * 16 + 8; // Center of 16x16 grid
+                        // CPU fallback: generate yellow flowers
+                        int centerBiomeIndex = 8 * 16 + 8;
                         BetaBiomeEnum centerBiome = currentChunkBiomes[centerBiomeIndex];
-                        
                         decoration_feature_count = BetaBiome.getFlowersPerChunk(centerBiome);
                         decoration_feature_index = 0;
                         decoration_step++;
                     }
                     else if (decoration_step == 4)
                     {
-                        // Step 4: Place yellow flowers (time-sliced)
+                        // Step 4: Place yellow flowers (CPU fallback only)
                         if (decoration_feature_index < decoration_feature_count)
                         {
                             int worldX = currentChunkX * 16;
@@ -4080,17 +4606,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                     else if (decoration_step == 5)
                     {
-                        // Step 5: Generate tall grass
-                        int centerBiomeIndex = 8 * 16 + 8; // Center of 16x16 grid
+                        // Step 5: Generate tall grass count (CPU fallback only)
+                        int centerBiomeIndex = 8 * 16 + 8;
                         BetaBiomeEnum centerBiome = currentChunkBiomes[centerBiomeIndex];
-                        
                         decoration_feature_count = BetaBiome.getGrassPerChunk(centerBiome);
                         decoration_feature_index = 0;
                         decoration_step++;
                     }
                     else if (decoration_step == 6)
                     {
-                        // Step 6: Place tall grass (time-sliced, 128 attempts per placement like Beta 1.7.3)
+                        // Step 6: Place tall grass (CPU fallback only)
                         if (decoration_feature_index < decoration_feature_count)
                         {
                             int worldX = currentChunkX * 16;
@@ -4112,7 +4637,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                     else if (decoration_step == 7)
                     {
-                        // Step 7: Generate red flowers (Beta 1.7.3 lines 527-532: 50% chance)
+                        // Step 7: Red flower (CPU fallback only)
                         if (rand.NextInt(2) == 0)
                         {
                             int worldX = currentChunkX * 16;
@@ -4130,7 +4655,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                     else
                     {
-                        // Decoration complete
+                        // Decoration complete — flush modified slices back
+                        _DecorationFlushColumnBuffer();
 #if LOGGING
                         if (enableDetailedTimings) agg_decorationColumns++;
 #endif
@@ -4312,17 +4838,122 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
     }
 
+    // ===== DECORATION COLUMN BUFFER =====
+    // During decoration, we merge all gpuCachedChunkSlices into a single flat byte[]
+    // so we can do direct array indexing instead of world.GetBlock/SetBlock.
+    // Layout: buffer[y * sizeXZ * sizeXZ + z * sizeXZ + x] — same as chunk data but full column height.
+
+    private void _DecorationBuildColumnBuffer()
+    {
+        int sXZ = world.chunkSizeXZ;
+        int sY = world.chunkSizeY;
+        int dimY = world.worldDimensionY;
+        int totalHeight = dimY * sY;
+        int chunkBlockCount = sXZ * sY * sXZ;
+        int columnBlockCount = sXZ * totalHeight * sXZ;
+
+        if (decoration_columnBuffer == null || decoration_columnBuffer.Length != columnBlockCount)
+        {
+            decoration_columnBuffer = new byte[columnBlockCount];
+            decoration_columnDirtySlice = new bool[dimY];
+        }
+
+        // Copy each slice into the merged buffer
+        for (int cy = 0; cy < dimY; cy++)
+        {
+            decoration_columnDirtySlice[cy] = false;
+            byte[] slice = gpuCachedChunkSlices != null && cy < gpuCachedChunkSlices.Length ? gpuCachedChunkSlices[cy] : null;
+            if (slice != null && slice.Length == chunkBlockCount)
+            {
+                System.Array.Copy(slice, 0, decoration_columnBuffer, cy * chunkBlockCount, chunkBlockCount);
+            }
+            else
+            {
+                System.Array.Clear(decoration_columnBuffer, cy * chunkBlockCount, chunkBlockCount);
+            }
+        }
+
+        // The column's world-space origin: chunk coords * chunkSize gives the block origin.
+        // currentChunkX/Z are centered chunk coordinates used by GetBlock/SetBlock.
+        // GetBlock expects global block coordinates, where chunkX << 4 = block X.
+        decoration_columnOriginX = currentChunkX * sXZ;
+        decoration_columnOriginZ = currentChunkZ * sXZ;
+        decoration_columnHeight = totalHeight;
+        decoration_sizeXZ = sXZ;
+    }
+
+    private void _DecorationFlushColumnBuffer()
+    {
+        if (decoration_columnBuffer == null || gpuCachedChunkSlices == null) return;
+
+        int sXZ = decoration_sizeXZ;
+        int sY = world.chunkSizeY;
+        int chunkBlockCount = sXZ * sY * sXZ;
+        int dimY = world.worldDimensionY;
+
+        for (int cy = 0; cy < dimY; cy++)
+        {
+            if (!decoration_columnDirtySlice[cy]) continue;
+
+            byte[] slice = cy < gpuCachedChunkSlices.Length ? gpuCachedChunkSlices[cy] : null;
+            if (slice != null)
+            {
+                System.Array.Copy(decoration_columnBuffer, cy * chunkBlockCount, slice, 0, chunkBlockCount);
+            }
+
+            // The top chunk's workingChunkData also needs updating
+            if (cy == currentChunkY)
+            {
+                System.Array.Copy(decoration_columnBuffer, cy * chunkBlockCount, workingChunkData, 0, chunkBlockCount);
+            }
+        }
+    }
+
+    private byte _DecorationGetBlock(int globalX, int globalY, int globalZ)
+    {
+        // In-column fast path
+        int localX = globalX - decoration_columnOriginX;
+        int localZ = globalZ - decoration_columnOriginZ;
+        if (localX >= 0 && localX < decoration_sizeXZ &&
+            localZ >= 0 && localZ < decoration_sizeXZ &&
+            globalY >= 0 && globalY < decoration_columnHeight)
+        {
+            return decoration_columnBuffer[globalY * decoration_sizeXZ * decoration_sizeXZ + localZ * decoration_sizeXZ + localX];
+        }
+        // Out-of-column fallback (tree canopy extending into neighbor columns)
+        return world.GetBlock(globalX, globalY, globalZ);
+    }
+
+    private void _DecorationSetBlock(int globalX, int globalY, int globalZ, byte blockType)
+    {
+        // In-column fast path
+        int localX = globalX - decoration_columnOriginX;
+        int localZ = globalZ - decoration_columnOriginZ;
+        if (localX >= 0 && localX < decoration_sizeXZ &&
+            localZ >= 0 && localZ < decoration_sizeXZ &&
+            globalY >= 0 && globalY < decoration_columnHeight)
+        {
+            decoration_columnBuffer[globalY * decoration_sizeXZ * decoration_sizeXZ + localZ * decoration_sizeXZ + localX] = blockType;
+            // Mark which chunk slice was modified
+            int chunkY = globalY / world.chunkSizeY;
+            if (chunkY < decoration_columnDirtySlice.Length)
+                decoration_columnDirtySlice[chunkY] = true;
+            return;
+        }
+        // Out-of-column fallback
+        world.SetBlock(globalX, globalY, globalZ, blockType);
+    }
+
     // ===== DECORATION METHODS (Beta 1.7.3 WorldGenTrees, WorldGenTallGrass, WorldGenFlowers) =====
     
     private int GetHighestSolidBlock(int globalX, int globalZ)
     {
-        // Find the highest non-air block at this X,Z coordinate
-        for (int y = world.worldDimensionY * world.chunkSizeY - 1; y >= 0; y--)
+        for (int y = decoration_columnHeight - 1; y >= 0; y--)
         {
-            byte blockID = world.GetBlock(globalX, y, globalZ);
+            byte blockID = _DecorationGetBlock(globalX, y, globalZ);
             if (blockID != airBlockID)
             {
-                return y + 1; // Return the air block above the solid block
+                return y + 1;
             }
         }
         return 0;
@@ -4331,13 +4962,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void GenerateTree(int x, int y, int z)
     {
         // EXACT port of Beta 1.7.3 WorldGenTrees.java
-        int treeHeight = rand.NextInt(3) + 4; // Random height 4-6
+        int treeHeight = rand.NextInt(3) + 4;
         
-        // Check if there's space for the tree
-        if (y < 1 || y + treeHeight + 1 > world.worldDimensionY * world.chunkSizeY) return;
+        if (y < 1 || y + treeHeight + 1 > decoration_columnHeight) return;
         
-        // Check if trunk can be placed (must be on grass or dirt)
-        byte blockBelow = world.GetBlock(x, y - 1, z);
+        byte blockBelow = _DecorationGetBlock(x, y - 1, z);
         if (blockBelow != grassBlockID && blockBelow != dirtBlockID) return;
         
         // Check if there's enough space for the canopy
@@ -4351,24 +4980,23 @@ public class McTerrainGenerator : UdonSharpBehaviour
             {
                 for (int checkZ = z - radius; checkZ <= z + radius; checkZ++)
                 {
-                    if (checkY >= 0 && checkY < world.worldDimensionY * world.chunkSizeY)
+                    if (checkY >= 0 && checkY < decoration_columnHeight)
                     {
-                        byte checkBlock = world.GetBlock(checkX, checkY, checkZ);
+                        byte checkBlock = _DecorationGetBlock(checkX, checkY, checkZ);
                         if (checkBlock != airBlockID && checkBlock != leavesBlockID)
                         {
-                            return; // Not enough space
+                            return;
                         }
                     }
                     else
                     {
-                        return; // Out of bounds
+                        return;
                     }
                 }
             }
         }
         
-        // Place dirt under the tree
-        world.SetBlock(x, y - 1, z, dirtBlockID);
+        _DecorationSetBlock(x, y - 1, z, dirtBlockID);
         
         // Generate leaves (canopy)
         for (int leafY = y - 3 + treeHeight; leafY <= y + treeHeight; leafY++)
@@ -4383,27 +5011,25 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 {
                     int zOffset = leafZ - z;
                     
-                    // Beta 1.7.3 logic: skip corners randomly, except at top
                     if ((System.Math.Abs(xOffset) != leafRadius || System.Math.Abs(zOffset) != leafRadius || rand.NextInt(2) != 0 && yOffset != 0))
                     {
-                        byte blockAtPos = world.GetBlock(leafX, leafY, leafZ);
-                        // Only place leaves if air or existing leaves
+                        byte blockAtPos = _DecorationGetBlock(leafX, leafY, leafZ);
                         if (blockAtPos == airBlockID || blockAtPos == leavesBlockID)
                         {
-                            world.SetBlock(leafX, leafY, leafZ, leavesBlockID);
+                            _DecorationSetBlock(leafX, leafY, leafZ, leavesBlockID);
                         }
                     }
                 }
             }
         }
         
-        // Generate trunk (wood blocks)
+        // Generate trunk
         for (int trunkY = 0; trunkY < treeHeight; trunkY++)
         {
-            byte blockAtPos = world.GetBlock(x, y + trunkY, z);
+            byte blockAtPos = _DecorationGetBlock(x, y + trunkY, z);
             if (blockAtPos == airBlockID || blockAtPos == leavesBlockID)
             {
-                world.SetBlock(x, y + trunkY, z, logBlockID);
+                _DecorationSetBlock(x, y + trunkY, z, logBlockID);
             }
         }
     }
@@ -4411,34 +5037,28 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void GenerateTallGrass(int x, int y, int z)
     {
         // EXACT port of Beta 1.7.3 WorldGenTallGrass.java
-        // Find the surface by moving down
         while (true)
         {
-            byte blockAtPos = world.GetBlock(x, y, z);
+            byte blockAtPos = _DecorationGetBlock(x, y, z);
             if ((blockAtPos != airBlockID && blockAtPos != leavesBlockID) || y <= 0)
             {
-                // Found surface or bedrock, now try 128 random placements
                 for (int attempt = 0; attempt < 128; attempt++)
                 {
                     int grassX = x + rand.NextInt(8) - rand.NextInt(8);
                     int grassY = y + rand.NextInt(4) - rand.NextInt(4);
                     int grassZ = z + rand.NextInt(8) - rand.NextInt(8);
                     
-                    // Check if air block
-                    if (grassY >= 0 && grassY < world.worldDimensionY * world.chunkSizeY)
+                    if (grassY >= 0 && grassY < decoration_columnHeight)
                     {
-                        byte blockAbove = world.GetBlock(grassX, grassY, grassZ);
+                        byte blockAbove = _DecorationGetBlock(grassX, grassY, grassZ);
                         if (blockAbove == airBlockID)
                         {
-                            // Check if can stay (grass/dirt below, enough light)
                             if (grassY > 0)
                             {
-                                byte blockBelow = world.GetBlock(grassX, grassY - 1, grassZ);
-                                if (blockBelow == grassBlockID || blockBelow == dirtBlockID)
+                                byte blockBelowGrass = _DecorationGetBlock(grassX, grassY - 1, grassZ);
+                                if (blockBelowGrass == grassBlockID || blockBelowGrass == dirtBlockID)
                                 {
-                                    // METADATA: Beta 1.7.3 uses metadata 1 for standard tall grass
-                                    // We don't have metadata support yet, so just place the block
-                                    world.SetBlock(grassX, grassY, grassZ, tallGrassBlockID);
+                                    _DecorationSetBlock(grassX, grassY, grassZ, tallGrassBlockID);
                                 }
                             }
                         }
@@ -4453,19 +5073,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void GenerateFlower(int x, int y, int z, byte flowerBlockID)
     {
         // EXACT port of Beta 1.7.3 WorldGenFlowers.java
-        // Try to place a single flower at this location
-        if (y >= 0 && y < world.worldDimensionY * world.chunkSizeY)
+        if (y >= 0 && y < decoration_columnHeight)
         {
-            byte blockAtPos = world.GetBlock(x, y, z);
+            byte blockAtPos = _DecorationGetBlock(x, y, z);
             if (blockAtPos == airBlockID)
             {
-                // Check if can stay (grass/dirt below, enough light)
                 if (y > 0)
                 {
-                    byte blockBelow = world.GetBlock(x, y - 1, z);
+                    byte blockBelow = _DecorationGetBlock(x, y - 1, z);
                     if (blockBelow == grassBlockID || blockBelow == dirtBlockID)
                     {
-                        world.SetBlock(x, y, z, flowerBlockID);
+                        _DecorationSetBlock(x, y, z, flowerBlockID);
                     }
                 }
             }
@@ -4474,13 +5092,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
     
     private void GenerateDebugPillar()
     {
-        // Generate a debug pillar at world origin (0,0) spanning full height
-        // This helps visualize lighting and chunk boundaries
         int pillarX = 0;
         int pillarZ = 0;
         int worldHeight = world.worldDimensionY * world.chunkSizeY;
         
-        // Use stone blocks for the pillar
         for (int y = 0; y < worldHeight; y++)
         {
             world.SetBlock(pillarX, y, pillarZ, stoneBlockID);
