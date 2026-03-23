@@ -38,6 +38,8 @@ Material:
     m_Ints: []
     m_Floats:
     - _ChunkSizeXZ: 16
+    - _ColumnBorder: 0
+    - _DensityGridSize: 5
     - _FlipXAxis: 1
     - _IceBlockId: 79
     - _OceanHeight: 64

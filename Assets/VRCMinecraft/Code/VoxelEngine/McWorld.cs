@@ -2377,7 +2377,6 @@ public class McWorld : UdonSharpBehaviour
 
     private void _AddCrossBlockQuads(ChunkData chunk, byte blockID, int x, int y, int z)
     {
-        // Inline texture slice lookup (cross blocks always use AllFacesSame)
         float textureSlice = (blockID < uv_allFacesCache.Length) ? uv_allFacesCache[blockID] : 0;
         Color biomeColor = _GetCachedBiomeColor(chunk, blockID, x, z);
         biomeColor.a = 1.0f;
@@ -2389,18 +2388,13 @@ public class McWorld : UdonSharpBehaviour
         float cx = x + 0.5f + ox;
         float cz = z + 0.5f + oz;
 
+        // Two perpendicular quads forming an X. Cutout shader uses Cull Off so both sides render.
         _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
             new Vector3(cx - 0.45f, y, cz - 0.45f), new Vector3(cx - 0.45f, y + 1, cz - 0.45f),
             new Vector3(cx + 0.45f, y + 1, cz + 0.45f), new Vector3(cx + 0.45f, y, cz + 0.45f));
         _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
-            new Vector3(cx + 0.45f, y, cz + 0.45f), new Vector3(cx + 0.45f, y + 1, cz + 0.45f),
-            new Vector3(cx - 0.45f, y + 1, cz - 0.45f), new Vector3(cx - 0.45f, y, cz - 0.45f));
-        _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
             new Vector3(cx + 0.45f, y, cz - 0.45f), new Vector3(cx + 0.45f, y + 1, cz - 0.45f),
             new Vector3(cx - 0.45f, y + 1, cz + 0.45f), new Vector3(cx - 0.45f, y, cz + 0.45f));
-        _EmitCrossQuad(chunk, blockID, textureSlice, biomeColor,
-            new Vector3(cx - 0.45f, y, cz + 0.45f), new Vector3(cx - 0.45f, y + 1, cz + 0.45f),
-            new Vector3(cx + 0.45f, y + 1, cz - 0.45f), new Vector3(cx + 0.45f, y, cz - 0.45f));
     }
 
     private void _EmitCrossQuad(ChunkData chunk, byte blockID, float textureSlice, Color color, Vector3 v0, Vector3 v1, Vector3 v2, Vector3 v3)

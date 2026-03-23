@@ -134,38 +134,14 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
 
             fixed calcBrightness(fixed3 normal)
             {
-                // Minecraft Beta 1.7.3 face shading values
-                // These need to match the original game for correct lighting
-                fixed brightness;
-                if (normal.y > 0.5) // Top face
-                {
-                    brightness = 1.0;
-                }
-                else if (normal.y < -0.5) // Bottom face
-                {
-                    brightness = 0.5; // Minecraft uses 0.5, not 0.2
-                }
-                else if (abs(normal.y) < 0.1 && abs(normal.x) > 0.5 && abs(normal.z) > 0.5) // Diagonal faces (cross-shaped blocks)
-                {
-                    // FIXED: Cross-shaped blocks (tall grass, flowers) don't get directional shading in Minecraft
-                    // They only use the light level, not face shading (RenderBlocks.java renderBlockReed line 1329-1330)
-                    // The brightness from lighting is already baked into the vertex color alpha
-                    brightness = 1.0; // Full brightness - no directional shading
-                }
-                else if (normal.x > 0.5 || normal.x < -0.5) // Left and right faces (X axis)
-                {
-                    brightness = 0.6; // Minecraft uses 0.6, not 0.3
-                }
-                else if (normal.z > 0.5 || normal.z < -0.5) // Front and back faces (Z axis)
-                {
-                    brightness = 0.8; // Minecraft uses 0.8, not 0.6
-                }
-                else // Fallback for unexpected normals
-                {
-                    brightness = 1.0;
-                }
+                // Cross-shaped blocks have diagonal normals where no single component > 0.9
+                fixed maxComp = max(max(abs(normal.x), abs(normal.y)), abs(normal.z));
+                if (maxComp < 0.9) return 1.0;
 
-                return brightness;
+                if (normal.y > 0.5) return 1.0;
+                if (normal.y < -0.5) return 0.5;
+                if (abs(normal.x) > abs(normal.z)) return 0.6;
+                return 0.8;
             }
             
             // MINECRAFT-STYLE RADIAL FOG CALCULATION
@@ -212,24 +188,27 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 fixed4 waterCol = lerp(waterFlow, waterStill, stillWeight);
                 col = lerp(col, waterCol, waterWeight);
 
-                // Apply biome-specific tinting (Corrected Method):
-                // The tint mask's ALPHA controls WHERE the tint is applied.
-                // The texture's brightness (col.r) scales the pure biome color (i.color.rgb).
-                // This prevents desaturation by preserving the biome color's hue and saturation.
-                fixed3 tintedColor = col.r * i.color.rgb;
+                // Biome tinting: col.rgb (not col.r) so colored textures like flowers keep their color.
+                // For grayscale textures (grass/leaves), R≈G≈B so col.rgb*biome == col.r*biome.
+                fixed3 tintedColor = col.rgb * i.color.rgb;
                 col.rgb = lerp(col.rgb, tintedColor, tintInput.a * (1.0 - waterWeight));
                 
-                // Apply lighting from vertex color alpha (calculated by lighting system)
-                // MINECRAFT LIGHTING: Both light brightness and face shading are in gamma space
-                // We need to multiply them together BEFORE converting to linear (if in linear color space)
-                
-                // Get the light brightness from vertex color (already gamma-corrected by lightBrightnessTable)
                 half minLightLevel = 0.02;
                 half lightBrightness;
                 if (_UseGpuExactAo > 0.5)
                 {
-                    half aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
-                    lightBrightness = max(minLightLevel, aoBrightness >= 0.0 ? aoBrightness : i.color.a);
+                    // Cross-shaped blocks have diagonal normals — AO basis doesn't apply.
+                    bool isCrossNormal = max(max(abs(i.normal.x), abs(i.normal.y)), abs(i.normal.z)) < 0.9;
+                    if (isCrossNormal)
+                    {
+                        half crossLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos);
+                        lightBrightness = max(minLightLevel, crossLight >= 0.0 ? crossLight : i.color.a);
+                    }
+                    else
+                    {
+                        half aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
+                        lightBrightness = max(minLightLevel, aoBrightness >= 0.0 ? aoBrightness : i.color.a);
+                    }
                 }
                 else if (_UseVertexLight > 0.5)
                 {
@@ -248,33 +227,19 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                     }
                 }
                 
-                // Get face shading multiplier (also in gamma space, matching Minecraft)
                 half faceBrightness = calcBrightness(i.normal);
-                
-                // Multiply in gamma space (matching Minecraft's approach)
                 half combinedBrightness = lightBrightness * faceBrightness;
-                
-                // Convert to linear space for Unity's linear rendering
-                // (If Unity is in gamma color space, this conversion is a no-op)
                 combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
                 
-                // Apply the final brightness
                 col.rgb *= combinedBrightness;
 
-                #if defined(_SURFACETYPE_CUTOUT) // ADDED: Conditional clip for Cutout mode
+                #if defined(_SURFACETYPE_CUTOUT)
                     clip(col.a - _Cutoff);
                 #endif
 
-                // MINECRAFT-STYLE RADIAL FOG APPLICATION
-                // Calculate fog factor based on radial distance (eliminates "fog wall" effect)
                 half fogFactor = calcMinecraftFog(i.worldPos);
-                
-                // Apply Minecraft-style fog blending
-                // Fog color should match the sky/atmosphere color for natural appearance
                 col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
                 
-                // Keep Unity's built-in fog as fallback (for compatibility)
-                // This ensures compatibility with Unity's fog system if needed
                 UNITY_APPLY_FOG(i.fogCoord, col);
                 
                 return col;

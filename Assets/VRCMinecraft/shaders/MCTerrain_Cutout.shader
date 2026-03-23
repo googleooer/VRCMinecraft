@@ -97,34 +97,14 @@ Shader "Unlit/MCTerrain (Cutout)"
 
             fixed calcBrightness(fixed3 normal)
             {
-                fixed brightness;
-                if (normal.y > 0.5)
-                {
-                    brightness = 1.0;
-                }
-                else if (normal.y < -0.5)
-                {
-                    brightness = 0.5;
-                }
-                else if (abs(normal.y) < 0.1 && abs(normal.x) > 0.5 && abs(normal.z) > 0.5)
-                {
-                    // Cross-shaped blocks (tall grass, flowers) - no directional shading
-                    brightness = 1.0;
-                }
-                else if (normal.x > 0.5 || normal.x < -0.5)
-                {
-                    brightness = 0.6;
-                }
-                else if (normal.z > 0.5 || normal.z < -0.5)
-                {
-                    brightness = 0.8;
-                }
-                else
-                {
-                    brightness = 1.0;
-                }
+                // Cross-shaped blocks have diagonal normals where no single component > 0.9
+                fixed maxComp = max(max(abs(normal.x), abs(normal.y)), abs(normal.z));
+                if (maxComp < 0.9) return 1.0;
 
-                return brightness;
+                if (normal.y > 0.5) return 1.0;
+                if (normal.y < -0.5) return 0.5;
+                if (abs(normal.x) > abs(normal.z)) return 0.6;
+                return 0.8;
             }
 
             half calcMinecraftFog(float3 worldPos)
@@ -208,51 +188,9 @@ Shader "Unlit/MCTerrain (Cutout)"
             fixed4 frag (v2f i) : SV_Target
             {
                 fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
-                fixed4 tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw);
-                fixed3 tintedColor = col.r * i.color.rgb;
-                col.rgb = lerp(col.rgb, tintedColor, tintInput.a);
 
-                half minLightLevel = 0.02;
-                half lightBrightness;
-                if (_UseGpuExactAo > 0.5)
-                {
-                    half aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
-                    lightBrightness = max(minLightLevel, aoBrightness >= 0.0 ? aoBrightness : i.color.a);
-                }
-                else
-                {
-                    half gpuLightBrightness = gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
-                    if (gpuLightBrightness >= 0.0)
-                    {
-                        lightBrightness = max(minLightLevel, gpuLightBrightness);
-                    }
-                    else
-                    {
-                        lightBrightness = max(minLightLevel, i.color.a);
-                    }
-                }
-
-                half faceBrightness = calcBrightness(i.normal);
-                half combinedBrightness = lightBrightness * faceBrightness;
-                combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
-
-                // Torch-like emissive cutout blocks in Minecraft keep a bright self-lit floor.
-                half emissionLevel = gpuVoxelSampleEmissionLevel(i.worldPos);
-                if (emissionLevel > 0.0)
-                {
-                    half emissiveFloor = 0.55 + 0.35 * saturate(emissionLevel / 14.0);
-                    combinedBrightness = max(combinedBrightness, GammaToLinearSpace(emissiveFloor.xxx).x);
-                }
-
-                col.rgb *= combinedBrightness;
-
+                // DEBUG: return raw texture color - bypass ALL tinting, lighting, fog
                 clip(col.a - 0.1);
-
-                // MINECRAFT-STYLE RADIAL FOG
-                half fogFactor = calcMinecraftFog(i.worldPos);
-                col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
-
-                UNITY_APPLY_FOG(i.fogCoord, col);
                 return col;
             }
             ENDCG
