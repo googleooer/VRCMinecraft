@@ -287,6 +287,11 @@ public class McWorld : UdonSharpBehaviour
     private int gpuPropDrawTableTexId;
     private int gpuPropFaceModeId;
     private int gpuPropFaceReadSlotId;
+    private int gpuPropBorderTexId;
+    private int gpuPropBorderInfoId;
+    private Texture2D gpuBorderTexture;
+    private Color32[] gpuBorderPixels;
+    private int gpuBorderWidth, gpuBorderHeight, gpuBorderStride;
     private int gpuFaceSummaryWidth = 64;
     private int gpuFaceSummaryHeight = 6;
     private Color32[][] gpuFaceReadbackPixels; // per-buffer, per-chunk face readback
@@ -390,6 +395,12 @@ public class McWorld : UdonSharpBehaviour
     private float stats_processActiveChunksTime = 0f;
     private float stats_reconciliationTime = 0f;
     private float stats_aggregateWindowStart = 0f;
+    private int stats_dataGenActiveSamplesTotal = 0;
+    private int stats_meshingActiveSamplesTotal = 0;
+    private int stats_reconciliationQueueSamplesTotal = 0;
+    private int stats_dataGenActiveMax = 0;
+    private int stats_meshingActiveMax = 0;
+    private int stats_reconciliationQueueMax = 0;
 
     // --- Chunk Management Stats ---
     private int stats_chunkCreations = 0;
@@ -422,6 +433,9 @@ public class McWorld : UdonSharpBehaviour
     private float stats_meshApplyTransparentTime = 0f;
     private float stats_meshApplyCutoutTime = 0f;
     private float stats_meshApplyColliderTime = 0f;
+    private float stats_meshNeighborCacheTime = 0f;
+    private float stats_meshDataPrepTime = 0f;
+    private float stats_meshMainLoopTime = 0f;
     private int stats_gpuFaceDecodeSteps = 0;
     private float stats_gpuFaceDecodeTime = 0f;
     private float stats_gpuFaceDecodeTimeMin = float.MaxValue;
@@ -433,6 +447,38 @@ public class McWorld : UdonSharpBehaviour
     private float stats_gpuFaceCompactEmitQuadTime = 0f;
     private float stats_gpuFaceCompactEmitCollisionTime = 0f;
     private int stats_meshDeferredChunks = 0;
+    private int stats_meshBoundaryChecksY = 0;
+    private int stats_meshBoundaryChecksZ = 0;
+    private int stats_meshBoundaryChecksX = 0;
+    private int stats_facesOpaque = 0;
+    private int stats_facesTransparent = 0;
+    private int stats_facesCutout = 0;
+    private int stats_meshPoolExhaustedDefers = 0;
+    private int stats_meshGpuBusyDefers = 0;
+    private int stats_meshGpuFrameThrottleFallbacks = 0;
+    private int stats_meshGpuRequestFailures = 0;
+    private int stats_meshInteractionPriorityCpuBypass = 0;
+    private int stats_meshBuildsWithMissingNeighbors = 0;
+    private int stats_meshMissingNeighborBits = 0;
+    private int stats_deferredColliderApplyCount = 0;
+    private int stats_deferredColliderWaitCount = 0;
+    private float stats_deferredColliderWaitTotal = 0f;
+    private float stats_deferredColliderWaitMax = 0f;
+    private int stats_firstMeshStartLatencyCount = 0;
+    private float stats_firstMeshStartLatencyTotal = 0f;
+    private float stats_firstMeshStartLatencyMax = 0f;
+
+    private const int SLOWEST_MESH_BUILD_COUNT = 3;
+    private float[] stats_slowestMeshBuildMs = new float[SLOWEST_MESH_BUILD_COUNT];
+    private int[] stats_slowestMeshChunkX = new int[SLOWEST_MESH_BUILD_COUNT];
+    private int[] stats_slowestMeshChunkY = new int[SLOWEST_MESH_BUILD_COUNT];
+    private int[] stats_slowestMeshChunkZ = new int[SLOWEST_MESH_BUILD_COUNT];
+    private float[] stats_slowestMeshDataPrepMs = new float[SLOWEST_MESH_BUILD_COUNT];
+    private float[] stats_slowestMeshMainLoopMs = new float[SLOWEST_MESH_BUILD_COUNT];
+    private float[] stats_slowestMeshApplyMs = new float[SLOWEST_MESH_BUILD_COUNT];
+    private int[] stats_slowestMeshFaceCount = new int[SLOWEST_MESH_BUILD_COUNT];
+    private int[] stats_slowestMeshVertexCount = new int[SLOWEST_MESH_BUILD_COUNT];
+    private byte[] stats_slowestMeshKind = new byte[SLOWEST_MESH_BUILD_COUNT];
 
     // --- Lighting Stats (aggregate) ---
     private int stats_lightingInitsTotal = 0;
@@ -733,6 +779,16 @@ public class McWorld : UdonSharpBehaviour
         gpuPropDrawTableTexId = VRCShader.PropertyToID("_DrawTableTex");
         gpuPropFaceModeId = VRCShader.PropertyToID("_Mode");
         gpuPropFaceReadSlotId = VRCShader.PropertyToID("_ReadSlotIndex");
+        gpuPropBorderTexId = VRCShader.PropertyToID("_BorderTex");
+        gpuPropBorderInfoId = VRCShader.PropertyToID("_BorderInfo");
+
+        // --- GPU Border Texture Init ---
+        int borderStride = Mathf.Max(chunkSizeXZ, chunkSizeY);
+        gpuBorderWidth = chunkSizeXZ;
+        gpuBorderHeight = 6 * borderStride;
+        gpuBorderStride = borderStride;
+        gpuBorderTexture = _CreateGpuTexture2D(gpuBorderWidth, gpuBorderHeight);
+        gpuBorderPixels = new Color32[gpuBorderWidth * gpuBorderHeight];
 
         // --- GPU Face Extraction Init ---
         gpuFaceAtlas = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_FaceAtlas");
@@ -1157,6 +1213,92 @@ public class McWorld : UdonSharpBehaviour
         _GpuOverlayTextureIntoAtlas(gpuClearTexture, ref gpuLightAtlas, ref gpuLightAtlasScratch);
     }
 
+    // Pack 1-block-deep boundary faces from all 6 neighbors into gpuBorderTexture.
+    // Layout: 6 faces × chunkSizeXZ wide × stride tall.
+    // Face order: +Y(0), -Y(1), +Z(2), -Z(3), +X(4), -X(5).
+    // Alpha=255 if neighbor data is valid, 0 if missing.
+    private void _GpuPackBorderData(ChunkData chunk)
+    {
+        if (!gpuBackendReady || chunk == null || gpuBorderPixels == null) return;
+
+        // Fill entire buffer with air + valid alpha.  Faces whose neighbor IS
+        // available will be overwritten with real data below.  Faces with missing
+        // neighbors keep blockID=0 (air) so ShouldDrawFace(solid, air) draws them.
+        {
+            Color32 airValid = new Color32(0, 0, 0, 255);
+            for (int i = 0; i < gpuBorderPixels.Length; i++)
+                gpuBorderPixels[i] = airValid;
+        }
+
+        int SX = chunkSizeXZ;
+        int SY = chunkSizeY;
+        int stride = gpuBorderStride;
+        int w = gpuBorderWidth;
+        byte missingMask = 0;
+
+        // +Y (face 0): sample PY neighbor at (x, 0, z)
+        ChunkData n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world + 1, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int z = 0; z < SX; z++)
+                for (int x = 0; x < SX; x++)
+                    gpuBorderPixels[(0 * stride + z) * w + x] = new Color32(_GetBlockLocal(n, x, 0, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world + 1, chunk.chunkZ_world) != -1)
+            missingMask |= 4; // bit 2 = +Y
+
+        // -Y (face 1): sample NY neighbor at (x, SY-1, z)
+        n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world - 1, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int z = 0; z < SX; z++)
+                for (int x = 0; x < SX; x++)
+                    gpuBorderPixels[(1 * stride + z) * w + x] = new Color32(_GetBlockLocal(n, x, SY - 1, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world - 1, chunk.chunkZ_world) != -1)
+            missingMask |= 8; // bit 3 = -Y
+
+        // +Z (face 2): sample PZ neighbor at (x, y, 0)
+        n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world + 1);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int x = 0; x < SX; x++)
+                    gpuBorderPixels[(2 * stride + y) * w + x] = new Color32(_GetBlockLocal(n, x, y, 0), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world + 1) != -1)
+            missingMask |= 16; // bit 4 = +Z
+
+        // -Z (face 3): sample NZ neighbor at (x, y, SX-1)
+        n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world - 1);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int x = 0; x < SX; x++)
+                    gpuBorderPixels[(3 * stride + y) * w + x] = new Color32(_GetBlockLocal(n, x, y, SX - 1), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world - 1) != -1)
+            missingMask |= 32; // bit 5 = -Z
+
+        // +X (face 4): sample PX neighbor at (0, y, z)
+        n = GetChunkAt(chunk.chunkX_world + 1, chunk.chunkY_world, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int z = 0; z < SX; z++)
+                    gpuBorderPixels[(4 * stride + y) * w + z] = new Color32(_GetBlockLocal(n, 0, y, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world + 1, chunk.chunkY_world, chunk.chunkZ_world) != -1)
+            missingMask |= 1; // bit 0 = +X
+
+        // -X (face 5): sample NX neighbor at (SX-1, y, z)
+        n = GetChunkAt(chunk.chunkX_world - 1, chunk.chunkY_world, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int z = 0; z < SX; z++)
+                    gpuBorderPixels[(5 * stride + y) * w + z] = new Color32(_GetBlockLocal(n, SX - 1, y, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world - 1, chunk.chunkY_world, chunk.chunkZ_world) != -1)
+            missingMask |= 2; // bit 1 = -X
+
+        chunk._borderMissingMask = missingMask;
+        gpuBorderTexture.SetPixels32(gpuBorderPixels);
+        gpuBorderTexture.Apply(false, false);
+    }
+
+    // Only one _GpuPackBorderData+Blit pair per frame — the border texture is shared
+    // and VRCGraphics.Blit may be deferred, so a second Pack overwrites the first's data.
+    private int _lastBorderBlitFrame = -1;
+
     private void _GpuSyncChunkBlocks(ChunkData chunk, byte[] blockData)
     {
         if (!gpuBackendReady || chunk == null || blockData == null || gpuUploadBlockTexture == null) return;
@@ -1506,6 +1648,8 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBorderTexId, gpuBorderTexture);
+        gpuFaceExtractMaterial.SetVector(gpuPropBorderInfoId, new Vector4(gpuBorderWidth, gpuBorderHeight, gpuBorderStride, 0f));
 
 #if LOGGING
         float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -1530,6 +1674,8 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBorderTexId, gpuBorderTexture);
+        gpuFaceExtractMaterial.SetVector(gpuPropBorderInfoId, new Vector4(gpuBorderWidth, gpuBorderHeight, gpuBorderStride, 0f));
         float blitStart = 0f;
 #if LOGGING
         if (enableDetailedTimings) blitStart = Time.realtimeSinceStartup;
@@ -1572,6 +1718,13 @@ public class McWorld : UdonSharpBehaviour
             gpuFaceReadbackStartMs[bufferIndex] = requestStartMs;
         }
 #endif
+        // Flush slot lookup/meta if dirty — _GpuSyncChunkBlocks may have evicted a slot
+        // and reused it, making the GPU's slot lookup stale for neighbor reads.
+        if (gpuSlotLookupDirty)
+        {
+            _GpuApplyLookupTextures();
+            gpuSlotLookupDirty = false;
+        }
         if (useCompactGpuFaceExport) _GpuRunFaceSummaryExportDirect(bufferIndex, slotIndex);
         else _GpuRunFaceExtractionDirect(bufferIndex, slotIndex);
         VRCAsyncGPUReadback.Request(gpuFaceReadbackTextures[bufferIndex], 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
@@ -1978,8 +2131,8 @@ public class McWorld : UdonSharpBehaviour
         float budgetSec = Mathf.Max(0.25f, adaptiveGpuMeshDecodeStepBudgetMs) * 0.001f;
         Color32[] facePixels = chunk._gpuFacePixels;
         int totalPixels = sizeY * stride;
-        int summaryBudgetCountdown = 64;
-        int crossBudgetCountdown = 16;
+        int summaryBudgetCountdown = 256;
+        int crossBudgetCountdown = 64;
         byte[] selfData = chunk._decompSelf;
         byte[] dataPX = chunk._decompPX;
         byte[] dataNX = chunk._decompNX;
@@ -2018,7 +2171,7 @@ public class McWorld : UdonSharpBehaviour
                     {
                         if (--summaryBudgetCountdown <= 0)
                         {
-                            summaryBudgetCountdown = 64;
+                            summaryBudgetCountdown = 256;
                             if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
                         }
                         continue;
@@ -2029,7 +2182,7 @@ public class McWorld : UdonSharpBehaviour
                     {
                         if (--summaryBudgetCountdown <= 0)
                         {
-                            summaryBudgetCountdown = 64;
+                            summaryBudgetCountdown = 256;
                             if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
                         }
                         continue;
@@ -2048,7 +2201,7 @@ public class McWorld : UdonSharpBehaviour
 
                     if (--summaryBudgetCountdown <= 0)
                     {
-                        summaryBudgetCountdown = 64;
+                        summaryBudgetCountdown = 256;
                         if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
                     }
                 }
@@ -2247,7 +2400,7 @@ public class McWorld : UdonSharpBehaviour
 
                     if (--crossBudgetCountdown <= 0)
                     {
-                        crossBudgetCountdown = 16;
+                        crossBudgetCountdown = 64;
                         if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
                     }
                 }
@@ -2338,6 +2491,12 @@ public class McWorld : UdonSharpBehaviour
                 {
                     chunk.pendingNeighborMeshRebuild = false;
                     TriggerNeighborMeshRebuilds(chunk);
+                }
+                // Immediately re-queue if we meshed with missing border data and the
+                // neighbors are now ready — don't wait for the passive heal scan.
+                if (chunk._borderMissingMask != 0)
+                {
+                    _TryImmediateBorderHeal(chunk);
                 }
                 if (useSummary)
                 {
@@ -2640,6 +2799,7 @@ public class McWorld : UdonSharpBehaviour
         newChunkData.transparentMeshFilter = transparentTransform != null ? transparentTransform.GetComponent<MeshFilter>() : null;
         newChunkData.cutoutMeshFilter = cutoutTransform != null ? cutoutTransform.GetComponent<MeshFilter>() : null;
         newChunkData.meshCollider = newChunkGO.GetComponent<MeshCollider>();
+        if (newChunkData.meshCollider != null) { newChunkData.meshCollider.sharedMesh = null; newChunkData.meshCollider.enabled = false; }
 
         // --- Initialize Buffers & State ---
         newChunkData._chunkDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
@@ -2689,6 +2849,12 @@ public class McWorld : UdonSharpBehaviour
             if (updateTime < stats_updateTimeMin) stats_updateTimeMin = updateTime;
             if (updateTime > stats_updateTimeMax) stats_updateTimeMax = updateTime;
             if (updateTime > updateTimeBudgetMs) stats_budgetExceededCount++;
+            stats_dataGenActiveSamplesTotal += activeDataGenCount;
+            stats_meshingActiveSamplesTotal += activeMeshingCount;
+            stats_reconciliationQueueSamplesTotal += deferredReconciliationQueue.Count;
+            if (activeDataGenCount > stats_dataGenActiveMax) stats_dataGenActiveMax = activeDataGenCount;
+            if (activeMeshingCount > stats_meshingActiveMax) stats_meshingActiveMax = activeMeshingCount;
+            if (deferredReconciliationQueue.Count > stats_reconciliationQueueMax) stats_reconciliationQueueMax = deferredReconciliationQueue.Count;
             stats_frameCount++;
 
             // Per-frame logging
@@ -2822,6 +2988,8 @@ public class McWorld : UdonSharpBehaviour
         }
 
         _ScheduleDeferredInteriorMeshUpdates(frameStart, frameBudget);
+        _HealStaleBorderChunks();
+        _PostWorldGenBorderCleanup();
 
         // --- FIXED: Process Incremental Lighting (managed by coordinator) ---
         // Note: Lighting is now handled by coordinator's STATE_LIGHTING, not here
@@ -2878,7 +3046,33 @@ public class McWorld : UdonSharpBehaviour
             if (deferredInteriorMeshScanCursor >= totalChunks) deferredInteriorMeshScanCursor = 0;
 
             ChunkData chunk = chunks_1D[chunkIndex];
-            if (chunk == null || !chunk.isMeshDeferred || chunk.isBuildingMesh || !chunk.isDataReady) continue;
+            if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh) continue;
+
+            // Self-heal: chunk was meshed with missing border data.  Re-mesh if
+            // the previously-missing neighbors are now available.
+            // These are correctness fixes — don't count against requestLimit so
+            // deferred-interior wakes still get their budget.
+            if (!chunk.isMeshDeferred && chunk._borderMissingMask != 0)
+            {
+                byte mask = chunk._borderMissingMask;
+                bool allNowReady = true;
+                for (int i = 0; i < 6; i++)
+                {
+                    if ((mask & (1 << i)) == 0) continue;
+                    int nx = chunk.chunkX_world + neighbor_dx_offsets[i];
+                    int ny = chunk.chunkY_world + neighbor_dy_offsets[i];
+                    int nz = chunk.chunkZ_world + neighbor_dz_offsets[i];
+                    ChunkData nc = GetChunkAt(nx, ny, nz);
+                    if (nc == null || !nc.isDataReady) { allNowReady = false; break; }
+                }
+                if (allNowReady)
+                {
+                    RequestChunkMeshUpdate(chunkIndex);
+                }
+                continue;
+            }
+
+            if (!chunk.isMeshDeferred) continue;
             if (!AreAllNeighborsReady(chunkIndex)) continue;
 
             bool shouldWake = _ShouldPrioritizeChunkMesh(chunk);
@@ -2888,9 +3082,104 @@ public class McWorld : UdonSharpBehaviour
             }
 
             chunk.isMeshDeferred = false;
+            chunk.pendingNeighborMeshRebuild = true;
             RequestChunkMeshUpdate(chunkIndex);
             scheduled++;
             if (scheduled >= requestLimit) break;
+        }
+    }
+
+    private int _borderHealCursor = 0;
+    private bool _postWorldGenBorderCleanupDone = false;
+
+    private void _PostWorldGenBorderCleanup()
+    {
+        if (_postWorldGenBorderCleanupDone) return;
+        if (coordinator == null || !coordinator.IsWorldGenComplete()) return;
+        if (chunks_1D == null || chunks_1D.Length == 0) return;
+
+        // Wait until no chunks are actively building a mesh so we don't race.
+        // Don't wait for isMeshDeferred — those haven't been meshed yet and
+        // can take many seconds to wake, blocking the cleanup for all other chunks.
+        for (int i = 0; i < chunks_1D.Length; i++)
+        {
+            ChunkData c = chunks_1D[i];
+            if (c != null && c.isBuildingMesh) return;
+        }
+
+        _postWorldGenBorderCleanupDone = true;
+
+        int rebuilt = 0;
+        for (int i = 0; i < chunks_1D.Length; i++)
+        {
+            ChunkData chunk = chunks_1D[i];
+            if (chunk == null || !chunk.isDataReady) continue;
+            // Deferred chunks haven't been meshed yet — no stale border to fix.
+            if (chunk.isMeshDeferred) continue;
+
+            chunk._borderMissingMask = 0;
+            RequestChunkMeshUpdate(i);
+            rebuilt++;
+        }
+#if LOGGING
+        Debug.Log($"[McWorld] Post-worldgen border cleanup: queued {rebuilt} chunks for rebuild");
+#endif
+    }
+
+    private void _TryImmediateBorderHeal(ChunkData chunk)
+    {
+        if (chunk == null || chunk._borderMissingMask == 0 || chunk.isBuildingMesh) return;
+        byte mask = chunk._borderMissingMask;
+        bool allReady = true;
+        for (int i = 0; i < 6; i++)
+        {
+            if ((mask & (1 << i)) == 0) continue;
+            ChunkData nc = GetChunkAt(
+                chunk.chunkX_world + neighbor_dx_offsets[i],
+                chunk.chunkY_world + neighbor_dy_offsets[i],
+                chunk.chunkZ_world + neighbor_dz_offsets[i]);
+            if (nc == null || !nc.isDataReady) { allReady = false; break; }
+        }
+        if (allReady)
+        {
+            int idx = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            if (idx >= 0) RequestChunkMeshUpdate(idx);
+        }
+    }
+
+    private void _HealStaleBorderChunks()
+    {
+        if (coordinator == null || chunks_1D == null || chunks_1D.Length == 0) return;
+        int totalChunks = chunks_1D.Length;
+        int scans = 256;
+        int healed = 0;
+        while (scans-- > 0)
+        {
+            int idx = _borderHealCursor;
+            _borderHealCursor++;
+            if (_borderHealCursor >= totalChunks) _borderHealCursor = 0;
+
+            ChunkData chunk = chunks_1D[idx];
+            if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh || chunk.isMeshDeferred) continue;
+            if (chunk._borderMissingMask == 0) continue;
+
+            byte mask = chunk._borderMissingMask;
+            bool allReady = true;
+            for (int i = 0; i < 6; i++)
+            {
+                if ((mask & (1 << i)) == 0) continue;
+                ChunkData nc = GetChunkAt(
+                    chunk.chunkX_world + neighbor_dx_offsets[i],
+                    chunk.chunkY_world + neighbor_dy_offsets[i],
+                    chunk.chunkZ_world + neighbor_dz_offsets[i]);
+                if (nc == null || !nc.isDataReady) { allReady = false; break; }
+            }
+            if (allReady)
+            {
+                RequestChunkMeshUpdate(idx);
+                healed++;
+                if (healed >= 16) return;
+            }
         }
     }
 
@@ -2934,6 +3223,13 @@ public class McWorld : UdonSharpBehaviour
     {
         if (chunk == null) return;
         chunk.pendingColliderApply = true;
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_deferredColliderApplyCount++;
+            chunk.profile_deferredColliderQueuedTime = Time.realtimeSinceStartup;
+        }
+#endif
     }
 
     private void _QueueDeferredLightingFinalize(ChunkData chunk)
@@ -3040,18 +3336,15 @@ public class McWorld : UdonSharpBehaviour
             }
 
             // pendingNeighborMeshRebuild is just 6 RequestChunkMeshUpdate calls — no per-block
-            // work. Always consume it regardless of player proximity or frame headroom.
-            // Under sustained load far chunks would be permanently skipped here because
-            // shouldRunNow stays false; the GPU lighting path sets this flag via
-            // HandleChunkPostDataGpuLighting when _ShouldDeferChunkSecondaryWork returns true.
+            // work. Process without counting against the task budget so it can't be starved
+            // by collider or lighting work sharing the same 2-per-frame limit.
             if (chunk.pendingNeighborMeshRebuild && !chunk.isBuildingMesh)
             {
                 chunk.pendingNeighborMeshRebuild = false;
                 TriggerNeighborMeshRebuilds(chunk);
-                completedTasks++;
-                if (completedTasks >= taskLimit) break;
                 continue;
             }
+
 
             if (chunk.pendingLightingFinalize)
             {
@@ -3177,8 +3470,19 @@ public class McWorld : UdonSharpBehaviour
             }
 
             // Populate decompressed cache so meshing never needs to decompress
-            chunk._cachedDecompressedData = generatedData;
-            chunk._decompCacheValid = true;
+            // For homogeneous chunks, don't cache the shared generator buffer —
+            // it gets overwritten by the next column. _GetBlockLocal handles
+            // homogeneous chunks via the typeof(byte) path instead.
+            if (isHomogeneous)
+            {
+                chunk._cachedDecompressedData = null;
+                chunk._decompCacheValid = false;
+            }
+            else
+            {
+                chunk._cachedDecompressedData = generatedData;
+                chunk._decompCacheValid = true;
+            }
             chunk._cachedDataVersion++;
             _RefreshChunkDerivedData(chunk, generatedData);
 
@@ -3220,6 +3524,12 @@ public class McWorld : UdonSharpBehaviour
             // Mark chunk as ready and data gen complete
             chunk.isDataReady = true;
             chunk.isGeneratingData = false;
+#if LOGGING
+            chunk.profile_dataReadyTime = Time.realtimeSinceStartup;
+            chunk.profile_waitingForFirstMesh = true;
+#endif
+
+
 
         }
     }
@@ -3509,6 +3819,18 @@ public class McWorld : UdonSharpBehaviour
         return _GetBlockLocal(chunk, localX, localY, localZ);
     }
 
+    public bool IsChunkMeshedAt(int globalX, int globalY, int globalZ)
+    {
+        int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;
+        int chunkY = globalY >> CHUNK_SIZE_SHIFT;
+        int centeredChunkZ = globalZ >> CHUNK_SIZE_SHIFT;
+        ChunkData chunk = GetChunkAt(centeredChunkX, chunkY, centeredChunkZ);
+        if (chunk == null) return false;
+        // Chunk has been meshed if it's data-ready, not currently building,
+        // and not pending a mesh rebuild (meaning it completed at least once).
+        return chunk.isDataReady && !chunk.isBuildingMesh && !chunk.pendingChunkMeshRebuild;
+    }
+
     public void SetBlock(int globalX, int globalY, int globalZ, byte blockType)
     {
         _SetBlockGlobal(globalX, globalY, globalZ, blockType, false);
@@ -3772,7 +4094,14 @@ public class McWorld : UdonSharpBehaviour
             if (neighborChunk == null || !neighborChunk.isDataReady) continue;
             // During worldgen, skip neighbors that haven't been meshed yet —
             // they'll get their own mesh build when promoted from deferred.
-            if (!interactionPriority && (neighborChunk.isMeshDeferred || neighborChunk.isBuildingMesh)) continue;
+            if (!interactionPriority && neighborChunk.isMeshDeferred) continue;
+            // Building neighbors started their face extract before our data existed —
+            // flag them for a self-rebuild after their current (stale) build completes.
+            if (!interactionPriority && neighborChunk.isBuildingMesh)
+            {
+                neighborChunk.pendingChunkMeshRebuild = true;
+                continue;
+            }
             if (interactionPriority) neighborChunk.interactionMeshPriority = true;
 
             RequestChunkMeshUpdate(neighborIndex);
@@ -3954,6 +4283,11 @@ public class McWorld : UdonSharpBehaviour
 
             ChunkData neighborChunk = GetChunkAt(n_cx, n_cy, n_cz);
 
+            // Null (unallocated) neighbors are deliberately treated as ready
+            // to avoid deadlocking the coordinator — all worker slots can be stuck
+            // in STATE_WAITING_FOR_MESH while no idle worker can instantiate
+            // the missing neighbor. The mesh is built with air on that boundary
+            // and _borderMissingMask is set so the heal loop fixes it later.
             if (neighborChunk != null && !neighborChunk.isDataReady) return false;
         }
         return true;
@@ -4044,6 +4378,16 @@ public class McWorld : UdonSharpBehaviour
         if (chunk == null || chunk.isBuildingMesh || chunk._chunkData == null) return;
 
         bool interactionPriority = chunk.interactionMeshPriority;
+#if LOGGING
+        if (enableDetailedTimings && chunk.profile_waitingForFirstMesh)
+        {
+            float firstMeshLatencyMs = (Time.realtimeSinceStartup - chunk.profile_dataReadyTime) * 1000f;
+            stats_firstMeshStartLatencyCount++;
+            stats_firstMeshStartLatencyTotal += firstMeshLatencyMs;
+            if (firstMeshLatencyMs > stats_firstMeshStartLatencyMax) stats_firstMeshStartLatencyMax = firstMeshLatencyMs;
+            chunk.profile_waitingForFirstMesh = false;
+        }
+#endif
         // Keep interactionMeshPriority alive — the step loop reads it to uncap steps.
         // Cleared when the mesh build finishes.
         chunk.isBuildingMesh = true;
@@ -4125,6 +4469,9 @@ public class McWorld : UdonSharpBehaviour
 
         if (!_AcquireMeshPool(chunk))
         {
+#if LOGGING
+            if (enableDetailedTimings) stats_meshPoolExhaustedDefers++;
+#endif
             chunk.isBuildingMesh = false;
             chunk.pendingChunkMeshRebuild = true;
             return;
@@ -4144,19 +4491,44 @@ public class McWorld : UdonSharpBehaviour
         // Keep GPU extraction for background worldgen where throughput matters more.
         // Water faces are added by the budget-gated GPU decode stage 2 via _AddWaterBlock,
         // which handles border samples and corner heights correctly.
-        if (!interactionPriority && _GpuFaceExtractionReady())
+        bool gpuFaceExtractionReady = _GpuFaceExtractionReady();
+#if LOGGING
+        if (enableDetailedTimings && interactionPriority && gpuFaceExtractionReady)
         {
-            if (_GpuHasAvailableReadbackBuffer())
+            stats_meshInteractionPriorityCpuBypass++;
+        }
+#endif
+        if (!interactionPriority && gpuFaceExtractionReady)
+        {
+            if (_lastBorderBlitFrame == Time.frameCount)
+            {
+#if LOGGING
+                if (enableDetailedTimings) stats_meshGpuFrameThrottleFallbacks++;
+#endif
+            }
+            else if (_GpuHasAvailableReadbackBuffer())
             {
                 _GpuSyncChunkBlocks(chunk, chunkData);
+                _GpuPackBorderData(chunk);
                 _PreComputeBiomeColors(chunk);
                 if (_GpuRequestChunkFaceReadback(chunk))
                 {
+                    _lastBorderBlitFrame = Time.frameCount;
                     return; // Mesh will be built when readback completes
                 }
+#if LOGGING
+                if (enableDetailedTimings) stats_meshGpuRequestFailures++;
+#endif
+                chunk._gpuMeshPending = true;
             }
             // GPU is busy or request failed — mark for GPU retry in _BuildChunkMeshStep
-            chunk._gpuMeshPending = true;
+            else
+            {
+#if LOGGING
+                if (enableDetailedTimings) stats_meshGpuBusyDefers++;
+#endif
+                chunk._gpuMeshPending = true;
+            }
         }
 
         // --- OPTIMIZATION: Use cached neighbor references ---
@@ -4167,6 +4539,21 @@ public class McWorld : UdonSharpBehaviour
         chunk.neighborNY = neighbors[3];
         chunk.neighborPZ = neighbors[4];
         chunk.neighborNZ = neighbors[5];
+
+        // Track missing neighbors for self-healing border scan (same as GPU path).
+        {
+            byte cpuMissing = 0;
+            for (int i = 0; i < 6; i++)
+            {
+                ChunkData nb = neighbors[i];
+                if ((nb == null || !nb.isDataReady) &&
+                    ChunkCenteredCoordsTo1D(chunk.chunkX_world + neighbor_dx_offsets[i],
+                                            chunk.chunkY_world + neighbor_dy_offsets[i],
+                                            chunk.chunkZ_world + neighbor_dz_offsets[i]) != -1)
+                    cpuMissing |= (byte)(1 << i);
+            }
+            chunk._borderMissingMask = cpuMissing;
+        }
 
 
 #if LOGGING
@@ -4267,16 +4654,54 @@ public class McWorld : UdonSharpBehaviour
         // OPTIMIZATION: GPU face extraction retry — chunk was deferred because GPU was busy
         if (chunk._gpuMeshPending)
         {
-            if (_GpuFaceExtractionReady() && _GpuHasAvailableReadbackBuffer())
+            if (_GpuFaceExtractionReady() && _GpuHasAvailableReadbackBuffer() && _lastBorderBlitFrame != Time.frameCount)
             {
                 chunk._gpuMeshPending = false;
                 _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+                _GpuPackBorderData(chunk);
                 _PreComputeBiomeColors(chunk);
                 if (_GpuRequestChunkFaceReadback(chunk))
                 {
+                    _lastBorderBlitFrame = Time.frameCount;
                     return; // Mesh will be built when readback completes
                 }
-                // If request failed, fall through to CPU path below
+#if LOGGING
+                if (enableDetailedTimings) stats_meshGpuRequestFailures++;
+#endif
+                // GPU request failed — falling through to CPU path.
+                // _GpuPackBorderData just overwrote _borderMissingMask with
+                // fresh neighbor availability, but the CPU decomp caches are
+                // from _DecompressNeighborsOnce (called when the mesh build
+                // started, possibly frames ago).  Refresh neighbor refs (which
+                // may have been created/invalidated mid-build) then re-sync
+                // decomp caches and mask so they match what the CPU mesher
+                // will actually see.
+                {
+                    ChunkData[] nbrs = _GetCachedNeighbors(chunk);
+                    chunk.neighborPX = nbrs[0]; chunk.neighborNX = nbrs[1];
+                    chunk.neighborPY = nbrs[2]; chunk.neighborNY = nbrs[3];
+                    chunk.neighborPZ = nbrs[4]; chunk.neighborNZ = nbrs[5];
+                }
+                _DecompressNeighborsOnce(chunk);
+                {
+                    byte cpuMissing = 0;
+                    for (int i = 0; i < 6; i++)
+                    {
+                        bool hasDecomp = false;
+                        if (i == 0) hasDecomp = chunk._decompPX != null;
+                        else if (i == 1) hasDecomp = chunk._decompNX != null;
+                        else if (i == 2) hasDecomp = chunk._decompPY != null;
+                        else if (i == 3) hasDecomp = chunk._decompNY != null;
+                        else if (i == 4) hasDecomp = chunk._decompPZ != null;
+                        else hasDecomp = chunk._decompNZ != null;
+                        if (!hasDecomp &&
+                            ChunkCenteredCoordsTo1D(chunk.chunkX_world + neighbor_dx_offsets[i],
+                                                    chunk.chunkY_world + neighbor_dy_offsets[i],
+                                                    chunk.chunkZ_world + neighbor_dz_offsets[i]) != -1)
+                            cpuMissing |= (byte)(1 << i);
+                    }
+                    chunk._borderMissingMask = cpuMissing;
+                }
             }
             else
             {
@@ -4432,6 +4857,12 @@ public class McWorld : UdonSharpBehaviour
                 chunk.pendingNeighborMeshRebuild = false;
                 TriggerNeighborMeshRebuilds(chunk);
             }
+            // Immediately re-queue if we meshed with missing border data and the
+            // neighbors are now ready — don't wait for the passive heal scan.
+            if (chunk._borderMissingMask != 0)
+            {
+                _TryImmediateBorderHeal(chunk);
+            }
 
             // Null out neighbor references to free memory
             chunk.neighborPX = null; chunk.neighborNX = null;
@@ -4488,6 +4919,9 @@ public class McWorld : UdonSharpBehaviour
         if (meshBuildTime < stats_meshBuildTimeMin) stats_meshBuildTimeMin = meshBuildTime;
         if (meshBuildTime > stats_meshBuildTimeMax) stats_meshBuildTimeMax = meshBuildTime;
         stats_meshStepsTotal += chunk.mesh_step_count;
+        stats_meshNeighborCacheTime += chunk.time_NeighborCache;
+        stats_meshDataPrepTime += chunk.time_DataPrep;
+        stats_meshMainLoopTime += chunk.time_MainLoop;
         stats_greedyAxisYTime += chunk.time_AxisY;
         stats_greedyAxisZTime += chunk.time_AxisZ;
         stats_greedyAxisXTime += chunk.time_AxisX;
@@ -4496,6 +4930,71 @@ public class McWorld : UdonSharpBehaviour
         stats_meshApplyTransparentTime += chunk.time_ApplyTransparent;
         stats_meshApplyCutoutTime += chunk.time_ApplyCutout;
         stats_meshApplyColliderTime += chunk.time_ApplyCollision;
+        stats_meshBoundaryChecksY += chunk.boundaryChecksY;
+        stats_meshBoundaryChecksZ += chunk.boundaryChecksZ;
+        stats_meshBoundaryChecksX += chunk.boundaryChecksX;
+        stats_facesOpaque += chunk.facesOpaque;
+        stats_facesTransparent += chunk.facesTransparent;
+        stats_facesCutout += chunk.facesCutout;
+        if (chunk._borderMissingMask != 0)
+        {
+            stats_meshBuildsWithMissingNeighbors++;
+            stats_meshMissingNeighborBits += _CountNeighborMaskBits(chunk._borderMissingMask);
+        }
+
+        _RecordSlowMeshBuild(chunk, meshBuildTime, usedGpuFaces, emptyMesh);
+    }
+
+    private int _CountNeighborMaskBits(byte mask)
+    {
+        int bits = 0;
+        for (int i = 0; i < 6; i++)
+        {
+            if ((mask & (1 << i)) != 0) bits++;
+        }
+        return bits;
+    }
+
+    private void _RecordSlowMeshBuild(ChunkData chunk, float meshBuildTime, bool usedGpuFaces, bool emptyMesh)
+    {
+        if (chunk == null) return;
+
+        int insertIndex = -1;
+        for (int i = 0; i < SLOWEST_MESH_BUILD_COUNT; i++)
+        {
+            if (meshBuildTime > stats_slowestMeshBuildMs[i])
+            {
+                insertIndex = i;
+                break;
+            }
+        }
+
+        if (insertIndex == -1) return;
+
+        for (int i = SLOWEST_MESH_BUILD_COUNT - 1; i > insertIndex; i--)
+        {
+            stats_slowestMeshBuildMs[i] = stats_slowestMeshBuildMs[i - 1];
+            stats_slowestMeshChunkX[i] = stats_slowestMeshChunkX[i - 1];
+            stats_slowestMeshChunkY[i] = stats_slowestMeshChunkY[i - 1];
+            stats_slowestMeshChunkZ[i] = stats_slowestMeshChunkZ[i - 1];
+            stats_slowestMeshDataPrepMs[i] = stats_slowestMeshDataPrepMs[i - 1];
+            stats_slowestMeshMainLoopMs[i] = stats_slowestMeshMainLoopMs[i - 1];
+            stats_slowestMeshApplyMs[i] = stats_slowestMeshApplyMs[i - 1];
+            stats_slowestMeshFaceCount[i] = stats_slowestMeshFaceCount[i - 1];
+            stats_slowestMeshVertexCount[i] = stats_slowestMeshVertexCount[i - 1];
+            stats_slowestMeshKind[i] = stats_slowestMeshKind[i - 1];
+        }
+
+        stats_slowestMeshBuildMs[insertIndex] = meshBuildTime;
+        stats_slowestMeshChunkX[insertIndex] = chunk.chunkX_world;
+        stats_slowestMeshChunkY[insertIndex] = chunk.chunkY_world;
+        stats_slowestMeshChunkZ[insertIndex] = chunk.chunkZ_world;
+        stats_slowestMeshDataPrepMs[insertIndex] = chunk.time_NeighborCache + chunk.time_DataPrep;
+        stats_slowestMeshMainLoopMs[insertIndex] = chunk.time_MainLoop;
+        stats_slowestMeshApplyMs[insertIndex] = chunk.time_ApplyOpaque + chunk.time_ApplyTransparent + chunk.time_ApplyCutout + chunk.time_ApplyCollision;
+        stats_slowestMeshFaceCount[insertIndex] = chunk.facesTotal;
+        stats_slowestMeshVertexCount[insertIndex] = chunk._opaqueVertexCount + chunk._transparentVertexCount + chunk._cutoutVertexCount;
+        stats_slowestMeshKind[insertIndex] = emptyMesh ? (byte)2 : (usedGpuFaces ? (byte)1 : (byte)0);
     }
 #endif
 
@@ -5493,12 +5992,8 @@ public class McWorld : UdonSharpBehaviour
         if (visibility == BlockVisibilityType.Opaque) { chunk._opaqueVertexCount += 4; chunk._opaqueTriangleCount += 6; }
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
         else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
-
         if (!chunk.pendingColliderMeshRebuild && visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4)
         {
-#if LOGGING
-            float collisionWriteStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
-#endif
             chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
             chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
             chunk._collisionVertices[chunk._collisionVertexCount + 2] = targetVertices[currentVertexCount + 2];
@@ -5510,12 +6005,6 @@ public class McWorld : UdonSharpBehaviour
             chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 2;
             chunk._collisionTriangles[chunk._collisionTriangleCount++] = chunk._collisionVertexCount + 3;
             chunk._collisionVertexCount += 4;
-#if LOGGING
-            if (stats_trackCompactEmitInternals)
-            {
-                stats_gpuFaceCompactEmitCollisionTime += (Time.realtimeSinceStartup - collisionWriteStart) * 1000f;
-            }
-#endif
         }
 
 #if LOGGING
@@ -5729,22 +6218,27 @@ public class McWorld : UdonSharpBehaviour
         int rowPairs = (height + 1) >> 1;
         int rowBase = (direction * chunkSizeY + slice) * compactWidth;
 
-        // Fast pre-scan: bail if no row-pair bitmask has any set bits.
-        // Skips Array.Clear + variable setup for the ~90% of slices that are empty.
+        // Pre-scan: bail if empty, and find min/max row bounds for targeted clear
+        int dataMinRP = rowPairs;
+        int dataMaxRP = -1;
+        for (int rp = 0; rp < rowPairs; rp++)
         {
-            bool anyBit = false;
-            for (int rp = 0; rp < rowPairs; rp++)
+            int pi = rowBase + rp;
+            if (pi < 0 || pi >= compactPixels.Length) break;
+            Color32 p = compactPixels[pi];
+            if ((p.r | p.g | p.b | p.a) != 0)
             {
-                int pi = rowBase + rp;
-                if (pi < 0 || pi >= compactPixels.Length) break;
-                Color32 p = compactPixels[pi];
-                if ((p.r | p.g | p.b | p.a) != 0) { anyBit = true; break; }
+                if (rp < dataMinRP) dataMinRP = rp;
+                dataMaxRP = rp;
             }
-            if (!anyBit) return false;
         }
+        if (dataMaxRP < 0) return false;
 
-        int maskCount = width * height;
-        System.Array.Clear(greedyMaskBlockIds, 0, maskCount);
+        // Clear only the rows that have data, not the entire mask
+        int clearMinRow = dataMinRP << 1;
+        int clearMaxRow = (dataMaxRP << 1) + 2;
+        if (clearMaxRow > height) clearMaxRow = height;
+        System.Array.Clear(greedyMaskBlockIds, clearMinRow * width, (clearMaxRow - clearMinRow) * width);
 
         bool anyFace = false;
         int[] packedGrassColors = chunk._cachedPackedGrassBiomeColors;
@@ -7333,6 +7827,14 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         float timer_start = 0f;
         if(enableDetailedTimings) timer_start = Time.realtimeSinceStartup;
+        if (enableDetailedTimings && chunk != null && chunk.profile_deferredColliderQueuedTime > 0f)
+        {
+            float deferredWaitMs = (Time.realtimeSinceStartup - chunk.profile_deferredColliderQueuedTime) * 1000f;
+            stats_deferredColliderWaitCount++;
+            stats_deferredColliderWaitTotal += deferredWaitMs;
+            if (deferredWaitMs > stats_deferredColliderWaitMax) stats_deferredColliderWaitMax = deferredWaitMs;
+            chunk.profile_deferredColliderQueuedTime = 0f;
+        }
 #endif
 
         if (chunk.meshCollider == null) return;
@@ -10734,8 +11236,12 @@ public class McWorld : UdonSharpBehaviour
         if (stats_frameCount > 0)
         {
             float avgUpdateTime = stats_updateTotalTime / stats_frameCount;
+            float avgDataGenActive = stats_dataGenActiveSamplesTotal / (float)stats_frameCount;
+            float avgMeshingActive = stats_meshingActiveSamplesTotal / (float)stats_frameCount;
+            float avgReconciliationQueue = stats_reconciliationQueueSamplesTotal / (float)stats_frameCount;
             logBuilder.AppendLine($"Update: avg {avgUpdateTime:F2}ms, min {stats_updateTimeMin:F2}ms, max {stats_updateTimeMax:F2}ms");
             logBuilder.AppendLine($"  Budget exceeded: {stats_budgetExceededCount} times ({(stats_budgetExceededCount / (float)stats_frameCount * 100f):F1}%)");
+            logBuilder.AppendLine($"  Queue pressure: datagen avg {avgDataGenActive:F1} max {stats_dataGenActiveMax}, meshing avg {avgMeshingActive:F1} max {stats_meshingActiveMax}, reconciliation avg {avgReconciliationQueue:F1} max {stats_reconciliationQueueMax}");
             if (enableDetailedTimings)
             {
                 logBuilder.AppendLine($"  Active processing: {stats_processActiveChunksTime:F2}ms total, reconciliation {stats_reconciliationTime:F2}ms total");
@@ -10769,6 +11275,11 @@ public class McWorld : UdonSharpBehaviour
             }
             if (enableDetailedTimings && stats_meshBuildTotal > 0)
             {
+                float avgNeighborCacheTime = stats_meshNeighborCacheTime / stats_meshBuildTotal;
+                float avgDataPrepTime = stats_meshDataPrepTime / stats_meshBuildTotal;
+                float avgMainLoopTime = stats_meshMainLoopTime / stats_meshBuildTotal;
+                float totalApplyTime = stats_meshApplyOpaqueTime + stats_meshApplyTransparentTime + stats_meshApplyCutoutTime + stats_meshApplyColliderTime;
+                logBuilder.AppendLine($"  Stage breakdown: neighbor cache {avgNeighborCacheTime:F2}ms, data prep {avgDataPrepTime:F2}ms, main loop {avgMainLoopTime:F2}ms, apply {totalApplyTime / stats_meshBuildTotal:F2}ms");
                 if (stats_gpuFaceDecodeSteps > 0)
                 {
                     float avgGpuDecodeStepMs = stats_gpuFaceDecodeTime / stats_gpuFaceDecodeSteps;
@@ -10790,6 +11301,16 @@ public class McWorld : UdonSharpBehaviour
                     logBuilder.AppendLine($"  Greedy Meshing: Y={stats_greedyAxisYTime / totalGreedy * 100f:F0}% ({stats_greedyAxisYTime:F1}ms), Z={stats_greedyAxisZTime / totalGreedy * 100f:F0}% ({stats_greedyAxisZTime:F1}ms), X={stats_greedyAxisXTime / totalGreedy * 100f:F0}% ({stats_greedyAxisXTime:F1}ms)");
                 }
                 logBuilder.AppendLine($"  Apply mesh: opaque {stats_meshApplyOpaqueTime:F2}ms, transparent {stats_meshApplyTransparentTime:F2}ms, cutout {stats_meshApplyCutoutTime:F2}ms, collider {stats_meshApplyColliderTime:F2}ms");
+                if (stats_firstMeshStartLatencyCount > 0 || stats_deferredColliderWaitCount > 0)
+                {
+                    float avgFirstMeshStartLatency = stats_firstMeshStartLatencyCount > 0 ? stats_firstMeshStartLatencyTotal / stats_firstMeshStartLatencyCount : 0f;
+                    float avgDeferredColliderWait = stats_deferredColliderWaitCount > 0 ? stats_deferredColliderWaitTotal / stats_deferredColliderWaitCount : 0f;
+                    logBuilder.AppendLine($"  Waits: first mesh start avg {avgFirstMeshStartLatency:F2}ms max {stats_firstMeshStartLatencyMax:F2}ms, deferred collider avg {avgDeferredColliderWait:F2}ms max {stats_deferredColliderWaitMax:F2}ms");
+                }
+                if (stats_meshPoolExhaustedDefers > 0 || stats_meshGpuBusyDefers > 0 || stats_meshGpuFrameThrottleFallbacks > 0 || stats_meshGpuRequestFailures > 0 || stats_meshInteractionPriorityCpuBypass > 0 || stats_meshBuildsWithMissingNeighbors > 0 || stats_deferredColliderApplyCount > 0)
+                {
+                    logBuilder.AppendLine($"  Stall reasons: pool {stats_meshPoolExhaustedDefers}, gpu busy {stats_meshGpuBusyDefers}, gpu frame throttle {stats_meshGpuFrameThrottleFallbacks}, gpu request fail {stats_meshGpuRequestFailures}, interaction cpu {stats_meshInteractionPriorityCpuBypass}, deferred collider {stats_deferredColliderApplyCount}, missing-neighbor builds {stats_meshBuildsWithMissingNeighbors}");
+                }
             }
 
             if (enableCounters && stats_faceCullingTests > 0)
@@ -10797,6 +11318,23 @@ public class McWorld : UdonSharpBehaviour
                 float cullRate = stats_facesCulled / (float)stats_faceCullingTests * 100f;
                 logBuilder.AppendLine($"  Face Culling: {stats_faceCullingTests} tests, {stats_facesCulled} culled ({cullRate:F1}%), {stats_facesDrawn} drawn");
                 logBuilder.AppendLine($"  Vertices: {stats_verticesOpaque} opaque, {stats_verticesTransparent} transparent, {stats_verticesCutout} cutout");
+                logBuilder.AppendLine($"  Face split: opaque {stats_facesOpaque}, transparent {stats_facesTransparent}, cutout {stats_facesCutout}");
+                logBuilder.AppendLine($"  Boundary checks: Y {stats_meshBoundaryChecksY}, Z {stats_meshBoundaryChecksZ}, X {stats_meshBoundaryChecksX}");
+                float totalVertices = stats_verticesOpaque + stats_verticesTransparent + stats_verticesCutout;
+                float msPerThousandFaces = stats_facesDrawn > 0 ? stats_meshBuildTimeTotal * 1000f / stats_facesDrawn : 0f;
+                float msPerThousandVertices = totalVertices > 0f ? stats_meshBuildTimeTotal * 1000f / totalVertices : 0f;
+                logBuilder.AppendLine($"  Throughput: {msPerThousandFaces:F2}ms / 1k faces, {msPerThousandVertices:F2}ms / 1k verts");
+                if (stats_meshBuildsWithMissingNeighbors > 0)
+                {
+                    logBuilder.AppendLine($"  Missing neighbors: avg {stats_meshMissingNeighborBits / (float)stats_meshBuildsWithMissingNeighbors:F2} sides on affected builds");
+                }
+            }
+
+            for (int i = 0; i < SLOWEST_MESH_BUILD_COUNT; i++)
+            {
+                if (stats_slowestMeshBuildMs[i] <= 0f) break;
+                string buildKind = stats_slowestMeshKind[i] == 2 ? "empty" : (stats_slowestMeshKind[i] == 1 ? "gpu" : "cpu");
+                logBuilder.AppendLine($"  Slowest #{i + 1}: ({stats_slowestMeshChunkX[i]},{stats_slowestMeshChunkY[i]},{stats_slowestMeshChunkZ[i]}) {stats_slowestMeshBuildMs[i]:F2}ms [{buildKind}] prep {stats_slowestMeshDataPrepMs[i]:F2}ms, loop {stats_slowestMeshMainLoopMs[i]:F2}ms, apply {stats_slowestMeshApplyMs[i]:F2}ms, faces {stats_slowestMeshFaceCount[i]}, verts {stats_slowestMeshVertexCount[i]}");
             }
         }
 
@@ -10891,6 +11429,12 @@ public class McWorld : UdonSharpBehaviour
         stats_budgetExceededCount = 0;
         stats_processActiveChunksTime = 0f;
         stats_reconciliationTime = 0f;
+        stats_dataGenActiveSamplesTotal = 0;
+        stats_meshingActiveSamplesTotal = 0;
+        stats_reconciliationQueueSamplesTotal = 0;
+        stats_dataGenActiveMax = 0;
+        stats_meshingActiveMax = 0;
+        stats_reconciliationQueueMax = 0;
         stats_meshBuildTotal = 0;
         stats_meshBuildCpuCompletions = 0;
         stats_meshBuildGpuCompletions = 0;
@@ -10914,6 +11458,9 @@ public class McWorld : UdonSharpBehaviour
         stats_meshApplyTransparentTime = 0f;
         stats_meshApplyCutoutTime = 0f;
         stats_meshApplyColliderTime = 0f;
+        stats_meshNeighborCacheTime = 0f;
+        stats_meshDataPrepTime = 0f;
+        stats_meshMainLoopTime = 0f;
         stats_gpuFaceDecodeSteps = 0;
         stats_gpuFaceDecodeTime = 0f;
         stats_gpuFaceDecodeTimeMin = float.MaxValue;
@@ -10925,6 +11472,26 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuFaceCompactEmitQuadTime = 0f;
         stats_gpuFaceCompactEmitCollisionTime = 0f;
         stats_meshDeferredChunks = 0;
+        stats_meshBoundaryChecksY = 0;
+        stats_meshBoundaryChecksZ = 0;
+        stats_meshBoundaryChecksX = 0;
+        stats_facesOpaque = 0;
+        stats_facesTransparent = 0;
+        stats_facesCutout = 0;
+        stats_meshPoolExhaustedDefers = 0;
+        stats_meshGpuBusyDefers = 0;
+        stats_meshGpuFrameThrottleFallbacks = 0;
+        stats_meshGpuRequestFailures = 0;
+        stats_meshInteractionPriorityCpuBypass = 0;
+        stats_meshBuildsWithMissingNeighbors = 0;
+        stats_meshMissingNeighborBits = 0;
+        stats_deferredColliderApplyCount = 0;
+        stats_deferredColliderWaitCount = 0;
+        stats_deferredColliderWaitTotal = 0f;
+        stats_deferredColliderWaitMax = 0f;
+        stats_firstMeshStartLatencyCount = 0;
+        stats_firstMeshStartLatencyTotal = 0f;
+        stats_firstMeshStartLatencyMax = 0f;
         stats_rleCompressions = 0;
         stats_rleDecompressions = 0;
         stats_rleCompressionTime = 0f;
@@ -10981,6 +11548,19 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuFaceReadbackCallbackCopyTime = 0f;
         stats_gpuFaceReadbackBytes = 0;
         stats_gpuFaceTileExtractTime = 0f;
+        for (int i = 0; i < SLOWEST_MESH_BUILD_COUNT; i++)
+        {
+            stats_slowestMeshBuildMs[i] = 0f;
+            stats_slowestMeshChunkX[i] = 0;
+            stats_slowestMeshChunkY[i] = 0;
+            stats_slowestMeshChunkZ[i] = 0;
+            stats_slowestMeshDataPrepMs[i] = 0f;
+            stats_slowestMeshMainLoopMs[i] = 0f;
+            stats_slowestMeshApplyMs[i] = 0f;
+            stats_slowestMeshFaceCount[i] = 0;
+            stats_slowestMeshVertexCount[i] = 0;
+            stats_slowestMeshKind[i] = 0;
+        }
 
         if (coordinator != null)
         {

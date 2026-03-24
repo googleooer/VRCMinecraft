@@ -407,6 +407,18 @@ public class McMovement : NUMovement
 
         if (!IsSolidBlock(feetBlock) && !IsSolidBlock(bodyBlock)) return;
 
+        // When airborne, only trust block data from chunks that have completed meshing.
+        // Chunks that are data-ready but not yet meshed can return stale/incorrect block
+        // data (especially high air chunks), causing false teleports.
+        if (!IsWalkable && world != null)
+        {
+            int bx = Mathf.FloorToInt(feetSample.x);
+            int by = Mathf.FloorToInt(feetSample.y);
+            int bz = Mathf.FloorToInt(feetSample.z);
+            if (flipXAxis) bx = -bx;
+            if (!world.IsChunkMeshedAt(bx, by, bz)) return;
+        }
+
         int baseVoxelY = Mathf.FloorToInt(feetSampleY);
 
         for (int dy = 1; dy <= 10; dy++)

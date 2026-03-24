@@ -65,6 +65,10 @@ public class McCoordinator : UdonSharpBehaviour
     private int chunkRebuildQueue_tail = 0;
     private int chunkRebuildQueue_count = 0;
     private const int MAX_REBUILD_QUEUE_SIZE = 256;
+    private int borderHealWorkerCursor = 0;
+    private readonly int[] _healDx = { 1, -1, 0,  0, 0,  0 };
+    private readonly int[] _healDy = { 0,  0, 1, -1, 0,  0 };
+    private readonly int[] _healDz = { 0,  0, 0,  0, 1, -1 };
 
 #if LOGGING
     [Header("Debug")] 
@@ -264,7 +268,14 @@ public class McCoordinator : UdonSharpBehaviour
                         // Check if neighbors are ready (expensive, but only when needed)
                         if (world.AreAllNeighborsReady(chunkIndex))
                         {
-                            if (world.ShouldDeferChunkMesh(chunkIndex))
+                            // Only defer mesh builds during initial worldgen, not rebuilds.
+                            // A chunk with _borderMissingMask != 0 needs re-meshing to fix
+                            // boundary artifacts — re-deferring it loops forever.
+                            // A chunk whose opaque mesh already has vertices was already
+                            // meshed once; this is a rebuild request, not a first build.
+                            bool isRebuild = chunk._borderMissingMask != 0
+                                || (chunk.opaqueMeshFilter != null && chunk.opaqueMeshFilter.sharedMesh != null && chunk.opaqueMeshFilter.sharedMesh.vertexCount > 0);
+                            if (!isRebuild && world.ShouldDeferChunkMesh(chunkIndex))
                             {
                                 world.MarkChunkMeshDeferred(chunkIndex);
                                 worker_targetChunkIndex[i] = -1;
@@ -371,6 +382,39 @@ public class McCoordinator : UdonSharpBehaviour
 #if LOGGING
                     if (enableDetailedTimings || enableAggregateLogging) rebuilds_Processed++;
 #endif
+                }
+            }
+            // Priority 1.5: Heal chunks with stale border data (bypass rebuild queue)
+            // Only after all chunks have been assigned for generation.
+            else if (!assigned && nextChunkIndexToAssign >= totalWorldChunks)
+            {
+                int scanLen = chunks != null ? chunksLen : 0;
+                for (int s = 0; s < 64 && scanLen > 0; s++)
+                {
+                    borderHealWorkerCursor++;
+                    if (borderHealWorkerCursor >= scanLen) borderHealWorkerCursor = 0;
+                    ChunkData hc = chunks[borderHealWorkerCursor];
+                    if (hc == null || !hc.isDataReady || hc.isBuildingMesh || hc.isMeshDeferred) continue;
+                    if (hc._borderMissingMask == 0) continue;
+                    byte hm = hc._borderMissingMask;
+                    bool ready = true;
+                    for (int d = 0; d < 6; d++)
+                    {
+                        if ((hm & (1 << d)) == 0) continue;
+                        ChunkData nc = world.GetChunkAt(
+                            hc.chunkX_world + _healDx[d],
+                            hc.chunkY_world + _healDy[d],
+                            hc.chunkZ_world + _healDz[d]);
+                        if (nc == null || !nc.isDataReady) { ready = false; break; }
+                    }
+                    if (ready)
+                    {
+                        worker_targetChunkIndex[i] = borderHealWorkerCursor;
+                        worker_state[i] = STATE_WAITING_FOR_MESH;
+                        assigned = true;
+                        assignedThisCycle++;
+                        break;
+                    }
                 }
             }
             // Priority 2: Initial world generation
@@ -557,6 +601,11 @@ public class McCoordinator : UdonSharpBehaviour
             if (worker_state[i] != STATE_IDLE) return true;
         }
         return false;
+    }
+
+    public bool IsWorldGenComplete()
+    {
+        return chunksCompletedCount >= totalWorldChunks && totalWorldChunks > 0;
     }
 
     /// <summary>
