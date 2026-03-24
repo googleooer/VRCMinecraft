@@ -107,6 +107,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public Material gpuColumnSurfaceReplaceMaterial;
     public Material gpuColumnDecorationMaterial;
     public Material gpuColumnTreeDecorationMaterial;
+    public Material gpuCaveCarveMaterial;
 
     [Header("GPU Noise Diagnostics")]
     public bool enableGpuNoiseDiagnostics = false;
@@ -198,6 +199,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int agg_gpuColumnsStarted;
     private int agg_gpuColumnsFinalized;
     private int agg_gpuFallbacks;
+    private int agg_gpuFallbackPrepareNoise;
+    private int agg_gpuFallbackFinalize;
+    private int agg_gpuFallbackReadbackFailure;
+    private int agg_gpuDiagnosticReadbackStalls;
     private int agg_gpuNoiseBlits;
     private float agg_gpuNoiseBlitTime;
     private int agg_gpuCombineBlits;
@@ -238,6 +243,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private float agg_gpuDiagnosticReadbackLatencyMax;
     private float agg_gpuDiagnosticReadbackCallbackCopyTime;
     private int agg_gpuDiagnosticReadbackBytes;
+    private const int SLOWEST_TERRAIN_CHUNK_COUNT = 3;
+    private float[] agg_slowestChunkTime = new float[SLOWEST_TERRAIN_CHUNK_COUNT];
+    private int[] agg_slowestChunkX = new int[SLOWEST_TERRAIN_CHUNK_COUNT];
+    private int[] agg_slowestChunkY = new int[SLOWEST_TERRAIN_CHUNK_COUNT];
+    private int[] agg_slowestChunkZ = new int[SLOWEST_TERRAIN_CHUNK_COUNT];
+    private float[] agg_slowestChunkPrep = new float[SLOWEST_TERRAIN_CHUNK_COUNT];
+    private float[] agg_slowestChunkGenerate = new float[SLOWEST_TERRAIN_CHUNK_COUNT];
+    private float[] agg_slowestChunkReplace = new float[SLOWEST_TERRAIN_CHUNK_COUNT];
 #endif
 
     [SerializeField, FindObjectOfType(true)]
@@ -488,6 +501,22 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuPropTreeCountId;
     private int gpuPropLogBlockIdDecor;
 
+    // GPU cave carving
+    private RenderTexture gpuCaveWorkTexture;
+    private int gpuPropCaveChunkXId, gpuPropCaveChunkZId;
+    private int gpuPropCaveWorldSeedHiId, gpuPropCaveWorldSeedLoId;
+    private int gpuPropCaveHashAHiId, gpuPropCaveHashALoId;
+    private int gpuPropCaveHashBHiId, gpuPropCaveHashBLoId;
+    private int gpuPropCaveGenerateId;
+    // MapGenBase hashA/hashB precomputed once per world seed
+    private bool gpuCaveHashesReady;
+    private int gpuCaveHashAHi, gpuCaveHashALo;
+    private int gpuCaveHashBHi, gpuCaveHashBLo;
+#if LOGGING
+    private int agg_gpuCaveBlits;
+    private float agg_gpuCaveBlitTime;
+#endif
+
     // Precomputed coordinate data for double-precision noise on GPU.
     // CPU computes floor() & 0xFF and fractional parts in double,
     // then uploads as float arrays so the GPU never does precision-sensitive coord math.
@@ -711,15 +740,27 @@ public class McTerrainGenerator : UdonSharpBehaviour
             sb.AppendFormat("  Surface assignments: top {0}, filler {1}, bedrock {2}, water {3}, gravel {4}, sand {5}, sandstone {6}\n",
                 agg_biomeTopAssignments, agg_biomeFillerAssignments, agg_biomeBedrockAssignments,
                 agg_biomeWaterAssignments, agg_biomeGravelAssignments, agg_biomeSandAssignments, agg_biomeSandstoneAssignments);
+            float msPerThousandVisited = agg_terrainVoxelsVisited > 0 ? agg_time_ActualChunkWork * 1000f / agg_terrainVoxelsVisited : 0f;
+            float msPerThousandAssignments = agg_terrainAssignments > 0 ? agg_time_ActualChunkWork * 1000f / agg_terrainAssignments : 0f;
+            sb.AppendFormat("  Throughput: {0:F3}ms / 1k visited voxels, {1:F3}ms / 1k assignments\n",
+                msPerThousandVisited, msPerThousandAssignments);
             if (agg_decorationColumns > 0)
             {
                 sb.AppendFormat("  Decoration: {0} columns, {1:F3}ms total, trees {2}, grass {3}, flowers {4}\n",
                     agg_decorationColumns, agg_time_Decoration, agg_treesPlaced, agg_tallGrassPlaced, agg_flowersPlaced);
             }
+            for (int i = 0; i < SLOWEST_TERRAIN_CHUNK_COUNT; i++)
+            {
+                if (agg_slowestChunkTime[i] <= 0f) break;
+                sb.AppendFormat("  Slowest #{0}: ({1},{2},{3}) {4:F3}ms, prep {5:F3}ms, terrain {6:F3}ms, replace {7:F3}ms\n",
+                    i + 1, agg_slowestChunkX[i], agg_slowestChunkY[i], agg_slowestChunkZ[i],
+                    agg_slowestChunkTime[i], agg_slowestChunkPrep[i], agg_slowestChunkGenerate[i], agg_slowestChunkReplace[i]);
+            }
         }
 
         bool hasGpuStats =
             agg_gpuColumnsStarted > 0 ||
+            agg_gpuFallbacks > 0 ||
             agg_gpuNoiseBlits > 0 ||
             agg_gpuBaseReadbacksCompleted > 0 ||
             agg_gpuDiagnosticReadbacksCompleted > 0 ||
@@ -731,12 +772,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
             sb.AppendLine("GPU Worldgen:");
             sb.AppendFormat("  Columns: started {0}, finalized {1}, fallbacks {2}\n",
                 agg_gpuColumnsStarted, agg_gpuColumnsFinalized, agg_gpuFallbacks);
+            if (agg_gpuFallbacks > 0 || agg_gpuDiagnosticReadbackStalls > 0)
+            {
+                sb.AppendFormat("  Fallback reasons: prepare noise {0}, finalize {1}, readback failure {2}, diagnostic stalls {3}\n",
+                    agg_gpuFallbackPrepareNoise, agg_gpuFallbackFinalize, agg_gpuFallbackReadbackFailure, agg_gpuDiagnosticReadbackStalls);
+            }
             sb.AppendFormat("  Blit submit: noise {0} ({1:F3}ms), combine {2} ({3:F3}ms), base fill {4} ({5:F3}ms), surface info {6} ({7:F3}ms), finalize {8} ({9:F3}ms)\n",
                 agg_gpuNoiseBlits, agg_gpuNoiseBlitTime,
                 agg_gpuCombineBlits, agg_gpuCombineBlitTime,
                 agg_gpuBaseFillBlits, agg_gpuBaseFillBlitTime,
                 agg_gpuSurfaceInfoBlits, agg_gpuSurfaceInfoBlitTime,
                 agg_gpuFinalizeBlits, agg_gpuFinalizeBlitTime);
+            sb.AppendFormat("  Cave blits: {0} ({1:F3}ms)\n",
+                agg_gpuCaveBlits, agg_gpuCaveBlitTime);
             sb.AppendFormat("  CPU->GPU uploads: noise inputs {0} ({1:F3}ms, {2:F1}KB), surface {3} ({4:F3}ms, {5:F1}KB), final column {6} ({7:F3}ms, {8:F1}KB)\n",
                 agg_gpuNoiseInputUploads, agg_gpuNoiseInputUploadTime, agg_gpuNoiseInputUploadBytes / 1024f,
                 agg_gpuSurfaceUploads, agg_gpuSurfaceUploadTime, agg_gpuSurfaceUploadBytes / 1024f,
@@ -820,6 +868,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_gpuColumnsStarted = 0;
         agg_gpuColumnsFinalized = 0;
         agg_gpuFallbacks = 0;
+        agg_gpuFallbackPrepareNoise = 0;
+        agg_gpuFallbackFinalize = 0;
+        agg_gpuFallbackReadbackFailure = 0;
+        agg_gpuDiagnosticReadbackStalls = 0;
         agg_gpuNoiseBlits = 0;
         agg_gpuNoiseBlitTime = 0f;
         agg_gpuCombineBlits = 0;
@@ -830,6 +882,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_gpuSurfaceInfoBlitTime = 0f;
         agg_gpuFinalizeBlits = 0;
         agg_gpuFinalizeBlitTime = 0f;
+        agg_gpuCaveBlits = 0;
+        agg_gpuCaveBlitTime = 0f;
 
         agg_gpuNoiseInputUploads = 0;
         agg_gpuNoiseInputUploadTime = 0f;
@@ -860,6 +914,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_gpuDiagnosticReadbackLatencyMax = 0f;
         agg_gpuDiagnosticReadbackCallbackCopyTime = 0f;
         agg_gpuDiagnosticReadbackBytes = 0;
+        for (int i = 0; i < SLOWEST_TERRAIN_CHUNK_COUNT; i++)
+        {
+            agg_slowestChunkTime[i] = 0f;
+            agg_slowestChunkX[i] = 0;
+            agg_slowestChunkY[i] = 0;
+            agg_slowestChunkZ[i] = 0;
+            agg_slowestChunkPrep[i] = 0f;
+            agg_slowestChunkGenerate[i] = 0f;
+            agg_slowestChunkReplace[i] = 0f;
+        }
     }
 
 
@@ -921,6 +985,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     }
 
     private void _AccumulateCompletedChunkProfile(
+        int chunkX,
+        int chunkY,
+        int chunkZ,
         float preparation,
         float prepGetBiomes,
         float prepSandNoise,
@@ -981,6 +1048,41 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_biomeGravelAssignments += biomeGravelAssignments;
         agg_biomeSandAssignments += biomeSandAssignments;
         agg_biomeSandstoneAssignments += biomeSandstoneAssignments;
+        _RecordSlowTerrainChunk(chunkX, chunkY, chunkZ, totalTime, preparation, time_GeneratingTerrain, time_ReplacingBiomes);
+    }
+
+    private void _RecordSlowTerrainChunk(int chunkX, int chunkY, int chunkZ, float totalTime, float preparation, float generateTime, float replaceTime)
+    {
+        int insertIndex = -1;
+        for (int i = 0; i < SLOWEST_TERRAIN_CHUNK_COUNT; i++)
+        {
+            if (totalTime > agg_slowestChunkTime[i])
+            {
+                insertIndex = i;
+                break;
+            }
+        }
+
+        if (insertIndex == -1) return;
+
+        for (int i = SLOWEST_TERRAIN_CHUNK_COUNT - 1; i > insertIndex; i--)
+        {
+            agg_slowestChunkTime[i] = agg_slowestChunkTime[i - 1];
+            agg_slowestChunkX[i] = agg_slowestChunkX[i - 1];
+            agg_slowestChunkY[i] = agg_slowestChunkY[i - 1];
+            agg_slowestChunkZ[i] = agg_slowestChunkZ[i - 1];
+            agg_slowestChunkPrep[i] = agg_slowestChunkPrep[i - 1];
+            agg_slowestChunkGenerate[i] = agg_slowestChunkGenerate[i - 1];
+            agg_slowestChunkReplace[i] = agg_slowestChunkReplace[i - 1];
+        }
+
+        agg_slowestChunkTime[insertIndex] = totalTime;
+        agg_slowestChunkX[insertIndex] = chunkX;
+        agg_slowestChunkY[insertIndex] = chunkY;
+        agg_slowestChunkZ[insertIndex] = chunkZ;
+        agg_slowestChunkPrep[insertIndex] = preparation;
+        agg_slowestChunkGenerate[insertIndex] = generateTime;
+        agg_slowestChunkReplace[insertIndex] = replaceTime;
     }
 #endif
 
@@ -1232,6 +1334,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
         gpuTreeAnchorBiomeBuffer = new BetaBiomeEnum[world.chunkSizeXZ * world.chunkSizeXZ];
 
+        // GPU cave carving RT
+        gpuCaveWorkTexture = _CreateGpuBlockIdRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_CaveWork");
+        // Precompute MapGenBase hashA/hashB from world seed (same for all columns)
+        gpuCaveHashesReady = false;
+
         _UploadGpuPermutationTable(gpuPermTextureNoise1, noiseGen1, 16);
         _UploadGpuPermutationTable(gpuPermTextureNoise2, noiseGen2, 16);
         _UploadGpuPermutationTable(gpuPermTextureNoise3, noiseGen3, 8);
@@ -1331,6 +1438,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuTreeAnchorChunkTexIds[6] = VRCShader.PropertyToID("_TreeChunkTex6");
         gpuTreeAnchorChunkTexIds[7] = VRCShader.PropertyToID("_TreeChunkTex7");
         gpuTreeAnchorChunkTexIds[8] = VRCShader.PropertyToID("_TreeChunkTex8");
+
+        // GPU cave property IDs
+        gpuPropCaveChunkXId = VRCShader.PropertyToID("_ChunkX");
+        gpuPropCaveChunkZId = VRCShader.PropertyToID("_ChunkZ");
+        gpuPropCaveWorldSeedHiId = VRCShader.PropertyToID("_WorldSeedHi");
+        gpuPropCaveWorldSeedLoId = VRCShader.PropertyToID("_WorldSeedLo");
+        gpuPropCaveHashAHiId = VRCShader.PropertyToID("_HashAHi");
+        gpuPropCaveHashALoId = VRCShader.PropertyToID("_HashALo");
+        gpuPropCaveHashBHiId = VRCShader.PropertyToID("_HashBHi");
+        gpuPropCaveHashBLoId = VRCShader.PropertyToID("_HashBLo");
+        gpuPropCaveGenerateId = VRCShader.PropertyToID("_GenerateCaves");
 
         // Precomputed coordinate property IDs
         gpuPropPermIdxXId = VRCShader.PropertyToID("_PermIdxX");
@@ -2441,6 +2559,42 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
         blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
+        // GPU cave carve pass
+        if (generateCaves && gpuCaveCarveMaterial != null)
+        {
+            _EnsureGpuCaveHashesReady();
+#if LOGGING
+            float caveBlitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+            int caveSeedInt = McUtils.GetMinecraftSeed(world.worldSeedString);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveChunkXId, currentChunkX);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveChunkZId, currentChunkZ);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveWorldSeedHiId, caveSeedInt < 0 ? -1 : 0);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveWorldSeedLoId, caveSeedInt);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveHashAHiId, gpuCaveHashAHi);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveHashALoId, gpuCaveHashALo);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveHashBHiId, gpuCaveHashBHi);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveHashBLoId, gpuCaveHashBLo);
+            gpuCaveCarveMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
+            gpuCaveCarveMaterial.SetInt(gpuPropChunkSizeXZId, sizeXZ);
+            gpuCaveCarveMaterial.SetInt(gpuPropFlipXAxisId, match1to1TerrainBaseline ? 0 : (flipXAxis ? 1 : 0));
+            gpuCaveCarveMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
+            gpuCaveCarveMaterial.SetInt(VRCShader.PropertyToID("_DirtBlockId"), dirtBlockID);
+            gpuCaveCarveMaterial.SetInt(VRCShader.PropertyToID("_GrassBlockId"), grassBlockID);
+            gpuCaveCarveMaterial.SetInt(gpuPropWaterBlockId, waterBlockID);
+            gpuCaveCarveMaterial.SetInt(VRCShader.PropertyToID("_StationaryWaterBlockId"), (int)BlockMaterial.STATIONARY_WATER);
+            gpuCaveCarveMaterial.SetInt(VRCShader.PropertyToID("_LavaBlockId"), (int)BlockMaterial.STATIONARY_LAVA);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveGenerateId, 1);
+            VRCGraphics.Blit(gpuColumnFinalTexture, gpuCaveWorkTexture, gpuCaveCarveMaterial);
+            VRCGraphics.Blit(gpuCaveWorkTexture, gpuColumnFinalTexture);
+#if LOGGING
+            if (enableDetailedTimings)
+            {
+                agg_gpuCaveBlits++;
+                agg_gpuCaveBlitTime += (Time.realtimeSinceStartup - caveBlitStart) * 1000f;
+            }
+#endif
+        }
         gpuColumnSurfaceInfoMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnFinalTexture);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropWorldHeightId, gpuWorldHeightBlocks);
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropChunkSizeXZId, sizeXZ);
@@ -3508,6 +3662,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
             maxStepTime = copyMs;
             minStepTime = copyMs;
             _AccumulateCompletedChunkProfile(
+                currentChunkX,
+                currentChunkY,
+                currentChunkZ,
                 display_time_Preparation,
                 display_time_Prep_GetBiomes,
                 display_time_Prep_SandNoise,
@@ -3715,7 +3872,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     if (!_StartGpuColumnGeneration())
                     {
 #if LOGGING
-                        if (enableDetailedTimings) agg_gpuFallbacks++;
+                        if (enableDetailedTimings) { agg_gpuFallbacks++; agg_gpuFallbackPrepareNoise++; }
 #endif
                         currentState = GenerationState.Prepare_AllocCache;
                         break;
@@ -3730,7 +3887,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     if (!_StartGpuColumnFinalize())
                     {
 #if LOGGING
-                        if (enableDetailedTimings) agg_gpuFallbacks++;
+                        if (enableDetailedTimings) { agg_gpuFallbacks++; agg_gpuFallbackFinalize++; }
 #endif
                         currentState = GenerationState.Prepare_AllocCache;
                         break;
@@ -3748,6 +3905,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         if (gpuDiagnosticReadbackStallFrames > GPU_DIAGNOSTIC_READBACK_STALL_LIMIT)
                         {
                             Debug.LogWarning("[GPU Noise Diagnostic] Readback stalled; aborting diagnostic and continuing normal GPU worldgen.");
+#if LOGGING
+                            if (enableDetailedTimings) agg_gpuDiagnosticReadbackStalls++;
+#endif
                             gpuColumnReadbackPending = false;
                             gpuReadbackPhase = GpuWorldgenReadbackPhase.None;
                             _BeginGpuBaseColumnReadback();
@@ -3757,7 +3917,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     if (gpuColumnReadbackFailed)
                     {
 #if LOGGING
-                        if (enableDetailedTimings) agg_gpuFallbacks++;
+                        if (enableDetailedTimings) { agg_gpuFallbacks++; agg_gpuFallbackReadbackFailure++; }
 #endif
                         currentState = GenerationState.Prepare_AllocCache;
                         break;
@@ -4725,6 +4885,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     int display_noise7Cells = timingsCached ? cached_noise7Cells : noise7Cells;
                     int display_noiseCombineCells = timingsCached ? cached_noiseCombineCells : noiseCombineCells;
                     _AccumulateCompletedChunkProfile(
+                        currentChunkX,
+                        currentChunkY,
+                        currentChunkZ,
                         display_time_Preparation,
                         display_time_Prep_GetBiomes,
                         display_time_Prep_SandNoise,
@@ -4823,6 +4986,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     // This method is now obsolete as the GPU handles all surface decoration.
     // private bool StepSurfaceDecoration() { ... }
+
+    private void _EnsureGpuCaveHashesReady()
+    {
+        if (gpuCaveHashesReady) return;
+        int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+        JavaRandom seedRand = new JavaRandom(worldSeed);
+        long hashALong = seedRand.NextLong() / 2L * 2L + 1L;
+        long hashBLong = seedRand.NextLong() / 2L * 2L + 1L;
+        gpuCaveHashAHi = (int)(hashALong >> 32);
+        gpuCaveHashALo = (int)(hashALong & 0xFFFFFFFFL);
+        gpuCaveHashBHi = (int)(hashBLong >> 32);
+        gpuCaveHashBLo = (int)(hashBLong & 0xFFFFFFFFL);
+        gpuCaveHashesReady = true;
+    }
 
     private void GenerateCaves(ushort[] chunkData, int chunkX, int chunkY, int chunkZ)
     {

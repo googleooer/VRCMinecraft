@@ -60,6 +60,7 @@ public class ChunkData
     public int _gpuFaceSlotIndex = -1;
     public int _gpuFaceReadbackQueueSlot = -1;
     public bool _gpuMeshPending = false;
+    public byte _borderMissingMask = 0; // bits 0-5 = +Y,-Y,+Z,-Z,+X,-X neighbors missing at mesh time
     public bool _gpuFaceBuildActive = false;
     public int _gpuFaceBuildStage = 0; // -1=summary prep, 0=greedy faces, 1=cross+torch, 2=water, 3=apply
     public int _gpuFaceDirection = 0;
@@ -198,5 +199,8 @@ public class ChunkData
 
     // --- Mesh Build Tracking ---
     public float meshBuildStartTime;
+    public float profile_dataReadyTime;
+    public float profile_deferredColliderQueuedTime;
+    public bool profile_waitingForFirstMesh;
 #endif
 }

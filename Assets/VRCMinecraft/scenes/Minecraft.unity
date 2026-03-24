@@ -14471,6 +14471,8 @@ MonoBehaviour:
     type: 2}
   gpuColumnTreeDecorationMaterial: {fileID: 2100000, guid: a504715080318d644805ba910cd65d74,
     type: 2}
+  gpuCaveCarveMaterial: {fileID: 2100000, guid: 146ef25f9cec05942817e6e1cde3b7e0,
+    type: 2}
   enableGpuNoiseDiagnostics: 0
   gpuNoiseDiagnosticDumpAllCells: 0
   gpuNoiseDiagnosticChunkX: 0

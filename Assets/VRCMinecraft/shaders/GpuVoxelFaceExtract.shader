@@ -7,6 +7,8 @@ Shader "VRCM/GpuVoxelFaceExtract"
         _SlotLookupTex ("Slot Lookup", 2D) = "black" {}
         _SlotMetaTex ("Slot Meta", 2D) = "black" {}
         _DrawTableTex ("Draw Table 256x256", 2D) = "black" {}
+        _BorderTex ("Border Data", 2D) = "black" {}
+        _BorderInfo ("Border Info", Vector) = (16, 96, 16, 0)
         _Mode ("Mode", Float) = 0
         _ReadSlotIndex ("Read Slot Index", Float) = 0
     }
@@ -46,6 +48,8 @@ Shader "VRCM/GpuVoxelFaceExtract"
             sampler2D _SlotLookupTex;
             sampler2D _SlotMetaTex;
             sampler2D _DrawTableTex;  // 256x256 shouldDraw lookup
+            sampler2D _BorderTex;     // Pre-packed neighbor boundary blocks
+            float4 _BorderInfo;       // (width, height, stride, 0)
             float _Mode;
             float _ReadSlotIndex;
             float4 _UdonVRCM_GpuAtlasInfo;   // (atlasWidth, atlasHeight, atlasSlotsX, atlasSlotsY)
@@ -91,39 +95,45 @@ Shader "VRCM/GpuVoxelFaceExtract"
                 return floor(tex2D(_MainTex, float2(atlasU, atlasV)).r * 255.0 + 0.5);
             }
 
-            // Get the neighbor block ID, handling cross-chunk boundaries
+            // Get the neighbor block ID, handling cross-chunk boundaries.
+            // For same-chunk lookups: reads from the atlas tile directly.
+            // For cross-chunk lookups: reads from the pre-packed border texture.
+            // selfId: returned when the neighbor's border data is missing (alpha=0).
             float GetNeighborBlockId(float slotIndex, float chunkX, float chunkY, float chunkZ,
                                      float localX, float localY, float localZ,
-                                     float dx, float dy, float dz)
+                                     float dx, float dy, float dz, float selfId)
             {
                 float nx = localX + dx;
                 float ny = localY + dy;
                 float nz = localZ + dz;
-                float nChunkX = chunkX;
-                float nChunkY = chunkY;
-                float nChunkZ = chunkZ;
 
-                // Handle chunk boundary crossing
-                if (nx < 0.0) { nx += _UdonVRCM_GpuChunkInfo.x; nChunkX -= 1.0; }
-                else if (nx >= _UdonVRCM_GpuChunkInfo.x) { nx -= _UdonVRCM_GpuChunkInfo.x; nChunkX += 1.0; }
+                float width = _UdonVRCM_GpuChunkInfo.x;
+                float height = _UdonVRCM_GpuChunkInfo.y;
 
-                if (ny < 0.0) { ny += _UdonVRCM_GpuChunkInfo.y; nChunkY -= 1.0; }
-                else if (ny >= _UdonVRCM_GpuChunkInfo.y) { ny -= _UdonVRCM_GpuChunkInfo.y; nChunkY += 1.0; }
-
-                if (nz < 0.0) { nz += _UdonVRCM_GpuChunkInfo.x; nChunkZ -= 1.0; }
-                else if (nz >= _UdonVRCM_GpuChunkInfo.x) { nz -= _UdonVRCM_GpuChunkInfo.x; nChunkZ += 1.0; }
-
-                // Same chunk — use provided slotIndex directly
-                if (nChunkX == chunkX && nChunkY == chunkY && nChunkZ == chunkZ)
+                // Same chunk — fast path, read from atlas tile
+                if (nx >= 0.0 && nx < width && ny >= 0.0 && ny < height && nz >= 0.0 && nz < width)
                 {
                     return SampleBlockId(slotIndex, nx, ny, nz);
                 }
 
-                // Different chunk — look up its slot
-                float valid = 0.0;
-                float neighborSlot = LookupNeighborSlot(nChunkX, nChunkY, nChunkZ, valid);
-                if (valid < 0.5) return 0.0; // treat unloaded chunk as air (draw face)
-                return SampleBlockId(neighborSlot, nx, ny, nz);
+                // Cross-chunk boundary — read from border texture
+                float borderU, borderV;
+                float stride = _BorderInfo.z;
+
+                if (dy > 0.5)        { borderU = localX; borderV = 0.0 * stride + localZ; }  // +Y
+                else if (dy < -0.5)  { borderU = localX; borderV = 1.0 * stride + localZ; }  // -Y
+                else if (dz > 0.5)   { borderU = localX; borderV = 2.0 * stride + localY; }  // +Z
+                else if (dz < -0.5)  { borderU = localX; borderV = 3.0 * stride + localY; }  // -Z
+                else if (dx > 0.5)   { borderU = localZ; borderV = 4.0 * stride + localY; }  // +X
+                else                 { borderU = localZ; borderV = 5.0 * stride + localY; }  // -X
+
+                float2 borderUv = float2(
+                    (borderU + 0.5) / _BorderInfo.x,
+                    (borderV + 0.5) / _BorderInfo.y
+                );
+                float4 borderSample = tex2D(_BorderTex, borderUv);
+                if (borderSample.a < 0.5) return 0; // neighbor not available → air → draw face
+                return floor(borderSample.r * 255.0 + 0.5);
             }
 
             // Look up the shouldDraw table: selfId on X axis, neighborId on Y axis
@@ -229,7 +239,7 @@ Shader "VRCM/GpuVoxelFaceExtract"
                                 float shapeType = floor(blockProps.b * 255.0 + 0.5);
                                 if (shapeType < 1.0)
                                 {
-                                    float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ);
+                                    float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ, selfId);
                                     if (ShouldDrawFace(selfId, neighborId) > 0.5) rowMask0 += exp2(u);
                                 }
                             }
@@ -258,7 +268,7 @@ Shader "VRCM/GpuVoxelFaceExtract"
                                 float shapeType = floor(blockProps.b * 255.0 + 0.5);
                                 if (shapeType < 1.0)
                                 {
-                                    float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ);
+                                    float neighborId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, offsetX, offsetY, offsetZ, selfId);
                                     if (ShouldDrawFace(selfId, neighborId) > 0.5) rowMask1 += exp2(u);
                                 }
                             }
@@ -302,22 +312,22 @@ Shader "VRCM/GpuVoxelFaceExtract"
                     float chunkZ = floor(slotMeta.b * 255.0 + 0.5);
                     float faceMask = 0.0;
 
-                    float nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 1, 0);
+                    float nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 1, 0, selfId);
                     if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 1.0;
 
-                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, -1, 0);
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, -1, 0, selfId);
                     if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 2.0;
 
-                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, 1);
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, 1, selfId);
                     if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 4.0;
 
-                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, -1);
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, -1, selfId);
                     if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 8.0;
 
-                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 1, 0, 0);
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 1, 0, 0, selfId);
                     if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 16.0;
 
-                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, -1, 0, 0);
+                    nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, -1, 0, 0, selfId);
                     if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 32.0;
 
                     return float4(faceMask / 255.0, selfId / 255.0, shapeType / 255.0, 1.0);
@@ -372,27 +382,27 @@ Shader "VRCM/GpuVoxelFaceExtract"
                 float faceMask = 0.0;
 
                 // +Y face (direction 0)
-                float nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 1, 0);
+                float nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 1, 0, selfId);
                 if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 1.0;
 
                 // -Y face (direction 1)
-                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, -1, 0);
+                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, -1, 0, selfId);
                 if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 2.0;
 
                 // +Z face (direction 2)
-                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, 1);
+                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, 1, selfId);
                 if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 4.0;
 
                 // -Z face (direction 3)
-                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, -1);
+                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 0, 0, -1, selfId);
                 if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 8.0;
 
                 // +X face (direction 4)
-                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 1, 0, 0);
+                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, 1, 0, 0, selfId);
                 if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 16.0;
 
                 // -X face (direction 5)
-                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, -1, 0, 0);
+                nId = GetNeighborBlockId(slotIndex, chunkX, chunkY, chunkZ, localX, localY, localZ, -1, 0, 0, selfId);
                 if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 32.0;
 
                 // Output: R=faceMask/255, G=blockID/255, B=shapeType/255, A=1 (valid)
