@@ -4623,7 +4623,11 @@ public class McWorld : UdonSharpBehaviour
 
         if (interactionPriority)
         {
-            int immediateStepBudget = 256;
+            // Player edits should start responding immediately, but finishing the
+            // whole rebuild on the interaction call path causes visible spikes.
+            // Kick a single step here, then let ProcessActiveChunks finish under
+            // the normal frame budget on subsequent updates.
+            int immediateStepBudget = 1;
             while (chunk.isBuildingMesh && immediateStepBudget-- > 0)
             {
                 _BuildChunkMeshStep(chunk);
