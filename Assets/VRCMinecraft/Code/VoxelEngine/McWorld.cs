@@ -299,8 +299,8 @@ public class McWorld : UdonSharpBehaviour
     private int gpuPropBorderInfoId;
     private int gpuPropFaceOccupancyAtlasGlobalId;
     private int gpuPropFaceOccupancyInfoId;
-    private Texture2D gpuBorderTexture;
-    private Color32[] gpuBorderPixels;
+    private Texture2D[] gpuBorderTextures;
+    private Color32[][] gpuBorderPixels;
     private int gpuBorderWidth, gpuBorderHeight, gpuBorderStride;
     private int gpuFaceSummaryWidth = 64;
     private int gpuFaceSummaryHeight = 6;
@@ -468,6 +468,8 @@ public class McWorld : UdonSharpBehaviour
     private int stats_meshGpuBusyDefers = 0;
     private int stats_meshGpuFrameThrottleFallbacks = 0;
     private int stats_meshGpuRequestFailures = 0;
+    private int stats_meshGpuBorderDefers = 0;
+    private int stats_meshGpuBorderCpuFallbacks = 0;
     private int stats_meshInteractionPriorityCpuBypass = 0;
     private int stats_meshBuildsWithMissingNeighbors = 0;
     private int stats_meshMissingNeighborBits = 0;
@@ -825,8 +827,13 @@ public class McWorld : UdonSharpBehaviour
         gpuBorderWidth = chunkSizeXZ;
         gpuBorderHeight = 6 * borderStride;
         gpuBorderStride = borderStride;
-        gpuBorderTexture = _CreateGpuTexture2D(gpuBorderWidth, gpuBorderHeight);
-        gpuBorderPixels = new Color32[gpuBorderWidth * gpuBorderHeight];
+        gpuBorderTextures = new Texture2D[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuBorderPixels = new Color32[GPU_FACE_READBACK_BUFFER_COUNT][];
+        for (int i = 0; i < GPU_FACE_READBACK_BUFFER_COUNT; i++)
+        {
+            gpuBorderTextures[i] = _CreateGpuTexture2D(gpuBorderWidth, gpuBorderHeight);
+            gpuBorderPixels[i] = new Color32[gpuBorderWidth * gpuBorderHeight];
+        }
 
         // --- GPU Face Extraction Init ---
         gpuFaceAtlas = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_FaceAtlas");
@@ -1362,21 +1369,26 @@ public class McWorld : UdonSharpBehaviour
         _GpuOverlayTextureIntoAtlas(gpuClearTexture, ref gpuLightAtlas, ref gpuLightAtlasScratch);
     }
 
-    // Pack 1-block-deep boundary faces from all 6 neighbors into gpuBorderTexture.
+    // Pack 1-block-deep boundary faces from all 6 neighbors into the readback buffer's border texture.
     // Layout: 6 faces × chunkSizeXZ wide × stride tall.
     // Face order: +Y(0), -Y(1), +Z(2), -Z(3), +X(4), -X(5).
     // Alpha=255 if neighbor data is valid, 0 if missing.
-    private void _GpuPackBorderData(ChunkData chunk)
+    private void _GpuPackBorderData(ChunkData chunk, int bufferIndex)
     {
-        if (!gpuBackendReady || chunk == null || gpuBorderPixels == null) return;
+        if (!gpuBackendReady || chunk == null || gpuBorderPixels == null || gpuBorderTextures == null) return;
+        if (bufferIndex < 0 || bufferIndex >= gpuBorderPixels.Length || bufferIndex >= gpuBorderTextures.Length) return;
+
+        Color32[] borderPixels = gpuBorderPixels[bufferIndex];
+        Texture2D borderTexture = gpuBorderTextures[bufferIndex];
+        if (borderPixels == null || borderTexture == null) return;
 
         // Fill entire buffer with air + valid alpha.  Faces whose neighbor IS
         // available will be overwritten with real data below.  Faces with missing
         // neighbors keep blockID=0 (air) so ShouldDrawFace(solid, air) draws them.
         {
             Color32 airValid = new Color32(0, 0, 0, 255);
-            for (int i = 0; i < gpuBorderPixels.Length; i++)
-                gpuBorderPixels[i] = airValid;
+            for (int i = 0; i < borderPixels.Length; i++)
+                borderPixels[i] = airValid;
         }
 
         int SX = chunkSizeXZ;
@@ -1390,7 +1402,7 @@ public class McWorld : UdonSharpBehaviour
         if (n != null && n.isDataReady)
             for (int z = 0; z < SX; z++)
                 for (int x = 0; x < SX; x++)
-                    gpuBorderPixels[(0 * stride + z) * w + x] = new Color32(_GetBlockLocal(n, x, 0, z), 0, 0, 255);
+                    borderPixels[(0 * stride + z) * w + x] = new Color32(_GetBlockLocal(n, x, 0, z), 0, 0, 255);
         else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world + 1, chunk.chunkZ_world) != -1)
             missingMask |= 4; // bit 2 = +Y
 
@@ -1399,7 +1411,7 @@ public class McWorld : UdonSharpBehaviour
         if (n != null && n.isDataReady)
             for (int z = 0; z < SX; z++)
                 for (int x = 0; x < SX; x++)
-                    gpuBorderPixels[(1 * stride + z) * w + x] = new Color32(_GetBlockLocal(n, x, SY - 1, z), 0, 0, 255);
+                    borderPixels[(1 * stride + z) * w + x] = new Color32(_GetBlockLocal(n, x, SY - 1, z), 0, 0, 255);
         else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world - 1, chunk.chunkZ_world) != -1)
             missingMask |= 8; // bit 3 = -Y
 
@@ -1408,7 +1420,7 @@ public class McWorld : UdonSharpBehaviour
         if (n != null && n.isDataReady)
             for (int y = 0; y < SY; y++)
                 for (int x = 0; x < SX; x++)
-                    gpuBorderPixels[(2 * stride + y) * w + x] = new Color32(_GetBlockLocal(n, x, y, 0), 0, 0, 255);
+                    borderPixels[(2 * stride + y) * w + x] = new Color32(_GetBlockLocal(n, x, y, 0), 0, 0, 255);
         else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world + 1) != -1)
             missingMask |= 16; // bit 4 = +Z
 
@@ -1417,7 +1429,7 @@ public class McWorld : UdonSharpBehaviour
         if (n != null && n.isDataReady)
             for (int y = 0; y < SY; y++)
                 for (int x = 0; x < SX; x++)
-                    gpuBorderPixels[(3 * stride + y) * w + x] = new Color32(_GetBlockLocal(n, x, y, SX - 1), 0, 0, 255);
+                    borderPixels[(3 * stride + y) * w + x] = new Color32(_GetBlockLocal(n, x, y, SX - 1), 0, 0, 255);
         else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world - 1) != -1)
             missingMask |= 32; // bit 5 = -Z
 
@@ -1426,7 +1438,7 @@ public class McWorld : UdonSharpBehaviour
         if (n != null && n.isDataReady)
             for (int y = 0; y < SY; y++)
                 for (int z = 0; z < SX; z++)
-                    gpuBorderPixels[(4 * stride + y) * w + z] = new Color32(_GetBlockLocal(n, 0, y, z), 0, 0, 255);
+                    borderPixels[(4 * stride + y) * w + z] = new Color32(_GetBlockLocal(n, 0, y, z), 0, 0, 255);
         else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world + 1, chunk.chunkY_world, chunk.chunkZ_world) != -1)
             missingMask |= 1; // bit 0 = +X
 
@@ -1435,18 +1447,14 @@ public class McWorld : UdonSharpBehaviour
         if (n != null && n.isDataReady)
             for (int y = 0; y < SY; y++)
                 for (int z = 0; z < SX; z++)
-                    gpuBorderPixels[(5 * stride + y) * w + z] = new Color32(_GetBlockLocal(n, SX - 1, y, z), 0, 0, 255);
+                    borderPixels[(5 * stride + y) * w + z] = new Color32(_GetBlockLocal(n, SX - 1, y, z), 0, 0, 255);
         else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world - 1, chunk.chunkY_world, chunk.chunkZ_world) != -1)
             missingMask |= 2; // bit 1 = -X
 
         chunk._borderMissingMask = missingMask;
-        gpuBorderTexture.SetPixels32(gpuBorderPixels);
-        gpuBorderTexture.Apply(false, false);
+        borderTexture.SetPixels32(borderPixels);
+        borderTexture.Apply(false, false);
     }
-
-    // Only one _GpuPackBorderData+Blit pair per frame — the border texture is shared
-    // and VRCGraphics.Blit may be deferred, so a second Pack overwrites the first's data.
-    private int _lastBorderBlitFrame = -1;
 
     private void _GpuSyncChunkBlocks(ChunkData chunk, byte[] blockData)
     {
@@ -1811,6 +1819,7 @@ public class McWorld : UdonSharpBehaviour
     private void _GpuRunFaceExtractionDirect(int bufferIndex, int slotIndex)
     {
         if (!_GpuFaceExtractionReady() || bufferIndex < 0 || bufferIndex >= gpuFaceReadbackTextures.Length) return;
+        if (gpuBorderTextures == null || bufferIndex >= gpuBorderTextures.Length || gpuBorderTextures[bufferIndex] == null) return;
 
         gpuFaceExtractMaterial.SetFloat(gpuPropFaceModeId, 1f);
         gpuFaceExtractMaterial.SetFloat(gpuPropFaceReadSlotId, slotIndex);
@@ -1818,7 +1827,7 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
-        gpuFaceExtractMaterial.SetTexture(gpuPropBorderTexId, gpuBorderTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBorderTexId, gpuBorderTextures[bufferIndex]);
         gpuFaceExtractMaterial.SetVector(gpuPropBorderInfoId, new Vector4(gpuBorderWidth, gpuBorderHeight, gpuBorderStride, 0f));
 
 #if LOGGING
@@ -1837,6 +1846,7 @@ public class McWorld : UdonSharpBehaviour
     private void _GpuRunFaceSummaryExportDirect(int bufferIndex, int slotIndex)
     {
         if (!_GpuFaceExtractionReady() || bufferIndex < 0 || bufferIndex >= gpuFaceReadbackTextures.Length) return;
+        if (gpuBorderTextures == null || bufferIndex >= gpuBorderTextures.Length || gpuBorderTextures[bufferIndex] == null) return;
 
         gpuFaceExtractMaterial.SetFloat(gpuPropFaceModeId, 2f);
         gpuFaceExtractMaterial.SetFloat(gpuPropFaceReadSlotId, slotIndex);
@@ -1844,7 +1854,7 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
         gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
-        gpuFaceExtractMaterial.SetTexture(gpuPropBorderTexId, gpuBorderTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBorderTexId, gpuBorderTextures[bufferIndex]);
         gpuFaceExtractMaterial.SetVector(gpuPropBorderInfoId, new Vector4(gpuBorderWidth, gpuBorderHeight, gpuBorderStride, 0f));
         float blitStart = 0f;
 #if LOGGING
@@ -1860,11 +1870,12 @@ public class McWorld : UdonSharpBehaviour
 #endif
     }
 
-    private bool _GpuRequestChunkFaceReadback(ChunkData chunk)
+    private bool _GpuRequestChunkFaceReadback(ChunkData chunk, int bufferIndex)
     {
         if (!_GpuFaceExtractionReady() || chunk == null) return false;
-        int bufferIndex = _GpuFindAvailableReadbackBuffer();
-        if (bufferIndex == -1) return false;
+        if (bufferIndex < 0 || gpuFaceReadbackState == null || bufferIndex >= gpuFaceReadbackState.Length) return false;
+        if (gpuFaceReadbackState[bufferIndex] != 0) return false;
+        // Caller must pack the matching border texture into this buffer before requesting.
 
         int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
         if (chunkIndex < 0 || chunkIndex >= totalWorldChunks) return false;
@@ -3249,18 +3260,7 @@ public class McWorld : UdonSharpBehaviour
             // deferred-interior wakes still get their budget.
             if (!chunk.isMeshDeferred && chunk._borderMissingMask != 0)
             {
-                byte mask = chunk._borderMissingMask;
-                bool allNowReady = true;
-                for (int i = 0; i < 6; i++)
-                {
-                    if ((mask & (1 << i)) == 0) continue;
-                    int nx = chunk.chunkX_world + neighbor_dx_offsets[i];
-                    int ny = chunk.chunkY_world + neighbor_dy_offsets[i];
-                    int nz = chunk.chunkZ_world + neighbor_dz_offsets[i];
-                    ChunkData nc = GetChunkAt(nx, ny, nz);
-                    if (nc == null || !nc.isDataReady) { allNowReady = false; break; }
-                }
-                if (allNowReady)
+                if (_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask))
                 {
                     RequestChunkMeshUpdate(chunkIndex);
                 }
@@ -3268,6 +3268,7 @@ public class McWorld : UdonSharpBehaviour
             }
 
             if (!chunk.isMeshDeferred) continue;
+            if (chunk._borderMissingMask != 0 && !_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask)) continue;
             if (!AreAllNeighborsReady(chunkIndex)) continue;
 
             bool shouldWake = _ShouldPrioritizeChunkMesh(chunk);
@@ -3286,6 +3287,23 @@ public class McWorld : UdonSharpBehaviour
 
     private int _borderHealCursor = 0;
     private bool _postWorldGenBorderCleanupDone = false;
+
+    private bool _AreMaskedNeighborsReady(ChunkData chunk, byte mask)
+    {
+        if (chunk == null || mask == 0) return true;
+
+        for (int i = 0; i < 6; i++)
+        {
+            if ((mask & (1 << i)) == 0) continue;
+            ChunkData neighborChunk = GetChunkAt(
+                chunk.chunkX_world + neighbor_dx_offsets[i],
+                chunk.chunkY_world + neighbor_dy_offsets[i],
+                chunk.chunkZ_world + neighbor_dz_offsets[i]);
+            if (neighborChunk == null || !neighborChunk.isDataReady) return false;
+        }
+
+        return true;
+    }
 
     private void _PostWorldGenBorderCleanup()
     {
@@ -3324,18 +3342,7 @@ public class McWorld : UdonSharpBehaviour
     private void _TryImmediateBorderHeal(ChunkData chunk)
     {
         if (chunk == null || chunk._borderMissingMask == 0 || chunk.isBuildingMesh) return;
-        byte mask = chunk._borderMissingMask;
-        bool allReady = true;
-        for (int i = 0; i < 6; i++)
-        {
-            if ((mask & (1 << i)) == 0) continue;
-            ChunkData nc = GetChunkAt(
-                chunk.chunkX_world + neighbor_dx_offsets[i],
-                chunk.chunkY_world + neighbor_dy_offsets[i],
-                chunk.chunkZ_world + neighbor_dz_offsets[i]);
-            if (nc == null || !nc.isDataReady) { allReady = false; break; }
-        }
-        if (allReady)
+        if (_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask))
         {
             int idx = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
             if (idx >= 0) RequestChunkMeshUpdate(idx);
@@ -3358,18 +3365,7 @@ public class McWorld : UdonSharpBehaviour
             if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh || chunk.isMeshDeferred) continue;
             if (chunk._borderMissingMask == 0) continue;
 
-            byte mask = chunk._borderMissingMask;
-            bool allReady = true;
-            for (int i = 0; i < 6; i++)
-            {
-                if ((mask & (1 << i)) == 0) continue;
-                ChunkData nc = GetChunkAt(
-                    chunk.chunkX_world + neighbor_dx_offsets[i],
-                    chunk.chunkY_world + neighbor_dy_offsets[i],
-                    chunk.chunkZ_world + neighbor_dz_offsets[i]);
-                if (nc == null || !nc.isDataReady) { allReady = false; break; }
-            }
-            if (allReady)
+            if (_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask))
             {
                 RequestChunkMeshUpdate(idx);
                 healed++;
@@ -4534,6 +4530,12 @@ public class McWorld : UdonSharpBehaviour
         return false;
     }
 
+    private bool _ShouldDeferIncompleteBackgroundMesh(ChunkData chunk, byte missingMask)
+    {
+        if (chunk == null || chunk.interactionMeshPriority) return false;
+        return _CountNeighborMaskBits(missingMask) > 1;
+    }
+
     public bool ShouldDeferChunkMesh(int chunkIndex)
     {
         if (!prioritizeVisibleShellMeshing || chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length) return false;
@@ -4685,20 +4687,24 @@ public class McWorld : UdonSharpBehaviour
 #endif
         if (!interactionPriority && gpuFaceExtractionReady)
         {
-            if (_lastBorderBlitFrame == Time.frameCount)
-            {
-#if LOGGING
-                if (enableDetailedTimings) stats_meshGpuFrameThrottleFallbacks++;
-#endif
-            }
-            else if (_GpuHasAvailableReadbackBuffer())
+            int gpuReadbackBufferIndex = _GpuFindAvailableReadbackBuffer();
+            if (gpuReadbackBufferIndex != -1)
             {
                 _GpuSyncChunkBlocks(chunk, chunkData);
-                _GpuPackBorderData(chunk);
-                _PreComputeBiomeColors(chunk);
-                if (_GpuRequestChunkFaceReadback(chunk))
+                _GpuPackBorderData(chunk, gpuReadbackBufferIndex);
+                if (_ShouldDeferIncompleteBackgroundMesh(chunk, chunk._borderMissingMask))
                 {
-                    _lastBorderBlitFrame = Time.frameCount;
+#if LOGGING
+                    if (enableDetailedTimings) stats_meshGpuBorderDefers++;
+#endif
+                    chunk.isBuildingMesh = false;
+                    chunk.interactionMeshPriority = false;
+                    MarkChunkMeshDeferred(chunkIndex);
+                    return;
+                }
+                _PreComputeBiomeColors(chunk);
+                if (_GpuRequestChunkFaceReadback(chunk, gpuReadbackBufferIndex))
+                {
                     return; // Mesh will be built when readback completes
                 }
 #if LOGGING
@@ -4854,15 +4860,27 @@ public class McWorld : UdonSharpBehaviour
         // OPTIMIZATION: GPU face extraction retry — chunk was deferred because GPU was busy
         if (chunk._gpuMeshPending)
         {
-            if (_GpuFaceExtractionReady() && _GpuHasAvailableReadbackBuffer() && _lastBorderBlitFrame != Time.frameCount)
+            int gpuReadbackBufferIndex = _GpuFindAvailableReadbackBuffer();
+            if (_GpuFaceExtractionReady() && gpuReadbackBufferIndex != -1)
             {
                 chunk._gpuMeshPending = false;
                 _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
-                _GpuPackBorderData(chunk);
-                _PreComputeBiomeColors(chunk);
-                if (_GpuRequestChunkFaceReadback(chunk))
+                _GpuPackBorderData(chunk, gpuReadbackBufferIndex);
+                if (_ShouldDeferIncompleteBackgroundMesh(chunk, chunk._borderMissingMask))
                 {
-                    _lastBorderBlitFrame = Time.frameCount;
+#if LOGGING
+                    if (enableDetailedTimings) stats_meshGpuBorderDefers++;
+#endif
+                    chunk.isBuildingMesh = false;
+                    chunk.interactionMeshPriority = false;
+                    int deferredChunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+                    if (deferredChunkIndex != -1) MarkChunkMeshDeferred(deferredChunkIndex);
+                    else chunk.isMeshDeferred = true;
+                    return;
+                }
+                _PreComputeBiomeColors(chunk);
+                if (_GpuRequestChunkFaceReadback(chunk, gpuReadbackBufferIndex))
+                {
                     return; // Mesh will be built when readback completes
                 }
 #if LOGGING
@@ -11507,9 +11525,9 @@ public class McWorld : UdonSharpBehaviour
                     float avgDeferredColliderWait = stats_deferredColliderWaitCount > 0 ? stats_deferredColliderWaitTotal / stats_deferredColliderWaitCount : 0f;
                     logBuilder.AppendLine($"  Waits: first mesh start avg {avgFirstMeshStartLatency:F2}ms max {stats_firstMeshStartLatencyMax:F2}ms, deferred collider avg {avgDeferredColliderWait:F2}ms max {stats_deferredColliderWaitMax:F2}ms");
                 }
-                if (stats_meshPoolExhaustedDefers > 0 || stats_meshGpuBusyDefers > 0 || stats_meshGpuFrameThrottleFallbacks > 0 || stats_meshGpuRequestFailures > 0 || stats_meshInteractionPriorityCpuBypass > 0 || stats_meshBuildsWithMissingNeighbors > 0 || stats_deferredColliderApplyCount > 0)
+                if (stats_meshPoolExhaustedDefers > 0 || stats_meshGpuBusyDefers > 0 || stats_meshGpuFrameThrottleFallbacks > 0 || stats_meshGpuRequestFailures > 0 || stats_meshGpuBorderDefers > 0 || stats_meshGpuBorderCpuFallbacks > 0 || stats_meshInteractionPriorityCpuBypass > 0 || stats_meshBuildsWithMissingNeighbors > 0 || stats_deferredColliderApplyCount > 0)
                 {
-                    logBuilder.AppendLine($"  Stall reasons: pool {stats_meshPoolExhaustedDefers}, gpu busy {stats_meshGpuBusyDefers}, gpu frame throttle {stats_meshGpuFrameThrottleFallbacks}, gpu request fail {stats_meshGpuRequestFailures}, interaction cpu {stats_meshInteractionPriorityCpuBypass}, deferred collider {stats_deferredColliderApplyCount}, missing-neighbor builds {stats_meshBuildsWithMissingNeighbors}");
+                    logBuilder.AppendLine($"  Stall reasons: pool {stats_meshPoolExhaustedDefers}, gpu busy {stats_meshGpuBusyDefers}, gpu frame throttle {stats_meshGpuFrameThrottleFallbacks}, gpu request fail {stats_meshGpuRequestFailures}, border defer {stats_meshGpuBorderDefers}, border cpu {stats_meshGpuBorderCpuFallbacks}, interaction cpu {stats_meshInteractionPriorityCpuBypass}, deferred collider {stats_deferredColliderApplyCount}, missing-neighbor builds {stats_meshBuildsWithMissingNeighbors}");
                 }
             }
 
@@ -11686,6 +11704,8 @@ public class McWorld : UdonSharpBehaviour
         stats_meshGpuBusyDefers = 0;
         stats_meshGpuFrameThrottleFallbacks = 0;
         stats_meshGpuRequestFailures = 0;
+        stats_meshGpuBorderDefers = 0;
+        stats_meshGpuBorderCpuFallbacks = 0;
         stats_meshInteractionPriorityCpuBypass = 0;
         stats_meshBuildsWithMissingNeighbors = 0;
         stats_meshMissingNeighborBits = 0;
