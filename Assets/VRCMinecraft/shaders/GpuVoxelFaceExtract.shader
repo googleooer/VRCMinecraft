@@ -49,10 +49,12 @@ Shader "VRCM/GpuVoxelFaceExtract"
             sampler2D _SlotMetaTex;
             sampler2D _DrawTableTex;  // 256x256 shouldDraw lookup
             sampler2D _BorderTex;     // Pre-packed neighbor boundary blocks
+            sampler2D _UdonVRCM_GpuFaceOccupancyAtlas;
             float4 _BorderInfo;       // (width, height, stride, 0)
             float _Mode;
             float _ReadSlotIndex;
             float4 _UdonVRCM_GpuAtlasInfo;   // (atlasWidth, atlasHeight, atlasSlotsX, atlasSlotsY)
+            float4 _UdonVRCM_GpuFaceOccupancyInfo; // (atlasWidth, atlasHeight, slotWidth, slotHeight)
             float4 _UdonVRCM_GpuWorldInfo;    // (worldDimX, worldDimY, worldDimZ, worldDimY*worldDimZ)
             float4 _UdonVRCM_GpuChunkInfo;    // (chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ)
             float4 _UdonVRCM_GpuVoxelOffset;  // (globalVoxelOffsetX, Y, Z, chunkSlotCapacity)
@@ -93,6 +95,25 @@ Shader "VRCM/GpuVoxelFaceExtract"
                 float atlasU = (tileX * _UdonVRCM_GpuChunkInfo.x + localX + 0.5) / _UdonVRCM_GpuAtlasInfo.x;
                 float atlasV = (tileY * (_UdonVRCM_GpuChunkInfo.y * _UdonVRCM_GpuChunkInfo.x) + localY * _UdonVRCM_GpuChunkInfo.x + localZ + 0.5) / _UdonVRCM_GpuAtlasInfo.y;
                 return floor(tex2D(_MainTex, float2(atlasU, atlasV)).r * 255.0 + 0.5);
+            }
+
+            float4 SampleOccupancySummary(float slotIndex, float axisIndex, float slice, float rowPair)
+            {
+                float tileX = fmod(slotIndex, _UdonVRCM_GpuAtlasInfo.z);
+                float tileY = floor(slotIndex / _UdonVRCM_GpuAtlasInfo.z);
+                float rowBase = slice;
+                if (axisIndex > 1.5)
+                {
+                    rowBase = _UdonVRCM_GpuChunkInfo.y + _UdonVRCM_GpuChunkInfo.x + slice;
+                }
+                else if (axisIndex > 0.5)
+                {
+                    rowBase = _UdonVRCM_GpuChunkInfo.y + slice;
+                }
+
+                float atlasU = (tileX * _UdonVRCM_GpuFaceOccupancyInfo.z + rowPair + 0.5) / _UdonVRCM_GpuFaceOccupancyInfo.x;
+                float atlasV = (tileY * _UdonVRCM_GpuFaceOccupancyInfo.w + rowBase + 0.5) / _UdonVRCM_GpuFaceOccupancyInfo.y;
+                return tex2D(_UdonVRCM_GpuFaceOccupancyAtlas, float2(atlasU, atlasV));
             }
 
             // Get the neighbor block ID, handling cross-chunk boundaries.
@@ -164,6 +185,9 @@ Shader "VRCM/GpuVoxelFaceExtract"
                     float direction = floor(pixelY / _UdonVRCM_GpuChunkInfo.y);
                     float slice = pixelY - direction * _UdonVRCM_GpuChunkInfo.y;
                     if (direction < 0.0 || direction > 5.0) return 0;
+                    float axisIndex = (direction <= 1.0) ? 0.0 : ((direction <= 3.0) ? 1.0 : 2.0);
+                    float4 occupancySummary = SampleOccupancySummary(slotIndex, axisIndex, slice, pixelX);
+                    if ((occupancySummary.r + occupancySummary.g + occupancySummary.b + occupancySummary.a) < 0.001) return 0;
 
                     float width = _UdonVRCM_GpuChunkInfo.x;
                     float height = _UdonVRCM_GpuChunkInfo.y;
