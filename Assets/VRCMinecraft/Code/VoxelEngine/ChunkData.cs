@@ -32,6 +32,7 @@ public class ChunkData
     public bool interactionMeshPriority = false;
     public bool pendingNeighborMeshRebuild = false;
     public bool pendingLightingFinalize = false;
+    public int _meshBuildVersion = 0;
 
     // --- Persistent Decompression Cache (OPTIMIZATION) ---
     public byte[] _cachedDecompressedData;

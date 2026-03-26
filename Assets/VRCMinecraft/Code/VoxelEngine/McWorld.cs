@@ -284,11 +284,21 @@ public class McWorld : UdonSharpBehaviour
     private Texture2D gpuShouldDrawTexture;
     private RenderTexture gpuFaceAtlas;
     private RenderTexture[] gpuFaceReadbackTextures;
+    private Texture2D gpuFaceOccupancyUploadTexture;
+    private Color32[] gpuFaceOccupancyUploadPixels;
+    private RenderTexture gpuFaceOccupancyAtlas;
+    private RenderTexture gpuFaceOccupancyAtlasScratch;
+    private int gpuFaceOccupancySlotWidth = 8;
+    private int gpuFaceOccupancySlotHeight = 48;
+    private int gpuFaceOccupancyAtlasWidth = 8;
+    private int gpuFaceOccupancyAtlasHeight = 48;
     private int gpuPropDrawTableTexId;
     private int gpuPropFaceModeId;
     private int gpuPropFaceReadSlotId;
     private int gpuPropBorderTexId;
     private int gpuPropBorderInfoId;
+    private int gpuPropFaceOccupancyAtlasGlobalId;
+    private int gpuPropFaceOccupancyInfoId;
     private Texture2D gpuBorderTexture;
     private Color32[] gpuBorderPixels;
     private int gpuBorderWidth, gpuBorderHeight, gpuBorderStride;
@@ -297,6 +307,7 @@ public class McWorld : UdonSharpBehaviour
     private Color32[][] gpuFaceReadbackPixels; // per-buffer, per-chunk face readback
     private ChunkData[] gpuFaceReadbackChunks;
     private int[] gpuFaceReadbackSlots;
+    private int[] gpuFaceReadbackBuildVersion;
     private float[] gpuFaceReadbackStartMs;
     private int[] gpuFaceReadbackState; // 0 idle, 1 in-flight, 2 ready
     private int[] gpuFaceReadbackInflightOrder;
@@ -540,6 +551,9 @@ public class McWorld : UdonSharpBehaviour
     private int stats_gpuChunkUploads = 0;
     private float stats_gpuChunkUploadTime = 0f;
     private int stats_gpuChunkUploadBytes = 0;
+    private int stats_gpuFaceOccupancyUploads = 0;
+    private float stats_gpuFaceOccupancyUploadTime = 0f;
+    private int stats_gpuFaceOccupancyUploadBytes = 0;
     private float stats_gpuFaceReadbackRequestStartMs = -1f;
     private int stats_gpuFaceReadbackRequests = 0;
     private int stats_gpuFaceReadbacksCompleted = 0;
@@ -713,12 +727,16 @@ public class McWorld : UdonSharpBehaviour
         gpuTileHeight = chunkSizeY * chunkSizeXZ;
         gpuFaceSummaryWidth = Mathf.Max(1, chunkSizeXZ / 2);
         gpuFaceSummaryHeight = GPU_FACE_COMPACT_DIRECTIONS * chunkSizeY;
+        gpuFaceOccupancySlotWidth = Mathf.Max(1, Mathf.Max((chunkSizeXZ + 1) >> 1, (chunkSizeY + 1) >> 1));
+        gpuFaceOccupancySlotHeight = chunkSizeY + chunkSizeXZ + chunkSizeXZ;
 
         float pixelAspect = gpuTileHeight / (float)Mathf.Max(1, gpuTileWidth);
         gpuAtlasSlotsX = Mathf.Clamp(Mathf.CeilToInt(Mathf.Sqrt(gpuChunkSlotCapacity * pixelAspect)), 1, gpuChunkSlotCapacity);
         gpuAtlasSlotsY = Mathf.Max(1, Mathf.CeilToInt(gpuChunkSlotCapacity / (float)gpuAtlasSlotsX));
         gpuAtlasWidth = gpuAtlasSlotsX * gpuTileWidth;
         gpuAtlasHeight = gpuAtlasSlotsY * gpuTileHeight;
+        gpuFaceOccupancyAtlasWidth = gpuAtlasSlotsX * gpuFaceOccupancySlotWidth;
+        gpuFaceOccupancyAtlasHeight = gpuAtlasSlotsY * gpuFaceOccupancySlotHeight;
 
         gpuChunkIndexToSlot = new int[totalWorldChunks];
         gpuChunkSyncedDataVersion = new int[totalWorldChunks];
@@ -731,11 +749,19 @@ public class McWorld : UdonSharpBehaviour
         gpuSlotLookupPixels = new Color32[worldDimensionX * worldDimensionY * worldDimensionZ];
         gpuSlotMetaPixels = new Color32[gpuChunkSlotCapacity];
         gpuUploadBlockPixels = new Color32[(gpuTileWidth / 4) * gpuTileHeight];
+        if (useCompactGpuFaceExport)
+        {
+            gpuFaceOccupancyUploadPixels = new Color32[gpuFaceOccupancySlotWidth * gpuFaceOccupancySlotHeight];
+        }
 
         gpuSlotLookupTexture = _CreateGpuTexture2D(worldDimensionX, worldDimensionY * worldDimensionZ);
         gpuSlotMetaTexture = _CreateGpuTexture2D(gpuChunkSlotCapacity, 1);
         gpuBlockPropertyTexture = _CreateGpuTexture2D(256, 1);
         gpuUploadBlockTexture = _CreateGpuTexture2D(gpuTileWidth / 4, gpuTileHeight);
+        if (useCompactGpuFaceExport)
+        {
+            gpuFaceOccupancyUploadTexture = _CreateGpuTexture2D(gpuFaceOccupancySlotWidth, gpuFaceOccupancySlotHeight);
+        }
         gpuClearTexture = _CreateGpuTexture2D(1, 1);
 
         gpuClearTexture.SetPixel(0, 0, new Color(0f, 0f, 0f, 0f));
@@ -752,11 +778,21 @@ public class McWorld : UdonSharpBehaviour
         gpuBlockAtlasScratch = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_BlockAtlas_B");
         gpuLightAtlas = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_LightAtlas_A");
         gpuLightAtlasScratch = _CreateGpuRenderTexture(gpuAtlasWidth, gpuAtlasHeight, "GPU_LightAtlas_B");
+        if (useCompactGpuFaceExport)
+        {
+            gpuFaceOccupancyAtlas = _CreateGpuRenderTexture(gpuFaceOccupancyAtlasWidth, gpuFaceOccupancyAtlasHeight, "GPU_FaceOccupancyAtlas_A");
+            gpuFaceOccupancyAtlasScratch = _CreateGpuRenderTexture(gpuFaceOccupancyAtlasWidth, gpuFaceOccupancyAtlasHeight, "GPU_FaceOccupancyAtlas_B");
+        }
 
         VRCGraphics.Blit(gpuClearTexture, gpuBlockAtlas);
         VRCGraphics.Blit(gpuClearTexture, gpuBlockAtlasScratch);
         VRCGraphics.Blit(gpuClearTexture, gpuLightAtlas);
         VRCGraphics.Blit(gpuClearTexture, gpuLightAtlasScratch);
+        if (useCompactGpuFaceExport)
+        {
+            VRCGraphics.Blit(gpuClearTexture, gpuFaceOccupancyAtlas);
+            VRCGraphics.Blit(gpuClearTexture, gpuFaceOccupancyAtlasScratch);
+        }
 
         gpuPropGpuEnabledId = VRCShader.PropertyToID("_UdonVRCM_GpuEnabled");
         gpuPropLightAtlasId = VRCShader.PropertyToID("_UdonVRCM_GpuLightAtlas");
@@ -764,7 +800,9 @@ public class McWorld : UdonSharpBehaviour
         gpuPropSlotLookupId = VRCShader.PropertyToID("_UdonVRCM_GpuSlotLookup");
         gpuPropSlotMetaGlobalId = VRCShader.PropertyToID("_UdonVRCM_GpuSlotMeta");
         gpuPropBlockPropsGlobalId = VRCShader.PropertyToID("_UdonVRCM_GpuBlockProps");
+        gpuPropFaceOccupancyAtlasGlobalId = VRCShader.PropertyToID("_UdonVRCM_GpuFaceOccupancyAtlas");
         gpuPropAtlasInfoId = VRCShader.PropertyToID("_UdonVRCM_GpuAtlasInfo");
+        gpuPropFaceOccupancyInfoId = VRCShader.PropertyToID("_UdonVRCM_GpuFaceOccupancyInfo");
         gpuPropWorldInfoId = VRCShader.PropertyToID("_UdonVRCM_GpuWorldInfo");
         gpuPropChunkInfoId = VRCShader.PropertyToID("_UdonVRCM_GpuChunkInfo");
         gpuPropVoxelOffsetId = VRCShader.PropertyToID("_UdonVRCM_GpuVoxelOffset");
@@ -797,6 +835,7 @@ public class McWorld : UdonSharpBehaviour
         gpuFaceReadbackPixels = new Color32[GPU_FACE_READBACK_BUFFER_COUNT][];
         gpuFaceReadbackChunks = new ChunkData[GPU_FACE_READBACK_BUFFER_COUNT];
         gpuFaceReadbackSlots = new int[GPU_FACE_READBACK_BUFFER_COUNT];
+        gpuFaceReadbackBuildVersion = new int[GPU_FACE_READBACK_BUFFER_COUNT];
         gpuFaceReadbackStartMs = new float[GPU_FACE_READBACK_BUFFER_COUNT];
         gpuFaceReadbackState = new int[GPU_FACE_READBACK_BUFFER_COUNT];
         gpuFaceReadbackInflightOrder = new int[GPU_FACE_READBACK_BUFFER_COUNT];
@@ -809,6 +848,7 @@ public class McWorld : UdonSharpBehaviour
             VRCGraphics.Blit(gpuClearTexture, gpuFaceReadbackTextures[i]);
             gpuFaceReadbackPixels[i] = new Color32[readbackWidth * readbackHeight];
             gpuFaceReadbackSlots[i] = -1;
+            gpuFaceReadbackBuildVersion[i] = -1;
             gpuFaceReadbackStartMs[i] = -1f;
         }
 
@@ -878,6 +918,11 @@ public class McWorld : UdonSharpBehaviour
         VRCShader.SetGlobalTexture(gpuPropSlotMetaGlobalId, gpuSlotMetaTexture);
         VRCShader.SetGlobalTexture(gpuPropBlockPropsGlobalId, gpuBlockPropertyTexture);
         VRCShader.SetGlobalVector(gpuPropAtlasInfoId, new Vector4(gpuAtlasWidth, gpuAtlasHeight, gpuAtlasSlotsX, gpuAtlasSlotsY));
+        if (gpuFaceOccupancyAtlas != null)
+        {
+            VRCShader.SetGlobalTexture(gpuPropFaceOccupancyAtlasGlobalId, gpuFaceOccupancyAtlas);
+            VRCShader.SetGlobalVector(gpuPropFaceOccupancyInfoId, new Vector4(gpuFaceOccupancyAtlasWidth, gpuFaceOccupancyAtlasHeight, gpuFaceOccupancySlotWidth, gpuFaceOccupancySlotHeight));
+        }
         VRCShader.SetGlobalVector(gpuPropWorldInfoId, new Vector4(worldDimensionX, worldDimensionY, worldDimensionZ, worldDimensionY * worldDimensionZ));
         VRCShader.SetGlobalVector(gpuPropChunkInfoId, new Vector4(chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ));
         VRCShader.SetGlobalVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
@@ -1184,6 +1229,110 @@ public class McWorld : UdonSharpBehaviour
         return new Vector4(minU, minV, sizeU, sizeV);
     }
 
+    private Vector4 _GpuGetFaceOccupancySlotRect(int slotIndex)
+    {
+        int tileX = slotIndex % gpuAtlasSlotsX;
+        int tileY = slotIndex / gpuAtlasSlotsX;
+        float minU = (tileX * gpuFaceOccupancySlotWidth) / (float)gpuFaceOccupancyAtlasWidth;
+        float minV = (tileY * gpuFaceOccupancySlotHeight) / (float)gpuFaceOccupancyAtlasHeight;
+        float sizeU = gpuFaceOccupancySlotWidth / (float)gpuFaceOccupancyAtlasWidth;
+        float sizeV = gpuFaceOccupancySlotHeight / (float)gpuFaceOccupancyAtlasHeight;
+        return new Vector4(minU, minV, sizeU, sizeV);
+    }
+
+    private void _GpuBuildFaceOccupancyUpload(byte[] blockData)
+    {
+        if (blockData == null || gpuFaceOccupancyUploadPixels == null) return;
+
+        for (int i = 0; i < gpuFaceOccupancyUploadPixels.Length; i++)
+        {
+            gpuFaceOccupancyUploadPixels[i] = new Color32(0, 0, 0, 0);
+        }
+
+        int stride = chunkSizeXZ * chunkSizeXZ;
+        int rowPairsXZ = (chunkSizeXZ + 1) >> 1;
+        int rowPairsY = (chunkSizeY + 1) >> 1;
+        int axisZOffset = chunkSizeY;
+        int axisXOffset = chunkSizeY + chunkSizeXZ;
+
+        for (int sliceY = 0; sliceY < chunkSizeY; sliceY++)
+        {
+            int yBase = sliceY * stride;
+            int uploadRow = sliceY * gpuFaceOccupancySlotWidth;
+            for (int rowPair = 0; rowPair < rowPairsXZ; rowPair++)
+            {
+                ushort rowMask0 = 0;
+                ushort rowMask1 = 0;
+                int z0 = rowPair << 1;
+                int z1 = z0 + 1;
+                int z0Base = yBase + z0 * chunkSizeXZ;
+                int z1Base = yBase + z1 * chunkSizeXZ;
+                for (int x = 0; x < chunkSizeXZ; x++)
+                {
+                    if (blockData[z0Base + x] != 0) rowMask0 |= (ushort)(1 << x);
+                    if (z1 < chunkSizeXZ && blockData[z1Base + x] != 0) rowMask1 |= (ushort)(1 << x);
+                }
+                gpuFaceOccupancyUploadPixels[uploadRow + rowPair] = new Color32(
+                    (byte)(rowMask0 & 0xFF),
+                    (byte)((rowMask0 >> 8) & 0xFF),
+                    (byte)(rowMask1 & 0xFF),
+                    (byte)((rowMask1 >> 8) & 0xFF)
+                );
+            }
+        }
+
+        for (int sliceZ = 0; sliceZ < chunkSizeXZ; sliceZ++)
+        {
+            int uploadRow = (axisZOffset + sliceZ) * gpuFaceOccupancySlotWidth;
+            for (int rowPair = 0; rowPair < rowPairsY; rowPair++)
+            {
+                ushort rowMask0 = 0;
+                ushort rowMask1 = 0;
+                int y0 = rowPair << 1;
+                int y1 = y0 + 1;
+                int y0Base = y0 * stride + sliceZ * chunkSizeXZ;
+                int y1Base = y1 * stride + sliceZ * chunkSizeXZ;
+                for (int x = 0; x < chunkSizeXZ; x++)
+                {
+                    if (blockData[y0Base + x] != 0) rowMask0 |= (ushort)(1 << x);
+                    if (y1 < chunkSizeY && blockData[y1Base + x] != 0) rowMask1 |= (ushort)(1 << x);
+                }
+                gpuFaceOccupancyUploadPixels[uploadRow + rowPair] = new Color32(
+                    (byte)(rowMask0 & 0xFF),
+                    (byte)((rowMask0 >> 8) & 0xFF),
+                    (byte)(rowMask1 & 0xFF),
+                    (byte)((rowMask1 >> 8) & 0xFF)
+                );
+            }
+        }
+
+        for (int sliceX = 0; sliceX < chunkSizeXZ; sliceX++)
+        {
+            int uploadRow = (axisXOffset + sliceX) * gpuFaceOccupancySlotWidth;
+            for (int rowPair = 0; rowPair < rowPairsY; rowPair++)
+            {
+                ushort rowMask0 = 0;
+                ushort rowMask1 = 0;
+                int y0 = rowPair << 1;
+                int y1 = y0 + 1;
+                int y0Base = y0 * stride + sliceX;
+                int y1Base = y1 * stride + sliceX;
+                for (int z = 0; z < chunkSizeXZ; z++)
+                {
+                    int bit = 1 << z;
+                    if (blockData[y0Base + z * chunkSizeXZ] != 0) rowMask0 |= (ushort)bit;
+                    if (y1 < chunkSizeY && blockData[y1Base + z * chunkSizeXZ] != 0) rowMask1 |= (ushort)bit;
+                }
+                gpuFaceOccupancyUploadPixels[uploadRow + rowPair] = new Color32(
+                    (byte)(rowMask0 & 0xFF),
+                    (byte)((rowMask0 >> 8) & 0xFF),
+                    (byte)(rowMask1 & 0xFF),
+                    (byte)((rowMask1 >> 8) & 0xFF)
+                );
+            }
+        }
+    }
+
     private void _GpuOverlayTextureIntoAtlas(Texture overlayTexture, ref RenderTexture currentAtlas, ref RenderTexture scratchAtlas)
     {
         if (!gpuBackendReady || overlayTexture == null || currentAtlas == null || scratchAtlas == null || gpuAtlasOverlayMaterial == null) return;
@@ -1365,6 +1514,27 @@ public class McWorld : UdonSharpBehaviour
         gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayPackedWidthId, (float)(chunkSizeXZ / 4));
         _GpuOverlayTextureIntoAtlas(gpuUploadBlockTexture, ref gpuBlockAtlas, ref gpuBlockAtlasScratch);
         gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayPackedWidthId, 0f);
+
+        if (useCompactGpuFaceExport && gpuFaceOccupancyUploadTexture != null && gpuFaceOccupancyAtlas != null && gpuFaceOccupancyAtlasScratch != null)
+        {
+            _GpuBuildFaceOccupancyUpload(blockData);
+#if LOGGING
+            uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+            gpuFaceOccupancyUploadTexture.SetPixels32(gpuFaceOccupancyUploadPixels);
+            gpuFaceOccupancyUploadTexture.Apply(false, false);
+#if LOGGING
+            if (enableDetailedTimings)
+            {
+                stats_gpuFaceOccupancyUploads++;
+                stats_gpuFaceOccupancyUploadTime += (Time.realtimeSinceStartup - uploadStart) * 1000f;
+                stats_gpuFaceOccupancyUploadBytes += gpuFaceOccupancyUploadPixels.Length * 4;
+            }
+#endif
+            gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetFaceOccupancySlotRect(slotIndex));
+            _GpuOverlayTextureIntoAtlas(gpuFaceOccupancyUploadTexture, ref gpuFaceOccupancyAtlas, ref gpuFaceOccupancyAtlasScratch);
+        }
+
         gpuChunkSyncedDataVersion[chunkIndex] = chunk._cachedDataVersion;
         _GpuRequestLightingRebuild();
         _GpuPublishGlobals();
@@ -1704,6 +1874,7 @@ public class McWorld : UdonSharpBehaviour
         chunk._gpuFaceSlotIndex = slotIndex;
         gpuFaceReadbackChunks[bufferIndex] = chunk;
         gpuFaceReadbackSlots[bufferIndex] = slotIndex;
+        gpuFaceReadbackBuildVersion[bufferIndex] = chunk._meshBuildVersion;
         gpuFaceReadbackState[bufferIndex] = 1;
         gpuFaceReadbackInflightOrder[gpuFaceReadbackInflightTail] = bufferIndex;
         gpuFaceReadbackInflightTail = (gpuFaceReadbackInflightTail + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
@@ -1731,6 +1902,17 @@ public class McWorld : UdonSharpBehaviour
         return true;
     }
 
+    private void _ResetGpuFaceReadbackBuffer(int bufferIndex)
+    {
+        if (bufferIndex < 0 || gpuFaceReadbackState == null || bufferIndex >= gpuFaceReadbackState.Length) return;
+
+        gpuFaceReadbackChunks[bufferIndex] = null;
+        gpuFaceReadbackSlots[bufferIndex] = -1;
+        gpuFaceReadbackBuildVersion[bufferIndex] = -1;
+        gpuFaceReadbackState[bufferIndex] = 0;
+        gpuFaceReadbackStartMs[bufferIndex] = -1f;
+    }
+
     public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
     {
         if (gpuFaceReadbackInflightCount <= 0) return;
@@ -1749,9 +1931,7 @@ public class McWorld : UdonSharpBehaviour
 
         if (request.hasError)
         {
-            gpuFaceReadbackChunks[bufferIndex] = null;
-            gpuFaceReadbackSlots[bufferIndex] = -1;
-            gpuFaceReadbackState[bufferIndex] = 0;
+            _ResetGpuFaceReadbackBuffer(bufferIndex);
 #if LOGGING
             if (enableDetailedTimings) stats_gpuFaceReadbackFailures++;
 #endif
@@ -1760,12 +1940,17 @@ public class McWorld : UdonSharpBehaviour
 
         if (!request.TryGetData(gpuFaceReadbackPixels[bufferIndex], 0))
         {
-            gpuFaceReadbackChunks[bufferIndex] = null;
-            gpuFaceReadbackSlots[bufferIndex] = -1;
-            gpuFaceReadbackState[bufferIndex] = 0;
+            _ResetGpuFaceReadbackBuffer(bufferIndex);
 #if LOGGING
             if (enableDetailedTimings) stats_gpuFaceReadbackFailures++;
 #endif
+            return;
+        }
+
+        ChunkData chunk = gpuFaceReadbackChunks[bufferIndex];
+        if (chunk == null || !chunk.isBuildingMesh || gpuFaceReadbackBuildVersion[bufferIndex] != chunk._meshBuildVersion)
+        {
+            _ResetGpuFaceReadbackBuffer(bufferIndex);
             return;
         }
 
@@ -1798,9 +1983,19 @@ public class McWorld : UdonSharpBehaviour
             if (processedThisFrame >= GPU_FACE_READBACKS_PER_FRAME) break;
             if (Time.realtimeSinceStartup - frameStart > frameBudget) break;
 
+            int bufferIndex = gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyHead];
+            ChunkData peekChunk = gpuFaceReadbackChunks[bufferIndex];
+            int buildVersion = gpuFaceReadbackBuildVersion[bufferIndex];
+            if (peekChunk == null || !peekChunk.isBuildingMesh || buildVersion != peekChunk._meshBuildVersion)
+            {
+                gpuFaceReadbackReadyHead = (gpuFaceReadbackReadyHead + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
+                gpuFaceReadbackReadyCount--;
+                _ResetGpuFaceReadbackBuffer(bufferIndex);
+                continue;
+            }
+
             // Check pool availability BEFORE dequeuing — if no slot is free,
             // leave the readback queued and retry next frame.
-            ChunkData peekChunk = gpuFaceReadbackChunks[gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyHead]];
             if (peekChunk != null && peekChunk._meshPoolSlot < 0)
             {
                 bool hasSlot = false;
@@ -1811,14 +2006,13 @@ public class McWorld : UdonSharpBehaviour
                 if (!hasSlot) break;
             }
 
-            int bufferIndex = gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyHead];
             gpuFaceReadbackReadyHead = (gpuFaceReadbackReadyHead + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
             gpuFaceReadbackReadyCount--;
 
             ChunkData chunk = gpuFaceReadbackChunks[bufferIndex];
             if (chunk != null)
             {
-                _StartGpuBuildMeshFromFaceData(chunk, gpuFaceReadbackPixels[bufferIndex], bufferIndex);
+                _StartGpuBuildMeshFromFaceData(chunk, gpuFaceReadbackPixels[bufferIndex], bufferIndex, buildVersion);
             }
             processedThisFrame++;
         }
@@ -1910,9 +2104,14 @@ public class McWorld : UdonSharpBehaviour
     }
 
 
-    private void _StartGpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels, int bufferIndex)
+    private void _StartGpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels, int bufferIndex, int buildVersion)
     {
         if (chunk == null || facePixels == null) return;
+        if (!chunk.isBuildingMesh || buildVersion != chunk._meshBuildVersion)
+        {
+            _ResetGpuFaceReadbackBuffer(bufferIndex);
+            return;
+        }
         if (!_AcquireMeshPool(chunk)) return;
 
         _ClearAllMeshBuffers(chunk);
@@ -1961,9 +2160,7 @@ public class McWorld : UdonSharpBehaviour
                 chunk._gpuFacePixels = new Color32[facePixels.Length];
             }
             System.Array.Copy(facePixels, chunk._gpuFacePixels, facePixels.Length);
-            gpuFaceReadbackChunks[bufferIndex] = null;
-            gpuFaceReadbackSlots[bufferIndex] = -1;
-            gpuFaceReadbackState[bufferIndex] = 0;
+            _ResetGpuFaceReadbackBuffer(bufferIndex);
             chunk._gpuFaceReadbackQueueSlot = -1;
             chunk._gpuFaceBuildUsesSummary = true;
             chunk._gpuFaceBuildActive = true;
@@ -2010,9 +2207,7 @@ public class McWorld : UdonSharpBehaviour
         int bufferIndex = chunk._gpuFaceReadbackQueueSlot;
         if (bufferIndex >= 0 && gpuFaceReadbackState != null && bufferIndex < gpuFaceReadbackState.Length)
         {
-            gpuFaceReadbackChunks[bufferIndex] = null;
-            gpuFaceReadbackSlots[bufferIndex] = -1;
-            gpuFaceReadbackState[bufferIndex] = 0;
+            _ResetGpuFaceReadbackBuffer(bufferIndex);
         }
 
         chunk._gpuFacePixels = null;
@@ -4392,11 +4587,12 @@ public class McWorld : UdonSharpBehaviour
         // Cleared when the mesh build finishes.
         chunk.isBuildingMesh = true;
         chunk.isMeshDeferred = false;
+        chunk._meshBuildVersion = chunk._meshBuildVersion + 1;
+        chunk._gpuMeshPending = false;
         chunk.pendingColliderApply = false;
         chunk.pendingColliderMeshRebuild = !_ShouldEnableChunkCollider(chunk);
         if (interactionPriority)
         {
-            chunk._gpuMeshPending = false;
             if (chunk._gpuFaceBuildActive)
             {
                 _ReleaseGpuFaceBuildBuffer(chunk);
@@ -4467,17 +4663,6 @@ public class McWorld : UdonSharpBehaviour
             return;
         }
 
-        if (!_AcquireMeshPool(chunk))
-        {
-#if LOGGING
-            if (enableDetailedTimings) stats_meshPoolExhaustedDefers++;
-#endif
-            chunk.isBuildingMesh = false;
-            chunk.pendingChunkMeshRebuild = true;
-            return;
-        }
-        _ClearAllMeshBuffers(chunk);
-
         byte[] chunkData = _GetDecompressedData(chunk);
         if (chunkData == null)
         {
@@ -4530,6 +4715,17 @@ public class McWorld : UdonSharpBehaviour
                 chunk._gpuMeshPending = true;
             }
         }
+
+        if (!_AcquireMeshPool(chunk))
+        {
+#if LOGGING
+            if (enableDetailedTimings) stats_meshPoolExhaustedDefers++;
+#endif
+            chunk.isBuildingMesh = false;
+            chunk.pendingChunkMeshRebuild = true;
+            return;
+        }
+        _ClearAllMeshBuffers(chunk);
 
         // --- OPTIMIZATION: Use cached neighbor references ---
         ChunkData[] neighbors = _GetCachedNeighbors(chunk);
@@ -11363,6 +11559,10 @@ public class McWorld : UdonSharpBehaviour
             logBuilder.AppendLine("GPU Backend:");
             logBuilder.AppendLine($"  Blit submit: atlas overlay {stats_gpuAtlasOverlayBlits} ({stats_gpuAtlasOverlayBlitTime:F3}ms), light seed {stats_gpuLightingSeedBlits} ({stats_gpuLightingSeedBlitTime:F3}ms), light propagate {stats_gpuLightingPropagateBlits} ({stats_gpuLightingPropagateBlitTime:F3}ms), face extract {stats_gpuFaceExtractBlits} ({stats_gpuFaceExtractBlitTime:F3}ms), face export {stats_gpuFaceExportBlits} ({stats_gpuFaceExportBlitTime:F3}ms)");
             logBuilder.AppendLine($"  CPU->GPU uploads: chunk blocks {stats_gpuChunkUploads} ({stats_gpuChunkUploadTime:F3}ms, {stats_gpuChunkUploadBytes / 1024f:F1}KB)");
+            if (stats_gpuFaceOccupancyUploads > 0)
+            {
+                logBuilder.AppendLine($"  Occupancy hierarchy uploads: {stats_gpuFaceOccupancyUploads} ({stats_gpuFaceOccupancyUploadTime:F3}ms, {stats_gpuFaceOccupancyUploadBytes / 1024f:F1}KB)");
+            }
             if (stats_gpuFaceReadbackRequests > 0)
             {
                 float avgLatency = stats_gpuFaceReadbacksCompleted > 0 ? stats_gpuFaceReadbackLatencyTotal / stats_gpuFaceReadbacksCompleted : 0f;
@@ -11542,6 +11742,9 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuChunkUploads = 0;
         stats_gpuChunkUploadTime = 0f;
         stats_gpuChunkUploadBytes = 0;
+        stats_gpuFaceOccupancyUploads = 0;
+        stats_gpuFaceOccupancyUploadTime = 0f;
+        stats_gpuFaceOccupancyUploadBytes = 0;
         stats_gpuFaceReadbackRequestStartMs = -1f;
         stats_gpuFaceReadbackRequests = 0;
         stats_gpuFaceReadbacksCompleted = 0;
