@@ -36265,6 +36265,8 @@ MonoBehaviour:
   maxConcurrentWorkers: 4
   updateTimeBudgetMs: 11
   skipCheckCycles: 1
+  deferredMeshWakeQueueThreshold: 32
+  deferredMeshWakeBurstPerCycle: 1
   columnsPerDataGenStep: 64
   voxelsPerMeshStep: 16384
   voxelsPerTerrainStep: 16384
