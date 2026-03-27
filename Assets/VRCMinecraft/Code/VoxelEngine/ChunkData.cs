@@ -29,6 +29,7 @@ public class ChunkData
     public bool pendingColliderApply = false;
     public bool pendingColliderMeshRebuild = false;
     public bool pendingChunkMeshRebuild = false;
+    public bool isQueuedForMeshRebuild = false;
     public bool interactionMeshPriority = false;
     public bool pendingNeighborMeshRebuild = false;
     public bool pendingLightingFinalize = false;
@@ -203,5 +204,6 @@ public class ChunkData
     public float profile_dataReadyTime;
     public float profile_deferredColliderQueuedTime;
     public bool profile_waitingForFirstMesh;
+    public bool profile_firstMeshWasDeferred;
 #endif
 }

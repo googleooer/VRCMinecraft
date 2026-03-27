@@ -477,9 +477,12 @@ public class McWorld : UdonSharpBehaviour
     private int stats_deferredColliderWaitCount = 0;
     private float stats_deferredColliderWaitTotal = 0f;
     private float stats_deferredColliderWaitMax = 0f;
-    private int stats_firstMeshStartLatencyCount = 0;
-    private float stats_firstMeshStartLatencyTotal = 0f;
-    private float stats_firstMeshStartLatencyMax = 0f;
+    private int stats_firstShellMeshStartLatencyCount = 0;
+    private float stats_firstShellMeshStartLatencyTotal = 0f;
+    private float stats_firstShellMeshStartLatencyMax = 0f;
+    private int stats_firstDeferredMeshStartLatencyCount = 0;
+    private float stats_firstDeferredMeshStartLatencyTotal = 0f;
+    private float stats_firstDeferredMeshStartLatencyMax = 0f;
 
     private const int SLOWEST_MESH_BUILD_COUNT = 3;
     private float[] stats_slowestMeshBuildMs = new float[SLOWEST_MESH_BUILD_COUNT];
@@ -3277,11 +3280,11 @@ public class McWorld : UdonSharpBehaviour
                 if (!hasHeadroom) continue;
             }
 
-            chunk.isMeshDeferred = false;
-            chunk.pendingNeighborMeshRebuild = true;
-            RequestChunkMeshUpdate(chunkIndex);
-            scheduled++;
-            if (scheduled >= requestLimit) break;
+            if (coordinator != null && coordinator.RequestDeferredChunkMeshUpdate(chunkIndex))
+            {
+                scheduled++;
+                if (scheduled >= requestLimit) break;
+            }
         }
     }
 
@@ -3718,6 +3721,7 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
             chunk.profile_dataReadyTime = Time.realtimeSinceStartup;
             chunk.profile_waitingForFirstMesh = true;
+            chunk.profile_firstMeshWasDeferred = false;
 #endif
 
 
@@ -4553,6 +4557,9 @@ public class McWorld : UdonSharpBehaviour
 
         chunk.isMeshDeferred = true;
 #if LOGGING
+        chunk.profile_firstMeshWasDeferred = true;
+#endif
+#if LOGGING
         if (enableCounters) stats_meshDeferredChunks++;
 #endif
     }
@@ -4579,10 +4586,20 @@ public class McWorld : UdonSharpBehaviour
         if (enableDetailedTimings && chunk.profile_waitingForFirstMesh)
         {
             float firstMeshLatencyMs = (Time.realtimeSinceStartup - chunk.profile_dataReadyTime) * 1000f;
-            stats_firstMeshStartLatencyCount++;
-            stats_firstMeshStartLatencyTotal += firstMeshLatencyMs;
-            if (firstMeshLatencyMs > stats_firstMeshStartLatencyMax) stats_firstMeshStartLatencyMax = firstMeshLatencyMs;
+            if (chunk.profile_firstMeshWasDeferred)
+            {
+                stats_firstDeferredMeshStartLatencyCount++;
+                stats_firstDeferredMeshStartLatencyTotal += firstMeshLatencyMs;
+                if (firstMeshLatencyMs > stats_firstDeferredMeshStartLatencyMax) stats_firstDeferredMeshStartLatencyMax = firstMeshLatencyMs;
+            }
+            else
+            {
+                stats_firstShellMeshStartLatencyCount++;
+                stats_firstShellMeshStartLatencyTotal += firstMeshLatencyMs;
+                if (firstMeshLatencyMs > stats_firstShellMeshStartLatencyMax) stats_firstShellMeshStartLatencyMax = firstMeshLatencyMs;
+            }
             chunk.profile_waitingForFirstMesh = false;
+            chunk.profile_firstMeshWasDeferred = false;
         }
 #endif
         // Keep interactionMeshPriority alive — the step loop reads it to uncap steps.
@@ -11519,11 +11536,12 @@ public class McWorld : UdonSharpBehaviour
                     logBuilder.AppendLine($"  Greedy Meshing: Y={stats_greedyAxisYTime / totalGreedy * 100f:F0}% ({stats_greedyAxisYTime:F1}ms), Z={stats_greedyAxisZTime / totalGreedy * 100f:F0}% ({stats_greedyAxisZTime:F1}ms), X={stats_greedyAxisXTime / totalGreedy * 100f:F0}% ({stats_greedyAxisXTime:F1}ms)");
                 }
                 logBuilder.AppendLine($"  Apply mesh: opaque {stats_meshApplyOpaqueTime:F2}ms, transparent {stats_meshApplyTransparentTime:F2}ms, cutout {stats_meshApplyCutoutTime:F2}ms, collider {stats_meshApplyColliderTime:F2}ms");
-                if (stats_firstMeshStartLatencyCount > 0 || stats_deferredColliderWaitCount > 0)
+                if (stats_firstShellMeshStartLatencyCount > 0 || stats_firstDeferredMeshStartLatencyCount > 0 || stats_deferredColliderWaitCount > 0)
                 {
-                    float avgFirstMeshStartLatency = stats_firstMeshStartLatencyCount > 0 ? stats_firstMeshStartLatencyTotal / stats_firstMeshStartLatencyCount : 0f;
+                    float avgShellMeshStartLatency = stats_firstShellMeshStartLatencyCount > 0 ? stats_firstShellMeshStartLatencyTotal / stats_firstShellMeshStartLatencyCount : 0f;
+                    float avgDeferredMeshStartLatency = stats_firstDeferredMeshStartLatencyCount > 0 ? stats_firstDeferredMeshStartLatencyTotal / stats_firstDeferredMeshStartLatencyCount : 0f;
                     float avgDeferredColliderWait = stats_deferredColliderWaitCount > 0 ? stats_deferredColliderWaitTotal / stats_deferredColliderWaitCount : 0f;
-                    logBuilder.AppendLine($"  Waits: first mesh start avg {avgFirstMeshStartLatency:F2}ms max {stats_firstMeshStartLatencyMax:F2}ms, deferred collider avg {avgDeferredColliderWait:F2}ms max {stats_deferredColliderWaitMax:F2}ms");
+                    logBuilder.AppendLine($"  Waits: first shell mesh avg {avgShellMeshStartLatency:F2}ms max {stats_firstShellMeshStartLatencyMax:F2}ms, first deferred mesh avg {avgDeferredMeshStartLatency:F2}ms max {stats_firstDeferredMeshStartLatencyMax:F2}ms, deferred collider avg {avgDeferredColliderWait:F2}ms max {stats_deferredColliderWaitMax:F2}ms");
                 }
                 if (stats_meshPoolExhaustedDefers > 0 || stats_meshGpuBusyDefers > 0 || stats_meshGpuFrameThrottleFallbacks > 0 || stats_meshGpuRequestFailures > 0 || stats_meshGpuBorderDefers > 0 || stats_meshGpuBorderCpuFallbacks > 0 || stats_meshInteractionPriorityCpuBypass > 0 || stats_meshBuildsWithMissingNeighbors > 0 || stats_deferredColliderApplyCount > 0)
                 {
@@ -11713,9 +11731,12 @@ public class McWorld : UdonSharpBehaviour
         stats_deferredColliderWaitCount = 0;
         stats_deferredColliderWaitTotal = 0f;
         stats_deferredColliderWaitMax = 0f;
-        stats_firstMeshStartLatencyCount = 0;
-        stats_firstMeshStartLatencyTotal = 0f;
-        stats_firstMeshStartLatencyMax = 0f;
+        stats_firstShellMeshStartLatencyCount = 0;
+        stats_firstShellMeshStartLatencyTotal = 0f;
+        stats_firstShellMeshStartLatencyMax = 0f;
+        stats_firstDeferredMeshStartLatencyCount = 0;
+        stats_firstDeferredMeshStartLatencyTotal = 0f;
+        stats_firstDeferredMeshStartLatencyMax = 0f;
         stats_rleCompressions = 0;
         stats_rleDecompressions = 0;
         stats_rleCompressionTime = 0f;

@@ -30,6 +30,10 @@ public class McCoordinator : UdonSharpBehaviour
     public float updateTimeBudgetMs = 8.0f;
     [Tooltip("Skip N state checks per worker to reduce overhead (higher = less responsive but faster)")]
     public int skipCheckCycles = 0;
+    [Tooltip("When the main rebuild queue is this small or smaller, allow a few deferred interior wakes to drain in the same cycle.")]
+    public int deferredMeshWakeQueueThreshold = 32;
+    [Tooltip("Maximum deferred interior wake assignments per coordinator cycle while the main rebuild queue still has work.")]
+    public int deferredMeshWakeBurstPerCycle = 1;
 
     [Header("Workload Per Step")]
     [Tooltip("How many Z-columns of voxels to generate per step inside a chunk. Higher values generate chunks faster but may cause lag spikes.")]
@@ -44,6 +48,7 @@ public class McCoordinator : UdonSharpBehaviour
     private int[] worker_targetChunkIndex;
     private int[] worker_state;
     private bool[] worker_usesExclusiveGenerator;
+    private bool[] worker_isDeferredMeshWake;
     private int[] worker_skipCheckCounter; // Skip state checks for N cycles to reduce overhead
     private const int STATE_IDLE = 0;
     private const int STATE_DATA_GEN = 1;
@@ -65,6 +70,11 @@ public class McCoordinator : UdonSharpBehaviour
     private int chunkRebuildQueue_tail = 0;
     private int chunkRebuildQueue_count = 0;
     private const int MAX_REBUILD_QUEUE_SIZE = 256;
+    private int[] deferredMeshQueue;
+    private int deferredMeshQueue_head = 0;
+    private int deferredMeshQueue_tail = 0;
+    private int deferredMeshQueue_count = 0;
+    private const int MAX_DEFERRED_MESH_QUEUE_SIZE = 256;
     private int borderHealWorkerCursor = 0;
     private readonly int[] _healDx = { 1, -1, 0,  0, 0,  0 };
     private readonly int[] _healDy = { 0,  0, 1, -1, 0,  0 };
@@ -93,11 +103,13 @@ public class McCoordinator : UdonSharpBehaviour
     private int workers_MeshCompleted;
     private int workers_MeshDeferred;
     private int rebuilds_Processed;
+    private int deferredMeshWakeAssignments;
     private int worldChunks_Assigned;
     private int peak_ActiveWorkers;
     private int peak_DataGenWorkers;
     private int peak_MeshingWorkers;
     private int peak_RebuildQueue;
+    private int peak_DeferredMeshQueue;
 #endif
 
     public void InitializeAndStartProcessing(McWorld worldInstance, int[] generatedRadialOrder, int worldTotalChunks)
@@ -122,16 +134,19 @@ public class McCoordinator : UdonSharpBehaviour
         worker_targetChunkIndex = new int[maxConcurrentWorkers];
         worker_state = new int[maxConcurrentWorkers];
         worker_usesExclusiveGenerator = new bool[maxConcurrentWorkers];
+        worker_isDeferredMeshWake = new bool[maxConcurrentWorkers];
         worker_skipCheckCounter = new int[maxConcurrentWorkers];
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
             worker_targetChunkIndex[i] = -1; // -1 indicates no chunk
             worker_state[i] = STATE_IDLE;
             worker_usesExclusiveGenerator[i] = false;
+            worker_isDeferredMeshWake[i] = false;
             worker_skipCheckCounter[i] = 0;
         }
 
         chunkRebuildQueue = new int[MAX_REBUILD_QUEUE_SIZE];
+        deferredMeshQueue = new int[MAX_DEFERRED_MESH_QUEUE_SIZE];
 
         // No longer using SendCustomEventDelayedSeconds - Update() will handle processing
     }
@@ -174,6 +189,7 @@ public class McCoordinator : UdonSharpBehaviour
             if (chunkIndex == -1 || chunkIndex >= chunksLen) {
                 worker_state[i] = STATE_IDLE;
                 worker_usesExclusiveGenerator[i] = false;
+                worker_isDeferredMeshWake[i] = false;
                 worker_skipCheckCounter[i] = 0;
                 continue;
             }
@@ -185,6 +201,7 @@ public class McCoordinator : UdonSharpBehaviour
                 worker_state[i] = STATE_IDLE;
                 worker_targetChunkIndex[i] = -1;
                 worker_usesExclusiveGenerator[i] = false;
+                worker_isDeferredMeshWake[i] = false;
                 continue;
             }
 
@@ -275,11 +292,12 @@ public class McCoordinator : UdonSharpBehaviour
                             // meshed once; this is a rebuild request, not a first build.
                             bool isRebuild = chunk._borderMissingMask != 0
                                 || (chunk.opaqueMeshFilter != null && chunk.opaqueMeshFilter.sharedMesh != null && chunk.opaqueMeshFilter.sharedMesh.vertexCount > 0);
-                            if (!isRebuild && world.ShouldDeferChunkMesh(chunkIndex))
+                            if (!isRebuild && !worker_isDeferredMeshWake[i] && world.ShouldDeferChunkMesh(chunkIndex))
                             {
                                 world.MarkChunkMeshDeferred(chunkIndex);
                                 worker_targetChunkIndex[i] = -1;
                                 worker_state[i] = STATE_IDLE;
+                                worker_isDeferredMeshWake[i] = false;
                                 worker_skipCheckCounter[i] = 0;
 
                                 if (chunksCompletedCount < totalWorldChunks)
@@ -295,6 +313,7 @@ public class McCoordinator : UdonSharpBehaviour
                             {
                                 continue;
                             }
+                            worker_isDeferredMeshWake[i] = false;
                             world.BuildChunkMesh(chunkIndex); 
                             worker_state[i] = STATE_MESHING;
                             worker_skipCheckCounter[i] = 0;
@@ -311,6 +330,7 @@ public class McCoordinator : UdonSharpBehaviour
                         {
                             chunk.pendingChunkMeshRebuild = false;
                             worker_state[i] = STATE_WAITING_FOR_MESH;
+                            worker_isDeferredMeshWake[i] = false;
                             worker_skipCheckCounter[i] = 0;
                             recheck = true;
                             continue;
@@ -319,6 +339,7 @@ public class McCoordinator : UdonSharpBehaviour
                         // Mesh building is complete
                         worker_targetChunkIndex[i] = -1;
                         worker_state[i] = STATE_IDLE;
+                        worker_isDeferredMeshWake[i] = false;
                         worker_skipCheckCounter[i] = 0;
                         
                         if(chunksCompletedCount < totalWorldChunks)
@@ -357,6 +378,8 @@ public class McCoordinator : UdonSharpBehaviour
         // --- 2. Assign new work to idle workers ---
         // OPTIMIZED: Allow multiple workers to be assigned in one cycle
         int assignedThisCycle = 0;
+        int rebuildAssignmentsThisCycle = 0;
+        int deferredWakeAssignmentsThisCycle = 0;
         int chunkInstantiationsThisFrame = 0;
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
@@ -365,9 +388,25 @@ public class McCoordinator : UdonSharpBehaviour
             if (worker_state[i] != STATE_IDLE) continue;
 
             bool assigned = false;
+            bool canInterleaveDeferredWake =
+                deferredMeshQueue_count > 0
+                && chunkRebuildQueue_count > 0
+                && chunkRebuildQueue_count <= deferredMeshWakeQueueThreshold
+                && deferredWakeAssignmentsThisCycle < deferredMeshWakeBurstPerCycle
+                && rebuildAssignmentsThisCycle > deferredWakeAssignmentsThisCycle;
+
+            if (canInterleaveDeferredWake)
+            {
+                assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                if (assigned)
+                {
+                    assignedThisCycle++;
+                    deferredWakeAssignmentsThisCycle++;
+                }
+            }
 
             // Priority 1: Process player-initiated rebuilds
-            if (chunkRebuildQueue_count > 0)
+            if (!assigned && chunkRebuildQueue_count > 0)
             {
                 int chunkIndexToRebuild = chunkRebuildQueue[chunkRebuildQueue_head];
                 chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
@@ -375,10 +414,19 @@ public class McCoordinator : UdonSharpBehaviour
 
                 if (chunkIndexToRebuild != -1)
                 {
+                    ChunkData rebuildChunk = chunks != null && chunkIndexToRebuild >= 0 && chunkIndexToRebuild < chunksLen ? chunks[chunkIndexToRebuild] : null;
+                    if (rebuildChunk != null) rebuildChunk.isQueuedForMeshRebuild = false;
                     worker_targetChunkIndex[i] = chunkIndexToRebuild;
                     worker_state[i] = STATE_WAITING_FOR_MESH;
+                    worker_isDeferredMeshWake[i] = rebuildChunk != null && rebuildChunk.isMeshDeferred;
+                    if (rebuildChunk != null && rebuildChunk.isMeshDeferred)
+                    {
+                        rebuildChunk.isMeshDeferred = false;
+                        rebuildChunk.pendingNeighborMeshRebuild = true;
+                    }
                     assigned = true;
                     assignedThisCycle++;
+                    rebuildAssignmentsThisCycle++;
 #if LOGGING
                     if (enableDetailedTimings || enableAggregateLogging) rebuilds_Processed++;
 #endif
@@ -435,6 +483,7 @@ public class McCoordinator : UdonSharpBehaviour
                     worker_targetChunkIndex[i] = newChunkIndex;
                     worker_state[i] = STATE_DATA_GEN;
                     worker_usesExclusiveGenerator[i] = world.StartChunkDataGeneration(newChunkIndex);
+                    worker_isDeferredMeshWake[i] = false;
                     if (worker_usesExclusiveGenerator[i]) isGeneratorBusy = true;
                     assigned = true;
                     assignedThisCycle++;
@@ -495,6 +544,15 @@ public class McCoordinator : UdonSharpBehaviour
                     chunksCompletedCount++; // already existed
                 }
             }
+            // Priority 3: Wake deferred interior meshes on their own queue
+            else if (!assigned && deferredMeshQueue_count > 0)
+            {
+                assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                if (assigned)
+                {
+                    assignedThisCycle++;
+                }
+            }
             
             // Keep filling idle workers until the frame budget says stop.
             if (assignedThisCycle >= maxConcurrentWorkers) break;
@@ -549,6 +607,7 @@ public class McCoordinator : UdonSharpBehaviour
             if (dataGenWorkers > peak_DataGenWorkers) peak_DataGenWorkers = dataGenWorkers;
             if (meshingWorkers > peak_MeshingWorkers) peak_MeshingWorkers = meshingWorkers;
             if (chunkRebuildQueue_count > peak_RebuildQueue) peak_RebuildQueue = chunkRebuildQueue_count;
+            if (deferredMeshQueue_count > peak_DeferredMeshQueue) peak_DeferredMeshQueue = deferredMeshQueue_count;
         }
 #endif
 
@@ -567,10 +626,10 @@ public class McCoordinator : UdonSharpBehaviour
         sb.AppendLine("Coordinator:");
         sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms, update workers {2:F3}ms, assign work {3:F3}ms\n",
             cycles_Processed, avgCycle, avgUpdate, avgAssign);
-        sb.AppendFormat("  Worker completions: data {0}, mesh {1}, deferred {2}, rebuilds {3}, world assigns {4}\n",
-            workers_DataGenCompleted, workers_MeshCompleted, workers_MeshDeferred, rebuilds_Processed, worldChunks_Assigned);
-        sb.AppendFormat("  Peaks: active {0}/{1}, data {2}, meshing {3}, rebuild queue {4}/{5}\n",
-            peak_ActiveWorkers, maxConcurrentWorkers, peak_DataGenWorkers, peak_MeshingWorkers, peak_RebuildQueue, MAX_REBUILD_QUEUE_SIZE);
+        sb.AppendFormat("  Worker completions: data {0}, mesh {1}, deferred {2}, rebuilds {3}, deferred wakes {4}, world assigns {5}\n",
+            workers_DataGenCompleted, workers_MeshCompleted, workers_MeshDeferred, rebuilds_Processed, deferredMeshWakeAssignments, worldChunks_Assigned);
+        sb.AppendFormat("  Peaks: active {0}/{1}, data {2}, meshing {3}, rebuild queue {4}/{5}, deferred queue {6}/{7}\n",
+            peak_ActiveWorkers, maxConcurrentWorkers, peak_DataGenWorkers, peak_MeshingWorkers, peak_RebuildQueue, MAX_REBUILD_QUEUE_SIZE, peak_DeferredMeshQueue, MAX_DEFERRED_MESH_QUEUE_SIZE);
         sb.AppendFormat("  Progress: {0}/{1} chunks ({2:F1}%)\n",
             chunksCompletedCount, totalWorldChunks,
             totalWorldChunks > 0 ? (chunksCompletedCount * 100f / totalWorldChunks) : 0f);
@@ -586,11 +645,13 @@ public class McCoordinator : UdonSharpBehaviour
         workers_MeshCompleted = 0;
         workers_MeshDeferred = 0;
         rebuilds_Processed = 0;
+        deferredMeshWakeAssignments = 0;
         worldChunks_Assigned = 0;
         peak_ActiveWorkers = 0;
         peak_DataGenWorkers = 0;
         peak_MeshingWorkers = 0;
         peak_RebuildQueue = 0;
+        peak_DeferredMeshQueue = 0;
     }
 #endif
 
@@ -618,12 +679,14 @@ public class McCoordinator : UdonSharpBehaviour
 
         ChunkData[] chunks = world != null ? world.chunks_1D : null;
         ChunkData chunk = chunks != null && chunkIndexToUpdate >= 0 && chunkIndexToUpdate < chunks.Length ? chunks[chunkIndexToUpdate] : null;
+        if (chunk == null) return;
         bool interactionPriority = chunk != null && chunk.interactionMeshPriority;
-        if (chunk != null && chunk.isBuildingMesh)
+        if (chunk.isBuildingMesh)
         {
             chunk.pendingChunkMeshRebuild = true;
             return;
         }
+        if (chunk.isQueuedForMeshRebuild) return;
 
         if (chunkRebuildQueue_count >= MAX_REBUILD_QUEUE_SIZE) return;
         
@@ -633,13 +696,6 @@ public class McCoordinator : UdonSharpBehaviour
         for(int i = 0; i < checkLimit; i++)
         {
             if (worker_targetChunkIndex[i] == chunkIndexToUpdate) return;
-        }
-
-        // OPTIMIZED: Only check last few items in queue (most likely duplicates are recent)
-        int checkCount = chunkRebuildQueue_count < 8 ? chunkRebuildQueue_count : 8;
-        for (int i = 0; i < checkCount; i++) {
-            int index = (chunkRebuildQueue_tail - 1 - i + MAX_REBUILD_QUEUE_SIZE) % MAX_REBUILD_QUEUE_SIZE;
-            if (chunkRebuildQueue[index] == chunkIndexToUpdate) return;
         }
 
         if (interactionPriority)
@@ -652,12 +708,76 @@ public class McCoordinator : UdonSharpBehaviour
             chunkRebuildQueue[chunkRebuildQueue_tail] = chunkIndexToUpdate;
             chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
         }
+        chunk.isQueuedForMeshRebuild = true;
         chunkRebuildQueue_count++;
+    }
+
+    public bool RequestDeferredChunkMeshUpdate(int chunkIndexToUpdate)
+    {
+        if (chunkIndexToUpdate == -1 || deferredMeshQueue_count >= MAX_DEFERRED_MESH_QUEUE_SIZE) return false;
+
+        ChunkData[] chunks = world != null ? world.chunks_1D : null;
+        ChunkData chunk = chunks != null && chunkIndexToUpdate >= 0 && chunkIndexToUpdate < chunks.Length ? chunks[chunkIndexToUpdate] : null;
+        if (chunk == null || !chunk.isMeshDeferred || chunk.isBuildingMesh) return false;
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToUpdate) return false;
+        }
+
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int queueIndex = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[queueIndex] == chunkIndexToUpdate) return false;
+        }
+
+        for (int i = 0; i < deferredMeshQueue_count; i++)
+        {
+            int queueIndex = (deferredMeshQueue_head + i) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+            if (deferredMeshQueue[queueIndex] == chunkIndexToUpdate) return false;
+        }
+
+        deferredMeshQueue[deferredMeshQueue_tail] = chunkIndexToUpdate;
+        deferredMeshQueue_tail = (deferredMeshQueue_tail + 1) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+        deferredMeshQueue_count++;
+        return true;
+    }
+
+    private bool _TryAssignDeferredMeshWake(int workerIndex, ChunkData[] chunks, int chunksLen)
+    {
+        int popLimit = deferredMeshQueue_count < 8 ? deferredMeshQueue_count : 8;
+        while (popLimit-- > 0 && deferredMeshQueue_count > 0)
+        {
+            int deferredChunkIndex = deferredMeshQueue[deferredMeshQueue_head];
+            deferredMeshQueue_head = (deferredMeshQueue_head + 1) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+            deferredMeshQueue_count--;
+
+            if (deferredChunkIndex == -1 || deferredChunkIndex >= chunksLen) continue;
+
+            ChunkData deferredChunk = chunks[deferredChunkIndex];
+            if (deferredChunk == null || !deferredChunk.isDataReady || deferredChunk.isBuildingMesh || !deferredChunk.isMeshDeferred) continue;
+
+            deferredChunk.isMeshDeferred = false;
+            deferredChunk.pendingNeighborMeshRebuild = true;
+            worker_targetChunkIndex[workerIndex] = deferredChunkIndex;
+            worker_state[workerIndex] = STATE_WAITING_FOR_MESH;
+            worker_isDeferredMeshWake[workerIndex] = true;
+#if LOGGING
+            if (enableDetailedTimings || enableAggregateLogging) deferredMeshWakeAssignments++;
+#endif
+            return true;
+        }
+
+        return false;
     }
 
     public bool IsChunkScheduledForMeshUpdate(int chunkIndexToCheck)
     {
         if (chunkIndexToCheck == -1) return false;
+
+        ChunkData[] chunks = world != null ? world.chunks_1D : null;
+        ChunkData chunk = chunks != null && chunkIndexToCheck >= 0 && chunkIndexToCheck < chunks.Length ? chunks[chunkIndexToCheck] : null;
+        if (chunk != null && chunk.isQueuedForMeshRebuild) return true;
 
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
@@ -669,7 +789,6 @@ public class McCoordinator : UdonSharpBehaviour
             int queueIndex = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
             if (chunkRebuildQueue[queueIndex] == chunkIndexToCheck) return true;
         }
-
         return false;
     }
 }

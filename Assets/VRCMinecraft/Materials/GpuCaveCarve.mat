@@ -72,7 +72,7 @@ Material:
     - _Amplitude: 10000
     - _ChunkSizeXZ: 16
     - _ChunkX: -1
-    - _ChunkZ: -2
+    - _ChunkZ: 3
     - _ClimateOctaveCount0: 4
     - _ClimateOctaveCount1: 4
     - _ClimateOctaveCount2: 2
