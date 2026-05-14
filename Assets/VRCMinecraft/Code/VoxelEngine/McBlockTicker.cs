@@ -1,0 +1,1733 @@
+#define LOGGING
+
+using UdonSharp;
+using UnityEngine;
+using VRRefAssist;
+using System.Text;
+
+/// <summary>
+/// Implements Beta 1.7.3's two block tick systems:
+/// 1. Scheduled ticks (deterministic, e.g. sand falling after neighbor change)
+/// 2. Random ticks (probabilistic, e.g. grass spread, leaf decay)
+/// Ported 1:1 from deobfuscated Beta 1.7.3 source.
+/// </summary>
+[Singleton]
+[UdonBehaviourSyncMode(BehaviourSyncMode.None)]
+public class McBlockTicker : UdonSharpBehaviour
+{
+    [Header("References")]
+    [SerializeField, FindObjectOfType(true)]
+    private McWorld world;
+    [SerializeField, FindObjectOfType(true)]
+    private McBlockTypeManager blockTypeManager;
+
+    [Header("Performance Tuning")]
+    [Tooltip("Max scheduled ticks to process per frame")]
+    public int scheduledTickBudget = 200;
+    [Tooltip("Max time in ms for scheduled tick processing per frame")]
+    public float scheduledTickTimeBudgetMs = 2.0f;
+    [Tooltip("Chunks to scan for random ticks per frame")]
+    public int randomTickChunksPerFrame = 4;
+    [Tooltip("Random voxel picks per chunk (MC uses 80 per section)")]
+    public int randomTicksPerChunk = 20;
+    [Tooltip("Max time in ms for random tick processing per frame")]
+    public float randomTickTimeBudgetMs = 1.0f;
+    [Tooltip("Enable block tick processing")]
+    public bool enableBlockTicks = true;
+
+    // --- Block ID constants (Beta 1.7.3) ---
+    private const byte B_AIR = 0;
+    private const byte B_STONE = 1;
+    private const byte B_GRASS = 2;
+    private const byte B_DIRT = 3;
+    private const byte B_COBBLESTONE = 4;
+    private const byte B_PLANKS = 5;
+    private const byte B_SAPLING = 6;
+    private const byte B_BEDROCK = 7;
+    private const byte B_WATER_FLOWING = 8;
+    private const byte B_WATER_STILL = 9;
+    private const byte B_LAVA_FLOWING = 10;
+    private const byte B_LAVA_STILL = 11;
+    private const byte B_SAND = 12;
+    private const byte B_GRAVEL = 13;
+    private const byte B_LOG = 17;
+    private const byte B_LEAVES = 18;
+    private const byte B_SPONGE = 19;
+    private const byte B_GLASS = 20;
+    private const byte B_TALLGRASS = 31;
+    private const byte B_DEADBUSH = 32;
+    private const byte B_FLOWER_DANDELION = 37;
+    private const byte B_FLOWER_ROSE = 38;
+    private const byte B_MUSHROOM_BROWN = 39;
+    private const byte B_MUSHROOM_RED = 40;
+    private const byte B_TNT = 46;
+    private const byte B_BOOKSHELF = 47;
+    private const byte B_OBSIDIAN = 49;
+    private const byte B_TORCH = 50;
+    private const byte B_FIRE = 51;
+    private const byte B_CROPS = 59;
+    private const byte B_FARMLAND = 60;
+    private const byte B_DOOR_WOOD = 64;
+    private const byte B_LADDER = 65;
+    private const byte B_RAIL = 66;
+    private const byte B_DOOR_IRON = 71;
+    private const byte B_REDSTONE_TORCH_OFF = 75;
+    private const byte B_REDSTONE_TORCH_ON = 76;
+    private const byte B_SNOW_LAYER = 78;
+    private const byte B_ICE = 79;
+    private const byte B_CACTUS = 81;
+    private const byte B_REED = 83;
+    private const byte B_FENCE = 85;
+    private const byte B_NETHERRACK = 87;
+    private const byte B_CLOTH = 35;
+    private const byte B_SIGN = 63;
+
+    // --- Scheduled Tick Min-Heap (sorted by scheduledFrame, MC-matching dedup) ---
+    private const int TICK_QUEUE_CAPACITY = 8192;
+    private int[] _tickX;
+    private int[] _tickY;
+    private int[] _tickZ;
+    private byte[] _tickBlockId;
+    private int[] _tickScheduledFrame;
+    private int _tickCount = 0;
+    private int _currentFrame = 0;
+
+    // --- Random Tick State ---
+    private int _randomTickSeed = 0;
+    private int _randomTickChunkCursor = 0;
+
+    // --- Fire Burn Rate Tables (from BlockFire.initializeBlock) ---
+    private int[] _chanceToEncourageFire;
+    private int[] _abilityToCatchFire;
+
+    // --- Falling Block Entity Pool ---
+    [Header("Falling Block Entities")]
+    [Tooltip("Pre-placed cube GameObjects to use as falling block visuals. 16 recommended.")]
+    [SerializeField] private Transform[] fallingBlockPool;
+    [SerializeField] private MeshRenderer[] fallingBlockRenderers;
+    private const int FALL_POOL_MAX = 16;
+    private float[] _fallPosX;
+    private float[] _fallPosY;
+    private float[] _fallPosZ;
+    private float[] _fallVelY;
+    private byte[] _fallBlockId;
+    private bool[] _fallActive;
+    private int[] _fallTicks;
+
+#if LOGGING
+    // --- Profiling Stats ---
+    private float stats_scheduledTickTimeMs;
+    private float stats_meshFlushTimeMs;
+    private float stats_randomTickTimeMs;
+    private float stats_fallingBlockTimeMs;
+    private int stats_scheduledTicksProcessed;
+
+    private int stats_randomTicksProcessed;
+    private int stats_randomTickChunksScanned;
+    private int stats_tickFrames;
+    private int stats_queuePeakCount;
+    private int stats_queueOverflows;
+    private int stats_fallingBlockSpawns;
+    private int stats_fallingBlockLandings;
+    private int stats_fallingBlockPoolExhausted;
+    private int stats_activeFallingPeak;
+
+    // Per-type dispatch counters
+    private int stats_dispatchWaterFlowing;
+    private int stats_dispatchLavaFlowing;
+    private int stats_dispatchLavaStill;
+    private int stats_dispatchFire;
+    private int stats_dispatchSand;
+    private int stats_dispatchGrass;
+    private int stats_dispatchLeaves;
+    private int stats_dispatchCactus;
+    private int stats_dispatchReed;
+    private int stats_dispatchSapling;
+    private int stats_dispatchFarmland;
+    private int stats_dispatchIce;
+    private int stats_dispatchSnow;
+    private int stats_dispatchCrops;
+    private int stats_dispatchOther;
+
+    // Block changes caused by tick systems
+    private int stats_tickSetBlockCalls;
+#endif
+
+    // --- Initialization ---
+    private bool _initialized = false;
+    private int _numAdjacentSources = 0;
+
+    void Start()
+    {
+        if (world == null || blockTypeManager == null)
+        {
+            Debug.LogError("[McBlockTicker] Missing references. Disabling.");
+            enabled = false;
+            return;
+        }
+
+        _tickX = new int[TICK_QUEUE_CAPACITY];
+        _tickY = new int[TICK_QUEUE_CAPACITY];
+        _tickZ = new int[TICK_QUEUE_CAPACITY];
+        _tickBlockId = new byte[TICK_QUEUE_CAPACITY];
+        _tickScheduledFrame = new int[TICK_QUEUE_CAPACITY];
+
+        _chanceToEncourageFire = new int[256];
+        _abilityToCatchFire = new int[256];
+        _InitFireBurnRates();
+
+        _flowDirResult = new bool[4];
+        _flowCostResult = new int[4];
+        _flowOffX = new int[] { -1, 1, 0, 0 };
+        _flowOffZ = new int[] { 0, 0, -1, 1 };
+        _flowOpposites = new int[] { 1, 0, 3, 2 };
+
+        _bcValid = new bool[BC_TOTAL];
+        _bcPosX = new int[BC_TOTAL];
+        _bcPosY = new int[BC_TOTAL];
+        _bcPosZ = new int[BC_TOTAL];
+        _bcBlock = new byte[BC_TOTAL];
+        _bcMeta = new byte[BC_TOTAL];
+
+        _fallPosX = new float[FALL_POOL_MAX];
+        _fallPosY = new float[FALL_POOL_MAX];
+        _fallPosZ = new float[FALL_POOL_MAX];
+        _fallVelY = new float[FALL_POOL_MAX];
+        _fallBlockId = new byte[FALL_POOL_MAX];
+        _fallActive = new bool[FALL_POOL_MAX];
+        _fallTicks = new int[FALL_POOL_MAX];
+        if (fallingBlockPool != null)
+        {
+            for (int i = 0; i < fallingBlockPool.Length && i < FALL_POOL_MAX; i++)
+            {
+                if (fallingBlockPool[i] != null)
+                    fallingBlockPool[i].gameObject.SetActive(false);
+            }
+        }
+
+        _randomTickSeed = (int)(Time.realtimeSinceStartup * 1000f) ^ 0x5DEECE66;
+        _initialized = true;
+    }
+
+    private void _InitFireBurnRates()
+    {
+        // Exact values from BlockFire.initializeBlock in Beta 1.7.3
+        _SetBurnRate(B_PLANKS, 5, 20);
+        _SetBurnRate(B_FENCE, 5, 20);
+        // stairCompactPlanks = 53
+        _SetBurnRate(53, 5, 20);
+        _SetBurnRate(B_LOG, 5, 5);
+        _SetBurnRate(B_LEAVES, 30, 60);
+        _SetBurnRate(B_BOOKSHELF, 30, 20);
+        _SetBurnRate(B_TNT, 15, 100);
+        _SetBurnRate(B_TALLGRASS, 60, 100);
+        _SetBurnRate(B_CLOTH, 30, 60);
+    }
+
+    private void _SetBurnRate(int blockId, int encouragement, int flammability)
+    {
+        if (blockId < 0 || blockId >= 256) return;
+        _chanceToEncourageFire[blockId] = encouragement;
+        _abilityToCatchFire[blockId] = flammability;
+    }
+
+    // --- Public API ---
+
+    /// <summary>
+    /// Schedule a block update after delayTicks frames.
+    /// Equivalent to MC's World.scheduleBlockUpdate.
+    /// </summary>
+    public void ScheduleBlockUpdate(int gx, int gy, int gz, byte blockId, int delayTicks)
+    {
+        if (!_initialized) return;
+        if (_tickCount >= TICK_QUEUE_CAPACITY)
+        {
+#if LOGGING
+            stats_queueOverflows++;
+#endif
+            return;
+        }
+
+        // MC dedup: scheduledTickSet.contains() — skip if same (x,y,z,blockId) already queued
+        for (int i = 0; i < _tickCount; i++)
+        {
+            if (_tickX[i] == gx && _tickY[i] == gy && _tickZ[i] == gz && _tickBlockId[i] == blockId)
+                return;
+        }
+
+        int scheduledFrame = _currentFrame + delayTicks;
+        int idx = _tickCount;
+        _tickX[idx] = gx;
+        _tickY[idx] = gy;
+        _tickZ[idx] = gz;
+        _tickBlockId[idx] = blockId;
+        _tickScheduledFrame[idx] = scheduledFrame;
+        _tickCount++;
+
+        // Sift up to maintain min-heap on scheduledFrame
+        while (idx > 0)
+        {
+            int parent = (idx - 1) >> 1;
+            if (_tickScheduledFrame[parent] <= _tickScheduledFrame[idx]) break;
+            _HeapSwap(idx, parent);
+            idx = parent;
+        }
+    }
+
+    private void _HeapSwap(int a, int b)
+    {
+        int t;
+        t = _tickX[a]; _tickX[a] = _tickX[b]; _tickX[b] = t;
+        t = _tickY[a]; _tickY[a] = _tickY[b]; _tickY[b] = t;
+        t = _tickZ[a]; _tickZ[a] = _tickZ[b]; _tickZ[b] = t;
+        t = _tickScheduledFrame[a]; _tickScheduledFrame[a] = _tickScheduledFrame[b]; _tickScheduledFrame[b] = t;
+        byte bt = _tickBlockId[a]; _tickBlockId[a] = _tickBlockId[b]; _tickBlockId[b] = bt;
+    }
+
+    private void _HeapRemoveMin()
+    {
+        _tickCount--;
+        if (_tickCount > 0)
+        {
+            _tickX[0] = _tickX[_tickCount];
+            _tickY[0] = _tickY[_tickCount];
+            _tickZ[0] = _tickZ[_tickCount];
+            _tickBlockId[0] = _tickBlockId[_tickCount];
+            _tickScheduledFrame[0] = _tickScheduledFrame[_tickCount];
+
+            // Sift down
+            int idx = 0;
+            while (true)
+            {
+                int left = (idx << 1) + 1;
+                int right = left + 1;
+                int smallest = idx;
+                if (left < _tickCount && _tickScheduledFrame[left] < _tickScheduledFrame[smallest])
+                    smallest = left;
+                if (right < _tickCount && _tickScheduledFrame[right] < _tickScheduledFrame[smallest])
+                    smallest = right;
+                if (smallest == idx) break;
+                _HeapSwap(idx, smallest);
+                idx = smallest;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Called by McWorld every frame. Processes scheduled and random ticks within budget.
+    /// </summary>
+    public void Tick()
+    {
+        if (!_initialized || !enableBlockTicks) return;
+        _currentFrame++;
+        _BlockCacheClearAll();
+
+        float frameStart = Time.realtimeSinceStartup;
+#if LOGGING
+        stats_tickFrames++;
+        if (_tickCount > stats_queuePeakCount) stats_queuePeakCount = _tickCount;
+#endif
+        world.BeginDeferredGpuSync();
+        world.BeginDeferredMeshUpdates();
+        _ProcessScheduledTicks(frameStart);
+#if LOGGING
+        float afterScheduled = Time.realtimeSinceStartup;
+        stats_scheduledTickTimeMs += (afterScheduled - frameStart) * 1000f;
+#endif
+        // Don't flush GPU sync — version tracking lets the budgeted
+        // _GpuMaintainResidentChunks loop handle re-uploads across
+        // multiple frames instead of stalling here.
+        world.EndDeferredGpuSync();
+        world.FlushDeferredMeshUpdates();
+#if LOGGING
+        float afterFlush = Time.realtimeSinceStartup;
+        stats_meshFlushTimeMs += (afterFlush - afterScheduled) * 1000f;
+#endif
+        _ProcessRandomTicks(frameStart);
+#if LOGGING
+        float afterRandom = Time.realtimeSinceStartup;
+        stats_randomTickTimeMs += (afterRandom - afterFlush) * 1000f;
+#endif
+        _UpdateFallingBlocks();
+#if LOGGING
+        stats_fallingBlockTimeMs += (Time.realtimeSinceStartup - afterRandom) * 1000f;
+        int activeFalling = 0;
+        if (fallingBlockPool != null)
+        {
+            for (int i = 0; i < FALL_POOL_MAX && i < fallingBlockPool.Length; i++)
+                if (_fallActive[i]) activeFalling++;
+        }
+        if (activeFalling > stats_activeFallingPeak) stats_activeFallingPeak = activeFalling;
+#endif
+    }
+
+    public void InvalidateBlockCache(int gx, int gy, int gz)
+    {
+        _BlockCacheInvalidate(gx, gy, gz);
+    }
+
+    // --- Scheduled Tick Processing ---
+
+    private void _ProcessScheduledTicks(float frameStart)
+    {
+        float budget = scheduledTickTimeBudgetMs * 0.001f;
+        int processed = 0;
+
+        while (_tickCount > 0 && processed < scheduledTickBudget)
+        {
+            if ((Time.realtimeSinceStartup - frameStart) > budget) break;
+
+            // Heap root is the earliest scheduled tick. Stop if it's not due yet.
+            if (_tickScheduledFrame[0] > _currentFrame) break;
+
+            int tx = _tickX[0];
+            int ty = _tickY[0];
+            int tz = _tickZ[0];
+            byte tickBid = _tickBlockId[0];
+
+            _HeapRemoveMin();
+
+            byte currentBlock = world.GetBlock(tx, ty, tz);
+            if (currentBlock == tickBid && currentBlock != B_AIR)
+            {
+                _DispatchUpdateTick(tx, ty, tz, currentBlock);
+            }
+            processed++;
+        }
+#if LOGGING
+        stats_scheduledTicksProcessed += processed;
+#endif
+    }
+
+    // --- Random Tick Processing ---
+
+    private void _ProcessRandomTicks(float frameStart)
+    {
+        float budget = randomTickTimeBudgetMs * 0.001f;
+        ChunkData[] chunks = world.chunks_1D;
+        if (chunks == null) return;
+        int totalChunks = chunks.Length;
+        if (totalChunks == 0) return;
+
+        int chunksProcessed = 0;
+#if LOGGING
+        int randomDispatches = 0;
+#endif
+        while (chunksProcessed < randomTickChunksPerFrame)
+        {
+            if ((Time.realtimeSinceStartup - frameStart) > budget) break;
+
+            if (_randomTickChunkCursor >= totalChunks)
+                _randomTickChunkCursor = 0;
+
+            ChunkData chunk = chunks[_randomTickChunkCursor];
+            _randomTickChunkCursor++;
+            chunksProcessed++;
+
+            if (chunk == null || !chunk.isDataReady) continue;
+
+            int baseX = chunk.chunkX_world * 16;
+            int baseY = chunk.chunkY_world * 16;
+            int baseZ = chunk.chunkZ_world * 16;
+
+            for (int i = 0; i < randomTicksPerChunk; i++)
+            {
+                _randomTickSeed = _randomTickSeed * 3 + 1013904223;
+                int rv = _randomTickSeed >> 2;
+                int lx = rv & 15;
+                int lz = (rv >> 8) & 15;
+                int ly = (rv >> 16) & 15;
+
+                byte blockId = world.GetBlock(baseX + lx, baseY + ly, baseZ + lz);
+                if (blockId != B_AIR && _IsRandomTickBlock(blockId))
+                {
+#if LOGGING
+                    randomDispatches++;
+#endif
+                    _DispatchUpdateTick(baseX + lx, baseY + ly, baseZ + lz, blockId);
+                }
+            }
+        }
+#if LOGGING
+        stats_randomTicksProcessed += randomDispatches;
+        stats_randomTickChunksScanned += chunksProcessed;
+#endif
+    }
+
+    /// <summary>
+    /// Returns true if this block type receives random ticks (MC's tickOnLoad).
+    /// </summary>
+    private bool _IsRandomTickBlock(byte blockId)
+    {
+        switch (blockId)
+        {
+            case B_GRASS:
+            case B_SAPLING:
+            case B_LEAVES:
+            case B_WATER_FLOWING:
+            case B_LAVA_FLOWING:
+            case B_LAVA_STILL: // stationary lava ticks for fire ignition
+            case B_FIRE:
+            case B_CROPS:
+            case B_FARMLAND:
+            case B_SNOW_LAYER:
+            case B_ICE:
+            case B_CACTUS:
+            case B_REED:
+            case B_MUSHROOM_BROWN:
+            case B_MUSHROOM_RED:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // --- Tick Dispatch ---
+
+    private void _DispatchUpdateTick(int gx, int gy, int gz, byte blockId)
+    {
+        switch (blockId)
+        {
+            case B_SAND:
+            case B_GRAVEL:
+#if LOGGING
+                stats_dispatchSand++;
+#endif
+                _UpdateTick_Sand(gx, gy, gz, blockId);
+                break;
+            case B_WATER_FLOWING:
+#if LOGGING
+                stats_dispatchWaterFlowing++;
+#endif
+                _UpdateTick_FlowingFluid(gx, gy, gz, true);
+                break;
+            case B_LAVA_FLOWING:
+#if LOGGING
+                stats_dispatchLavaFlowing++;
+#endif
+                _UpdateTick_FlowingFluid(gx, gy, gz, false);
+                break;
+            case B_LAVA_STILL:
+#if LOGGING
+                stats_dispatchLavaStill++;
+#endif
+                _UpdateTick_StationaryLava(gx, gy, gz);
+                break;
+            case B_FIRE:
+#if LOGGING
+                stats_dispatchFire++;
+#endif
+                _UpdateTick_Fire(gx, gy, gz);
+                break;
+            case B_GRASS:
+#if LOGGING
+                stats_dispatchGrass++;
+#endif
+                _UpdateTick_Grass(gx, gy, gz);
+                break;
+            case B_LEAVES:
+#if LOGGING
+                stats_dispatchLeaves++;
+#endif
+                _UpdateTick_Leaves(gx, gy, gz);
+                break;
+            case B_CACTUS:
+#if LOGGING
+                stats_dispatchCactus++;
+#endif
+                _UpdateTick_Cactus(gx, gy, gz);
+                break;
+            case B_REED:
+#if LOGGING
+                stats_dispatchReed++;
+#endif
+                _UpdateTick_Reed(gx, gy, gz);
+                break;
+            case B_SAPLING:
+#if LOGGING
+                stats_dispatchSapling++;
+#endif
+                _UpdateTick_Sapling(gx, gy, gz);
+                break;
+            case B_FARMLAND:
+#if LOGGING
+                stats_dispatchFarmland++;
+#endif
+                _UpdateTick_Farmland(gx, gy, gz);
+                break;
+            case B_ICE:
+#if LOGGING
+                stats_dispatchIce++;
+#endif
+                _UpdateTick_Ice(gx, gy, gz);
+                break;
+            case B_SNOW_LAYER:
+#if LOGGING
+                stats_dispatchSnow++;
+#endif
+                _UpdateTick_Snow(gx, gy, gz);
+                break;
+            case B_CROPS:
+#if LOGGING
+                stats_dispatchCrops++;
+#endif
+                _UpdateTick_Crops(gx, gy, gz);
+                break;
+            default:
+#if LOGGING
+                stats_dispatchOther++;
+#endif
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Called by McWorld when a block changes. Dispatches onNeighborBlockChange
+    /// to the 6 neighbors. Equivalent to MC's notifyBlocksOfNeighborChange.
+    /// </summary>
+    public void NotifyNeighborsOfBlockChange(int gx, int gy, int gz, byte changedBlockId)
+    {
+        if (!_initialized) return;
+        _OnNeighborChange(gx - 1, gy, gz, changedBlockId);
+        _OnNeighborChange(gx + 1, gy, gz, changedBlockId);
+        _OnNeighborChange(gx, gy - 1, gz, changedBlockId);
+        _OnNeighborChange(gx, gy + 1, gz, changedBlockId);
+        _OnNeighborChange(gx, gy, gz - 1, changedBlockId);
+        _OnNeighborChange(gx, gy, gz + 1, changedBlockId);
+    }
+
+    /// <summary>
+    /// Called when a block is placed/changed. Schedules the block's own initial tick.
+    /// Mirrors MC's Block.onBlockAdded (e.g. BlockSand, BlockFlowing, BlockFire).
+    /// </summary>
+    public void OnBlockAdded(int gx, int gy, int gz, byte blockId)
+    {
+        if (!_initialized) return;
+        switch (blockId)
+        {
+            case B_SAND:
+            case B_GRAVEL:
+                ScheduleBlockUpdate(gx, gy, gz, blockId, 3);
+                break;
+            case B_WATER_FLOWING:
+                ScheduleBlockUpdate(gx, gy, gz, blockId, 5);
+                break;
+            case B_LAVA_FLOWING:
+                ScheduleBlockUpdate(gx, gy, gz, blockId, 30);
+                break;
+            case B_FIRE:
+                ScheduleBlockUpdate(gx, gy, gz, blockId, 40);
+                break;
+        }
+    }
+
+    private void _OnNeighborChange(int gx, int gy, int gz, byte changedBlockId)
+    {
+        byte blockId = _FlowCacheGetBlock(gx, gy, gz);
+        if (blockId == B_AIR) return;
+
+        switch (blockId)
+        {
+            case B_SAND:
+            case B_GRAVEL:
+                ScheduleBlockUpdate(gx, gy, gz, blockId, 3);
+                break;
+            case B_WATER_STILL:
+                _OnNeighborChange_StationaryFluid(gx, gy, gz, true);
+                break;
+            case B_LAVA_STILL:
+                _OnNeighborChange_StationaryFluid(gx, gy, gz, false);
+                break;
+            case B_WATER_FLOWING:
+                ScheduleBlockUpdate(gx, gy, gz, B_WATER_FLOWING, 5);
+                break;
+            case B_LAVA_FLOWING:
+                _CheckForHarden(gx, gy, gz);
+                ScheduleBlockUpdate(gx, gy, gz, B_LAVA_FLOWING, 30);
+                break;
+            case B_FIRE:
+                _OnNeighborChange_Fire(gx, gy, gz);
+                break;
+            case B_CACTUS:
+                _OnNeighborChange_Cactus(gx, gy, gz);
+                break;
+            case B_FLOWER_DANDELION:
+            case B_FLOWER_ROSE:
+            case B_MUSHROOM_BROWN:
+            case B_MUSHROOM_RED:
+            case B_TALLGRASS:
+            case B_DEADBUSH:
+                _OnNeighborChange_Flower(gx, gy, gz);
+                break;
+            case B_REED:
+                _OnNeighborChange_Reed(gx, gy, gz);
+                break;
+            case B_TORCH:
+            case B_REDSTONE_TORCH_OFF:
+            case B_REDSTONE_TORCH_ON:
+                world.DropTorchIfUnsupported(gx, gy, gz);
+                break;
+        }
+    }
+
+    // --- LCG Random Helper ---
+    private int _NextRandom()
+    {
+        _randomTickSeed = _randomTickSeed * 1103515245 + 12345;
+        return (_randomTickSeed >> 16) & 0x7FFF;
+    }
+
+    // =====================================================================
+    // BLOCK BEHAVIORS — ported 1:1 from Beta 1.7.3 deobfuscated source
+    // =====================================================================
+
+    // --- SAND / GRAVEL (BlockSand.java) ---
+
+    private void _UpdateTick_Sand(int gx, int gy, int gz, byte blockId)
+    {
+        if (!_CanFallBelow(gx, gy - 1, gz) || gy < 1) return;
+
+        if (fallingBlockPool != null && fallingBlockPool.Length > 0)
+        {
+            world.SetBlock(gx, gy, gz, B_AIR);
+            _SpawnFallingBlock(gx, gy, gz, blockId);
+        }
+        else
+        {
+            // No pool available — fall instantly (MC fallInstantly path)
+            world.SetBlock(gx, gy, gz, B_AIR);
+            int targetY = gy - 1;
+            while (targetY > 0 && _CanFallBelow(gx, targetY - 1, gz))
+                targetY--;
+            if (targetY > 0)
+                world.SetBlock(gx, targetY, gz, blockId);
+        }
+    }
+
+    private bool _CanFallBelow(int gx, int gy, int gz)
+    {
+        byte below = world.GetBlock(gx, gy, gz);
+        if (below == B_AIR) return true;
+        if (below == B_FIRE) return true;
+        if (below == B_WATER_FLOWING || below == B_WATER_STILL) return true;
+        if (below == B_LAVA_FLOWING || below == B_LAVA_STILL) return true;
+        return false;
+    }
+
+    // --- FLOWING FLUID (BlockFlowing.java) ---
+
+    private void _UpdateTick_FlowingFluid(int gx, int gy, int gz, bool isWater)
+    {
+        byte selfId = isWater ? B_WATER_FLOWING : B_LAVA_FLOWING;
+        byte stillId = isWater ? B_WATER_STILL : B_LAVA_STILL;
+        int flowDecay = _GetFlowDecay(gx, gy, gz, isWater);
+        int decayRate = 1;
+        if (!isWater) decayRate = 2; // lava flows slower in overworld
+
+        bool settled = true;
+
+        if (flowDecay > 0)
+        {
+            int smallest = -100;
+            _numAdjacentSources = 0;
+
+            int s1 = _GetSmallestFlowDecay(gx - 1, gy, gz, isWater, smallest);
+            int s2 = _GetSmallestFlowDecay(gx + 1, gy, gz, isWater, s1);
+            int s3 = _GetSmallestFlowDecay(gx, gy, gz - 1, isWater, s2);
+            int s4 = _GetSmallestFlowDecay(gx, gy, gz + 1, isWater, s3);
+            int newDecay = s4 + decayRate;
+
+            if (newDecay >= 8 || s4 < 0) newDecay = -1;
+
+            int aboveDecay = _GetFlowDecay(gx, gy + 1, gz, isWater);
+            if (aboveDecay >= 0)
+            {
+                newDecay = aboveDecay >= 8 ? aboveDecay : aboveDecay + 8;
+            }
+
+            // Water source duplication: 2+ adjacent sources on solid ground
+            if (isWater && _numAdjacentSources >= 2)
+            {
+                byte belowBlock = _FlowCacheGetBlock(gx, gy - 1, gz);
+                bool belowSolid = belowBlock != B_AIR && blockTypeManager.GetBlockIsSolid(belowBlock);
+                if (belowSolid)
+                    newDecay = 0;
+                else if (_IsFluidBlock(gx, gy - 1, gz, isWater) && _FlowCacheGetMeta(gx, gy, gz) == 0)
+                    newDecay = 0;
+            }
+
+            // Lava sticky randomness
+            if (!isWater && flowDecay < 8 && newDecay < 8 && newDecay > flowDecay && (_NextRandom() % 4) != 0)
+            {
+                newDecay = flowDecay;
+                settled = false;
+            }
+
+            if (newDecay != flowDecay)
+            {
+                flowDecay = newDecay;
+                if (newDecay < 0)
+                {
+                    world.SetBlock(gx, gy, gz, B_AIR);
+                }
+                else
+                {
+                    world.SetBlockMetadata(gx, gy, gz, (byte)newDecay);
+                    ScheduleBlockUpdate(gx, gy, gz, selfId, isWater ? 5 : 30);
+                    world.NotifyNeighborsOfBlockChange(gx, gy, gz, selfId);
+                }
+            }
+            else if (settled)
+            {
+                // Convert to stationary
+                _ConvertToStationary(gx, gy, gz, isWater);
+            }
+        }
+        else
+        {
+            // Source block (flowDecay == 0), convert to stationary
+            _ConvertToStationary(gx, gy, gz, isWater);
+        }
+
+        // Flow downward
+        if (_LiquidCanDisplace(gx, gy - 1, gz, isWater))
+        {
+            int downMeta = flowDecay >= 8 ? flowDecay : flowDecay + 8;
+            world.SetBlockAndMetadata(gx, gy - 1, gz, selfId, (byte)downMeta);
+            ScheduleBlockUpdate(gx, gy - 1, gz, selfId, isWater ? 5 : 30);
+        }
+        else if (flowDecay >= 0 && (flowDecay == 0 || _BlockBlocksFlow(gx, gy - 1, gz)))
+        {
+            // Flow horizontally
+            int hDecay = flowDecay + decayRate;
+            if (flowDecay >= 8) hDecay = 1;
+            if (hDecay >= 8) return;
+
+            bool[] optimal = _GetOptimalFlowDirections(gx, gy, gz, isWater);
+            if (optimal[0]) _FlowIntoBlock(gx - 1, gy, gz, hDecay, isWater);
+            if (optimal[1]) _FlowIntoBlock(gx + 1, gy, gz, hDecay, isWater);
+            if (optimal[2]) _FlowIntoBlock(gx, gy, gz - 1, hDecay, isWater);
+            if (optimal[3]) _FlowIntoBlock(gx, gy, gz + 1, hDecay, isWater);
+        }
+    }
+
+    private void _ConvertToStationary(int gx, int gy, int gz, bool isWater)
+    {
+        byte meta = _FlowCacheGetMeta(gx, gy, gz);
+        byte stillId = isWater ? B_WATER_STILL : B_LAVA_STILL;
+        // MC func_30003_j: setBlockAndMetadata (NO notify) + markDirty
+        world.SetBlockAndMetadataSilent(gx, gy, gz, stillId, meta);
+    }
+
+    private int _GetFlowDecay(int gx, int gy, int gz, bool isWater)
+    {
+        byte b = _FlowCacheGetBlock(gx, gy, gz);
+        if (isWater)
+        {
+            if (b != B_WATER_FLOWING && b != B_WATER_STILL) return -1;
+        }
+        else
+        {
+            if (b != B_LAVA_FLOWING && b != B_LAVA_STILL) return -1;
+        }
+        return _FlowCacheGetMeta(gx, gy, gz);
+    }
+
+    private int _GetSmallestFlowDecay(int gx, int gy, int gz, bool isWater, int currentSmallest)
+    {
+        int decay = _GetFlowDecay(gx, gy, gz, isWater);
+        if (decay < 0) return currentSmallest;
+        if (decay == 0) _numAdjacentSources++;
+        if (decay >= 8) decay = 0;
+        return (currentSmallest >= 0 && decay >= currentSmallest) ? currentSmallest : decay;
+    }
+
+    private bool _LiquidCanDisplace(int gx, int gy, int gz, bool isWater)
+    {
+        byte b = _FlowCacheGetBlock(gx, gy, gz);
+        if (isWater)
+        {
+            if (b == B_WATER_FLOWING || b == B_WATER_STILL) return false;
+        }
+        else
+        {
+            if (b == B_LAVA_FLOWING || b == B_LAVA_STILL) return false;
+        }
+        if (b == B_LAVA_FLOWING || b == B_LAVA_STILL) return false;
+        if (b == B_DOOR_WOOD || b == B_DOOR_IRON || b == B_SIGN || b == B_LADDER || b == B_REED) return false;
+        if (b == B_AIR) return true;
+        return !blockTypeManager.GetBlockIsSolid(b);
+    }
+
+    private bool _BlockBlocksFlow(int gx, int gy, int gz)
+    {
+        byte b = _FlowCacheGetBlock(gx, gy, gz);
+        if (b == B_DOOR_WOOD || b == B_DOOR_IRON || b == B_SIGN || b == B_LADDER || b == B_REED) return true;
+        if (b == B_AIR) return false;
+        return blockTypeManager.GetBlockIsSolid(b);
+    }
+
+    private bool _IsFluidBlock(int gx, int gy, int gz, bool isWater)
+    {
+        byte b = _FlowCacheGetBlock(gx, gy, gz);
+        if (isWater) return b == B_WATER_FLOWING || b == B_WATER_STILL;
+        return b == B_LAVA_FLOWING || b == B_LAVA_STILL;
+    }
+
+    private void _FlowIntoBlock(int gx, int gy, int gz, int decay, bool isWater)
+    {
+        if (!_LiquidCanDisplace(gx, gy, gz, isWater)) return;
+        byte selfId = isWater ? B_WATER_FLOWING : B_LAVA_FLOWING;
+        world.SetBlockAndMetadata(gx, gy, gz, selfId, (byte)decay);
+        ScheduleBlockUpdate(gx, gy, gz, selfId, isWater ? 5 : 30);
+    }
+
+    // Reusable arrays for flow direction calculation (UdonSharp can't do stack arrays)
+    private bool[] _flowDirResult;
+    private int[] _flowCostResult;
+    private int[] _flowOffX;
+    private int[] _flowOffZ;
+    private int[] _flowOpposites;
+
+    // Frame-wide block cache using modular position hashing.
+    // Survives across ticks within a frame so adjacent water ticks and
+    // notification reads share cached data. 16×4×16 = 1024 entries.
+    private const int BC_BITS_XZ = 4;
+    private const int BC_SIZE_XZ = 1 << BC_BITS_XZ; // 16
+    private const int BC_MASK_XZ = BC_SIZE_XZ - 1;  // 0xF
+    private const int BC_BITS_Y = 2;
+    private const int BC_SIZE_Y = 1 << BC_BITS_Y;   // 4
+    private const int BC_MASK_Y = BC_SIZE_Y - 1;     // 0x3
+    private const int BC_TOTAL = BC_SIZE_XZ * BC_SIZE_XZ * BC_SIZE_Y; // 1024
+
+    private bool[] _bcValid;
+    private int[] _bcPosX;
+    private int[] _bcPosY;
+    private int[] _bcPosZ;
+    private byte[] _bcBlock;
+    private byte[] _bcMeta;
+
+    private int _BCIdx(int gx, int gy, int gz)
+    {
+        return (gx & BC_MASK_XZ) + ((gz & BC_MASK_XZ) << BC_BITS_XZ) + ((gy & BC_MASK_Y) << (BC_BITS_XZ + BC_BITS_XZ));
+    }
+
+    private byte _FlowCacheGetBlock(int gx, int gy, int gz)
+    {
+        int idx = _BCIdx(gx, gy, gz);
+        if (_bcValid[idx] && _bcPosX[idx] == gx && _bcPosY[idx] == gy && _bcPosZ[idx] == gz)
+            return _bcBlock[idx];
+        byte b = world.GetBlockAndMeta(gx, gy, gz);
+        _bcValid[idx] = true;
+        _bcPosX[idx] = gx;
+        _bcPosY[idx] = gy;
+        _bcPosZ[idx] = gz;
+        _bcBlock[idx] = b;
+        _bcMeta[idx] = world.lastMetaResult;
+        return b;
+    }
+
+    private byte _FlowCacheGetMeta(int gx, int gy, int gz)
+    {
+        int idx = _BCIdx(gx, gy, gz);
+        if (_bcValid[idx] && _bcPosX[idx] == gx && _bcPosY[idx] == gy && _bcPosZ[idx] == gz)
+            return _bcMeta[idx];
+        byte b = world.GetBlockAndMeta(gx, gy, gz);
+        _bcValid[idx] = true;
+        _bcPosX[idx] = gx;
+        _bcPosY[idx] = gy;
+        _bcPosZ[idx] = gz;
+        _bcBlock[idx] = b;
+        _bcMeta[idx] = world.lastMetaResult;
+        return world.lastMetaResult;
+    }
+
+    private void _BlockCacheClearAll()
+    {
+        System.Array.Clear(_bcValid, 0, BC_TOTAL);
+    }
+
+    private void _BlockCacheInvalidate(int gx, int gy, int gz)
+    {
+        int idx = _BCIdx(gx, gy, gz);
+        if (_bcValid[idx] && _bcPosX[idx] == gx && _bcPosY[idx] == gy && _bcPosZ[idx] == gz)
+            _bcValid[idx] = false;
+    }
+
+    private bool[] _GetOptimalFlowDirections(int gx, int gy, int gz, bool isWater)
+    {
+
+        for (int d = 0; d < 4; d++)
+        {
+            _flowCostResult[d] = 1000;
+            int nx = gx + _flowOffX[d];
+            int nz = gz + _flowOffZ[d];
+
+            // Inline _BlockBlocksFlow + _IsFluidBlock: single GetBlock instead of 2-3
+            byte nb = _FlowCacheGetBlock(nx, gy, nz);
+            if (nb == B_DOOR_WOOD || nb == B_DOOR_IRON || nb == B_SIGN || nb == B_LADDER || nb == B_REED) continue;
+            if (nb != B_AIR && blockTypeManager.GetBlockIsSolid(nb)) continue;
+            bool isFluid = isWater ? (nb == B_WATER_FLOWING || nb == B_WATER_STILL) : (nb == B_LAVA_FLOWING || nb == B_LAVA_STILL);
+            if (isFluid && _FlowCacheGetMeta(nx, gy, nz) == 0) continue;
+
+            // Inline _BlockBlocksFlow for below
+            byte belowNb = _FlowCacheGetBlock(nx, gy - 1, nz);
+            if (belowNb == B_DOOR_WOOD || belowNb == B_DOOR_IRON || belowNb == B_SIGN || belowNb == B_LADDER || belowNb == B_REED)
+            { /* blocks flow */ }
+            else if (belowNb == B_AIR || !blockTypeManager.GetBlockIsSolid(belowNb))
+            {
+                _flowCostResult[d] = 0;
+                continue;
+            }
+            _flowCostResult[d] = _CalculateFlowCost(nx, gy, nz, 1, d, isWater);
+        }
+
+        int minCost = _flowCostResult[0];
+        for (int d = 1; d < 4; d++)
+            if (_flowCostResult[d] < minCost) minCost = _flowCostResult[d];
+
+        for (int d = 0; d < 4; d++)
+            _flowDirResult[d] = _flowCostResult[d] == minCost;
+
+        return _flowDirResult;
+    }
+
+    private int _CalculateFlowCost(int gx, int gy, int gz, int depth, int fromDir, bool isWater)
+    {
+        int best = 1000;
+
+        for (int d = 0; d < 4; d++)
+        {
+            if (d == _flowOpposites[fromDir]) continue;
+
+            int nx = gx + _flowOffX[d];
+            int nz = gz + _flowOffZ[d];
+
+            // Inline _BlockBlocksFlow + _IsFluidBlock: single GetBlock instead of 2-3
+            byte nb = _FlowCacheGetBlock(nx, gy, nz);
+            if (nb == B_DOOR_WOOD || nb == B_DOOR_IRON || nb == B_SIGN || nb == B_LADDER || nb == B_REED) continue;
+            if (nb != B_AIR && blockTypeManager.GetBlockIsSolid(nb)) continue;
+            bool isFluid = isWater ? (nb == B_WATER_FLOWING || nb == B_WATER_STILL) : (nb == B_LAVA_FLOWING || nb == B_LAVA_STILL);
+            if (isFluid && _FlowCacheGetMeta(nx, gy, nz) == 0) continue;
+
+            // Inline _BlockBlocksFlow for below
+            byte belowNb = _FlowCacheGetBlock(nx, gy - 1, nz);
+            if (belowNb == B_DOOR_WOOD || belowNb == B_DOOR_IRON || belowNb == B_SIGN || belowNb == B_LADDER || belowNb == B_REED)
+            { /* blocks flow, fall through to recurse */ }
+            else if (belowNb == B_AIR || !blockTypeManager.GetBlockIsSolid(belowNb))
+                return depth;
+
+            if (depth < 4)
+            {
+                int cost = _CalculateFlowCost(nx, gy, nz, depth + 1, d, isWater);
+                if (cost < best) { best = cost; if (best == depth + 1) return best; }
+            }
+        }
+        return best;
+    }
+
+    private void _OnNeighborChange_StationaryFluid(int gx, int gy, int gz, bool isWater)
+    {
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        byte flowingId = isWater ? B_WATER_FLOWING : B_LAVA_FLOWING;
+        // MC func_30004_j: setBlockAndMetadata (NO notify) + scheduleBlockUpdate
+        world.SetBlockAndMetadataSilent(gx, gy, gz, flowingId, meta);
+        ScheduleBlockUpdate(gx, gy, gz, flowingId, isWater ? 5 : 30);
+    }
+
+    // --- LAVA/WATER HARDENING (BlockFluid.checkForHarden) ---
+
+    private void _CheckForHarden(int gx, int gy, int gz)
+    {
+        byte b = world.GetBlock(gx, gy, gz);
+        bool isLava = (b == B_LAVA_FLOWING || b == B_LAVA_STILL);
+        if (!isLava) return;
+
+        bool touchesWater =
+            _IsWaterAt(gx, gy, gz - 1) || _IsWaterAt(gx, gy, gz + 1) ||
+            _IsWaterAt(gx - 1, gy, gz) || _IsWaterAt(gx + 1, gy, gz) ||
+            _IsWaterAt(gx, gy + 1, gz);
+
+        if (!touchesWater) return;
+
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        if (meta == 0)
+            world.SetBlock(gx, gy, gz, B_OBSIDIAN);
+        else if (meta <= 4)
+            world.SetBlock(gx, gy, gz, B_COBBLESTONE);
+    }
+
+    private bool _IsWaterAt(int gx, int gy, int gz)
+    {
+        byte b = world.GetBlock(gx, gy, gz);
+        return b == B_WATER_FLOWING || b == B_WATER_STILL;
+    }
+
+    // --- STATIONARY LAVA (BlockStationary.updateTick — fire ignition) ---
+
+    private void _UpdateTick_StationaryLava(int gx, int gy, int gz)
+    {
+        int attempts = _NextRandom() % 3;
+        int cx = gx, cy = gy, cz = gz;
+        for (int i = 0; i < attempts; i++)
+        {
+            cx += (_NextRandom() % 3) - 1;
+            cy++;
+            cz += (_NextRandom() % 3) - 1;
+            byte above = world.GetBlock(cx, cy, cz);
+            if (above == B_AIR)
+            {
+                if (_IsBurnable(cx - 1, cy, cz) || _IsBurnable(cx + 1, cy, cz) ||
+                    _IsBurnable(cx, cy, cz - 1) || _IsBurnable(cx, cy, cz + 1) ||
+                    _IsBurnable(cx, cy - 1, cz) || _IsBurnable(cx, cy + 1, cz))
+                {
+                    world.SetBlock(cx, cy, cz, B_FIRE);
+                    return;
+                }
+            }
+            else if (above != B_AIR && blockTypeManager.GetBlockIsSolid(above))
+            {
+                return;
+            }
+        }
+    }
+
+    private bool _IsBurnable(int gx, int gy, int gz)
+    {
+        byte b = world.GetBlock(gx, gy, gz);
+        // MC checks blockMaterial.getBurning() — wood/planks/leaves/wool/etc
+        return _chanceToEncourageFire[b] > 0;
+    }
+
+    // --- FIRE (BlockFire.java) ---
+
+    private void _UpdateTick_Fire(int gx, int gy, int gz)
+    {
+        bool onNetherrack = world.GetBlock(gx, gy - 1, gz) == B_NETHERRACK;
+
+        // Check if fire can stay
+        byte belowBlock = world.GetBlock(gx, gy - 1, gz);
+        bool belowNormal = belowBlock != B_AIR && blockTypeManager.GetBlockIsSolid(belowBlock);
+        if (!belowNormal && !_HasAdjacentFlammable(gx, gy, gz))
+        {
+            world.SetBlock(gx, gy, gz, B_AIR);
+            return;
+        }
+
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+
+        // Age the fire
+        if (meta < 15)
+        {
+            int newMeta = meta + (_NextRandom() % 3 == 0 ? 1 : 0);
+            if (newMeta > 15) newMeta = 15;
+            world.SetBlockMetadata(gx, gy, gz, (byte)newMeta);
+        }
+
+        // Schedule next tick
+        ScheduleBlockUpdate(gx, gy, gz, B_FIRE, 40);
+
+        if (!onNetherrack && !_HasAdjacentFlammable(gx, gy, gz))
+        {
+            if (!belowNormal || meta > 3)
+            {
+                world.SetBlock(gx, gy, gz, B_AIR);
+                return;
+            }
+        }
+
+        if (!onNetherrack && !_CanBlockCatchFire(gx, gy - 1, gz) && meta == 15 && (_NextRandom() % 4) == 0)
+        {
+            world.SetBlock(gx, gy, gz, B_AIR);
+            return;
+        }
+
+        // Try to burn adjacent blocks
+        _TryBurnBlock(gx + 1, gy, gz, 300, meta);
+        _TryBurnBlock(gx - 1, gy, gz, 300, meta);
+        _TryBurnBlock(gx, gy - 1, gz, 250, meta);
+        _TryBurnBlock(gx, gy + 1, gz, 250, meta);
+        _TryBurnBlock(gx, gy, gz - 1, 300, meta);
+        _TryBurnBlock(gx, gy, gz + 1, 300, meta);
+
+        // Spread fire to nearby air blocks
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            for (int dz = -1; dz <= 1; dz++)
+            {
+                for (int dy = -1; dy <= 4; dy++)
+                {
+                    if (dx == 0 && dy == 0 && dz == 0) continue;
+                    int nx = gx + dx, ny = gy + dy, nz = gz + dz;
+                    int chance = _GetEncouragementForPos(nx, ny, nz);
+                    if (chance <= 0) continue;
+
+                    int divisor = 100;
+                    if (dy > 1) divisor += (dy - 1) * 100;
+
+                    int spreadChance = (chance + 40) / (meta + 30);
+                    if (spreadChance > 0 && (_NextRandom() % divisor) <= spreadChance)
+                    {
+                        int newAge = meta + (_NextRandom() % 5) / 4;
+                        if (newAge > 15) newAge = 15;
+                        world.SetBlockAndMetadata(nx, ny, nz, B_FIRE, (byte)newAge);
+                    }
+                }
+            }
+        }
+    }
+
+    private void _TryBurnBlock(int gx, int gy, int gz, int chance, int fireMeta)
+    {
+        byte b = world.GetBlock(gx, gy, gz);
+        int flammability = _abilityToCatchFire[b];
+        if ((_NextRandom() % chance) >= flammability) return;
+
+        bool isTnt = (b == B_TNT);
+
+        if ((_NextRandom() % (fireMeta + 10)) < 5)
+        {
+            int newAge = fireMeta + (_NextRandom() % 5) / 4;
+            if (newAge > 15) newAge = 15;
+            world.SetBlockAndMetadata(gx, gy, gz, B_FIRE, (byte)newAge);
+        }
+        else
+        {
+            world.SetBlock(gx, gy, gz, B_AIR);
+        }
+    }
+
+    private void _OnNeighborChange_Fire(int gx, int gy, int gz)
+    {
+        byte below = world.GetBlock(gx, gy - 1, gz);
+        bool belowNormal = below != B_AIR && blockTypeManager.GetBlockIsSolid(below);
+        if (!belowNormal && !_HasAdjacentFlammable(gx, gy, gz))
+            world.SetBlock(gx, gy, gz, B_AIR);
+    }
+
+    private bool _HasAdjacentFlammable(int gx, int gy, int gz)
+    {
+        return _CanBlockCatchFire(gx + 1, gy, gz) || _CanBlockCatchFire(gx - 1, gy, gz) ||
+               _CanBlockCatchFire(gx, gy - 1, gz) || _CanBlockCatchFire(gx, gy + 1, gz) ||
+               _CanBlockCatchFire(gx, gy, gz - 1) || _CanBlockCatchFire(gx, gy, gz + 1);
+    }
+
+    private bool _CanBlockCatchFire(int gx, int gy, int gz)
+    {
+        byte b = world.GetBlock(gx, gy, gz);
+        return _chanceToEncourageFire[b] > 0;
+    }
+
+    private int _GetEncouragementForPos(int gx, int gy, int gz)
+    {
+        if (world.GetBlock(gx, gy, gz) != B_AIR) return 0;
+        int best = 0;
+        byte b;
+        b = world.GetBlock(gx + 1, gy, gz); if (_chanceToEncourageFire[b] > best) best = _chanceToEncourageFire[b];
+        b = world.GetBlock(gx - 1, gy, gz); if (_chanceToEncourageFire[b] > best) best = _chanceToEncourageFire[b];
+        b = world.GetBlock(gx, gy - 1, gz); if (_chanceToEncourageFire[b] > best) best = _chanceToEncourageFire[b];
+        b = world.GetBlock(gx, gy + 1, gz); if (_chanceToEncourageFire[b] > best) best = _chanceToEncourageFire[b];
+        b = world.GetBlock(gx, gy, gz - 1); if (_chanceToEncourageFire[b] > best) best = _chanceToEncourageFire[b];
+        b = world.GetBlock(gx, gy, gz + 1); if (_chanceToEncourageFire[b] > best) best = _chanceToEncourageFire[b];
+        return best;
+    }
+
+    // --- GRASS (BlockGrass.java) ---
+
+    private void _UpdateTick_Grass(int gx, int gy, int gz)
+    {
+        // TODO: proper light check once lighting query is exposed
+        // For now, use a simplified version
+        byte above = world.GetBlock(gx, gy + 1, gz);
+        int aboveOpacity = (above != B_AIR) ? blockTypeManager.GetBlockLightOpacity(above) : 0;
+
+        if (aboveOpacity > 2)
+        {
+            // Dark — die to dirt (25% chance per tick, matching MC's random(4)!=0 skip)
+            if ((_NextRandom() % 4) == 0)
+                world.SetBlock(gx, gy, gz, B_DIRT);
+        }
+        else
+        {
+            // Try to spread to nearby dirt
+            int tx = gx + (_NextRandom() % 3) - 1;
+            int ty = gy + (_NextRandom() % 5) - 3;
+            int tz = gz + (_NextRandom() % 3) - 1;
+            if (world.GetBlock(tx, ty, tz) == B_DIRT)
+            {
+                byte aboveTarget = world.GetBlock(tx, ty + 1, tz);
+                int targetOpacity = (aboveTarget != B_AIR) ? blockTypeManager.GetBlockLightOpacity(aboveTarget) : 0;
+                if (targetOpacity <= 2)
+                    world.SetBlock(tx, ty, tz, B_GRASS);
+            }
+        }
+    }
+
+    // --- LEAVES (BlockLeaves.java) ---
+
+    private void _UpdateTick_Leaves(int gx, int gy, int gz)
+    {
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        // Bit 3 (0x08) = needs decay check (set when nearby log removed)
+        if ((meta & 8) == 0) return;
+
+        // BFS: search for a log within 4 blocks
+        // Simplified: scan a 9x9x9 cube for any log block
+        bool foundLog = false;
+        for (int dx = -4; dx <= 4 && !foundLog; dx++)
+        {
+            for (int dy = -4; dy <= 4 && !foundLog; dy++)
+            {
+                for (int dz = -4; dz <= 4 && !foundLog; dz++)
+                {
+                    if (world.GetBlock(gx + dx, gy + dy, gz + dz) == B_LOG)
+                        foundLog = true;
+                }
+            }
+        }
+
+        if (foundLog)
+        {
+            // Clear the decay flag
+            world.SetBlockMetadata(gx, gy, gz, (byte)(meta & ~8));
+        }
+        else
+        {
+            // Decay: remove the leaf
+            world.SetBlock(gx, gy, gz, B_AIR);
+        }
+    }
+
+    // --- CACTUS (BlockCactus.java) ---
+
+    private void _UpdateTick_Cactus(int gx, int gy, int gz)
+    {
+        if (world.GetBlock(gx, gy + 1, gz) != B_AIR) return;
+
+        int height = 1;
+        while (world.GetBlock(gx, gy - height, gz) == B_CACTUS) height++;
+        if (height >= 3) return;
+
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        if (meta >= 15)
+        {
+            world.SetBlock(gx, gy + 1, gz, B_CACTUS);
+            world.SetBlockMetadata(gx, gy, gz, 0);
+        }
+        else
+        {
+            world.SetBlockMetadata(gx, gy, gz, (byte)(meta + 1));
+        }
+    }
+
+    private void _OnNeighborChange_Cactus(int gx, int gy, int gz)
+    {
+        if (!_CanCactusStay(gx, gy, gz))
+            world.SetBlock(gx, gy, gz, B_AIR);
+    }
+
+    private bool _CanCactusStay(int gx, int gy, int gz)
+    {
+        // No solid blocks adjacent horizontally
+        byte nx = world.GetBlock(gx - 1, gy, gz);
+        byte px = world.GetBlock(gx + 1, gy, gz);
+        byte nz = world.GetBlock(gx, gy, gz - 1);
+        byte pz = world.GetBlock(gx, gy, gz + 1);
+        if (nx != B_AIR && blockTypeManager.GetBlockIsSolid(nx)) return false;
+        if (px != B_AIR && blockTypeManager.GetBlockIsSolid(px)) return false;
+        if (nz != B_AIR && blockTypeManager.GetBlockIsSolid(nz)) return false;
+        if (pz != B_AIR && blockTypeManager.GetBlockIsSolid(pz)) return false;
+        byte below = world.GetBlock(gx, gy - 1, gz);
+        return below == B_CACTUS || below == B_SAND;
+    }
+
+    // --- REED / SUGARCANE (BlockReed.java) ---
+
+    private void _UpdateTick_Reed(int gx, int gy, int gz)
+    {
+        if (world.GetBlock(gx, gy + 1, gz) != B_AIR) return;
+
+        int height = 1;
+        while (world.GetBlock(gx, gy - height, gz) == B_REED) height++;
+        if (height >= 3) return;
+
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        if (meta >= 15)
+        {
+            world.SetBlock(gx, gy + 1, gz, B_REED);
+            world.SetBlockMetadata(gx, gy, gz, 0);
+        }
+        else
+        {
+            world.SetBlockMetadata(gx, gy, gz, (byte)(meta + 1));
+        }
+    }
+
+    private void _OnNeighborChange_Reed(int gx, int gy, int gz)
+    {
+        byte below = world.GetBlock(gx, gy - 1, gz);
+        if (below != B_REED && below != B_GRASS && below != B_DIRT)
+            world.SetBlock(gx, gy, gz, B_AIR);
+    }
+
+    // --- FLOWER / MUSHROOM / TALLGRASS (BlockFlower.java) ---
+
+    private void _OnNeighborChange_Flower(int gx, int gy, int gz)
+    {
+        byte below = world.GetBlock(gx, gy - 1, gz);
+        if (below != B_GRASS && below != B_DIRT && below != B_FARMLAND)
+            world.SetBlock(gx, gy, gz, B_AIR);
+    }
+
+    // --- SAPLING (BlockSapling.java) ---
+
+    private void _UpdateTick_Sapling(int gx, int gy, int gz)
+    {
+        // Simplified: small random chance to grow into a basic tree
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        if ((_NextRandom() % 7) != 0) return;
+
+        if ((meta & 8) == 0)
+        {
+            // Set stage flag
+            world.SetBlockMetadata(gx, gy, gz, (byte)(meta | 8));
+        }
+        else
+        {
+            // Grow a simple tree (trunk + canopy)
+            _GrowSimpleTree(gx, gy, gz);
+        }
+    }
+
+    private void _GrowSimpleTree(int gx, int gy, int gz)
+    {
+        int trunkHeight = 4 + (_NextRandom() % 3);
+
+        // Check space
+        for (int h = 1; h <= trunkHeight + 1; h++)
+        {
+            if (world.GetBlock(gx, gy + h, gz) != B_AIR) return;
+        }
+
+        // Remove sapling
+        world.SetBlock(gx, gy, gz, B_AIR);
+
+        // Place trunk
+        for (int h = 0; h < trunkHeight; h++)
+            world.SetBlock(gx, gy + h, gz, B_LOG);
+
+        // Place canopy (simple sphere-ish)
+        int canopyBase = gy + trunkHeight - 2;
+        for (int dy = 0; dy <= 2; dy++)
+        {
+            int radius = (dy < 2) ? 2 : 1;
+            for (int dx = -radius; dx <= radius; dx++)
+            {
+                for (int dz = -radius; dz <= radius; dz++)
+                {
+                    if (dx == 0 && dz == 0 && dy < 2) continue; // trunk occupies center
+                    if (Mathf.Abs(dx) == radius && Mathf.Abs(dz) == radius && dy < 2 && (_NextRandom() % 2) == 0) continue;
+                    int lx = gx + dx, ly = canopyBase + dy, lz = gz + dz;
+                    if (world.GetBlock(lx, ly, lz) == B_AIR)
+                        world.SetBlock(lx, ly, lz, B_LEAVES);
+                }
+            }
+        }
+    }
+
+    // --- FARMLAND (BlockFarmland.java) ---
+
+    private void _UpdateTick_Farmland(int gx, int gy, int gz)
+    {
+        // Check for water within 4 blocks horizontally and 1 block vertically
+        bool hydrated = false;
+        for (int dx = -4; dx <= 4 && !hydrated; dx++)
+        {
+            for (int dz = -4; dz <= 4 && !hydrated; dz++)
+            {
+                byte b = world.GetBlock(gx + dx, gy, gz + dz);
+                if (b == B_WATER_FLOWING || b == B_WATER_STILL) hydrated = true;
+                b = world.GetBlock(gx + dx, gy + 1, gz + dz);
+                if (b == B_WATER_FLOWING || b == B_WATER_STILL) hydrated = true;
+            }
+        }
+
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        if (hydrated)
+        {
+            world.SetBlockMetadata(gx, gy, gz, 7);
+        }
+        else if (meta > 0)
+        {
+            world.SetBlockMetadata(gx, gy, gz, (byte)(meta - 1));
+        }
+        else
+        {
+            // Not hydrated and meta is 0 — revert to dirt if nothing planted above
+            byte above = world.GetBlock(gx, gy + 1, gz);
+            if (above != B_CROPS)
+                world.SetBlock(gx, gy, gz, B_DIRT);
+        }
+    }
+
+    // --- ICE (BlockIce.java) ---
+
+    private void _UpdateTick_Ice(int gx, int gy, int gz)
+    {
+        // Melt if exposed to light > 11
+        // Simplified: melt if no opaque block above (sky-exposed)
+        byte above = world.GetBlock(gx, gy + 1, gz);
+        if (above == B_AIR || blockTypeManager.GetBlockLightOpacity(above) == 0)
+        {
+            world.SetBlock(gx, gy, gz, B_WATER_STILL);
+        }
+    }
+
+    // --- SNOW LAYER (BlockSnow.java) ---
+
+    private void _UpdateTick_Snow(int gx, int gy, int gz)
+    {
+        // Melt if exposed to bright light
+        byte above = world.GetBlock(gx, gy + 1, gz);
+        if (above == B_AIR || blockTypeManager.GetBlockLightOpacity(above) == 0)
+        {
+            // Only melt with some probability to avoid instant snow destruction
+            if ((_NextRandom() % 4) == 0)
+                world.SetBlock(gx, gy, gz, B_AIR);
+        }
+    }
+
+    // --- CROPS (BlockCrops.java) ---
+
+    private void _UpdateTick_Crops(int gx, int gy, int gz)
+    {
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
+        if (meta >= 7) return; // Fully grown
+
+        // Growth rate depends on farmland hydration and adjacency — simplified
+        if ((_NextRandom() % 5) == 0)
+        {
+            world.SetBlockMetadata(gx, gy, gz, (byte)(meta + 1));
+        }
+    }
+
+    // =====================================================================
+    // FALLING BLOCK ENTITIES (EntityFallingSand.java)
+    // =====================================================================
+
+    private void _SpawnFallingBlock(int gx, int gy, int gz, byte blockId)
+    {
+        if (fallingBlockPool == null) return;
+
+        int slot = -1;
+        for (int i = 0; i < FALL_POOL_MAX && i < fallingBlockPool.Length; i++)
+        {
+            if (!_fallActive[i])
+            {
+                slot = i;
+                break;
+            }
+        }
+
+        if (slot < 0)
+        {
+#if LOGGING
+            stats_fallingBlockPoolExhausted++;
+#endif
+            // Pool exhausted — fall instantly
+            int targetY = gy - 1;
+            while (targetY > 0 && _CanFallBelow(gx, targetY - 1, gz))
+                targetY--;
+            if (targetY > 0)
+                world.SetBlock(gx, targetY, gz, blockId);
+            return;
+        }
+
+        // MC: EntityFallingSand spawns at block center (x+0.5, y+0.5, z+0.5)
+        _fallPosX[slot] = gx + 0.5f;
+        _fallPosY[slot] = gy + 0.5f;
+        _fallPosZ[slot] = gz + 0.5f;
+        _fallVelY[slot] = 0f;
+        _fallBlockId[slot] = blockId;
+        _fallActive[slot] = true;
+        _fallTicks[slot] = 0;
+#if LOGGING
+        stats_fallingBlockSpawns++;
+#endif
+
+        if (fallingBlockPool[slot] != null)
+        {
+            fallingBlockPool[slot].position = new Vector3(_fallPosX[slot], _fallPosY[slot], _fallPosZ[slot]);
+            fallingBlockPool[slot].localScale = new Vector3(0.98f, 0.98f, 0.98f);
+            fallingBlockPool[slot].gameObject.SetActive(true);
+
+            // Set texture slice on the material if renderer is available
+            if (fallingBlockRenderers != null && slot < fallingBlockRenderers.Length && fallingBlockRenderers[slot] != null)
+            {
+                int texSlice = blockTypeManager.GetBlockTextureSlice_AllFaces(blockId);
+                fallingBlockRenderers[slot].material.SetFloat("_TexIndex", texSlice);
+            }
+        }
+    }
+
+    private void _UpdateFallingBlocks()
+    {
+        if (fallingBlockPool == null) return;
+        float dt = Time.deltaTime;
+        if (dt <= 0f) return;
+
+        // MC runs entity physics at 20 TPS. Scale forces by tick ratio.
+        float tickRatio = dt / 0.05f;
+
+        for (int i = 0; i < FALL_POOL_MAX && i < fallingBlockPool.Length; i++)
+        {
+            if (!_fallActive[i]) continue;
+
+            _fallTicks[i]++;
+
+            // MC: motionY -= 0.04 per tick, then motionY *= 0.98
+            _fallVelY[i] -= 0.04f * tickRatio;
+            _fallVelY[i] *= Mathf.Pow(0.98f, tickRatio);
+
+            _fallPosY[i] += _fallVelY[i] * tickRatio;
+
+            // Update visual
+            if (fallingBlockPool[i] != null)
+            {
+                fallingBlockPool[i].position = new Vector3(_fallPosX[i], _fallPosY[i], _fallPosZ[i]);
+            }
+
+            // Check landing: block below feet position
+            int bx = Mathf.FloorToInt(_fallPosX[i]);
+            int by = Mathf.FloorToInt(_fallPosY[i] - 0.5f);
+            int bz = Mathf.FloorToInt(_fallPosZ[i]);
+
+            // MC clears its own block if still present at current position
+            int curBx = Mathf.FloorToInt(_fallPosX[i]);
+            int curBy = Mathf.FloorToInt(_fallPosY[i]);
+            int curBz = Mathf.FloorToInt(_fallPosZ[i]);
+            if (world.GetBlock(curBx, curBy, curBz) == _fallBlockId[i])
+            {
+                world.SetBlock(curBx, curBy, curBz, B_AIR);
+            }
+
+            bool landed = !_CanFallBelow(bx, by, bz) && _fallVelY[i] <= 0f;
+            bool timedOut = _fallTicks[i] > 600;
+            bool belowWorld = _fallPosY[i] < -64f;
+
+            if (landed || timedOut || belowWorld)
+            {
+                _fallActive[i] = false;
+                if (fallingBlockPool[i] != null)
+                    fallingBlockPool[i].gameObject.SetActive(false);
+
+                if (landed)
+                {
+#if LOGGING
+                    stats_fallingBlockLandings++;
+#endif
+                    int placeY = by + 1;
+                    byte existing = world.GetBlock(bx, placeY, bz);
+                    if (existing == B_AIR || existing == B_FIRE ||
+                        existing == B_WATER_FLOWING || existing == B_WATER_STILL ||
+                        existing == B_LAVA_FLOWING || existing == B_LAVA_STILL)
+                    {
+                        world.SetBlock(bx, placeY, bz, _fallBlockId[i]);
+                    }
+                }
+            }
+        }
+    }
+
+#if LOGGING
+    public void AppendAggregatePerformanceStats(StringBuilder sb)
+    {
+        if (sb == null || stats_tickFrames <= 0) return;
+
+        float avgScheduledMs = stats_scheduledTickTimeMs / stats_tickFrames;
+        float avgFlushMs = stats_meshFlushTimeMs / stats_tickFrames;
+        float avgRandomMs = stats_randomTickTimeMs / stats_tickFrames;
+        float avgFallingMs = stats_fallingBlockTimeMs / stats_tickFrames;
+        float totalMs = stats_scheduledTickTimeMs + stats_meshFlushTimeMs + stats_randomTickTimeMs + stats_fallingBlockTimeMs;
+        float avgTotalMs = totalMs / stats_tickFrames;
+
+        sb.AppendLine("Block Ticker:");
+        sb.AppendFormat("  Frames: {0}, avg {1:F3}ms/frame (scheduled {2:F3}ms, mesh flush {3:F3}ms, random {4:F3}ms, falling {5:F3}ms)\n",
+            stats_tickFrames, avgTotalMs, avgScheduledMs, avgFlushMs, avgRandomMs, avgFallingMs);
+        sb.AppendFormat("  Scheduled ticks: {0} processed, queue peak {1}/{2}\n",
+            stats_scheduledTicksProcessed, stats_queuePeakCount, TICK_QUEUE_CAPACITY);
+        if (stats_queueOverflows > 0)
+            sb.AppendFormat("  WARNING: {0} tick queue overflows\n", stats_queueOverflows);
+        sb.AppendFormat("  Random ticks: {0} dispatches across {1} chunk scans\n",
+            stats_randomTicksProcessed, stats_randomTickChunksScanned);
+
+        int totalDispatches = stats_dispatchWaterFlowing + stats_dispatchLavaFlowing +
+            stats_dispatchLavaStill + stats_dispatchFire + stats_dispatchSand +
+            stats_dispatchGrass + stats_dispatchLeaves + stats_dispatchCactus +
+            stats_dispatchReed + stats_dispatchSapling + stats_dispatchFarmland +
+            stats_dispatchIce + stats_dispatchSnow + stats_dispatchCrops + stats_dispatchOther;
+
+        if (totalDispatches > 0)
+        {
+            sb.AppendFormat("  Dispatch breakdown ({0} total):\n", totalDispatches);
+            if (stats_dispatchWaterFlowing > 0) sb.AppendFormat("    water_flowing: {0}\n", stats_dispatchWaterFlowing);
+            if (stats_dispatchLavaFlowing > 0) sb.AppendFormat("    lava_flowing: {0}\n", stats_dispatchLavaFlowing);
+            if (stats_dispatchLavaStill > 0) sb.AppendFormat("    lava_still(ignition): {0}\n", stats_dispatchLavaStill);
+            if (stats_dispatchFire > 0) sb.AppendFormat("    fire: {0}\n", stats_dispatchFire);
+            if (stats_dispatchSand > 0) sb.AppendFormat("    sand/gravel: {0}\n", stats_dispatchSand);
+            if (stats_dispatchGrass > 0) sb.AppendFormat("    grass: {0}\n", stats_dispatchGrass);
+            if (stats_dispatchLeaves > 0) sb.AppendFormat("    leaves: {0}\n", stats_dispatchLeaves);
+            if (stats_dispatchCactus > 0) sb.AppendFormat("    cactus: {0}\n", stats_dispatchCactus);
+            if (stats_dispatchReed > 0) sb.AppendFormat("    reed: {0}\n", stats_dispatchReed);
+            if (stats_dispatchSapling > 0) sb.AppendFormat("    sapling: {0}\n", stats_dispatchSapling);
+            if (stats_dispatchFarmland > 0) sb.AppendFormat("    farmland: {0}\n", stats_dispatchFarmland);
+            if (stats_dispatchIce > 0) sb.AppendFormat("    ice: {0}\n", stats_dispatchIce);
+            if (stats_dispatchSnow > 0) sb.AppendFormat("    snow: {0}\n", stats_dispatchSnow);
+            if (stats_dispatchCrops > 0) sb.AppendFormat("    crops: {0}\n", stats_dispatchCrops);
+            if (stats_dispatchOther > 0) sb.AppendFormat("    other: {0}\n", stats_dispatchOther);
+        }
+
+        if (stats_fallingBlockSpawns > 0 || stats_fallingBlockLandings > 0 || stats_fallingBlockPoolExhausted > 0)
+        {
+            sb.AppendFormat("  Falling blocks: {0} spawned, {1} landed, {2} pool exhausted, peak active {3}/{4}\n",
+                stats_fallingBlockSpawns, stats_fallingBlockLandings, stats_fallingBlockPoolExhausted,
+                stats_activeFallingPeak, FALL_POOL_MAX);
+        }
+    }
+
+    public void ResetAggregatePerformanceStats()
+    {
+        stats_scheduledTickTimeMs = 0f;
+        stats_meshFlushTimeMs = 0f;
+        stats_randomTickTimeMs = 0f;
+        stats_fallingBlockTimeMs = 0f;
+        stats_scheduledTicksProcessed = 0;
+
+        stats_randomTicksProcessed = 0;
+        stats_randomTickChunksScanned = 0;
+        stats_tickFrames = 0;
+        stats_queuePeakCount = 0;
+        stats_queueOverflows = 0;
+        stats_fallingBlockSpawns = 0;
+        stats_fallingBlockLandings = 0;
+        stats_fallingBlockPoolExhausted = 0;
+        stats_activeFallingPeak = 0;
+        stats_dispatchWaterFlowing = 0;
+        stats_dispatchLavaFlowing = 0;
+        stats_dispatchLavaStill = 0;
+        stats_dispatchFire = 0;
+        stats_dispatchSand = 0;
+        stats_dispatchGrass = 0;
+        stats_dispatchLeaves = 0;
+        stats_dispatchCactus = 0;
+        stats_dispatchReed = 0;
+        stats_dispatchSapling = 0;
+        stats_dispatchFarmland = 0;
+        stats_dispatchIce = 0;
+        stats_dispatchSnow = 0;
+        stats_dispatchCrops = 0;
+        stats_dispatchOther = 0;
+        stats_tickSetBlockCalls = 0;
+    }
+#endif
+}

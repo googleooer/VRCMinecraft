@@ -697,6 +697,9 @@ public class McBlockTypeManager : UdonSharpBehaviour
                 sideSlice = BETA_SLICE_REDSTONE_TORCH_ON;
                 lightEmission = 7;
                 return true;
+            case 51: // fire
+                lightEmission = 15;
+                return true;
         }
 
         return false;

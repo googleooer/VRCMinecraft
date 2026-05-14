@@ -58,6 +58,11 @@ public class ChunkData
     public byte _chunkGlobalMinZ = 255, _chunkGlobalMaxZ = 0;
     public byte[] torchMountData;
 
+    // --- Block Metadata (Beta 1.7.3 style) ---
+    // Per-voxel metadata (water flow level, fire age, cactus/reed growth, leaf decay flags, etc.)
+    // Index: y * 256 + z * 16 + x
+    public byte[] blockMetadata;
+
     // --- GPU Face Extraction State ---
     public int _gpuFaceSlotIndex = -1;
     public int _gpuFaceReadbackQueueSlot = -1;

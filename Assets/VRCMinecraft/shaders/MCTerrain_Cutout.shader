@@ -4,9 +4,11 @@ Shader "Unlit/MCTerrain (Cutout)"
     {
         _MainTex ("Texture Array", 2DArray) = "white" {}
         _TintMask ("Tint Mask Array", 2DArray) = "black" {}
+        _FireTex ("Fire Strip Texture", 2D) = "black" {}
         _BiomeColor ("Biome Color", Color) = (1,1,1,0)
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
+        _FireSpeed ("Fire Anim Speed", Float) = 20.0
 
         // MINECRAFT-STYLE RADIAL FOG PROPERTIES
         _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0)
@@ -55,9 +57,11 @@ Shader "Unlit/MCTerrain (Cutout)"
             UNITY_DECLARE_TEX2DARRAY(_MainTex);
             float4 _MainTex_ST;
             UNITY_DECLARE_TEX2DARRAY(_TintMask);
+            sampler2D _FireTex;
 
             int _SkyLight;
             half _DayProgress;
+            float _FireSpeed;
 
             fixed4 _BiomeColor;
 
@@ -187,13 +191,39 @@ Shader "Unlit/MCTerrain (Cutout)"
 
             fixed4 frag (v2f i) : SV_Target
             {
-                fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
+                fixed4 col;
 
-                // DEBUG: return raw texture color - bypass ALL tinting, lighting, fog
+                // Fire: sample from dedicated strip texture, step through 32 frames
+                if (i.color.g < 0.01)
+                {
+                    // Step through frames discretely like MC tick-based animation
+                    float frameIndex = floor(fmod(_Time.y * 20.0, 32.0));
+                    float frameOffset = frameIndex / 32.0;
+                    float2 fireUV = float2(i.uvw.x, i.uvw.y + frameOffset);
+                    col = tex2D(_FireTex, fireUV);
+                }
+                else
+                {
+                    col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
+                }
                 clip(col.a - 0.1);
+
+                // Apply lighting
+                half faceBrightness = calcBrightness(i.normal);
+                half lightBrightness = max(0.02, i.color.a);
+                half gpuLight = sampleGpuLightBrightness(i.worldPos, i.normal);
+                if (gpuLight >= 0.0) lightBrightness = max(0.02, gpuLight);
+                col.rgb *= GammaToLinearSpace((lightBrightness * faceBrightness).xxx).x;
+
+                // Fog
+                half fogFactor = calcMinecraftFog(i.worldPos);
+                col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
+
+                UNITY_APPLY_FOG(i.fogCoord, col);
                 return col;
             }
             ENDCG
         }
     }
 }
+

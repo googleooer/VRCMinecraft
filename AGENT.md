@@ -4,6 +4,8 @@ When consulting the Minecraft Beta 1.7.3 source code, only check *.java files.
 You can consult Minecraft Beta 1.7.3's source code from F:\vrchat_projects\VRCMinecraft_Beta173_Deobf\RetroMCP
 You can check .unity scene files to get the structure of a scene.
 
+When generating scripts that are just for the editor, make sure that you're doing it properly so it doesn't trigger UdonSharp. See Assets/Editor/VRCMinecraft/ for reference.
+
 # UdonSharp limitations
 Always make sure to check udon_blacklisted.txt, udon_whitelisted_types.txt, and udon_whitelisted.txt
 Local method declarations are not currently supported by UdonSharp.

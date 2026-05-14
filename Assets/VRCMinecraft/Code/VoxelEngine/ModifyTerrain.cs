@@ -1,4 +1,4 @@
-﻿using UdonSharp;
+using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using VRC.Udon.Common;
@@ -388,7 +388,7 @@ public class ModifyTerrain : UdonSharpBehaviour
     {
         if (placeableBlockPalette == null || placeableBlockPalette.Length == 0)
         {
-            placeableBlockPalette = new byte[] { 1, 2, 3, 4, 5, 20, 50, 75, 76 };
+            placeableBlockPalette = new byte[] { 1, 2, 12, 4, 5, 50, 8, 10, 51 };
         }
 
         if (_selectedPlaceableBlockIndex < 0 || _selectedPlaceableBlockIndex >= placeableBlockPalette.Length)

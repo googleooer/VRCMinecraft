@@ -42,6 +42,10 @@ public class McMovement : NUMovement
     private bool inWeb;
     private float groundSlipperiness = DEFAULT_SLIPPERINESS;
     private bool hasEnvironmentStateSample;
+    private int[] _flowDxArr;
+    private int[] _flowDzArr;
+    private float[] _solidAheadOffsets;
+    private float[] _envSampleHeights;
 
     protected override void ControllerStart()
     {
@@ -65,6 +69,11 @@ public class McMovement : NUMovement
         mcVelocity = Vector3.zero;
         Velocity = Vector3.zero;
         hasEnvironmentStateSample = false;
+
+        _flowDxArr = new int[] { -1, 0, 1, 0 };
+        _flowDzArr = new int[] { 0, -1, 0, 1 };
+        _solidAheadOffsets = new float[] { -0.3f, 0f, 0.3f };
+        _envSampleHeights = new float[3];
     }
 
     protected override void ControllerUpdate()
@@ -170,6 +179,12 @@ public class McMovement : NUMovement
     private void SimulateFluid(float strafe, float forward, float tickRatio, bool jumpPressed, float accel)
     {
         ApplyMoveFlying(strafe, forward, accel, tickRatio);
+
+        // MC: BlockFluid.velocityToAddToEntity — flow pushes the player
+        Vector3 flowVec = GetFlowVector();
+        mcVelocity.x += flowVec.x * tickRatio;
+        mcVelocity.y += flowVec.y * tickRatio;
+        mcVelocity.z += flowVec.z * tickRatio;
 
         if (jumpPressed)
         {
@@ -341,16 +356,13 @@ public class McMovement : NUMovement
         blockBelowId = SampleBlock(footCenter);
         groundSlipperiness = GetSlipperiness(blockBelowId);
 
-        float[] sampleHeights = new float[]
-        {
-            basePos.y - halfHeight + 0.1f,
-            basePos.y,
-            basePos.y + halfHeight - 0.1f
-        };
+        _envSampleHeights[0] = basePos.y - halfHeight + 0.1f;
+        _envSampleHeights[1] = basePos.y;
+        _envSampleHeights[2] = basePos.y + halfHeight - 0.1f;
 
-        for (int i = 0; i < sampleHeights.Length; i++)
+        for (int i = 0; i < _envSampleHeights.Length; i++)
         {
-            float y = sampleHeights[i];
+            float y = _envSampleHeights[i];
             Vector3 centerSample = new Vector3(basePos.x, y, basePos.z);
             InspectBlock(centerSample);
             InspectBlock(new Vector3(basePos.x + radius, y, basePos.z));
@@ -546,11 +558,10 @@ public class McMovement : NUMovement
         Vector3 origin = transform.position + Controller.center;
         Vector3 dir = horizontal.normalized;
         float probeDistance = Controller.radius + 0.12f;
-        float[] heightOffsets = { -0.3f, 0f, 0.3f };
 
-        for (int i = 0; i < heightOffsets.Length; i++)
+        for (int i = 0; i < _solidAheadOffsets.Length; i++)
         {
-            Vector3 samplePoint = origin + ControllerUp * heightOffsets[i] + dir * probeDistance;
+            Vector3 samplePoint = origin + ControllerUp * _solidAheadOffsets[i] + dir * probeDistance;
             byte blockId = SampleBlock(samplePoint);
             if (IsSolidBlock(blockId))
             {
@@ -612,6 +623,79 @@ public class McMovement : NUMovement
         }
 
         return blockId == (byte)BlockMaterial.LAVA || blockId == (byte)BlockMaterial.STATIONARY_LAVA;
+    }
+
+    private int GetEffectiveFlowDecay(int x, int y, int z, bool water)
+    {
+        byte b = world.GetBlock(x, y, z);
+        if (water)
+        {
+            if (b != (byte)BlockMaterial.WATER && b != (byte)BlockMaterial.STATIONARY_WATER) return -1;
+        }
+        else
+        {
+            if (b != (byte)BlockMaterial.LAVA && b != (byte)BlockMaterial.STATIONARY_LAVA) return -1;
+        }
+        int meta = world.GetBlockMetadata(x, y, z);
+        if (meta >= 8) meta = 0;
+        return meta;
+    }
+
+    private Vector3 GetFlowVector()
+    {
+        if (world == null) return Vector3.zero;
+
+        Vector3 feetPos = transform.position;
+        int bx = Mathf.FloorToInt(feetPos.x);
+        int by = Mathf.FloorToInt(feetPos.y);
+        int bz = Mathf.FloorToInt(feetPos.z);
+        if (flipXAxis) bx = -bx;
+
+        bool water = inWater;
+        int selfDecay = GetEffectiveFlowDecay(bx, by, bz, water);
+        if (selfDecay < 0) return Vector3.zero;
+
+        float vx = 0f;
+        float vz = 0f;
+
+        // MC checks 4 horizontal neighbors: -X, -Z, +X, +Z
+        for (int d = 0; d < 4; d++)
+        {
+            int nx = bx + _flowDxArr[d];
+            int nz = bz + _flowDzArr[d];
+            int neighborDecay = GetEffectiveFlowDecay(nx, by, nz, water);
+
+            if (neighborDecay < 0)
+            {
+                byte nb = world.GetBlock(nx, by, nz);
+                if (nb == 0 || !IsSolidBlock(nb))
+                {
+                    int belowDecay = GetEffectiveFlowDecay(nx, by - 1, nz, water);
+                    if (belowDecay >= 0)
+                    {
+                        int diff = belowDecay - (selfDecay - 8);
+                        vx += _flowDxArr[d] * diff;
+                        vz += _flowDzArr[d] * diff;
+                    }
+                }
+            }
+            else
+            {
+                int diff = neighborDecay - selfDecay;
+                vx += _flowDxArr[d] * diff;
+                vz += _flowDzArr[d] * diff;
+            }
+        }
+
+        Vector3 flow = new Vector3(vx, 0f, vz);
+        if (flow.sqrMagnitude > 0.0001f)
+            flow = flow.normalized;
+
+        // MC: velocityToAddToEntity uses the normalized flow vector
+        // Scale to a reasonable push force per tick (MC adds raw normalized vector)
+        float pushStrength = 0.014f;
+        if (flipXAxis) flow.x = -flow.x;
+        return flow * pushStrength;
     }
 
     private void EmitWaterEntryParticles()

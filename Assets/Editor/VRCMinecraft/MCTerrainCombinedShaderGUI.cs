@@ -69,6 +69,17 @@ public class MCTerrainCombinedShaderGUI : ShaderGUI
         if (currentSurfaceType == SurfaceType.Cutout)
         {
             materialEditor.RangeProperty(cutoffProp, "Alpha Cutoff");
+
+            MaterialProperty fireTexProp = FindProperty("_FireTex", props, false);
+            MaterialProperty fireSpeedProp = FindProperty("_FireSpeed", props, false);
+            if (fireTexProp != null)
+            {
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField("Fire Animation", EditorStyles.boldLabel);
+                materialEditor.TexturePropertySingleLine(new GUIContent("Fire Strip Texture", "16x512 fire animation strip (32 frames)"), fireTexProp);
+                if (fireSpeedProp != null)
+                    materialEditor.FloatProperty(fireSpeedProp, "Fire Anim Speed (fps)");
+            }
         }
         
         EditorGUILayout.Space();

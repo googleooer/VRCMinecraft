@@ -6,6 +6,7 @@ Shader "Unlit/MCTerrain (Transparent)"
         _BiomeColor ("Biome Color", Color) = (1,1,1,0)
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
+        _LavaTex ("Lava Strip Texture", 2D) = "white" {}
 
         // MINECRAFT-STYLE RADIAL FOG PROPERTIES
         _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0)
@@ -25,6 +26,7 @@ Shader "Unlit/MCTerrain (Transparent)"
         Pass
         {
             Blend SrcAlpha OneMinusSrcAlpha
+            ZWrite On
 
             CGPROGRAM
             #pragma vertex vert
@@ -67,6 +69,7 @@ Shader "Unlit/MCTerrain (Transparent)"
             half _FogEnd;
             half _FogMode;
             float _UseGpuExactAo;
+            sampler2D _LavaTex;
 
             // GPU LIGHT ATLAS GLOBALS
             sampler2D _UdonVRCM_GpuLightAtlas;
@@ -205,7 +208,54 @@ Shader "Unlit/MCTerrain (Transparent)"
 
             fixed4 frag (v2f i) : SV_Target
             {
-                fixed4 col = tex2D(_MainTex, round(i.uv)) * half4(_BiomeColor.rgb,1);
+                bool isWaterOrLava = (i.color.b < 0.01);
+                bool isLava = (i.color.g < 0.01 && isWaterOrLava);
+                fixed4 col;
+
+                if (isLava)
+                {
+                    // Lava: sample from animated strip, 20fps, 32 frames
+                    float frameIndex = floor(fmod(_Time.y * 20.0, 32.0));
+                    float frameOffset = frameIndex / 32.0;
+                    float2 lavaUV = float2(i.uv.x, frac(i.uv.y) / 32.0 + frameOffset);
+                    col = tex2D(_LavaTex, lavaUV);
+                    // Fallback: if texture not assigned (near-white from default), use MC lava orange
+                    if (col.r > 0.99 && col.g > 0.99 && col.b > 0.99)
+                        col = fixed4(1.0, 0.42, 0.0, 1.0);
+                    col.a = 1.0;
+
+                    // Lava emits its own light (lightValue=15 in MC), so it's always fully bright
+                    half lavaLight = max(0.02, i.color.a);
+                    half lavaFace = 1.0;
+                    half lavaBrightness = GammaToLinearSpace((lavaLight * lavaFace).xxx).x;
+                    col.rgb *= lavaBrightness;
+
+                    half fogFactor = calcMinecraftFog(i.worldPos);
+                    col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
+                    UNITY_APPLY_FOG(i.fogCoord, col);
+                    return col;
+                }
+
+                if (isWaterOrLava)
+                {
+                    // Water path
+                    col = tex2D(_MainTex, round(i.uv)) * half4(_BiomeColor.rgb, 1);
+
+                    half lightBrightness = max(0.02, i.color.a);
+                    // MC uses 1.0 for all water faces regardless of normal direction.
+                    // The per-face multipliers (0.5 bottom, 0.8 N/S, 0.6 E/W) are baked
+                    // into the CPU brightness via _GetWaterBlockBrightness sampling the neighbor.
+                    half combinedBrightness = GammaToLinearSpace(lightBrightness.xxx).x;
+                    col.rgb *= combinedBrightness;
+
+                    half fogFactor = calcMinecraftFog(i.worldPos);
+                    col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
+                    UNITY_APPLY_FOG(i.fogCoord, col);
+                    return col;
+                }
+
+                // Non-fluid transparent block (e.g. glass, ice)
+                col = tex2D(_MainTex, round(i.uv)) * half4(_BiomeColor.rgb, 1);
 
                 half minLightLevel = 0.02;
                 half lightBrightness;
@@ -232,7 +282,6 @@ Shader "Unlit/MCTerrain (Transparent)"
                 combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
                 col.rgb *= combinedBrightness;
 
-                // MINECRAFT-STYLE RADIAL FOG
                 half fogFactor = calcMinecraftFog(i.worldPos);
                 col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
 
