@@ -11,6 +11,9 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
         [HideInInspector] _WaterFlowSlice ("Water Flow Slice", Float) = -1
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
+        _FireTex ("Fire Strip Texture", 2D) = "black" {}
+        _LavaTex ("Lava Strip Texture", 2D) = "white" {}
+        _FireSpeed ("Fire Anim Speed", Float) = 20.0
         _Cutoff ("Alpha Cutoff", Range(0.0, 1.0)) = 0.5 // ADDED: Alpha cutoff for Cutout mode
         _UseVertexLight ("Use Vertex Light", Float) = 1
         [HideInInspector] _UseGpuExactAo ("Use GPU Exact AO", Float) = 0
@@ -96,6 +99,9 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
 
             int _SkyLight;
             half _DayProgress;
+            sampler2D _FireTex;
+            sampler2D _LavaTex;
+            float _FireSpeed;
             
             // MINECRAFT-STYLE RADIAL FOG VARIABLES
             fixed4 _FogColor;
@@ -178,24 +184,69 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
 
             fixed4 frag (v2f i) : SV_Target
             {
-                fixed4 col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
-                fixed4 tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw);
-                fixed4 waterStill = tex2D(_WaterStillTex, i.uvw.xy).rgba;
-                fixed4 waterFlow = tex2D(_WaterFlowTex, i.uvw.xy).rgba;
-                fixed stillWeight = saturate(1.0 - abs(i.uvw.z - _WaterStillSlice) * 4.0);
-                fixed flowWeight = saturate(1.0 - abs(i.uvw.z - _WaterFlowSlice) * 4.0) * (1.0 - stillWeight);
-                fixed waterWeight = saturate(stillWeight + flowWeight);
-                fixed4 waterCol = lerp(waterFlow, waterStill, stillWeight);
-                col = lerp(col, waterCol, waterWeight);
+                fixed4 col;
+                // Fire: green=0, blue=1. Lava: green=0, blue=0. Water: green=1, blue=0.
+                bool isFire = (i.color.g < 0.01 && i.color.b > 0.5);
+                bool isLava = (i.color.g < 0.01 && i.color.b < 0.01);
+                bool isWater = (!isLava && !isFire && i.color.b < 0.01);
 
-                // Biome tinting: col.rgb (not col.r) so colored textures like flowers keep their color.
-                // For grayscale textures (grass/leaves), R≈G≈B so col.rgb*biome == col.r*biome.
-                fixed3 tintedColor = col.rgb * i.color.rgb;
-                col.rgb = lerp(col.rgb, tintedColor, tintInput.a * (1.0 - waterWeight));
+                if (isLava)
+                {
+                    float3 viewDir = normalize(_WorldSpaceCameraPos - i.worldPos);
+                    if (dot(i.normal, viewDir) < 0) discard;
+
+                    bool isFlowingLava = (i.color.r > 0.25);
+                    float frameIndex = floor(fmod(_Time.y * 10.0, 64.0));
+                    float frameOffset = frameIndex / 64.0;
+                    // Flowing lava scrolls downward (MC TextureLavaFlowFX), still lava doesn't
+                    float scrollOffset = isFlowingLava ? _Time.y * 1.25 : 0.0;
+                    float2 lavaUV = float2(frac(i.uvw.x), frac(i.uvw.y - scrollOffset) / 64.0 + frameOffset);
+                    col = tex2D(_LavaTex, lavaUV);
+                    // Fallback if texture not assigned (white default)
+                    if (col.r > 0.99 && col.g > 0.99 && col.b > 0.99)
+                        col = fixed4(1.0, 0.42, 0.0, 1.0);
+                    col.a = 1.0;
+                }
+                else if (isFire)
+                {
+                    float frameIndex = floor(fmod(_Time.y * 20.0, 32.0));
+                    float frameOffset = frameIndex / 32.0;
+                    float2 fireUV = float2(i.uvw.x, i.uvw.y + frameOffset);
+                    col = tex2D(_FireTex, fireUV);
+                }
+                else
+                {
+                    col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
+                }
+                fixed4 tintInput = fixed4(0,0,0,0);
+                fixed waterWeight = 0;
+                if (!isFire && !isLava)
+                {
+                    tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw);
+                    fixed4 waterStill = tex2D(_WaterStillTex, i.uvw.xy).rgba;
+                    fixed4 waterFlow = tex2D(_WaterFlowTex, i.uvw.xy).rgba;
+                    fixed stillWeight = saturate(1.0 - abs(i.uvw.z - _WaterStillSlice) * 4.0);
+                    fixed flowWeight = saturate(1.0 - abs(i.uvw.z - _WaterFlowSlice) * 4.0) * (1.0 - stillWeight);
+                    waterWeight = saturate(stillWeight + flowWeight);
+                    fixed4 waterCol = lerp(waterFlow, waterStill, stillWeight);
+                    col = lerp(col, waterCol, waterWeight);
+
+                    fixed3 tintedColor = col.rgb * i.color.rgb;
+                    col.rgb = lerp(col.rgb, tintedColor, tintInput.a * (1.0 - waterWeight));
+                }
                 
                 half minLightLevel = 0.02;
                 half lightBrightness;
-                if (_UseGpuExactAo > 0.5)
+                // Water/lava: MC uses max(lightAt(self), lightAt(above)) to avoid self-darkening
+                // from lightOpacity. Sample both the block's position and one block above.
+                if (isWater || isLava)
+                {
+                    half selfLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos);
+                    half aboveLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos + float3(0, 1, 0));
+                    half fluidLight = max(selfLight, aboveLight);
+                    lightBrightness = max(minLightLevel, fluidLight >= 0.0 ? fluidLight : i.color.a);
+                }
+                else if (_UseGpuExactAo > 0.5)
                 {
                     // Cross-shaped blocks have diagonal normals — AO basis doesn't apply.
                     bool isCrossNormal = max(max(abs(i.normal.x), abs(i.normal.y)), abs(i.normal.z)) < 0.9;
@@ -227,7 +278,8 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                     }
                 }
                 
-                half faceBrightness = calcBrightness(i.normal);
+                // Water and lava use faceBrightness=1.0 (MC behavior: no directional shading on fluid surfaces)
+                half faceBrightness = (isWater || isLava) ? 1.0 : calcBrightness(i.normal);
                 half combinedBrightness = lightBrightness * faceBrightness;
                 combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
                 

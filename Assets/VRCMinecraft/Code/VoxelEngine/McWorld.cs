@@ -87,6 +87,8 @@ public class McWorld : UdonSharpBehaviour
     public McBlockTypeManager blockTypeManager;
     [SerializeField, FindObjectOfType(true)]
     private McCoordinator coordinator;
+    [SerializeField, FindObjectOfType(true)]
+    private McBlockTicker blockTicker;
 
     [Header("Biome Color Textures (Beta 1.7.3)")]
     [Tooltip("grasscolor.png from Beta 1.7.3 (256x256)")]
@@ -95,6 +97,10 @@ public class McWorld : UdonSharpBehaviour
     public Texture2D foliageColorTexture;
     [Tooltip("watercolor.png from Beta 1.7.3 (256x256)")]
     public Texture2D waterColorTexture;
+    [Tooltip("Generated fire animation strip (16x512, 32 frames). Use Tools > VRCMinecraft > Generate Fire Texture.")]
+    public Texture2D fireStripTexture;
+    [Tooltip("Generated lava animation strip (16x512, 32 frames). Use Tools > VRCMinecraft > Generate Lava Texture.")]
+    public Texture2D lavaStripTexture;
     [Tooltip("Minecraft Beta 1.7.3-style smooth lighting and ambient occlusion for terrain.")]
     public bool ambientOcclusion = true;
 
@@ -246,6 +252,20 @@ public class McWorld : UdonSharpBehaviour
 
     // --- GPU Voxel Backend State ---
     private bool gpuBackendReady = false;
+
+    // Deferred GPU sync: block ticker sets this so multiple SetBlock calls in one
+    // tick batch share a single GPU chunk upload instead of one per voxel write.
+    private bool _gpuSyncDeferred = false;
+    private int[] _gpuDeferredDirtyChunks;
+    private int _gpuDeferredDirtyCount = 0;
+    private const int GPU_DEFERRED_DIRTY_MAX = 64;
+
+    // Deferred mesh updates: block ticker sets this so mesh rebuilds are batched
+    // after all ticks instead of firing inline per SetBlock
+    private bool _meshUpdateDeferred = false;
+    private int[] _meshDeferredDirtyChunks;
+    private int _meshDeferredDirtyCount = 0;
+    private const int MESH_DEFERRED_DIRTY_MAX = 64;
     private int gpuAtlasSlotsX = 1;
     private int gpuAtlasSlotsY = 1;
     private int gpuTileWidth = 16;
@@ -903,6 +923,7 @@ public class McWorld : UdonSharpBehaviour
             int emission = blockTypeManager.GetBlockLightEmission(blockId);
             int shape = _UsesCustomBlockMesh(blockId, null, 0) ? (int)McBlockShapeType.Cross : (int)blockTypeManager.GetBlockShapeType(blockId);
             bool opaqueCube = blockId != 0
+                && !_IsFluidBlock(blockId)
                 && blockTypeManager.GetBlockVisibilityType(blockId) == BlockVisibilityType.Opaque
                 && shape == (int)McBlockShapeType.Cube;
             pixels[i] = new Color32(
@@ -1457,6 +1478,53 @@ public class McWorld : UdonSharpBehaviour
         chunk._borderMissingMask = missingMask;
         borderTexture.SetPixels32(borderPixels);
         borderTexture.Apply(false, false);
+    }
+
+    public void BeginDeferredGpuSync()
+    {
+        if (_gpuDeferredDirtyChunks == null)
+            _gpuDeferredDirtyChunks = new int[GPU_DEFERRED_DIRTY_MAX];
+        _gpuDeferredDirtyCount = 0;
+        _gpuSyncDeferred = true;
+    }
+
+    public void FlushDeferredGpuSync()
+    {
+        _gpuSyncDeferred = false;
+        for (int i = 0; i < _gpuDeferredDirtyCount; i++)
+        {
+            int ci = _gpuDeferredDirtyChunks[i];
+            if (ci < 0 || chunks_1D == null || ci >= chunks_1D.Length) continue;
+            ChunkData chunk = chunks_1D[ci];
+            if (chunk == null || !chunk.isDataReady) continue;
+            _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+        }
+        _gpuDeferredDirtyCount = 0;
+    }
+
+    public void EndDeferredGpuSync()
+    {
+        _gpuSyncDeferred = false;
+        _gpuDeferredDirtyCount = 0;
+    }
+
+    public void BeginDeferredMeshUpdates()
+    {
+        if (_meshDeferredDirtyChunks == null)
+            _meshDeferredDirtyChunks = new int[MESH_DEFERRED_DIRTY_MAX];
+        _meshDeferredDirtyCount = 0;
+        _meshUpdateDeferred = true;
+    }
+
+    public void FlushDeferredMeshUpdates()
+    {
+        _meshUpdateDeferred = false;
+        for (int i = 0; i < _meshDeferredDirtyCount; i++)
+        {
+            int ci = _meshDeferredDirtyChunks[i];
+            RequestChunkMeshUpdate(ci);
+        }
+        _meshDeferredDirtyCount = 0;
     }
 
     private void _GpuSyncChunkBlocks(ChunkData chunk, byte[] blockData)
@@ -2656,7 +2724,7 @@ public class McWorld : UdonSharpBehaviour
                             int idx = y * waterStride + col;
                             if (idx >= decompLen) break;
                             byte blockID = chunk._decompSelf[idx];
-                            if (!_IsWaterBlock(blockID)) continue;
+                            if (!_IsWaterBlock(blockID) && !_IsLavaBlock(blockID)) continue;
                             _AddWaterBlock(chunk, x, y, z, blockID);
                         }
                         if (--waterBudgetCountdown <= 0)
@@ -2745,6 +2813,12 @@ public class McWorld : UdonSharpBehaviour
 
     private void _AddCrossBlockQuads(ChunkData chunk, byte blockID, int x, int y, int z)
     {
+        if (blockID == 51)
+        {
+            BlockVisibilityType vis = (blockID < visibilityCache.Length) ? visibilityCache[blockID] : BlockVisibilityType.Cutout;
+            _AddFireBlock(chunk, new Vector3(x, y, z), vis);
+            return;
+        }
         float textureSlice = (blockID < uv_allFacesCache.Length) ? uv_allFacesCache[blockID] : 0;
         Color biomeColor = _GetCachedBiomeColor(chunk, blockID, x, z);
         biomeColor.a = 1.0f;
@@ -2829,6 +2903,7 @@ public class McWorld : UdonSharpBehaviour
         _EnableSharedChunkMaterialInstancing(sharedOpaqueChunkMaterial);
         _EnableSharedChunkMaterialInstancing(sharedTransparentChunkMaterial);
         _EnableSharedChunkMaterialInstancing(sharedCutoutChunkMaterial);
+        _ApplyFireTextureToMaterials();
         _ApplyTerrainLightingSourceToSharedMaterials();
     }
 
@@ -2836,6 +2911,29 @@ public class McWorld : UdonSharpBehaviour
     {
         if (material == null) return;
         if (!material.enableInstancing) material.enableInstancing = true;
+    }
+
+    private void _ApplyFireTextureToMaterials()
+    {
+        if (fireStripTexture != null)
+        {
+            int fireTexId = VRCShader.PropertyToID("_FireTex");
+            int fireSpeedId = VRCShader.PropertyToID("_FireSpeed");
+            Material[] fireMats = new Material[] { sharedOpaqueChunkMaterial, sharedCutoutChunkMaterial };
+            for (int i = 0; i < fireMats.Length; i++)
+            {
+                Material m = fireMats[i];
+                if (m == null) continue;
+                m.SetTexture(fireTexId, fireStripTexture);
+                m.SetFloat(fireSpeedId, 20f);
+            }
+        }
+
+        if (lavaStripTexture != null && sharedTransparentChunkMaterial != null)
+        {
+            int lavaTexId = VRCShader.PropertyToID("_LavaTex");
+            sharedTransparentChunkMaterial.SetTexture(lavaTexId, lavaStripTexture);
+        }
     }
 
     private RenderTexture _CreateWaterRT(string name, bool isStateTexture)
@@ -3047,6 +3145,7 @@ public class McWorld : UdonSharpBehaviour
 
         _UpdateBetaWaterAnimation();
         ProcessActiveChunks();
+        if (blockTicker != null) blockTicker.Tick();
         _UpdateGpuDebugHud();
 
 #if LOGGING
@@ -3980,6 +4079,18 @@ public class McWorld : UdonSharpBehaviour
     {
         if (chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length) return;
 
+        // During tick batch processing, collect dirty chunks instead of building immediately
+        if (_meshUpdateDeferred)
+        {
+            if (_meshDeferredDirtyChunks != null && _meshDeferredDirtyCount < MESH_DEFERRED_DIRTY_MAX)
+            {
+                for (int i = 0; i < _meshDeferredDirtyCount; i++)
+                    if (_meshDeferredDirtyChunks[i] == chunkIndex) return;
+                _meshDeferredDirtyChunks[_meshDeferredDirtyCount++] = chunkIndex;
+            }
+            return;
+        }
+
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk != null
             && chunk.interactionMeshPriority
@@ -4012,6 +4123,30 @@ public class McWorld : UdonSharpBehaviour
         int localZ = globalZ & CHUNK_SIZE_MASK;
 
         return _GetBlockLocal(chunk, localX, localY, localZ);
+    }
+
+    // Combined block+metadata lookup (one chunk resolve instead of two).
+    // Returns block type; caller reads lastMetaResult for the metadata.
+    [System.NonSerialized] public byte lastMetaResult;
+
+    public byte GetBlockAndMeta(int globalX, int globalY, int globalZ)
+    {
+        int cx = globalX >> CHUNK_SIZE_SHIFT;
+        int cy = globalY >> CHUNK_SIZE_SHIFT;
+        int cz = globalZ >> CHUNK_SIZE_SHIFT;
+        ChunkData chunk = GetChunkAt(cx, cy, cz);
+        if (chunk == null || !chunk.isDataReady)
+        {
+            lastMetaResult = 0;
+            return 0;
+        }
+        int lx = globalX & CHUNK_SIZE_MASK;
+        int ly = globalY & CHUNK_SIZE_MASK;
+        int lz = globalZ & CHUNK_SIZE_MASK;
+        byte blockType = _GetBlockLocal(chunk, lx, ly, lz);
+        int idx = ly * (chunkSizeXZ * chunkSizeXZ) + lz * chunkSizeXZ + lx;
+        lastMetaResult = (chunk.blockMetadata != null && idx >= 0 && idx < chunk.blockMetadata.Length) ? chunk.blockMetadata[idx] : (byte)0;
+        return blockType;
     }
 
     public bool IsChunkMeshedAt(int globalX, int globalY, int globalZ)
@@ -4077,6 +4212,106 @@ public class McWorld : UdonSharpBehaviour
         _SetTorchMountGlobal(globalX, globalY, globalZ, torchMount, false);
     }
 
+    public byte GetBlockMetadata(int globalX, int globalY, int globalZ)
+    {
+        int cx = globalX >> CHUNK_SIZE_SHIFT;
+        int cy = globalY >> CHUNK_SIZE_SHIFT;
+        int cz = globalZ >> CHUNK_SIZE_SHIFT;
+        ChunkData chunk = GetChunkAt(cx, cy, cz);
+        if (chunk == null || !chunk.isDataReady || chunk.blockMetadata == null) return 0;
+        int idx = (globalY & CHUNK_SIZE_MASK) * (chunkSizeXZ * chunkSizeXZ) + (globalZ & CHUNK_SIZE_MASK) * chunkSizeXZ + (globalX & CHUNK_SIZE_MASK);
+        return (idx >= 0 && idx < chunk.blockMetadata.Length) ? chunk.blockMetadata[idx] : (byte)0;
+    }
+
+    public void SetBlockMetadata(int globalX, int globalY, int globalZ, byte metadata)
+    {
+        int cx = globalX >> CHUNK_SIZE_SHIFT;
+        int cy = globalY >> CHUNK_SIZE_SHIFT;
+        int cz = globalZ >> CHUNK_SIZE_SHIFT;
+        ChunkData chunk = GetChunkAt(cx, cy, cz);
+        if (chunk == null || !chunk.isDataReady) return;
+        if (chunk.blockMetadata == null)
+            chunk.blockMetadata = new byte[chunk._chunkDataSize];
+        int lx = globalX & CHUNK_SIZE_MASK;
+        int ly = globalY & CHUNK_SIZE_MASK;
+        int lz = globalZ & CHUNK_SIZE_MASK;
+        int idx = ly * (chunkSizeXZ * chunkSizeXZ) + lz * chunkSizeXZ + lx;
+        if (idx < 0 || idx >= chunk.blockMetadata.Length) return;
+        byte oldMeta = chunk.blockMetadata[idx];
+        if (oldMeta == metadata) return;
+        chunk.blockMetadata[idx] = metadata;
+
+        // Metadata changed — trigger mesh rebuild so water levels etc. are visible
+        int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        RequestChunkMeshUpdate(chunkIndex);
+        if (blockTicker != null) blockTicker.InvalidateBlockCache(globalX, globalY, globalZ);
+    }
+
+    /// <summary>
+    /// Sets block type AND metadata atomically, then fires notifications.
+    /// MC's setBlockAndMetadataWithNotify — metadata is correct before neighbors read it.
+    /// </summary>
+    public void SetBlockAndMetadata(int globalX, int globalY, int globalZ, byte blockType, byte metadata)
+    {
+        // Pre-write metadata so it's correct when notifications fire
+        int cx = globalX >> CHUNK_SIZE_SHIFT;
+        int cy = globalY >> CHUNK_SIZE_SHIFT;
+        int cz = globalZ >> CHUNK_SIZE_SHIFT;
+        ChunkData chunk = GetChunkAt(cx, cy, cz);
+        if (chunk != null && chunk.isDataReady)
+        {
+            if (chunk.blockMetadata == null)
+                chunk.blockMetadata = new byte[chunk._chunkDataSize];
+            int lx = globalX & CHUNK_SIZE_MASK;
+            int ly = globalY & CHUNK_SIZE_MASK;
+            int lz = globalZ & CHUNK_SIZE_MASK;
+            int idx = ly * (chunkSizeXZ * chunkSizeXZ) + lz * chunkSizeXZ + lx;
+            if (idx >= 0 && idx < chunk.blockMetadata.Length)
+                chunk.blockMetadata[idx] = metadata;
+        }
+
+        // Now set block type — this triggers notifications with metadata already correct
+        _SetBlockGlobal(globalX, globalY, globalZ, blockType, false);
+    }
+
+    /// <summary>
+    /// Public entry point so McBlockTicker can trigger cascading neighbor notifications
+    /// from its own block modifications (e.g. water flowing into a new block).
+    /// </summary>
+    public void NotifyNeighborsOfBlockChange(int globalX, int globalY, int globalZ, byte blockType)
+    {
+        if (blockTicker != null)
+            blockTicker.NotifyNeighborsOfBlockChange(globalX, globalY, globalZ, blockType);
+    }
+
+    /// <summary>
+    /// MC's setBlockAndMetadata + markBlocksDirty/markBlockNeedsUpdate.
+    /// Sets block+metadata and triggers mesh rebuild, but NO neighbor notifications
+    /// and NO onBlockAdded. Used for flowing↔stationary conversions that must not cascade.
+    /// </summary>
+    public void SetBlockAndMetadataSilent(int globalX, int globalY, int globalZ, byte blockType, byte metadata)
+    {
+        int cx = globalX >> CHUNK_SIZE_SHIFT;
+        int cy = globalY >> CHUNK_SIZE_SHIFT;
+        int cz = globalZ >> CHUNK_SIZE_SHIFT;
+        ChunkData chunk = GetChunkAt(cx, cy, cz);
+        if (chunk == null) return;
+
+        // Write metadata
+        if (chunk.blockMetadata == null)
+            chunk.blockMetadata = new byte[chunk._chunkDataSize];
+        int lx = globalX & CHUNK_SIZE_MASK;
+        int ly = globalY & CHUNK_SIZE_MASK;
+        int lz = globalZ & CHUNK_SIZE_MASK;
+        int idx = ly * (chunkSizeXZ * chunkSizeXZ) + lz * chunkSizeXZ + lx;
+        if (idx >= 0 && idx < chunk.blockMetadata.Length)
+            chunk.blockMetadata[idx] = metadata;
+
+        // Write block type + trigger mesh rebuild (no notifications)
+        _SetBlockLocal(chunk, lx, ly, lz, blockType, true, false);
+        if (blockTicker != null) blockTicker.InvalidateBlockCache(globalX, globalY, globalZ);
+    }
+
     private void _SetBlockGlobal(int globalX, int globalY, int globalZ, byte blockType, bool interactionPriority)
     {
         // OPTIMIZATION: Use bitwise operations instead of division/modulus
@@ -4094,13 +4329,30 @@ public class McWorld : UdonSharpBehaviour
         byte oldBlockType = _GetBlockLocal(chunk, localX, localY, localZ);
         _SetBlockLocal(chunk, localX, localY, localZ, blockType, true, interactionPriority);
 
-        // Update lighting if block changed
+        // Update lighting if block changed — skip for fluid transitions to avoid
+        // cascading propagation corruption that turns chunks black
         if (oldBlockType != blockType && chunk.lightData != null && !_UsesGpuTerrainLightSampling())
         {
-            _UpdateBlockLighting(chunk, localX, localY, localZ, oldBlockType, blockType);
+            bool oldIsFluid = oldBlockType == 8 || oldBlockType == 9 || oldBlockType == 10 || oldBlockType == 11;
+            bool newIsFluid = blockType == 8 || blockType == 9 || blockType == 10 || blockType == 11;
+            if (!oldIsFluid && !newIsFluid)
+            {
+                _UpdateBlockLighting(chunk, localX, localY, localZ, oldBlockType, blockType);
+            }
         }
 
-        _DropUnsupportedTorchNeighbors(globalX, globalY, globalZ, interactionPriority);
+        // MC parity: torch support is NOT checked by the changing block.
+        // Torches self-check via onNeighborBlockChange (handled in McBlockTicker._OnNeighborChange).
+
+        if (blockTicker != null)
+        {
+            blockTicker.InvalidateBlockCache(globalX, globalY, globalZ);
+            if (oldBlockType != blockType)
+            {
+                blockTicker.NotifyNeighborsOfBlockChange(globalX, globalY, globalZ, blockType);
+                blockTicker.OnBlockAdded(globalX, globalY, globalZ, blockType);
+            }
+        }
     }
 
     private bool _IsTorchBlock(byte blockType)
@@ -4250,15 +4502,15 @@ public class McWorld : UdonSharpBehaviour
 
     private void _DropUnsupportedTorchNeighbors(int globalX, int globalY, int globalZ, bool interactionPriority)
     {
-        _DropTorchIfUnsupported(globalX - 1, globalY, globalZ, interactionPriority);
-        _DropTorchIfUnsupported(globalX + 1, globalY, globalZ, interactionPriority);
-        _DropTorchIfUnsupported(globalX, globalY - 1, globalZ, interactionPriority);
-        _DropTorchIfUnsupported(globalX, globalY + 1, globalZ, interactionPriority);
-        _DropTorchIfUnsupported(globalX, globalY, globalZ - 1, interactionPriority);
-        _DropTorchIfUnsupported(globalX, globalY, globalZ + 1, interactionPriority);
+        DropTorchIfUnsupported(globalX - 1, globalY, globalZ);
+        DropTorchIfUnsupported(globalX + 1, globalY, globalZ);
+        DropTorchIfUnsupported(globalX, globalY - 1, globalZ);
+        DropTorchIfUnsupported(globalX, globalY + 1, globalZ);
+        DropTorchIfUnsupported(globalX, globalY, globalZ - 1);
+        DropTorchIfUnsupported(globalX, globalY, globalZ + 1);
     }
 
-    private void _DropTorchIfUnsupported(int globalX, int globalY, int globalZ, bool interactionPriority)
+    public void DropTorchIfUnsupported(int globalX, int globalY, int globalZ)
     {
         byte blockType = (byte)(GetBlock(globalX, globalY, globalZ) & 0xFF);
         if (!_IsTorchBlock(blockType)) return;
@@ -4266,7 +4518,7 @@ public class McWorld : UdonSharpBehaviour
         byte torchMount = GetTorchMount(globalX, globalY, globalZ);
         if (_CanTorchStayAt(globalX, globalY, globalZ, torchMount)) return;
 
-        _SetBlockGlobal(globalX, globalY, globalZ, 0, interactionPriority);
+        _SetBlockGlobal(globalX, globalY, globalZ, 0, false);
     }
 
     public void TriggerNeighborMeshRebuilds(ChunkData chunk)
@@ -6413,6 +6665,7 @@ public class McWorld : UdonSharpBehaviour
                 byte selfID = selfData[selfIndex];
                 if (selfID == 0) continue;
                 if (_UsesCustomBlockMesh(selfID, shapeCache, shapeCacheLen)) continue;
+                if (_IsFluidBlock(selfID)) continue;
 
                 int neighborX = x;
                 int neighborY = y;
@@ -7120,6 +7373,11 @@ public class McWorld : UdonSharpBehaviour
 
     private void _AddCrossShapedBlock(ChunkData chunk, Vector3 blockPos, byte blockID, BlockVisibilityType visibility)
     {
+        if (blockID == 51)
+        {
+            _AddFireBlock(chunk, blockPos, visibility);
+            return;
+        }
         // Cross-shaped blocks use 2 perpendicular quads forming an X shape when viewed from above
         // The quads extend from corner to corner: (0,0,0)→(1,1,1) and (1,0,0)→(0,1,1)
 
@@ -7248,6 +7506,232 @@ public class McWorld : UdonSharpBehaviour
             else chunk.facesCutout += 2;
         }
 #endif
+    }
+
+    private bool _IsFlammableForRender(byte blockId)
+    {
+        // MC's chanceToEncourageFire > 0
+        return blockId == 5 || blockId == 17 || blockId == 18 || blockId == 35 ||
+               blockId == 46 || blockId == 47 || blockId == 53 || blockId == 85 ||
+               blockId == 31;
+    }
+
+    private bool _IsBlockSolidForFire(ChunkData chunk, int lx, int ly, int lz)
+    {
+        byte b = _GetFluidRenderBlock(chunk, lx, ly, lz);
+        return b != 0 && _GetVisibilityType(b) == BlockVisibilityType.Opaque;
+    }
+
+    private void _AddFireBlock(ChunkData chunk, Vector3 blockPos, BlockVisibilityType visibility)
+    {
+        float bx = blockPos.x, by = blockPos.y, bz = blockPos.z;
+        float textureSlice = _GetTextureSlice(51, FACE_INDEX_SIDE);
+        float brightness = _GetCachedBrightnessAtBlock(chunk, (int)bx, (int)by, (int)bz);
+        Color col = new Color(1f, 0f, 1f, brightness); // green=0 flags fire for shader animation
+
+        int lx = (int)bx, ly = (int)by, lz = (int)bz;
+
+        bool belowSolid = _IsBlockSolidForFire(chunk, lx, ly - 1, lz);
+        bool belowFlammable = _IsFlammableForRender(_GetFluidRenderBlock(chunk, lx, ly - 1, lz));
+
+        if (!belowSolid && !belowFlammable)
+        {
+            // Wall fire: panels against flammable neighbors
+            // MC uses 0.2 offset, 1.4 tall, 1/16 Y offset
+            float yo = 1f / 16f;
+            float h = 1.4f;
+
+            bool nxFlam = _IsFlammableForRender(_GetFluidRenderBlock(chunk, lx - 1, ly, lz));
+            bool pxFlam = _IsFlammableForRender(_GetFluidRenderBlock(chunk, lx + 1, ly, lz));
+            bool nzFlam = _IsFlammableForRender(_GetFluidRenderBlock(chunk, lx, ly, lz - 1));
+            bool pzFlam = _IsFlammableForRender(_GetFluidRenderBlock(chunk, lx, ly, lz + 1));
+            bool pyFlam = _IsFlammableForRender(_GetFluidRenderBlock(chunk, lx, ly + 1, lz));
+
+            int panels = 0;
+            if (nxFlam) panels++;
+            if (pxFlam) panels++;
+            if (nzFlam) panels++;
+            if (pzFlam) panels++;
+            if (pyFlam) panels++;
+            if (panels == 0) panels = 1;
+
+            // Each wall panel = 8 verts (front+back)
+            int neededVerts = panels * 8;
+            Vector3[] tv; int[] tt; Vector3[] tu; Vector3[] tn; Color[] tc;
+            int vc, trc;
+            if (!_GetFireMeshBuffers(chunk, visibility, neededVerts, out tv, out tt, out tu, out tn, out tc, out vc, out trc))
+                return;
+
+            // MC: each wall gets a flat panel inset by 0.2 from the wall face, double-sided
+            if (nxFlam)
+            {
+                // -X wall: panel at x+0.2, Z from 0→1
+                _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                    bx + 0.2f, bx + 0.2f, bx + 0.2f, bx + 0.2f,
+                    by + yo, by + h + yo, by + h + yo, by + yo,
+                    bz + 1f, bz + 1f, bz, bz,
+                    textureSlice, col);
+            }
+            if (pxFlam)
+            {
+                // +X wall: panel at x+0.8, Z from 0→1
+                _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                    bx + 0.8f, bx + 0.8f, bx + 0.8f, bx + 0.8f,
+                    by + yo, by + h + yo, by + h + yo, by + yo,
+                    bz, bz, bz + 1f, bz + 1f,
+                    textureSlice, col);
+            }
+            if (nzFlam)
+            {
+                // -Z wall: panel at z+0.2, X from 0→1
+                _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                    bx, bx, bx + 1f, bx + 1f,
+                    by + yo, by + h + yo, by + h + yo, by + yo,
+                    bz + 0.2f, bz + 0.2f, bz + 0.2f, bz + 0.2f,
+                    textureSlice, col);
+            }
+            if (pzFlam)
+            {
+                // +Z wall: panel at z+0.8, X from 0→1
+                _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                    bx + 1f, bx + 1f, bx, bx,
+                    by + yo, by + h + yo, by + h + yo, by + yo,
+                    bz + 0.8f, bz + 0.8f, bz + 0.8f, bz + 0.8f,
+                    textureSlice, col);
+            }
+            if (pyFlam)
+            {
+                // Ceiling fire: two crossed panels like floor fire but at y+1
+                _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                    bx, bx, bx + 1f, bx + 1f,
+                    by + 1f + yo, by + 1f - 0.2f + yo, by + 1f - 0.2f + yo, by + 1f + yo,
+                    bz + 0.5f, bz + 0.5f, bz + 0.5f, bz + 0.5f,
+                    textureSlice, col);
+            }
+            if (!nxFlam && !pxFlam && !nzFlam && !pzFlam && !pyFlam)
+            {
+                _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                    bx, bx, bx + 1f, bx + 1f,
+                    by + yo, by + h + yo, by + h + yo, by + yo,
+                    bz + 0.5f, bz + 0.5f, bz + 0.5f, bz + 0.5f,
+                    textureSlice, col);
+            }
+
+            _SetFireMeshCounts(chunk, visibility, vc, trc);
+        }
+        else
+        {
+            // Floor fire: MC uses 4 flat vertical panels (8 double-sided quads)
+            // Panel pair 1 (frame 1): two YZ-plane panels at x±0.2/0.3 from center
+            // Panel pair 2 (frame 1): two XY-plane panels at z±0.2/0.3 from center
+            // Panel pair 3 (frame 2): two YZ-plane panels at x±0.4/0.5 from center (wider)
+            // Panel pair 4 (frame 2): two XY-plane panels at z±0.4/0.5 from center (wider)
+            int neededVerts = 32; // 4 panels × 8 verts (front+back)
+            Vector3[] tv; int[] tt; Vector3[] tu; Vector3[] tn; Color[] tc;
+            int vc, trc;
+            if (!_GetFireMeshBuffers(chunk, visibility, neededVerts, out tv, out tt, out tu, out tn, out tc, out vc, out trc))
+                return;
+
+            float h = 1.4f;
+            // Panel 1: YZ plane at x+0.2, full Z range, frame 1
+            _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                bx + 0.2f, bx + 0.2f, bx + 0.2f, bx + 0.2f,
+                by, by + h, by + h, by,
+                bz + 1f, bz + 1f, bz, bz,
+                textureSlice, col);
+            // Panel 2: YZ plane at x+0.8, full Z range, back face
+            _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                bx + 0.8f, bx + 0.8f, bx + 0.8f, bx + 0.8f,
+                by, by + h, by + h, by,
+                bz, bz, bz + 1f, bz + 1f,
+                textureSlice, col);
+            // Panel 3: XY plane at z+0.8, full X range
+            _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                bx + 1f, bx + 1f, bx, bx,
+                by, by + h, by + h, by,
+                bz + 0.8f, bz + 0.8f, bz + 0.8f, bz + 0.8f,
+                textureSlice, col);
+            // Panel 4: XY plane at z+0.2, full X range
+            _AddFireQuadPair(tv, tt, tu, tn, tc, ref vc, ref trc,
+                bx, bx, bx + 1f, bx + 1f,
+                by, by + h, by + h, by,
+                bz + 0.2f, bz + 0.2f, bz + 0.2f, bz + 0.2f,
+                textureSlice, col);
+
+            _SetFireMeshCounts(chunk, visibility, vc, trc);
+        }
+    }
+
+    private bool _GetFireMeshBuffers(ChunkData chunk, BlockVisibilityType visibility, int neededVerts,
+        out Vector3[] tv, out int[] tt, out Vector3[] tu, out Vector3[] tn, out Color[] tc,
+        out int vc, out int trc)
+    {
+        if (visibility == BlockVisibilityType.Cutout)
+        {
+            if (chunk._cutoutVertexCount + neededVerts > MAX_VERTS) { tv = null; tt = null; tu = null; tn = null; tc = null; vc = 0; trc = 0; return false; }
+            tv = chunk._cutoutVertices; tt = chunk._cutoutTriangles; tu = chunk._cutoutUVs; tn = chunk._cutoutNormals; tc = chunk._cutoutColors;
+            vc = chunk._cutoutVertexCount; trc = chunk._cutoutTriangleCount;
+        }
+        else
+        {
+            if (chunk._transparentVertexCount + neededVerts > MAX_VERTS) { tv = null; tt = null; tu = null; tn = null; tc = null; vc = 0; trc = 0; return false; }
+            tv = chunk._transparentVertices; tt = chunk._transparentTriangles; tu = chunk._transparentUVs; tn = chunk._transparentNormals; tc = chunk._transparentColors;
+            vc = chunk._transparentVertexCount; trc = chunk._transparentTriangleCount;
+        }
+        return true;
+    }
+
+    private void _SetFireMeshCounts(ChunkData chunk, BlockVisibilityType visibility, int vc, int trc)
+    {
+        if (visibility == BlockVisibilityType.Cutout) { chunk._cutoutVertexCount = vc; chunk._cutoutTriangleCount = trc; }
+        else { chunk._transparentVertexCount = vc; chunk._transparentTriangleCount = trc; }
+    }
+
+    private void _AddFireQuadPair(Vector3[] tv, int[] tt, Vector3[] tu, Vector3[] tn, Color[] tc,
+        ref int vc, ref int trc,
+        float x0, float x1, float x2, float x3,
+        float y0, float y1, float y2, float y3,
+        float z0, float z1, float z2, float z3,
+        float texSlice, Color col)
+    {
+        // Front face
+        tv[vc + 0] = new Vector3(x0, y0, z0);
+        tv[vc + 1] = new Vector3(x1, y1, z1);
+        tv[vc + 2] = new Vector3(x2, y2, z2);
+        tv[vc + 3] = new Vector3(x3, y3, z3);
+        float frameV = 1.0f / 32.0f; // one frame height in the 32-frame strip
+        tu[vc + 0] = new Vector3(0, 0, texSlice);
+        tu[vc + 1] = new Vector3(0, frameV, texSlice);
+        tu[vc + 2] = new Vector3(1, frameV, texSlice);
+        tu[vc + 3] = new Vector3(1, 0, texSlice);
+        Vector3 n = Vector3.up;
+        for (int i = 0; i < 4; i++) { tn[vc + i] = n; tc[vc + i] = col; }
+        tt[trc + 0] = vc + 0; tt[trc + 1] = vc + 1; tt[trc + 2] = vc + 2;
+        tt[trc + 3] = vc + 0; tt[trc + 4] = vc + 2; tt[trc + 5] = vc + 3;
+        vc += 4; trc += 6;
+    }
+
+    private void _AddFireWallPanel(Vector3[] tv, int[] tt, Vector3[] tu, Vector3[] tn, Color[] tc,
+        ref int vc, ref int trc,
+        float x0, float y0, float z0, float x1, float y1, float z1,
+        Vector3 normal, float texSlice, Color col)
+    {
+        // A wall panel from (x0,y0,z0)-(x1,y0,z0) at bottom to (x0,y1,z1)-(x1,y1,z1) at top
+        // For X-axis panels: z0=z1 (z const), x varies
+        // For Z-axis panels: x0=x1 (x const), z varies
+        tv[vc + 0] = new Vector3(x0, y0, z0);
+        tv[vc + 1] = new Vector3(x0, y1, z0);
+        tv[vc + 2] = new Vector3(x1, y1, z1);
+        tv[vc + 3] = new Vector3(x1, y0, z1);
+        float frameV = 1.0f / 32.0f;
+        tu[vc + 0] = new Vector3(0, 0, texSlice);
+        tu[vc + 1] = new Vector3(0, frameV, texSlice);
+        tu[vc + 2] = new Vector3(1, frameV, texSlice);
+        tu[vc + 3] = new Vector3(1, 0, texSlice);
+        for (int i = 0; i < 4; i++) { tn[vc + i] = normal; tc[vc + i] = col; }
+        tt[trc + 0] = vc + 0; tt[trc + 1] = vc + 1; tt[trc + 2] = vc + 2;
+        tt[trc + 3] = vc + 0; tt[trc + 4] = vc + 2; tt[trc + 5] = vc + 3;
+        vc += 4; trc += 6;
     }
 
     private void _AddTorchBlocks(ChunkData chunk)
@@ -7466,6 +7950,16 @@ public class McWorld : UdonSharpBehaviour
         return blockID == BLOCK_WATER_MOVING || blockID == BLOCK_WATER_STILL;
     }
 
+    private bool _IsLavaBlock(byte blockID)
+    {
+        return blockID == 10 || blockID == 11;
+    }
+
+    private bool _IsFluidBlock(byte blockID)
+    {
+        return _IsWaterBlock(blockID) || _IsLavaBlock(blockID);
+    }
+
     private byte _GetFluidRenderBlock(ChunkData originChunk, int localX, int localY, int localZ)
     {
         if (originChunk == null) return 0;
@@ -7524,10 +8018,11 @@ public class McWorld : UdonSharpBehaviour
         return blockID != 0 && _GetVisibilityType(blockID) == BlockVisibilityType.Opaque;
     }
 
-    private bool _ShouldRenderWaterFace(ChunkData chunk, int neighborX, int neighborY, int neighborZ, int side)
+    private bool _ShouldRenderFluidFace(ChunkData chunk, int neighborX, int neighborY, int neighborZ, int side, bool isLava)
     {
         byte neighborBlock = _GetFluidRenderBlock(chunk, neighborX, neighborY, neighborZ);
-        if (_IsWaterBlock(neighborBlock) || neighborBlock == BLOCK_ICE) return false;
+        bool neighborIsSameFluid = isLava ? _IsLavaBlock(neighborBlock) : _IsWaterBlock(neighborBlock);
+        if (neighborIsSameFluid || (!isLava && neighborBlock == BLOCK_ICE)) return false;
         if (side == 1) return true;
         return !_IsOpaqueCubeForWater(neighborBlock);
     }
@@ -7538,12 +8033,47 @@ public class McWorld : UdonSharpBehaviour
         return (level + 1) / 9.0f;
     }
 
-    private int _GetWaterFlowDecay(ChunkData chunk, int localX, int localY, int localZ)
+    private int _GetFluidFlowDecay(ChunkData chunk, int localX, int localY, int localZ, bool isLava)
     {
-        return _IsWaterBlock(_GetFluidRenderBlock(chunk, localX, localY, localZ)) ? 0 : -1;
+        byte block = _GetFluidRenderBlock(chunk, localX, localY, localZ);
+        bool isSameFluid = isLava ? _IsLavaBlock(block) : _IsWaterBlock(block);
+        if (!isSameFluid) return -1;
+        return _GetFluidRenderMetadata(chunk, localX, localY, localZ);
     }
 
-    private float _GetWaterCornerHeight(ChunkData chunk, int cornerX, int localY, int cornerZ)
+    private int _GetFluidRenderMetadata(ChunkData originChunk, int localX, int localY, int localZ)
+    {
+        if (originChunk == null) return 0;
+
+        int sampleChunkX = originChunk.chunkX_world;
+        int sampleChunkY = originChunk.chunkY_world;
+        int sampleChunkZ = originChunk.chunkZ_world;
+
+        while (localX < 0) { localX += chunkSizeXZ; sampleChunkX--; }
+        while (localX >= chunkSizeXZ) { localX -= chunkSizeXZ; sampleChunkX++; }
+        while (localY < 0) { localY += chunkSizeY; sampleChunkY--; }
+        while (localY >= chunkSizeY) { localY -= chunkSizeY; sampleChunkY++; }
+        while (localZ < 0) { localZ += chunkSizeXZ; sampleChunkZ--; }
+        while (localZ >= chunkSizeXZ) { localZ -= chunkSizeXZ; sampleChunkZ++; }
+
+        ChunkData sampleChunk;
+        if (sampleChunkX == originChunk.chunkX_world &&
+            sampleChunkY == originChunk.chunkY_world &&
+            sampleChunkZ == originChunk.chunkZ_world)
+        {
+            sampleChunk = originChunk;
+        }
+        else
+        {
+            sampleChunk = GetChunkAt(sampleChunkX, sampleChunkY, sampleChunkZ);
+        }
+
+        if (sampleChunk == null || !sampleChunk.isDataReady || sampleChunk.blockMetadata == null) return 0;
+        int idx = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
+        return (idx >= 0 && idx < sampleChunk.blockMetadata.Length) ? sampleChunk.blockMetadata[idx] : 0;
+    }
+
+    private float _GetFluidCornerHeight(ChunkData chunk, int cornerX, int localY, int cornerZ, bool isLava)
     {
         int sampleCount = 0;
         float sampleSum = 0.0f;
@@ -7553,13 +8083,16 @@ public class McWorld : UdonSharpBehaviour
             int sampleX = cornerX - (i & 1);
             int sampleZ = cornerZ - ((i >> 1) & 1);
 
-            if (_IsWaterBlock(_GetFluidRenderBlock(chunk, sampleX, localY + 1, sampleZ)))
+            byte aboveBlock = _GetFluidRenderBlock(chunk, sampleX, localY + 1, sampleZ);
+            bool aboveSame = isLava ? _IsLavaBlock(aboveBlock) : _IsWaterBlock(aboveBlock);
+            if (aboveSame)
             {
                 return 1.0f;
             }
 
             byte sampleBlock = _GetFluidRenderBlock(chunk, sampleX, localY, sampleZ);
-            if (!_IsWaterBlock(sampleBlock))
+            bool sampleSame = isLava ? _IsLavaBlock(sampleBlock) : _IsWaterBlock(sampleBlock);
+            if (!sampleSame)
             {
                 if (!_IsBlockSolid(sampleBlock))
                 {
@@ -7569,9 +8102,9 @@ public class McWorld : UdonSharpBehaviour
             }
             else
             {
-                // Water metadata does not exist in this voxel format yet, so every fluid
-                // sample is treated as level 0. That matches Beta still-water pools exactly.
-                float percentAir = _GetWaterPercentAir(0);
+                int meta = _GetFluidRenderMetadata(chunk, sampleX, localY, sampleZ);
+                int effectiveLevel = meta >= 8 ? 0 : meta;
+                float percentAir = _GetWaterPercentAir(effectiveLevel);
                 sampleSum += percentAir * 10.0f;
                 sampleCount += 10;
                 sampleSum += percentAir;
@@ -7583,9 +8116,9 @@ public class McWorld : UdonSharpBehaviour
         return 1.0f - sampleSum / sampleCount;
     }
 
-    private float _GetWaterFlowAngle(ChunkData chunk, int localX, int localY, int localZ)
+    private float _GetFluidFlowAngle(ChunkData chunk, int localX, int localY, int localZ, bool isLava)
     {
-        int flowDecay = _GetWaterFlowDecay(chunk, localX, localY, localZ);
+        int flowDecay = _GetFluidFlowDecay(chunk, localX, localY, localZ, isLava);
         if (flowDecay < 0) return -1000.0f;
 
         float flowX = 0.0f;
@@ -7600,13 +8133,13 @@ public class McWorld : UdonSharpBehaviour
             else if (side == 2) sampleX++;
             else sampleZ++;
 
-            int neighborDecay = _GetWaterFlowDecay(chunk, sampleX, localY, sampleZ);
+            int neighborDecay = _GetFluidFlowDecay(chunk, sampleX, localY, sampleZ, isLava);
             if (neighborDecay < 0)
             {
                 byte neighborBlock = _GetFluidRenderBlock(chunk, sampleX, localY, sampleZ);
                 if (!_IsBlockSolid(neighborBlock))
                 {
-                    neighborDecay = _GetWaterFlowDecay(chunk, sampleX, localY - 1, sampleZ);
+                    neighborDecay = _GetFluidFlowDecay(chunk, sampleX, localY - 1, sampleZ, isLava);
                     if (neighborDecay >= 0)
                     {
                         int decayDelta = neighborDecay - (flowDecay - 8);
@@ -7644,7 +8177,9 @@ public class McWorld : UdonSharpBehaviour
         Vector3 faceNormal,
         Vector2 uv0, Vector2 uv1, Vector2 uv2, Vector2 uv3,
         float textureSlice,
-        float brightness)
+        float brightness,
+        bool isLava,
+        bool isFlowingLava)
     {
         if (chunk == null || chunk._transparentVertexCount + 4 > MAX_VERTS) return;
 
@@ -7660,11 +8195,16 @@ public class McWorld : UdonSharpBehaviour
         chunk._transparentNormals[vertexIndex + 2] = faceNormal;
         chunk._transparentNormals[vertexIndex + 3] = faceNormal;
 
-        Color waterVertexColor = new Color(1.0f, 1.0f, 1.0f, brightness);
-        chunk._transparentColors[vertexIndex + 0] = waterVertexColor;
-        chunk._transparentColors[vertexIndex + 1] = waterVertexColor;
-        chunk._transparentColors[vertexIndex + 2] = waterVertexColor;
-        chunk._transparentColors[vertexIndex + 3] = waterVertexColor;
+        // Water: R=1 G=1 B=0 A=brightness
+        // Still lava (ID 11):   R=0.0 G=0 B=0 A=brightness
+        // Flowing lava (ID 10): R=0.5 G=0 B=0 A=brightness (R>0.25 = flowing in shader)
+        Color fluidVertexColor = isLava
+            ? new Color(isFlowingLava ? 0.5f : 0.0f, 0.0f, 0.0f, brightness)
+            : new Color(1.0f, 1.0f, 0.0f, brightness);
+        chunk._transparentColors[vertexIndex + 0] = fluidVertexColor;
+        chunk._transparentColors[vertexIndex + 1] = fluidVertexColor;
+        chunk._transparentColors[vertexIndex + 2] = fluidVertexColor;
+        chunk._transparentColors[vertexIndex + 3] = fluidVertexColor;
 
         chunk._transparentUVs[vertexIndex + 0] = new Vector3(uv0.x, uv0.y, textureSlice);
         chunk._transparentUVs[vertexIndex + 1] = new Vector3(uv1.x, uv1.y, textureSlice);
@@ -7692,25 +8232,32 @@ public class McWorld : UdonSharpBehaviour
 
     private void _AddWaterBlock(ChunkData chunk, int localX, int localY, int localZ, byte blockID)
     {
-        bool renderTop = _ShouldRenderWaterFace(chunk, localX, localY + 1, localZ, 1);
-        bool renderBottom = _ShouldRenderWaterFace(chunk, localX, localY - 1, localZ, 0);
-        bool renderSouth = _ShouldRenderWaterFace(chunk, localX, localY, localZ - 1, 2);
-        bool renderNorth = _ShouldRenderWaterFace(chunk, localX, localY, localZ + 1, 3);
-        bool renderWest = _ShouldRenderWaterFace(chunk, localX - 1, localY, localZ, 4);
-        bool renderEast = _ShouldRenderWaterFace(chunk, localX + 1, localY, localZ, 5);
+        bool isLava = _IsLavaBlock(blockID);
+        bool renderTop = _ShouldRenderFluidFace(chunk, localX, localY + 1, localZ, 1, isLava);
+        bool renderBottom = _ShouldRenderFluidFace(chunk, localX, localY - 1, localZ, 0, isLava);
+        bool renderSouth = _ShouldRenderFluidFace(chunk, localX, localY, localZ - 1, 2, isLava);
+        bool renderNorth = _ShouldRenderFluidFace(chunk, localX, localY, localZ + 1, 3, isLava);
+        bool renderWest = _ShouldRenderFluidFace(chunk, localX - 1, localY, localZ, 4, isLava);
+        bool renderEast = _ShouldRenderFluidFace(chunk, localX + 1, localY, localZ, 5, isLava);
         if (!renderTop && !renderBottom && !renderSouth && !renderNorth && !renderWest && !renderEast) return;
 
-        float stillSlice = betaWaterStillSlice >= 0 ? betaWaterStillSlice : _GetTextureSlice(blockID, FACE_INDEX_TOP);
-        float flowSlice = betaWaterFlowSlice >= 0 ? betaWaterFlowSlice : _GetTextureSlice(blockID, FACE_INDEX_SIDE);
+        float stillSlice = 0;
+        float flowSlice = 0;
+        if (!isLava)
+        {
+            stillSlice = betaWaterStillSlice >= 0 ? betaWaterStillSlice : _GetTextureSlice(blockID, FACE_INDEX_TOP);
+            flowSlice = betaWaterFlowSlice >= 0 ? betaWaterFlowSlice : _GetTextureSlice(blockID, FACE_INDEX_SIDE);
+        }
+        // Lava: textureSlice is ignored since the shader samples from _LavaTex
 
-        float heightNW = _GetWaterCornerHeight(chunk, localX, localY, localZ);
-        float heightSW = _GetWaterCornerHeight(chunk, localX, localY, localZ + 1);
-        float heightSE = _GetWaterCornerHeight(chunk, localX + 1, localY, localZ + 1);
-        float heightNE = _GetWaterCornerHeight(chunk, localX + 1, localY, localZ);
+        float heightNW = _GetFluidCornerHeight(chunk, localX, localY, localZ, isLava);
+        float heightSW = _GetFluidCornerHeight(chunk, localX, localY, localZ + 1, isLava);
+        float heightSE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ + 1, isLava);
+        float heightNE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ, isLava);
 
         if (renderTop)
         {
-            float flowAngle = _GetWaterFlowAngle(chunk, localX, localY, localZ);
+            float flowAngle = _GetFluidFlowAngle(chunk, localX, localY, localZ, isLava);
             float sinOffset = 0.0f;
             float cosOffset = 0.5f;
             float topSlice = stillSlice;
@@ -7733,7 +8280,8 @@ public class McWorld : UdonSharpBehaviour
                 new Vector2(0.5f + cosOffset + sinOffset, 0.5f + cosOffset - sinOffset),
                 new Vector2(0.5f + cosOffset - sinOffset, 0.5f - cosOffset - sinOffset),
                 topSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY, localZ));
+                _GetWaterBlockBrightness(chunk, localX, localY, localZ),
+                isLava, isLava && flowAngle > -999.0f);
         }
 
         if (renderBottom)
@@ -7750,7 +8298,8 @@ public class McWorld : UdonSharpBehaviour
                 new Vector2(1.0f, 1.0f),
                 new Vector2(1.0f, 0.0f),
                 stillSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY - 1, localZ));
+                _GetWaterBlockBrightness(chunk, localX, localY - 1, localZ),
+                isLava, false);
         }
 
         const float sideMaxV = 0.999375f;
@@ -7769,7 +8318,8 @@ public class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY, localZ - 1));
+                _GetWaterBlockBrightness(chunk, localX, localY, localZ - 1),
+                isLava, isLava);
         }
 
         if (renderNorth)
@@ -7786,7 +8336,8 @@ public class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY, localZ + 1));
+                _GetWaterBlockBrightness(chunk, localX, localY, localZ + 1),
+                isLava, isLava);
         }
 
         if (renderWest)
@@ -7803,7 +8354,8 @@ public class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX - 1, localY, localZ));
+                _GetWaterBlockBrightness(chunk, localX - 1, localY, localZ),
+                isLava, isLava);
         }
 
         if (renderEast)
@@ -7820,7 +8372,8 @@ public class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX + 1, localY, localZ));
+                _GetWaterBlockBrightness(chunk, localX + 1, localY, localZ),
+                isLava, isLava);
         }
     }
 
@@ -7841,7 +8394,7 @@ public class McWorld : UdonSharpBehaviour
                 for (int y = minY; y <= maxY; y++)
                 {
                     byte blockID = chunk._decompSelf[y * stride + columnIndex];
-                    if (!_IsWaterBlock(blockID)) continue;
+                    if (!_IsWaterBlock(blockID) && !_IsLavaBlock(blockID)) continue;
                     _AddWaterBlock(chunk, x, y, z, blockID);
                 }
             }
@@ -8246,7 +8799,24 @@ public class McWorld : UdonSharpBehaviour
                 chunk.torchMountData[torchMountIndex] = 0;
             }
         }
-        _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+        if (_gpuSyncDeferred)
+        {
+            int ci = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            if (ci >= 0 && _gpuDeferredDirtyChunks != null && _gpuDeferredDirtyCount < GPU_DEFERRED_DIRTY_MAX)
+            {
+                bool alreadyTracked = false;
+                for (int di = 0; di < _gpuDeferredDirtyCount; di++)
+                {
+                    if (_gpuDeferredDirtyChunks[di] == ci) { alreadyTracked = true; break; }
+                }
+                if (!alreadyTracked)
+                    _gpuDeferredDirtyChunks[_gpuDeferredDirtyCount++] = ci;
+            }
+        }
+        else
+        {
+            _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+        }
         _GpuRequestLightingRebuild();
 
         if (!updateMesh) return;
@@ -8533,8 +9103,9 @@ public class McWorld : UdonSharpBehaviour
                 bool draw;
                 bool customMeshA = _UsesCustomBlockMesh((byte)a, shapeTypeCache, maxId);
                 bool customMeshB = _UsesCustomBlockMesh((byte)b, shapeTypeCache, maxId);
-                if (customMeshA) draw = false;
-                else if (b == 0 || customMeshB) draw = true; // air or non-cube custom mesh
+                bool fluidA = _IsFluidBlock((byte)a);
+                if (customMeshA || fluidA) draw = false;
+                else if (b == 0 || customMeshB || _IsFluidBlock((byte)b)) draw = true;
                 else if (visA == BlockVisibilityType.Invisible) draw = false;
                 else
                 {
@@ -10382,7 +10953,7 @@ public class McWorld : UdonSharpBehaviour
                     if (blockID == 0) continue;
 
                     chunk._isAllAir = false;
-                    if (!chunk._hasWaterBlocks && _IsWaterBlock(blockID))
+                    if (!chunk._hasWaterBlocks && (_IsWaterBlock(blockID) || _IsLavaBlock(blockID)))
                     {
                         chunk._hasWaterBlocks = true;
                     }
@@ -11497,6 +12068,11 @@ public class McWorld : UdonSharpBehaviour
             terrainGenerator.AppendAggregatePerformanceStats(logBuilder);
         }
 
+        if (blockTicker != null)
+        {
+            blockTicker.AppendAggregatePerformanceStats(logBuilder);
+        }
+
         if (stats_meshBuildTotal > 0)
         {
             float avgMeshTime = stats_meshBuildTimeTotal / stats_meshBuildTotal;
@@ -11818,6 +12394,11 @@ public class McWorld : UdonSharpBehaviour
         if (terrainGenerator != null)
         {
             terrainGenerator.ResetAggregatePerformanceStats();
+        }
+
+        if (blockTicker != null)
+        {
+            blockTicker.ResetAggregatePerformanceStats();
         }
     }
 #endif
