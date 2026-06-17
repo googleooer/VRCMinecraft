@@ -25,15 +25,19 @@ public class McCoordinator : UdonSharpBehaviour
 
     [Header("Performance")]
     [Tooltip("How many chunks can be processed (data-gen or meshing) concurrently.")]
-    public int maxConcurrentWorkers = 4;
+    public int maxConcurrentWorkers = 16;
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
-    public float updateTimeBudgetMs = 8.0f;
+    public float updateTimeBudgetMs = 16.0f;
+    [Tooltip("While the ONE-TIME initial world generation is running, use this larger per-cycle budget so terrain data-gen completes faster (frame rate during the load matters far less than total load time). Reverts to updateTimeBudgetMs automatically once gen completes. Set <= updateTimeBudgetMs to disable.")]
+    public float loadPhaseUpdateBudgetMs = 45.0f;
     [Tooltip("Skip N state checks per worker to reduce overhead (higher = less responsive but faster)")]
     public int skipCheckCycles = 0;
     [Tooltip("When the main rebuild queue is this small or smaller, allow a few deferred interior wakes to drain in the same cycle.")]
     public int deferredMeshWakeQueueThreshold = 32;
     [Tooltip("Maximum deferred interior wake assignments per coordinator cycle while the main rebuild queue still has work.")]
     public int deferredMeshWakeBurstPerCycle = 1;
+    [Tooltip("How many brand-new chunks may be instantiated per coordinator cycle. Larger values let an idle column drain into multiple workers in one frame after a readback completes (worldgen throughput multiplier).")]
+    public int maxChunkInstantiationsPerCycle = 16;
 
     [Header("Workload Per Step")]
     [Tooltip("How many Z-columns of voxels to generate per step inside a chunk. Higher values generate chunks faster but may cause lag spikes.")]
@@ -161,7 +165,12 @@ public class McCoordinator : UdonSharpBehaviour
         if (world == null || worker_state == null || radialChunkOrder == null) return;
         
         float cycleStartTime = Time.realtimeSinceStartup;
-        float cycleBudget = updateTimeBudgetMs * 0.001f;
+        // Load-phase budget boost: terrain data-gen drains faster at a larger budget during
+        // the one-time initial generation; revert to the normal budget once complete so
+        // steady-state frame rate is protected. Accuracy is unaffected.
+        float effectiveBudgetMs = (chunksCompletedCount < totalWorldChunks && loadPhaseUpdateBudgetMs > updateTimeBudgetMs)
+            ? loadPhaseUpdateBudgetMs : updateTimeBudgetMs;
+        float cycleBudget = effectiveBudgetMs * 0.001f;
 
 #if LOGGING
         System.DateTime cycleStart = System.DateTime.MinValue;
@@ -466,9 +475,13 @@ public class McCoordinator : UdonSharpBehaviour
                 }
             }
             // Priority 2: Initial world generation
-            // Limit to 1 InstantiateAndConfigureChunk per frame — the Unity API calls
-            // (Instantiate, Find, GetComponent ×4) cost ~0.8ms each and stack badly.
-            else if (chunkInstantiationsThisFrame < 1 && nextChunkIndexToAssign < totalWorldChunks && (!isGeneratorBusy || world.CanStartChunkDataGenerationWithoutExclusiveGenerator(radialChunkOrder[nextChunkIndexToAssign])))
+            // Old limit was 1 instantiation per frame — that capped worldgen at framerate.
+            // With column caching (radial order visits all Y per (x,z) consecutively), the
+            // first chunk in a column waits for the GPU readback (~80ms), then 7 more
+            // sibling chunks can all be allocated to free workers immediately. Allowing
+            // a burst here removes the gap between readback completion and chunks actually
+            // entering the data-gen state.
+            else if (chunkInstantiationsThisFrame < maxChunkInstantiationsPerCycle && nextChunkIndexToAssign < totalWorldChunks && (!isGeneratorBusy || world.CanStartChunkDataGenerationWithoutExclusiveGenerator(radialChunkOrder[nextChunkIndexToAssign])))
             {
                 int chunk1DIndex = radialChunkOrder[nextChunkIndexToAssign];
                 nextChunkIndexToAssign++;

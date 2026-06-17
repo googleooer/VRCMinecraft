@@ -34,13 +34,18 @@ public class JavaRandom
         SetSeed(seed);
     }
 
+    // OpenJDK uses a process-wide static AtomicLong here, but UdonSharp does not support
+    // static fields on user-defined types. We keep it as an instance field — for this
+    // project the parameterless `new JavaRandom()` path is never used by worldgen
+    // (worldgen always seeds explicitly with `new JavaRandom(long)`), so the practical
+    // impact of the missing global counter is nil.
     private long seedUniquifier = 8682522807148012L;
     private long SeedUniquifier()
     {
         // L'Ecuyer, "Tables of Linear Congruential Generators of
-        // Different Sizes and Good Lattice Structure", 1999
-        long current = seedUniquifier;
-        long next = current * 181783497276652981L;
+        // Different Sizes and Good Lattice Structure", 1999. Correct constant is
+        // 1181783497276652981L (19 digits). Previous code dropped the leading 1.
+        long next = seedUniquifier * 1181783497276652981L;
         seedUniquifier = next;
         return next;
     }
@@ -52,9 +57,21 @@ public class JavaRandom
 
     protected int Next(int bits)
     {
+        // Java spec: this.seed = (this.seed * 0x5DEECE66DL + 0xBL) & ((1L << 48) - 1);
+        //            return (int)(this.seed >>> (48 - bits));
+        // Java's `(int)long` is bit-pattern truncation — for next(32) with bit 31 set, it
+        // produces a negative int. C# `(int)long` is bit-pattern truncation outside `checked`
+        // blocks, BUT the Udon runtime always uses checked semantics for the underlying
+        // SystemConvert.ToInt32(long) extern, which throws OverflowException for values
+        // outside [int.MinValue, int.MaxValue]. UdonSharp does not support `unchecked`.
+        //
+        // Workaround: the XOR-then-subtract trick maps any unsigned 32-bit value held in
+        // a long ([0, 2^32)) into the equivalent signed int range ([-2^31, 2^31)) using
+        // only long arithmetic. For shifted >= 2^31, this produces a negative long that
+        // fits in int range; for shifted < 2^31, it's a no-op on the numeric value.
         seed = (seed * multiplier + addend) & mask;
-        ulong clamped = (ulong)seed >> (48 - bits);
-        return clamped > int.MaxValue ? int.MaxValue : (int)clamped;
+        long shifted = seed >> (48 - bits);
+        return (int)((shifted ^ 0x80000000L) - 0x80000000L);
     }
 
     public int NextInt()

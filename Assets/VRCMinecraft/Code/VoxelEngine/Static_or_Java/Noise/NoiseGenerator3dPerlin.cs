@@ -3,9 +3,12 @@ using System;
 public class NoiseGenerator3dPerlin
 {
     public readonly int[] permutations;
-    
-    // Pre-computed gradient lookup tables to eliminate branching
+
+    // Pre-computed gradient lookup tables to eliminate branching.
     // Note: These are instance fields instead of static due to UdonSharp limitations
+    // (static fields are not supported on user-defined types). Reverted from a brief
+    // perf experiment with static — Udon flagged it. ~35KB total across 92 instances
+    // built per worldgen `init(seed)`. Acceptable.
     public readonly double[] GRAD_X = new double[16] {1,  -1,  1, -1, 1, -1, 1, -1, 0,  0,  0,  0,  1,  0, -1,  0};
     public readonly double[] GRAD_Y = new double[16] {1,   1, -1, -1, 0,  0,  0,  0,  1, -1,  1, -1, 1, -1,  1, -1};
     public readonly double[] GRAD_Z = new double[16] {0,   0,  0,  0,  1,  1, -1, -1, 1,  1, -1, -1, 0,  1,  0, -1};

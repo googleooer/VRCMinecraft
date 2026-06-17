@@ -46,7 +46,7 @@ public class SeedTesterWindow : EditorWindow
         // Button to trigger the seed calculation
         if (GUILayout.Button("Calculate Seed"))
         {
-            int calculatedSeed = McUtils.GetMinecraftSeed(seedInput);
+            long calculatedSeed = McUtils.GetMinecraftSeed(seedInput);
             seedResultText = $"Seed Result: {calculatedSeed}";
             permTableResultText = "(Permutation table cleared)";
         }
@@ -54,9 +54,9 @@ public class SeedTesterWindow : EditorWindow
         // Button to trigger permutation table generation
         if (GUILayout.Button("Generate Permutation Table"))
         {
-            int seed = McUtils.GetMinecraftSeed(seedInput);
+            long seed = McUtils.GetMinecraftSeed(seedInput);
             seedResultText = $"Using Seed: {seed}";
-            
+
             int[] permTable = McUtils.GetPermutationTable(new JavaRandom(seed));
             
             // Format the byte array into a readable string

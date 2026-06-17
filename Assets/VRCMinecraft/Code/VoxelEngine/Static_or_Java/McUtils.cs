@@ -40,47 +40,49 @@ public static class McUtils
 
 
     /// <summary>
-    /// Converts a string into a Minecraft Beta 1.7.3 compatible integer seed.
-    /// This function replicates the original game's two-step logic within Udon's constraints.
+    /// Converts a string into a Minecraft Beta 1.7.3 compatible 64-bit seed.
+    /// Replicates GuiCreateWorld.java:75-89 exactly:
+    ///  - empty or pure-"0" string => fresh random long
+    ///  - parseable long => use it
+    ///  - otherwise => String.hashCode() widened to long
     /// </summary>
-    /// <param name="seedString">The input string from the user.</param>
-    /// <returns>A 32-bit signed integer seed.</returns>
-    public static int GetMinecraftSeed(string seedString)
+    public static long GetMinecraftSeed(string seedString)
     {
-        // --- Step 0: Handle Empty Seed ---
-        // If the seed string is empty, the original game would generate a new random seed.
-        // Since we want a deterministic function, we'll return 0, which is the hash of an empty string anyway.
+        // Step 0: empty seed -> fresh random long (Java: new Random().nextLong())
         if (string.IsNullOrEmpty(seedString))
         {
-            return 0;
+            return _RandomLongSeed();
         }
 
-        // --- Step 1: Try to Parse as a Number ---
-        // The original game tried to parse the string as a 64-bit long. Udon only supports
-        // 32-bit ints. We will try to parse as an int. If it succeeds, we use that value.
-        // If it fails (either because it contains letters or is too large for an int),
-        // we fall through to the hashing mechanism, which is the correct behavior.
-        if (int.TryParse(seedString, out int parsedSeed))
+        // Step 1: try to parse as 64-bit long (Java: Long.parseLong)
+        if (long.TryParse(seedString, out long parsedSeed))
         {
-            return parsedSeed;
+            // Java behavior: literal "0" still triggers the random branch.
+            if (parsedSeed != 0L) return parsedSeed;
+            return _RandomLongSeed();
         }
 
-        // --- Step 2: Fallback to Java's String.hashCode() Algorithm ---
-        // This is executed if the string is not a valid 32-bit integer.
-        // The formula is: s[0]*31^(n-1) + s[1]*31^(n-2) + ... + s[n-1]
-        // A more efficient way to compute this is iteratively: h = 31 * h + val[i]
+        // Step 2: Java String.hashCode() -> widened to long.
+        // The C# `int` type wraps on overflow by default, matching Java's behavior.
         int hash = 0;
         for (int i = 0; i < seedString.Length; i++)
         {
-            char character = seedString[i];
-            // The C# `int` type is a 32-bit signed integer, and its arithmetic
-            // operations (like multiplication and addition) will wrap on overflow
-            // by default. This perfectly mimics the behavior of Java's integer
-            // arithmetic, so no special handling is required.
-            hash = (31 * hash) + character;
+            hash = (31 * hash) + seedString[i];
         }
+        return (long)hash;
+    }
 
-        return hash;
+    private static long _RandomLongSeed()
+    {
+        // Mix System time with a deterministic-enough source for VRChat clients.
+        // Not bit-identical to Java's `new Random().nextLong()` (which uses
+        // System.nanoTime ^ seedUniquifier), but produces a fresh 64-bit value.
+        long ticks = System.DateTime.UtcNow.Ticks;
+        // Spread entropy across all 64 bits
+        ticks ^= ticks << 13;
+        ticks ^= (long)((ulong)ticks >> 7);
+        ticks ^= ticks << 17;
+        return ticks;
     }
 
     /// <summary>

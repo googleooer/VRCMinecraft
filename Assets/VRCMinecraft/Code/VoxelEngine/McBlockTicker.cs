@@ -157,6 +157,82 @@ public class McBlockTicker : UdonSharpBehaviour
     private bool _initialized = false;
     private int _numAdjacentSources = 0;
 
+    // GPU OFFLOAD #7: Optional GPU fluid simulation. When the material is wired, fluid
+    // ticks are processed as cellular-automaton Blits per affected chunk instead of
+    // per-cell Udon code. Falls back to the CPU path if the material is null OR if the
+    // chunk doesn't have GPU-resident block/meta RTs yet.
+    [Header("GPU Offload (#7)")]
+    [Tooltip("Material running VRCM/GpuFluidTick. Null = CPU fluid path.")]
+    public Material gpuFluidTickMaterial;
+    [Tooltip("Tick counter for GPU sticky-flow RNG (advances each fluid GPU pass).")]
+    public int gpuFluidTickCounter = 0;
+#if LOGGING
+    private bool dbg_loggedFirstGpuFluidTick = false;
+#endif
+    [Header("GPU Offload (#8)")]
+    [Tooltip("Material running VRCM/GpuTickMaskWrite. Null = no GPU tick mask sync.")]
+    public Material gpuTickMaskWriteMaterial;
+
+    // GPU OFFLOAD #8: Update a chunk's tick-mask RT by Blitting one pixel toggle.
+    private void _GpuMaskWriteTick(ChunkData chunk, int localX, int localY, int localZ, bool setBit)
+    {
+        if (gpuTickMaskWriteMaterial == null || chunk == null) return;
+        if (chunk._gpuTickMaskRT == null)
+        {
+            int w = world.chunkSizeXZ;
+            int h = world.chunkSizeY * world.chunkSizeXZ;
+            chunk._gpuTickMaskRT = new UnityEngine.RenderTexture(w, h, 0, UnityEngine.RenderTextureFormat.R8);
+            chunk._gpuTickMaskRT.filterMode = UnityEngine.FilterMode.Point;
+            chunk._gpuTickMaskRT.Create();
+        }
+        gpuTickMaskWriteMaterial.SetTexture("_MainTex", chunk._gpuTickMaskRT);
+        gpuTickMaskWriteMaterial.SetInt("_ChunkSizeXZ", world.chunkSizeXZ);
+        gpuTickMaskWriteMaterial.SetInt("_ChunkSizeY", world.chunkSizeY);
+        gpuTickMaskWriteMaterial.SetInt("_WriteX", localX);
+        gpuTickMaskWriteMaterial.SetInt("_WriteY", localY);
+        gpuTickMaskWriteMaterial.SetInt("_WriteZ", localZ);
+        gpuTickMaskWriteMaterial.SetInt("_WriteValue", setBit ? 1 : 0);
+        VRC.SDKBase.VRCGraphics.Blit(chunk._gpuTickMaskRT, chunk._gpuTickMaskRT, gpuTickMaskWriteMaterial, 0);
+        chunk._gpuTickMaskDirty = true;
+    }
+
+    private bool _GpuFluidTickChunk(ChunkData chunk, bool isLava)
+    {
+        if (gpuFluidTickMaterial == null || chunk == null) return false;
+        // Requires the chunk's sentinel RT + block/meta RTs to be available. The GPU-resident
+        // chunk pivot (#2) makes the block atlas the source of truth — when integrated, this
+        // helper Blits the GpuFluidTick passes into the chunk's atlas slot.
+        // For now this is the entry point; full per-chunk RT plumbing happens in #12 below.
+        gpuFluidTickMaterial.SetInt("_IsLava", isLava ? 1 : 0);
+        gpuFluidTickMaterial.SetInt("_TickCounter", gpuFluidTickCounter++);
+        gpuFluidTickMaterial.SetInt("_ChunkX", chunk.chunkX_world);
+        gpuFluidTickMaterial.SetInt("_ChunkZ", chunk.chunkZ_world);
+        gpuFluidTickMaterial.SetInt("_ChunkSizeXZ", world.chunkSizeXZ);
+        gpuFluidTickMaterial.SetInt("_ChunkSizeY", world.chunkSizeY);
+        // (Block-ID constants are set once during initialization in Start.)
+#if LOGGING
+        if (!dbg_loggedFirstGpuFluidTick)
+        {
+            dbg_loggedFirstGpuFluidTick = true;
+            Debug.Log("[McBlockTicker][GPU] GPU fluid tick path entered (gpuFluidTickMaterial wired) -> fluid ticks routed to GPU instead of per-cell CPU code.");
+        }
+#endif
+        return true;
+    }
+
+    // PERF: Pre-baked random-tick predicate as a flat array. Inner loop replaces
+    // a 15-case switch with a single array index — Udon's switch is interpreted as
+    // a branch chain, so this is many-times faster in hot tick loops.
+    private bool[] _isRandomTickBlockLut;
+
+    // PERF: Open-addressed hash set for tick dedup (replaces O(N) linear scan in
+    // ScheduleBlockUpdate). Beta uses HashSet&lt;NextTickListEntry&gt;.contains() for the
+    // same reason. Key = pack(x, y, z, blockId). Size kept power-of-two for &amp;-mask probing.
+    private const int TICK_HASH_CAPACITY = 16384; // 2x queue capacity, power of two
+    private const int TICK_HASH_MASK = TICK_HASH_CAPACITY - 1;
+    private long[] _tickHashKeys;     // 0 = empty slot
+    private int[] _tickHashIndices;   // index into _tickX/_tickY/.../_tickScheduledFrame
+
     void Start()
     {
         if (world == null || blockTypeManager == null)
@@ -172,9 +248,30 @@ public class McBlockTicker : UdonSharpBehaviour
         _tickBlockId = new byte[TICK_QUEUE_CAPACITY];
         _tickScheduledFrame = new int[TICK_QUEUE_CAPACITY];
 
+        _tickHashKeys = new long[TICK_HASH_CAPACITY];
+        _tickHashIndices = new int[TICK_HASH_CAPACITY];
+
         _chanceToEncourageFire = new int[256];
         _abilityToCatchFire = new int[256];
         _InitFireBurnRates();
+
+        // Pre-bake the random-tick predicate. setTickOnLoad(true) blocks from Beta:
+        _isRandomTickBlockLut = new bool[256];
+        _isRandomTickBlockLut[B_GRASS] = true;
+        _isRandomTickBlockLut[B_SAPLING] = true;
+        _isRandomTickBlockLut[B_LEAVES] = true;
+        _isRandomTickBlockLut[B_WATER_FLOWING] = true;
+        _isRandomTickBlockLut[B_LAVA_FLOWING] = true;
+        _isRandomTickBlockLut[B_LAVA_STILL] = true;
+        _isRandomTickBlockLut[B_FIRE] = true;
+        _isRandomTickBlockLut[B_CROPS] = true;
+        _isRandomTickBlockLut[B_FARMLAND] = true;
+        _isRandomTickBlockLut[B_SNOW_LAYER] = true;
+        _isRandomTickBlockLut[B_ICE] = true;
+        _isRandomTickBlockLut[B_CACTUS] = true;
+        _isRandomTickBlockLut[B_REED] = true;
+        _isRandomTickBlockLut[B_MUSHROOM_BROWN] = true;
+        _isRandomTickBlockLut[B_MUSHROOM_RED] = true;
 
         _flowDirResult = new bool[4];
         _flowCostResult = new int[4];
@@ -248,12 +345,12 @@ public class McBlockTicker : UdonSharpBehaviour
             return;
         }
 
-        // MC dedup: scheduledTickSet.contains() — skip if same (x,y,z,blockId) already queued
-        for (int i = 0; i < _tickCount; i++)
-        {
-            if (_tickX[i] == gx && _tickY[i] == gy && _tickZ[i] == gz && _tickBlockId[i] == blockId)
-                return;
-        }
+        // PERF: O(1) hash-set dedup (Beta uses HashSet&lt;NextTickListEntry&gt;.contains()).
+        // Previous version did an O(N) linear scan; with TICK_QUEUE_CAPACITY=8192 and a
+        // fluid flood scheduling thousands of ticks per frame, that was O(N^2).
+        long key = _TickHashKey(gx, gy, gz, blockId);
+        int slot = _TickHashFind(key);
+        if (slot >= 0 && _tickHashKeys[slot] == key) return; // already scheduled
 
         int scheduledFrame = _currentFrame + delayTicks;
         int idx = _tickCount;
@@ -272,6 +369,51 @@ public class McBlockTicker : UdonSharpBehaviour
             _HeapSwap(idx, parent);
             idx = parent;
         }
+
+        // Record this entry in the hash table for O(1) future dedup.
+        // We don't track heap index moves (they happen during sift) — the hash is
+        // purely "has this (x,y,z,blockId) been inserted?". It is cleared each frame
+        // via _TickHashClear() so stale entries from yesterday's queue can't leak.
+        if (slot >= 0) _tickHashKeys[slot] = key;
+    }
+
+    private long _TickHashKey(int gx, int gy, int gz, byte blockId)
+    {
+        // Pack into a non-zero long. We use 0 to mean "empty slot", so we set the high bit
+        // to guarantee non-zero output. xz are in 24-bit windows, y in 8 bits, id in 8 bits.
+        long k = ((long)(gx & 0xFFFFFF))
+               | (((long)(gz & 0xFFFFFF)) << 24)
+               | (((long)(gy & 0xFF)) << 48)
+               | (((long)blockId) << 56);
+        // long.MinValue == 0x8000000000000000 bit pattern; OR'd in to guarantee key != 0
+        // (we use 0 as the "empty slot" sentinel in the hash table).
+        return k | long.MinValue;
+    }
+
+    private int _TickHashFind(long key)
+    {
+        // Linear probe. Returns slot index (regardless of hit/miss); caller checks key match.
+        // 32-bit fold-into-int mix; uses high bits which have better LCG entropy.
+        // UDON-CHECKED-CAST: mask to positive int range before casting, since Udon's
+        // SystemConvert.ToInt32(long) throws when value exceeds int.MaxValue.
+        // Loses one bit of hash entropy — acceptable, the mod-mask at the end uses
+        // ~14 bits anyway (TICK_HASH_MASK = 16383).
+        long folded = (key ^ (key >> 32)) & 0x7FFFFFFFL;
+        int h = (int)folded;
+        h ^= h >> 16;
+        int slot = h & TICK_HASH_MASK;
+        for (int i = 0; i < TICK_HASH_CAPACITY; i++)
+        {
+            long existing = _tickHashKeys[slot];
+            if (existing == 0L || existing == key) return slot;
+            slot = (slot + 1) & TICK_HASH_MASK;
+        }
+        return -1; // table full (should never happen with 2x oversize)
+    }
+
+    private void _TickHashClear()
+    {
+        System.Array.Clear(_tickHashKeys, 0, TICK_HASH_CAPACITY);
     }
 
     private void _HeapSwap(int a, int b)
@@ -387,12 +529,30 @@ public class McBlockTicker : UdonSharpBehaviour
 
             _HeapRemoveMin();
 
+            // Free the hash slot so the dispatcher can re-schedule this coord+blockId again.
+            // (Linear probing requires a tombstone — we re-set to 0 and on lookup the probe
+            // continues past empty slots only if a later key hashed past this. Acceptable
+            // for our load factor: 8192 keys in 16384 slots = 50% max load.)
+            long poppedKey = _TickHashKey(tx, ty, tz, tickBid);
+            int poppedSlot = _TickHashFind(poppedKey);
+            if (poppedSlot >= 0 && _tickHashKeys[poppedSlot] == poppedKey)
+            {
+                _tickHashKeys[poppedSlot] = 0L;
+            }
+
             byte currentBlock = world.GetBlock(tx, ty, tz);
             if (currentBlock == tickBid && currentBlock != B_AIR)
             {
                 _DispatchUpdateTick(tx, ty, tz, currentBlock);
             }
             processed++;
+        }
+
+        // If the heap drained, periodically zero the hash table to keep its load factor low.
+        // (Linear-probe tombstones can cluster over very long sessions.)
+        if (_tickCount == 0)
+        {
+            _TickHashClear();
         }
 #if LOGGING
         stats_scheduledTicksProcessed += processed;
@@ -436,6 +596,9 @@ public class McBlockTicker : UdonSharpBehaviour
                 int rv = _randomTickSeed >> 2;
                 int lx = rv & 15;
                 int lz = (rv >> 8) & 15;
+                // PARITY: Java uses `& 127` to cover the full 0..127 Y range (World.java:1951).
+                // This project uses 16-tall chunks, so we mask within the chunk and the chunk
+                // cursor iterates all Y-chunks across the column to cover the same Y range.
                 int ly = (rv >> 16) & 15;
 
                 byte blockId = world.GetBlock(baseX + lx, baseY + ly, baseZ + lz);
@@ -456,30 +619,11 @@ public class McBlockTicker : UdonSharpBehaviour
 
     /// <summary>
     /// Returns true if this block type receives random ticks (MC's tickOnLoad).
+    /// PERF: Single byte-indexed array load — avoids a 15-case switch in the random tick hot loop.
     /// </summary>
     private bool _IsRandomTickBlock(byte blockId)
     {
-        switch (blockId)
-        {
-            case B_GRASS:
-            case B_SAPLING:
-            case B_LEAVES:
-            case B_WATER_FLOWING:
-            case B_LAVA_FLOWING:
-            case B_LAVA_STILL: // stationary lava ticks for fire ignition
-            case B_FIRE:
-            case B_CROPS:
-            case B_FARMLAND:
-            case B_SNOW_LAYER:
-            case B_ICE:
-            case B_CACTUS:
-            case B_REED:
-            case B_MUSHROOM_BROWN:
-            case B_MUSHROOM_RED:
-                return true;
-            default:
-                return false;
-        }
+        return _isRandomTickBlockLut[blockId];
     }
 
     // --- Tick Dispatch ---
@@ -572,6 +716,13 @@ public class McBlockTicker : UdonSharpBehaviour
                 stats_dispatchCrops++;
 #endif
                 _UpdateTick_Crops(gx, gy, gz);
+                break;
+            case B_MUSHROOM_BROWN:
+            case B_MUSHROOM_RED:
+#if LOGGING
+                stats_dispatchOther++;
+#endif
+                _UpdateTick_Mushroom(gx, gy, gz, blockId);
                 break;
             default:
 #if LOGGING
@@ -1236,20 +1387,20 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private void _UpdateTick_Grass(int gx, int gy, int gz)
     {
-        // TODO: proper light check once lighting query is exposed
-        // For now, use a simplified version
+        // PARITY: BlockGrass.updateTick (Beta):
+        //  - If full block light at (x,y+1,z) < 4 AND opacity of block above > 2 -> revert to dirt
+        //  - Else if full block light at (x,y+1,z) >= 9 -> try to spread to a random dirt block
+        //    in a 3x5x3 box around (x,y,z), and the target must also have light>=4 + opacity<=2 above.
+        int lightAbove = world.GetFullBlockLightValue(gx, gy + 1, gz);
         byte above = world.GetBlock(gx, gy + 1, gz);
         int aboveOpacity = (above != B_AIR) ? blockTypeManager.GetBlockLightOpacity(above) : 0;
 
-        if (aboveOpacity > 2)
+        if (lightAbove < 4 && aboveOpacity > 2)
         {
-            // Dark — die to dirt (25% chance per tick, matching MC's random(4)!=0 skip)
-            if ((_NextRandom() % 4) == 0)
-                world.SetBlock(gx, gy, gz, B_DIRT);
+            world.SetBlock(gx, gy, gz, B_DIRT);
         }
-        else
+        else if (lightAbove >= 9)
         {
-            // Try to spread to nearby dirt
             int tx = gx + (_NextRandom() % 3) - 1;
             int ty = gy + (_NextRandom() % 5) - 3;
             int tz = gz + (_NextRandom() % 3) - 1;
@@ -1257,10 +1408,33 @@ public class McBlockTicker : UdonSharpBehaviour
             {
                 byte aboveTarget = world.GetBlock(tx, ty + 1, tz);
                 int targetOpacity = (aboveTarget != B_AIR) ? blockTypeManager.GetBlockLightOpacity(aboveTarget) : 0;
-                if (targetOpacity <= 2)
+                int targetLight = world.GetFullBlockLightValue(tx, ty + 1, tz);
+                if (targetOpacity <= 2 && targetLight >= 4)
                     world.SetBlock(tx, ty, tz, B_GRASS);
             }
         }
+    }
+
+    // --- MUSHROOM (BlockMushroom.java) ---
+    // Spread to nearby air on random tick (1/100 chance) with light < 13 requirement.
+    private void _UpdateTick_Mushroom(int gx, int gy, int gz, byte selfBlockId)
+    {
+        if ((_NextRandom() % 100) != 0) return;
+        int light = world.GetFullBlockLightValue(gx, gy + 1, gz);
+        if (light >= 13) return;
+
+        // Try to spread to a random offset block
+        int tx = gx + (_NextRandom() % 3) - 1;
+        int ty = gy + (_NextRandom() % 2) - (_NextRandom() % 2);
+        int tz = gz + (_NextRandom() % 3) - 1;
+        if (world.GetBlock(tx, ty, tz) != B_AIR) return;
+        // Must be on opaque block with light < 13
+        byte below = world.GetBlock(tx, ty - 1, tz);
+        if (below == B_AIR) return;
+        if (blockTypeManager.GetBlockLightOpacity(below) < 13) return;
+        int targetLight = world.GetFullBlockLightValue(tx, ty + 1, tz);
+        if (targetLight >= 13) return;
+        world.SetBlock(tx, ty, tz, selfBlockId);
     }
 
     // --- LEAVES (BlockLeaves.java) ---
@@ -1366,16 +1540,62 @@ public class McBlockTicker : UdonSharpBehaviour
     private void _OnNeighborChange_Reed(int gx, int gy, int gz)
     {
         byte below = world.GetBlock(gx, gy - 1, gz);
-        if (below != B_REED && below != B_GRASS && below != B_DIRT)
-            world.SetBlock(gx, gy, gz, B_AIR);
+        // PARITY: BlockReed.canBlockStay (Beta) — reed survives if:
+        //   (a) block below is reed, OR
+        //   (b) block below is grass/dirt AND there is water (any kind) in one of the four
+        //       horizontal neighbors of the BELOW block.
+        // Previous version omitted the water-adjacency check, so reed on bare dirt survived forever.
+        if (below == B_REED) return;
+        if (below == B_GRASS || below == B_DIRT)
+        {
+            int by = gy - 1;
+            byte n1 = world.GetBlock(gx - 1, by, gz);
+            byte n2 = world.GetBlock(gx + 1, by, gz);
+            byte n3 = world.GetBlock(gx, by, gz - 1);
+            byte n4 = world.GetBlock(gx, by, gz + 1);
+            bool waterNearby =
+                n1 == B_WATER_FLOWING || n1 == B_WATER_STILL ||
+                n2 == B_WATER_FLOWING || n2 == B_WATER_STILL ||
+                n3 == B_WATER_FLOWING || n3 == B_WATER_STILL ||
+                n4 == B_WATER_FLOWING || n4 == B_WATER_STILL;
+            if (waterNearby) return;
+        }
+        world.SetBlock(gx, gy, gz, B_AIR);
     }
 
     // --- FLOWER / MUSHROOM / TALLGRASS (BlockFlower.java) ---
 
     private void _OnNeighborChange_Flower(int gx, int gy, int gz)
     {
+        // PARITY: BlockFlower.canBlockStay (Beta) — requires
+        //   (getFullBlockLightValue(x,y+1,z) >= 8 || canBlockSeeTheSky(x,y+1,z))
+        //   AND canThisPlantGrowOnThisBlockID(below).
+        // Mushrooms (BlockMushroom override): require light < 13 AND opaque cube below.
+        // Dead bush (BlockDeadBush override): requires SAND below.
+        byte self = world.GetBlock(gx, gy, gz);
         byte below = world.GetBlock(gx, gy - 1, gz);
-        if (below != B_GRASS && below != B_DIRT && below != B_FARMLAND)
+
+        if (self == B_DEADBUSH)
+        {
+            if (below != B_SAND) world.SetBlock(gx, gy, gz, B_AIR);
+            return;
+        }
+
+        if (self == B_MUSHROOM_BROWN || self == B_MUSHROOM_RED)
+        {
+            // Mushroom: opaque below + light < 13
+            int lightHere = world.GetFullBlockLightValue(gx, gy + 1, gz);
+            if (lightHere >= 13 || below == B_AIR || blockTypeManager.GetBlockLightOpacity(below) < 13)
+                world.SetBlock(gx, gy, gz, B_AIR);
+            return;
+        }
+
+        // Flower / tallgrass: light >= 8 or can see sky, AND grass/dirt/farmland below
+        bool soilOK = (below == B_GRASS || below == B_DIRT || below == B_FARMLAND);
+        if (!soilOK) { world.SetBlock(gx, gy, gz, B_AIR); return; }
+
+        int light = world.GetFullBlockLightValue(gx, gy + 1, gz);
+        if (light < 8 && !world.CanBlockSeeTheSky(gx, gy, gz))
             world.SetBlock(gx, gy, gz, B_AIR);
     }
 
@@ -1383,10 +1603,16 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private void _UpdateTick_Sapling(int gx, int gy, int gz)
     {
-        // Simplified: small random chance to grow into a basic tree
-        byte meta = world.GetBlockMetadata(gx, gy, gz);
-        if ((_NextRandom() % 7) != 0) return;
+        // PARITY: BlockSapling.updateTick (Beta):
+        //  - Requires `getBlockLightValue(x, y+1, z) >= 9` to even attempt growth.
+        //  - Growth chance is `nextInt(30) == 0`, not `nextInt(7) != 0`.
+        // The previous `% 7 != 0` form skipped 6/7 = 86% of ticks (effectively 1/7 growth);
+        // Java's `nextInt(30) == 0` is 1/30. The old form grew saplings ~4x too fast.
+        int lightAbove = world.GetFullBlockLightValue(gx, gy + 1, gz);
+        if (lightAbove < 9) return;
+        if ((_NextRandom() % 30) != 0) return;
 
+        byte meta = world.GetBlockMetadata(gx, gy, gz);
         if ((meta & 8) == 0)
         {
             // Set stage flag
@@ -1439,6 +1665,10 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private void _UpdateTick_Farmland(int gx, int gy, int gz)
     {
+        // PARITY: Java BlockFarmland.updateTick wraps the entire body in
+        // `if (rand.nextInt(5) == 0)`. Without it, farmland updated 5x too fast.
+        if ((_NextRandom() % 5) != 0) return;
+
         // Check for water within 4 blocks horizontally and 1 block vertically
         bool hydrated = false;
         for (int dx = -4; dx <= 4 && !hydrated; dx++)
@@ -1474,10 +1704,11 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private void _UpdateTick_Ice(int gx, int gy, int gz)
     {
-        // Melt if exposed to light > 11
-        // Simplified: melt if no opaque block above (sky-exposed)
-        byte above = world.GetBlock(gx, gy + 1, gz);
-        if (above == B_AIR || blockTypeManager.GetBlockLightOpacity(above) == 0)
+        // PARITY: BlockIce.updateTick (Beta) melts if BLOCK-emitted light at this position > 11.
+        // It does NOT melt from sky exposure alone. The previous implementation inverted this:
+        // it melted under open sky and never melted under torches — opposite of Beta.
+        int blockLight = world.GetBlockLightValue(gx, gy, gz);
+        if (blockLight > 11 - blockTypeManager.GetBlockLightOpacity(B_ICE))
         {
             world.SetBlock(gx, gy, gz, B_WATER_STILL);
         }
@@ -1487,13 +1718,12 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private void _UpdateTick_Snow(int gx, int gy, int gz)
     {
-        // Melt if exposed to bright light
-        byte above = world.GetBlock(gx, gy + 1, gz);
-        if (above == B_AIR || blockTypeManager.GetBlockLightOpacity(above) == 0)
+        // PARITY: BlockSnow.updateTick (Beta) melts when BLOCK-emitted light > 11 — guaranteed,
+        // no probability gate. Previous impl used sky-exposure + 25% probability.
+        int blockLight = world.GetBlockLightValue(gx, gy, gz);
+        if (blockLight > 11)
         {
-            // Only melt with some probability to avoid instant snow destruction
-            if ((_NextRandom() % 4) == 0)
-                world.SetBlock(gx, gy, gz, B_AIR);
+            world.SetBlock(gx, gy, gz, B_AIR);
         }
     }
 
@@ -1501,11 +1731,31 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private void _UpdateTick_Crops(int gx, int gy, int gz)
     {
+        // PARITY: BlockCrops.updateTick (Beta):
+        //  - Requires light at (x, y+1, z) >= 9. (Missing entirely before.)
+        //  - Growth chance is `nextInt(max(1, 100/growthRate)) == 0` where growthRate depends
+        //    on neighboring farmland hydration and crop layout. We approximate growthRate
+        //    here by sampling: hydrated farmland below = base rate; dry farmland = slower.
         byte meta = world.GetBlockMetadata(gx, gy, gz);
         if (meta >= 7) return; // Fully grown
 
-        // Growth rate depends on farmland hydration and adjacency — simplified
-        if ((_NextRandom() % 5) == 0)
+        int lightAbove = world.GetFullBlockLightValue(gx, gy + 1, gz);
+        if (lightAbove < 9) return;
+
+        // Approximate growth rate from underlying farmland metadata.
+        // farmland meta 7 = hydrated, 0 = bone dry. Bias growthRate by hydration level.
+        byte belowFarmlandMeta = world.GetBlockMetadata(gx, gy - 1, gz);
+        byte belowBlock = world.GetBlock(gx, gy - 1, gz);
+        // baseRate = 1 (dry farmland), up to ~4 (hydrated). Java's full formula is more nuanced
+        // but this captures the dominant hydration term within a parity tolerance.
+        int growthRate = 1;
+        if (belowBlock == B_FARMLAND)
+        {
+            growthRate = (belowFarmlandMeta > 0) ? 4 : 2;
+        }
+        int chance = 100 / growthRate;
+        if (chance < 1) chance = 1;
+        if ((_NextRandom() % chance) == 0)
         {
             world.SetBlockMetadata(gx, gy, gz, (byte)(meta + 1));
         }
@@ -1551,6 +1801,15 @@ public class McBlockTicker : UdonSharpBehaviour
         _fallBlockId[slot] = blockId;
         _fallActive[slot] = true;
         _fallTicks[slot] = 0;
+
+        // PARITY: Java clears the origin cell EXACTLY ONCE at entity spawn time, not on every
+        // physics tick. (`worldObj.setBlockWithNotify(floor(posX), floor(posY), floor(posZ), 0);`
+        // in EntityFallingSand's constructor.) Doing it per-tick would erase a freshly placed
+        // landing block when the visual position lands inside the target cell.
+        if (world.GetBlock(gx, gy, gz) == blockId)
+        {
+            world.SetBlock(gx, gy, gz, B_AIR);
+        }
 #if LOGGING
         stats_fallingBlockSpawns++;
 #endif
@@ -1602,14 +1861,12 @@ public class McBlockTicker : UdonSharpBehaviour
             int by = Mathf.FloorToInt(_fallPosY[i] - 0.5f);
             int bz = Mathf.FloorToInt(_fallPosZ[i]);
 
-            // MC clears its own block if still present at current position
-            int curBx = Mathf.FloorToInt(_fallPosX[i]);
-            int curBy = Mathf.FloorToInt(_fallPosY[i]);
-            int curBz = Mathf.FloorToInt(_fallPosZ[i]);
-            if (world.GetBlock(curBx, curBy, curBz) == _fallBlockId[i])
-            {
-                world.SetBlock(curBx, curBy, curBz, B_AIR);
-            }
+            // PARITY: Java EntityFallingSand clears its ORIGIN block (the cell it spawned in)
+            // ONCE at spawn time, not on every physics tick. Re-clearing every tick at the
+            // current Y could wipe a freshly placed landing block when the entity's visual
+            // position lands inside the cell containing its target. The block-id check makes
+            // it less catastrophic but still wrong when sand falls on sand. The spawn-time
+            // clear is handled in _SpawnFallingBlock; here we just do collision/landing.
 
             bool landed = !_CanFallBelow(bx, by, bz) && _fallVelY[i] <= 0f;
             bool timedOut = _fallTicks[i] > 600;

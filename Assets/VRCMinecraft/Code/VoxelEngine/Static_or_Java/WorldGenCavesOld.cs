@@ -7,9 +7,36 @@ public class WorldGenCavesOld {
 
     public const double MIN_HORIZONTAL_SIZE = 1.5D;
 
+    // PARITY+PERF: Beta's `MathHelper.SIN_TABLE` — a 65,536-entry float LUT used by
+    // cave shaping (and Beta-wide). Matching this LUT gets us closer to Beta cave
+    // shapes than Unity's `Mathf.Sin` (which routes through `System.Math.Sin` and
+    // would not have the same 16-bit quantization).
+    // Note: UdonSharp does not support static fields on user-defined types, so this
+    // is an instance field. 256 KB one-time alloc per WorldGenCavesOld instance.
+    private readonly float[] _sinTable = new float[65536];
+    private bool _sinTableReady = false;
+
     public WorldGenCavesOld() {
         maxGenerationRadius = 8;
         rand = new JavaRandom();
+        _InitSinTable();
+    }
+
+    private void _InitSinTable() {
+        if (_sinTableReady) return;
+        for (int i = 0; i < 65536; i++) {
+            _sinTable[i] = (float)System.Math.Sin((double)i * System.Math.PI * 2.0 / 65536.0);
+        }
+        _sinTableReady = true;
+    }
+
+    private float _Sin(float x) {
+        return _sinTable[(int)(x * 10430.378F) & 0xFFFF];
+    }
+
+    private float _Cos(float x) {
+        // cos(x) = sin(x + PI/2) ; +16384 indices = quarter turn in the 65536-entry table
+        return _sinTable[(int)(x * 10430.378F + 16384.0F) & 0xFFFF];
     }
 
     protected void generateDefaultBranch(McWorld world, int generatedChunkX, int generatedChunkZ, double structureOriginBlockX, double structureOriginBlockY, double structureOriginBlockZ) {
@@ -45,18 +72,18 @@ public class WorldGenCavesOld {
         for (; currentCaveSystemRadius < maxCaveSystemRadius; currentCaveSystemRadius++) {
 
             //caveRadius grows as we go out of the center
-            double caveRadiusHorizontal = MIN_HORIZONTAL_SIZE + (double) (Mathf.Sin((float) currentCaveSystemRadius * 3.141593F / (float) maxCaveSystemRadius) * maxHorizontalSize * 1.0f);
+            double caveRadiusHorizontal = MIN_HORIZONTAL_SIZE + (double) (_Sin((float) currentCaveSystemRadius * 3.141593F / (float) maxCaveSystemRadius) * maxHorizontalSize * 1.0f);
             double caveRadiusVertical = caveRadiusHorizontal * verticalCaveSizeMultiplier;
 
             //from sin(alpha)=y/r and cos(alpha)=x/r ==> x = r*cos(alpha) and y = r*sin(alpha)
             //always moves by one block in some direction
             //x is horizontal radius, y is vertical
-            float horizontalDirectionSize = Mathf.Cos(directionAngleVertical);
-            float directionY = Mathf.Sin(directionAngleVertical);
+            float horizontalDirectionSize = _Cos(directionAngleVertical);
+            float directionY = _Sin(directionAngleVertical);
             //y is directionZ and is is directionX
-            currentBlockX += Mathf.Cos(directionAngleHorizontal) * horizontalDirectionSize;
+            currentBlockX += _Cos(directionAngleHorizontal) * horizontalDirectionSize;
             currentBlockY += directionY;
-            currentBlockZ += Mathf.Sin(directionAngleHorizontal) * horizontalDirectionSize;
+            currentBlockZ += _Sin(directionAngleHorizontal) * horizontalDirectionSize;
             if (allowSteepCave) {
                 directionAngleVertical *= 0.92F;
             } else {
@@ -132,7 +159,10 @@ public class WorldGenCavesOld {
                         continue;
                     }
 
-                    for (int localY = endY; localY >= startY; localY--) {
+                    // PARITY: Java iterates `var48 = var36 - 1; var48 >= var54; --var48` (MapGenCaves.java).
+                    // Block reads/writes happen at `localY + 1`, so starting localY = endY - 1 carves blocks at
+                    // Y range [startY+1, endY], matching Java. The old `localY = endY` carved one block too high.
+                    for (int localY = endY - 1; localY >= startY; localY--) {
                         double yDistanceScaled = (((double)localY + 0.5D) - currentBlockY) / caveRadiusVertical;
                         //yDistanceScaled > -0.7 ==> flattened floor
                         if (yDistanceScaled > -0.7D &&

@@ -21,7 +21,10 @@ public class McMovement : NUMovement
     private const float WATER_JUMP_BOOST = 0.04f;
     private const float WEB_HORIZONTAL_SCALE = 0.25f;
     private const float WEB_VERTICAL_SCALE = 0.05f;
-    private const float SOUL_SAND_MULTIPLIER = 0.4f;
+    // PARITY: Beta 1.7.3 has no Soul Sand movement penalty — that was added in 1.0/Release.
+    // The constant + multiply branch below was wrong. Keeping the constant declared for ABI
+    // compatibility (other code may reference it), but the slowdown is now a no-op (1.0).
+    private const float SOUL_SAND_MULTIPLIER = 1.0f;
     private const float DEFAULT_SLIPPERINESS = 0.6f;
     private const float INPUT_DAMP = 0.98f;
     private const float VERTICAL_DAMP = 0.98f;
@@ -262,12 +265,9 @@ public class McMovement : NUMovement
         {
             float slipperiness = GetGroundSlipperiness();
             friction = slipperiness * AIR_DRAG;
-            if (blockBelowId == (byte)BlockMaterial.SOUL_SAND)
-            {
-                float soul = Mathf.Pow(SOUL_SAND_MULTIPLIER, tickRatio);
-                mcVelocity.x *= soul;
-                mcVelocity.z *= soul;
-            }
+            // PARITY: Beta 1.7.3 BlockSoulSand has no slipperiness override and no
+            // onEntityWalking override that slows entities. The slow-walking-on-soul-sand
+            // behavior was introduced post-Beta. Branch removed for parity.
         }
 
         mcVelocity.y -= GRAVITY_PER_TICK * tickRatio;

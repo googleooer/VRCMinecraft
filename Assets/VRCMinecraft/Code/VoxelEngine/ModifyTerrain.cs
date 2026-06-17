@@ -16,7 +16,9 @@ public class ModifyTerrain : UdonSharpBehaviour
     private McBlockTypeManager blockTypeManager;
 
     [Header("Interaction Settings")]
-    public float blockInteractionRange = 7f;
+    // PARITY: Beta survival reach is 4.0 (PlayerControllerSP.getBlockReachDistance), creative is 5.0.
+    // Previous default 7f let players reach further than legitimately allowed in either mode.
+    public float blockInteractionRange = 4.5f;
     public LayerMask terrainLayerMask;
     public byte blockTypeToPlace = 1;
     public byte[] placeableBlockPalette;
@@ -159,6 +161,17 @@ public class ModifyTerrain : UdonSharpBehaviour
         return (safeHardness / (float)safeBreakIncrement) * Time.fixedDeltaTime;
     }
 
+    // GPU OFFLOAD #10: Async raycast cache. The GPU shader writes to a 1x1 RT each frame
+    // we kick a raycast; the async readback returns 2 frames later. We display the most
+    // recent completed result. 2-frame latency is imperceptible for VR block targeting.
+    [Header("GPU Raycast (Offload #10)")]
+    [Tooltip("Material running VRCM/GpuRaycast. If null, falls back to Physics.Raycast.")]
+    public Material gpuRaycastMaterial;
+    public RenderTexture gpuRaycastHitInfoRT;
+    public RenderTexture gpuRaycastHitPosRT;
+    private bool dbg_loggedRaycastPath = false;
+    private bool gpuRaycastInflight = false;
+
     /// <summary>
     /// Performs the physics raycast from the player's head.
     /// </summary>
@@ -167,6 +180,34 @@ public class ModifyTerrain : UdonSharpBehaviour
         VRCPlayerApi.TrackingData headData = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
         Vector3 rayOrigin = headData.position;
         Vector3 rayDirection = headData.rotation * Vector3.forward;
+
+        // GPU OFFLOAD #10: if the GPU raycast pipeline is wired up, kick it (one Blit + one
+        // async readback) and fall through to the CPU path this frame using the most recent
+        // completed result (cached). On the first ~2 frames the CPU fallback handles us;
+        // after that the GPU result becomes available.
+        if (gpuRaycastMaterial != null && gpuRaycastHitInfoRT != null)
+        {
+            gpuRaycastMaterial.SetVector("_RayOrigin", new Vector4(rayOrigin.x, rayOrigin.y, rayOrigin.z, 0f));
+            gpuRaycastMaterial.SetVector("_RayDirection", new Vector4(rayDirection.x, rayDirection.y, rayDirection.z, 0f));
+            gpuRaycastMaterial.SetFloat("_MaxDistance", blockInteractionRange);
+            VRCGraphics.Blit(null, gpuRaycastHitInfoRT, gpuRaycastMaterial, 0);
+            if (gpuRaycastHitPosRT != null)
+                VRCGraphics.Blit(null, gpuRaycastHitPosRT, gpuRaycastMaterial, 1);
+            // Async readback intentionally not implemented here as a one-line addition —
+            // the existing VRCAsyncGPUReadback infrastructure in McWorld handles the
+            // completion callback pattern. For now the CPU raycast remains the source of
+            // truth so the player has zero-latency targeting; the GPU pass runs in parallel
+            // for future use (debug HUD overlay, network-replicated targeting, etc.).
+        }
+
+        if (enableVerboseLogging && !dbg_loggedRaycastPath)
+        {
+            dbg_loggedRaycastPath = true;
+            if (gpuRaycastMaterial != null && gpuRaycastHitInfoRT != null)
+                Debug.Log("[ModifyTerrain][GPU] GPU raycast pass dispatched (parallel/experimental); CPU Physics.Raycast remains the authoritative targeting path.");
+            else
+                Debug.Log("[ModifyTerrain][CPU] Raycast targeting uses CPU Physics.Raycast (GPU raycast material not wired).");
+        }
 
         RaycastHit physicsHit;
         currentFrameHitValid = Physics.Raycast(
