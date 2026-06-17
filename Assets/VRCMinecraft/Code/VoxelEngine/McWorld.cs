@@ -38,6 +38,15 @@ public class McWorld : UdonSharpBehaviour
     // Runtime state for the load-phase budget boost (see Update()).
     private bool _loadPhaseBudgetRestored = false;
     private float _runtimeUpdateBudgetMs = 0f;
+
+    // --- Terrain-correctness harness (for validating the generator parallelization refactor) ---
+    // When on, records an FNV-1a fingerprint of the raw generated block data for a fixed set of
+    // chunk coords (near spawn, complete early in the radial order). Call DebugLogTerrainFingerprint()
+    // after letting gen run, and compare the logged sum before/after a refactor — equal sum ==
+    // byte-for-byte identical terrain. The fixed coord set makes it comparable regardless of gen speed.
+    public bool debugTerrainChecksum = false;
+    private int[] _dbgCsCx; private int[] _dbgCsCy; private int[] _dbgCsCz;
+    private uint[] _dbgCsHash; private bool[] _dbgCsDone; private int _dbgCsN;
     [Tooltip("Budget per incremental GPU mesh decode step in milliseconds. Lower values reduce hitches from GPU mesh completion.")]
     public float gpuMeshDecodeStepBudgetMs = 1.5f;
     [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame.")]
@@ -3933,6 +3942,8 @@ public class McWorld : UdonSharpBehaviour
             chunk._cachedDataVersion++;
             _RefreshChunkDerivedData(chunk, generatedData);
 
+            if (debugTerrainChecksum) _DebugRecordChunkChecksum(chunk, generatedData);
+
             _GpuSyncChunkBlocks(chunk, generatedData);
 
             // OPTIMIZATION: Invalidate neighbor cache since chunk data changed
@@ -3980,6 +3991,79 @@ public class McWorld : UdonSharpBehaviour
 
 
         }
+    }
+
+    // --- Terrain-correctness harness implementation ---
+    private void _DebugInitChecksumSet()
+    {
+        // 4 columns near the world center × every Y level = a fixed sample that completes
+        // early in the radial gen order. Centered chunk coords (match chunk.chunkX_world).
+        int[] colX = new int[] { 0, 1, 0, -1 };
+        int[] colZ = new int[] { 0, 0, 1, -1 };
+        int nCols = 4;
+        int yCount = worldDimensionY;
+        _dbgCsN = nCols * yCount;
+        _dbgCsCx = new int[_dbgCsN];
+        _dbgCsCy = new int[_dbgCsN];
+        _dbgCsCz = new int[_dbgCsN];
+        _dbgCsHash = new uint[_dbgCsN];
+        _dbgCsDone = new bool[_dbgCsN];
+        int idx = 0;
+        for (int c = 0; c < nCols; c++)
+        {
+            for (int y = 0; y < yCount; y++)
+            {
+                _dbgCsCx[idx] = colX[c];
+                _dbgCsCy[idx] = y;
+                _dbgCsCz[idx] = colZ[c];
+                idx++;
+            }
+        }
+    }
+
+    private void _DebugRecordChunkChecksum(ChunkData chunk, byte[] data)
+    {
+        if (chunk == null) return;
+        if (_dbgCsCx == null) _DebugInitChecksumSet();
+        for (int i = 0; i < _dbgCsN; i++)
+        {
+            if (_dbgCsDone[i]) continue;
+            if (chunk.chunkX_world == _dbgCsCx[i] && chunk.chunkY_world == _dbgCsCy[i] && chunk.chunkZ_world == _dbgCsCz[i])
+            {
+                uint h = 2166136261u;
+                h = (h ^ (uint)(chunk.chunkX_world & 0xFF)) * 16777619u;
+                h = (h ^ (uint)(chunk.chunkY_world & 0xFF)) * 16777619u;
+                h = (h ^ (uint)(chunk.chunkZ_world & 0xFF)) * 16777619u;
+                if (data != null)
+                {
+                    int n = data.Length;
+                    for (int k = 0; k < n; k++)
+                    {
+                        h = (h ^ (uint)data[k]) * 16777619u;
+                    }
+                }
+                _dbgCsHash[i] = h;
+                _dbgCsDone[i] = true;
+                break;
+            }
+        }
+    }
+
+    // Call from execute_code via SendCustomEvent("DebugLogTerrainFingerprint") after letting gen run.
+    public void DebugLogTerrainFingerprint()
+    {
+        if (_dbgCsCx == null)
+        {
+            Debug.Log("[TERRAIN_FP] not initialized — enable debugTerrainChecksum and let some chunks generate first.");
+            return;
+        }
+        uint sum = 0;
+        int done = 0;
+        for (int i = 0; i < _dbgCsN; i++)
+        {
+            if (_dbgCsDone[i]) { sum += _dbgCsHash[i]; done++; }
+        }
+        Debug.Log("[TERRAIN_FP] sum=" + sum + " done=" + done + "/" + _dbgCsN);
     }
 
     // FIXED: Called by Coordinator to start incremental lighting (STATE_LIGHTING)
