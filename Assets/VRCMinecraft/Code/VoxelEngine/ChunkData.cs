@@ -19,6 +19,17 @@ public class ChunkData
     public MeshCollider selectionCollider; // Selection/focus collision (includes focusable non-solid blocks)
 
     // --- Data & State ---
+    // PERF: Pair `_chunkData` with a discriminator byte so the hot _GetBlockLocal /
+    // _SetBlockLocal paths can do `switch (_chunkDataKind)` (single byte compare)
+    // instead of `_chunkData.GetType()` which is a virtual call + RTTI scan in Udon —
+    // the single most expensive op on every block read on the slow path.
+    // Kinds: 0 = unset/null, 1 = homogeneous (boxed byte), 2 = raw byte[],
+    //        3 = column RLE (ushort[][]).
+    public const byte CHUNK_KIND_NULL = 0;
+    public const byte CHUNK_KIND_HOMOGENEOUS = 1;
+    public const byte CHUNK_KIND_RAW = 2;
+    public const byte CHUNK_KIND_RLE = 3;
+    public byte _chunkDataKind;
     public object _chunkData;
     public int _chunkDataSize;
     public bool isDataReady = false;
@@ -156,6 +167,58 @@ public class ChunkData
     public Color[] _cachedBiomeColors;
     public int[] _cachedPackedGrassBiomeColors;
     public bool _cachedBiomeColorsValid = false;
+
+    // GPU OFFLOAD #3: Per-chunk biome tint RTs (16x16) baked by GpuBiomeColorBake shader.
+    // Sampled directly by mesh shader (no CPU readback). Only allocated when GPU bake is enabled.
+    public UnityEngine.RenderTexture _gpuBiomeGrassRT;
+    public UnityEngine.RenderTexture _gpuBiomeFoliageRT;
+    public UnityEngine.RenderTexture _gpuBiomeWaterRT;
+    public bool _gpuBiomeColorsBaked = false;
+
+    // GPU OFFLOAD #3: Per-chunk 16x16 climate Texture2D (temperature.r + rainfall.g) used as
+    // input to the biome color baker. Populated from the terrain generator's
+    // wcm.temperatures/rainfall via SetPixels32 + Apply.
+    public UnityEngine.Texture2D _gpuClimateTex;
+    public UnityEngine.Color32[] _gpuClimateUploadScratch;
+
+    // GPU OFFLOAD #9: AO output RT — packed AO values per voxel face vertex for the mesh shader.
+    public UnityEngine.RenderTexture _gpuAORT;
+    public bool _gpuAOBaked = false;
+
+    // GPU OFFLOAD #4: Sentinel border RT — same chunk-block format but with 1-voxel border
+    // filled from 6 neighbors via Blit (not CPU). Mesh shader samples this for face culling.
+    public UnityEngine.RenderTexture _gpuSentinelRT;
+    public bool _gpuSentinelBuilt = false;
+
+    // GPU OFFLOAD #7: per-chunk fluid level RT (8-bit) for the GPU water/lava CA pass.
+    public UnityEngine.RenderTexture _gpuFluidLevelRT;
+    public UnityEngine.RenderTexture _gpuFluidLevelRTNext;
+
+    // GPU OFFLOAD #8: per-chunk scheduled-tick bitmask RT (1 bit per voxel).
+    public UnityEngine.RenderTexture _gpuTickMaskRT;
+    public bool _gpuTickMaskDirty = false;
+
+    // GPU OFFLOAD #5: Per-chunk face buffer RT — packed (x,y,z,face,blockId,ao,light)
+    // for every visible face. Sized by face count from GpuVoxelFaceExtract's summary pass.
+    // Sampled by GpuVoxelQuadDraw vertex shader at unity_InstanceID time.
+    public UnityEngine.RenderTexture _gpuQuadFaceBufferRT;
+    public int _gpuQuadFaceCount = 0;
+    // Per-chunk bounds for instanced draw (used as Bounds for culling).
+    public UnityEngine.Bounds _gpuQuadDrawBounds;
+
+    // GPU OFFLOAD #2: GPU-resident chunk flag. True for chunks whose authoritative block
+    // data lives in the GPU atlas slot — `_chunkData` may be null and `_cachedDecompressedData`
+    // may be stale. Mesh + lighting passes sample from the GPU atlas directly.
+    //
+    // When _isGpuResident is true and CPU code needs blocks (collision/raycast/tick),
+    // McWorld.GetBlock triggers a sync readback into `_cachedDecompressedData` via
+    // `_GpuRehydrateCpuMirror`. The flag is cleared once the player walks close enough
+    // to bring the chunk into the cpuMirrorRadius.
+    public bool _isGpuResident = false;
+
+    // Pending hydration request — set when CPU code calls GetBlock on a GPU-resident
+    // chunk; cleared by the readback completion handler.
+    public bool _gpuMirrorRehydratePending = false;
 
 #if LOGGING
     // --- Debugging & Timings ---

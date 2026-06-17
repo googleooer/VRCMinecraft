@@ -71,8 +71,8 @@ Material:
     m_Floats:
     - _Amplitude: 10000
     - _ChunkSizeXZ: 16
-    - _ChunkX: 0
-    - _ChunkZ: 2
+    - _ChunkX: -7
+    - _ChunkZ: -3
     - _ClimateOctaveCount0: 4
     - _ClimateOctaveCount1: 4
     - _ClimateOctaveCount2: 2
@@ -85,9 +85,9 @@ Material:
     - _GridX: 0.0061035156
     - _GridY: 0.000030517578
     - _GridZ: 0.0061035156
-    - _HashAHi: 2.1474836e+9
+    - _HashAHi: -468256480
     - _HashALo: 1.98295e+9
-    - _HashBHi: 2.1474836e+9
+    - _HashBHi: -523969630
     - _HashBLo: 333505950
     - _Is2D: 1
     - _LavaBlockId: 11

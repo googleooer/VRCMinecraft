@@ -127,6 +127,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public bool enableDetailedTimings = true;
     public bool enableCounters = true;
     public bool enableMemoryTracking = true;
+
+    // CPU/GPU path tracing one-shot guard
+    private bool dbg_loggedFirstGpuChunkCopy = false;
     
     private DateTime time_Total_Start;
     private float time_Preparation, time_GeneratingTerrain, time_ReplacingBiomes;
@@ -202,6 +205,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int agg_gpuFallbackPrepareNoise;
     private int agg_gpuFallbackFinalize;
     private int agg_gpuFallbackReadbackFailure;
+    // GPU OFFLOAD #1: counts chunks whose CPU mirror copy was skipped (GPU-only chunks).
+    private int agg_gpuChunkMirrorSkips;
     private int agg_gpuDiagnosticReadbackStalls;
     private int agg_gpuNoiseBlits;
     private float agg_gpuNoiseBlitTime;
@@ -266,7 +271,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
     // The random state for the generator, based on the seed
     private JavaRandom rand;
-    private int generatorSeed;
+    // PARITY: 64-bit seed matches Java's Long. Truncating to int dropped the top 32 bits
+    // and produced a different world even with a matching numeric seed.
+    private long generatorSeed;
 
     private NoiseGeneratorOctaves3D noiseGen1;
     private NoiseGeneratorOctaves3D noiseGen2;
@@ -309,6 +316,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
     
     // Cache for the main 3D noise field for a column
     private double[] noiseCache;
+
+    // PERF: Pre-baked 1/2^n for n in [0..15]. Replaces 16 Math.Pow calls per chunk.
+    // (Instance field — UdonSharp does not support static fields on UdonSharpBehaviours.)
+    private double[] _octaveFrequencyLut;
     
     // RADICAL OPTIMIZATION: Simple caching for last biome query
     // Avoids re-computing biomes for same coordinates
@@ -639,7 +650,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return x * sizeXZ + z;
     }
 
-    public void init(int seed)
+    public void init(long seed)
     {
         DateTime startTime = DateTime.UtcNow;
         if (isInitialized) return;
@@ -680,9 +691,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         noiseGen6 = new NoiseGeneratorOctaves3D(rand, 10);
         noiseGen7 = new NoiseGeneratorOctaves3D(rand, 16);
         treeNoise = new NoiseGeneratorOctaves3D(rand, 8);
-        biomeTempNoiseGen = new NoiseGeneratorOctaves2D(new JavaRandom((long)seed * 9871L), 4);
-        biomeRainNoiseGen = new NoiseGeneratorOctaves2D(new JavaRandom((long)seed * 39811L), 4);
-        biomeModifierNoiseGen = new NoiseGeneratorOctaves2D(new JavaRandom((long)seed * 543321L), 2);
+        biomeTempNoiseGen = new NoiseGeneratorOctaves2D(new JavaRandom(seed * 9871L), 4);
+        biomeRainNoiseGen = new NoiseGeneratorOctaves2D(new JavaRandom(seed * 39811L), 4);
+        biomeModifierNoiseGen = new NoiseGeneratorOctaves2D(new JavaRandom(seed * 543321L), 2);
 
         caves = new WorldGenCavesOld();
         _InitializeGpuWorldgen();
@@ -1471,6 +1482,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuPreFracZ = new float[GPU_MAX_XZSIZE];
 
         gpuWorldgenReady = true;
+#if LOGGING
+        Debug.Log("[McTerrainGen][GPU] GPU worldgen resources initialized (gpuWorldgenReady=true) -> GPU terrain generation is available.");
+#endif
     }
 
     private void _UploadGpuPermutationTable(Texture2D targetTexture, NoiseGeneratorOctaves3D source, int octaveCount)
@@ -2521,7 +2535,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         double[] cpuSandN = noiseGen4.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.03125D, 0.03125D, 1.0D);
         _UploadCpuSurfaceNoise(cpuSandN, sizeXZ, gpuSandNoiseTexture);
 
-        double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
+        double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0134D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
         _UploadCpuSurfaceNoise(cpuGravelN, sizeXZ, gpuGravelNoiseTexture);
 
         double[] cpuStoneN = noiseGen5.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.0625D, 0.0625D, 0.0625D);
@@ -2566,11 +2580,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
             float caveBlitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
-            int caveSeedInt = McUtils.GetMinecraftSeed(world.worldSeedString);
+            long caveSeedLong = McUtils.GetMinecraftSeed(world.worldSeedString);
             gpuCaveCarveMaterial.SetInt(gpuPropCaveChunkXId, currentChunkX);
             gpuCaveCarveMaterial.SetInt(gpuPropCaveChunkZId, currentChunkZ);
-            gpuCaveCarveMaterial.SetInt(gpuPropCaveWorldSeedHiId, caveSeedInt < 0 ? -1 : 0);
-            gpuCaveCarveMaterial.SetInt(gpuPropCaveWorldSeedLoId, caveSeedInt);
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveWorldSeedHiId, (int)(caveSeedLong >> 32));
+            // UDON-CHECKED-CAST: `(int)(long & 0xFFFFFFFFL)` overflows the Udon runtime's
+            // checked Int32 conversion when the value exceeds int.MaxValue. XOR-then-subtract
+            // maps unsigned 32-bit [0, 2^32) into signed int [-2^31, 2^31) without overflow.
+            long _caveSeedLo = caveSeedLong & 0xFFFFFFFFL;
+            gpuCaveCarveMaterial.SetInt(gpuPropCaveWorldSeedLoId, (int)((_caveSeedLo ^ 0x80000000L) - 0x80000000L));
             gpuCaveCarveMaterial.SetInt(gpuPropCaveHashAHiId, gpuCaveHashAHi);
             gpuCaveCarveMaterial.SetInt(gpuPropCaveHashALoId, gpuCaveHashALo);
             gpuCaveCarveMaterial.SetInt(gpuPropCaveHashBHiId, gpuCaveHashBHi);
@@ -2855,7 +2873,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
         double[] cpuSandN = noiseGen4.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.03125D, 0.03125D, 1.0D);
         _UploadCpuSurfaceNoise(cpuSandN, sizeXZ, gpuSandNoiseTexture);
-        double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
+        double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0134D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
         _UploadCpuSurfaceNoise(cpuGravelN, sizeXZ, gpuGravelNoiseTexture);
         double[] cpuStoneN = noiseGen5.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.0625D, 0.0625D, 0.0625D);
         _UploadCpuSurfaceNoise(cpuStoneN, sizeXZ, gpuStoneNoiseTexture);
@@ -2896,8 +2914,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         ref int candidateCount, int maxCandidates,
         ref int requiredTreeAnchorMask)
     {
-        int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
-        long decorSeed = (long)chunkX * 1364927L + (long)chunkZ * 7420851L ^ (long)worldSeed;
+        long worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+        long decorSeed = (long)chunkX * 1364927L + (long)chunkZ * 7420851L ^ worldSeed;
         JavaRandom dRand = new JavaRandom(decorSeed);
 
         BetaBiomeEnum centerBiome;
@@ -3117,6 +3135,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
         byte[] slice = currentChunkY >= 0 && currentChunkY < gpuCachedChunkSlices.Length ? gpuCachedChunkSlices[currentChunkY] : null;
         if (slice == null) return;
+
+        // GPU OFFLOAD #1 NOTE: A previous attempt skipped this copy for distant chunks,
+        // but that broke the GPU atlas upload path (which depends on workingChunkData being
+        // populated). The atlas-skip optimization now lives in chunk completion (`_chunkData`
+        // assignment), not here. This copy is a cheap Array.Copy and always runs.
 
 #if LOGGING
         float workingCopyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -3634,6 +3657,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
         completedData = workingChunkData;
 
 #if LOGGING
+        if (enableVerboseLogging && !dbg_loggedFirstGpuChunkCopy)
+        {
+            dbg_loggedFirstGpuChunkCopy = true;
+            Debug.Log("[McTerrainGen][GPU] First GPU-generated chunk slice copied to CPU -> GPU worldgen path is producing chunks (CPU noise-gen bypassed for these).");
+        }
         if (enableDetailedTimings)
         {
             float copyMs = (Time.realtimeSinceStartup - copyStart) * 1000f;
@@ -3842,6 +3870,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 // Apply built-in -15 block offset to align with Minecraft
                 noiseX = _GetTerrainBlockStartX(currentChunkX);
                 noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
+                // PARITY: Beta uses 109.0134D as the Y offset for gravel noise. Matches both
+                // CPU and GPU paths. (Previous GPU shader path used 109.0 which shifted gravel
+                // banks; this CPU call already had the correct value.)
                 this.gravelNoise = this.noiseGen4.generateNoiseOctaves(this.gravelNoise, noiseX, 109.0134D, noiseZ, 16, 1, 16, 0.03125D, 1.0D, 0.03125D);
 #if LOGGING
                 if (enableDetailedTimings) { time_Prep_GravelNoise = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
@@ -4029,6 +4060,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     double d0 = 684.412D;
                     double d1 = 684.412D;
 
+                    // PERF: Octave frequencies are powers of 1/2 — pre-baked LUT eliminates
+                    // 16 `System.Math.Pow` calls (each a marshaled C++ trip) per chunk worldgen.
+                    if (_octaveFrequencyLut == null)
+                    {
+                        _octaveFrequencyLut = new double[16];
+                        double freq = 1.0;
+                        for (int o = 0; o < 16; o++)
+                        {
+                            _octaveFrequencyLut[o] = freq;
+                            freq *= 0.5;
+                        }
+                    }
+
 #if LOGGING
                     DateTime tNoiseStart = DateTime.UtcNow;
 #endif
@@ -4037,7 +4081,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     if (currentNoiseGenerator == 0) // noise1 (16 octaves)
                     {
                         if (currentOctave == 0) currentNoiseOutput = noise1;
-                        double frequency = System.Math.Pow(0.5, currentOctave);
+                        double frequency = _octaveFrequencyLut[currentOctave];
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
                         int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
@@ -4057,7 +4101,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     else if (currentNoiseGenerator == 1) // noise2 (16 octaves)
                     {
                         if (currentOctave == 0) currentNoiseOutput = noise2;
-                        double frequency = System.Math.Pow(0.5, currentOctave);
+                        double frequency = _octaveFrequencyLut[currentOctave];
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
                         int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
@@ -4077,7 +4121,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     else if (currentNoiseGenerator == 2) // noise3 (8 octaves)
                     {
                         if (currentOctave == 0) currentNoiseOutput = noise3;
-                        double frequency = System.Math.Pow(0.5, currentOctave);
+                        double frequency = _octaveFrequencyLut[currentOctave];
                         // CRITICAL: Handle coordinate flip for Minecraft right-handed system
                         // Apply built-in offset (converted to noise grid scale: blocks/4)
                         int noiseStartX = _GetTerrainNoiseStartX(currentChunkX, byte0);
@@ -4339,14 +4383,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
                     int xPieceOffset = terrain_xPiece * 4;
                     int zPieceOffset = terrain_zPiece * 4;
-                    
+
+                    // PERF: Hoist the 4 noise-corner indices out of the yPiece loop — they only
+                    // depend on (terrain_xPiece, terrain_zPiece, l_gt, b2_gt), none of which change
+                    // inside the yPiece loop. Saves 4 multiplies + 4 adds per yPiece iteration.
+                    int idx00 = ((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 0)) * b2_gt;
+                    int idx01 = ((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 1)) * b2_gt;
+                    int idx10 = ((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 0)) * b2_gt;
+                    int idx11 = ((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 1)) * b2_gt;
+
                     for (int yPiece = startYPiece; yPiece < endYPiece; yPiece++)
                     {
-                        // Cache noise indices
-                        int idx00 = ((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 0)) * b2_gt;
-                        int idx01 = ((terrain_xPiece + 0) * l_gt + (terrain_zPiece + 1)) * b2_gt;
-                        int idx10 = ((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 0)) * b2_gt;
-                        int idx11 = ((terrain_xPiece + 1) * l_gt + (terrain_zPiece + 1)) * b2_gt;
                         
                         double d1 = nCache[idx00 + yPiece];
                         double d2 = nCache[idx01 + yPiece];
@@ -4379,11 +4426,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                     int xLoc = i2 + xPieceOffset;
                                     double d15 = d10;
                                     double d16 = (d11 - d10) * 0.25D;
-                                    
+                                    // PERF: Hoist `(xPieceOffset+i2)*16` out of the k2 loop — it's invariant.
+                                    int tempsRowBase = xLoc * 16 + zPieceOffset;
+
                                     for (int k2 = 0; k2 < 4; k2++)
                                     {
                                         int currentZ = k2 + zPieceOffset;
-                                        double d17 = temps[(xPieceOffset + i2) * 16 + (zPieceOffset + k2)];
+                                        double d17 = temps[tempsRowBase + k2];
                                         
                                         BlockMaterial block = BlockMaterial.AIR;
                                         if (yLoc < oceanHeight_gt)
@@ -4613,30 +4662,35 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         }
                     }
 
-                    // Apply bedrock only in bottom world chunk (global Y 0..4)
-                    if (currentChunkY == 0)
+                    // PARITY: Java's ChunkProviderGenerate.replaceBlocksForBiome loops Y from 127
+                    // down to 0 for EVERY column, calling `rand.nextInt(5)` on every iteration —
+                    // the `if (var17 <= 0 + rand.nextInt(5))` check fires for every y, not just
+                    // y in [0..4]. We must consume the same RNG state so downstream decoration
+                    // RNG order matches. Per column: 128 NextInt(5) calls. Loop order matches
+                    // Java: (x outer, z middle, y inner).
+                    int worldHeightTotal = world.worldDimensionY * world.chunkSizeY;
+                    int bedrockYTop = (worldHeightTotal < 128) ? worldHeightTotal : 128;
+                    byte bedrockID = bedrockBlockID;
+                    bool applyHere = (currentChunkY == 0);
+
+                    for (int x = 0; x < sizeXZ; x++)
                     {
-                        int maxLocal = sizeY - 1;
-                        if (maxLocal > 4) maxLocal = 4;
-                        byte bedrockID = bedrockBlockID;
-                        for (int yLocal = 0; yLocal <= maxLocal; yLocal++)
+                        for (int z = 0; z < sizeXZ; z++)
                         {
-                            int globalY = chunkYBase + yLocal;
-                            int yBase = yLocal * xyStride;
-                            for (int z = 0; z < sizeXZ; z++)
+                            // Walk Y from top of column down to 0, consuming one NextInt(5) per cell.
+                            for (int globalY = bedrockYTop - 1; globalY >= 0; globalY--)
                             {
-                                int zBase = z * sizeXZ;
-                                for (int x = 0; x < sizeXZ; x++)
-                                {
-                                    if (globalY <= random.NextInt(5))
-                                    {
-                                        int idx = yBase + zBase + x;
-                                        data[idx] = bedrockID;
+                                int r = random.NextInt(5);
+                                if (!applyHere) continue;          // RNG-consumed but no write outside bottom chunk
+                                if (globalY > 4) continue;         // Beta only writes bedrock at Y<=4 (NextInt(5) is 0..4)
+                                if (globalY > r) continue;         // Java: `if(var17 <= rand.nextInt(5))` -> globalY <= r
+                                int yLocal = globalY - chunkYBase;
+                                if (yLocal < 0 || yLocal >= sizeY) continue;
+                                int idx = yLocal * xyStride + z * sizeXZ + x;
+                                data[idx] = bedrockID;
 #if LOGGING
-                                        if (enableDetailedTimings) biomeBedrockAssignments++;
+                                if (enableDetailedTimings) biomeBedrockAssignments++;
 #endif
-                                    }
-                                }
                             }
                         }
                     }
@@ -4680,11 +4734,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         else
                         {
                             // CPU fallback: initialize decoration random seed + build column buffer
-                            int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+                            long worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
                             JavaRandom seedRand = new JavaRandom(worldSeed);
                             long var7 = seedRand.NextLong() / 2L * 2L + 1L;
                             long var9 = seedRand.NextLong() / 2L * 2L + 1L;
-                            rand.SetSeed((long)currentChunkX * var7 + (long)currentChunkZ * var9 ^ (long)worldSeed);
+                            rand.SetSeed((long)currentChunkX * var7 + (long)currentChunkZ * var9 ^ worldSeed);
                             _DecorationBuildColumnBuffer();
                             decoration_step++;
                         }
@@ -4834,7 +4888,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
             case GenerationState.Complete:
                 completedData = workingChunkData;
 
-                // DIAGNOSTIC: Dump block counts in the completed chunk
+                // DIAGNOSTIC: Per-chunk block-count dump used to fire here unconditionally.
+                // With 64 chunks in flight, the Debug.Log + StringBuilder churn was adding
+                // ~5-10ms/chunk of overhead. Gated behind `enableVerboseLogging` so it can
+                // be turned on for one-off debugging without dominating frame time.
+                if (enableVerboseLogging)
                 {
                     int diagStone = 0, diagAir = 0, diagWater = 0, diagBedrock = 0, diagOther = 0;
                     for (int di = 0; di < workingChunkData.Length; di++)
@@ -4851,8 +4909,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     diagBuf.Append("stone=").Append(diagStone).Append(" air=").Append(diagAir).Append(" water=").Append(diagWater);
                     diagBuf.Append(" bedrock=").Append(diagBedrock).Append(" other=").Append(diagOther);
                     diagBuf.Append(" gpu=").Append(gpuWorldgenReady ? "Y" : "N");
-                    
-                    // Dump a cross-section at localY=0 (first layer of this chunk)
                     int sXZ = world.chunkSizeXZ;
                     diagBuf.Append("\n  Y=0 row z=0: ");
                     for (int dx = 0; dx < sXZ; dx++)
@@ -4990,14 +5046,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void _EnsureGpuCaveHashesReady()
     {
         if (gpuCaveHashesReady) return;
-        int worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+        long worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
         JavaRandom seedRand = new JavaRandom(worldSeed);
         long hashALong = seedRand.NextLong() / 2L * 2L + 1L;
         long hashBLong = seedRand.NextLong() / 2L * 2L + 1L;
         gpuCaveHashAHi = (int)(hashALong >> 32);
-        gpuCaveHashALo = (int)(hashALong & 0xFFFFFFFFL);
+        // UDON-CHECKED-CAST: see comment above. XOR-then-subtract bit-pattern cast.
+        long _hashALo = hashALong & 0xFFFFFFFFL;
+        gpuCaveHashALo = (int)((_hashALo ^ 0x80000000L) - 0x80000000L);
         gpuCaveHashBHi = (int)(hashBLong >> 32);
-        gpuCaveHashBLo = (int)(hashBLong & 0xFFFFFFFFL);
+        long _hashBLo = hashBLong & 0xFFFFFFFFL;
+        gpuCaveHashBLo = (int)((_hashBLo ^ 0x80000000L) - 0x80000000L);
         gpuCaveHashesReady = true;
     }
 
