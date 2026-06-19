@@ -67,6 +67,10 @@ public class ChunkData
     public byte _chunkGlobalMinY = 255, _chunkGlobalMaxY = 0;
     public byte _chunkGlobalMinX = 255, _chunkGlobalMaxX = 0;
     public byte _chunkGlobalMinZ = 255, _chunkGlobalMaxZ = 0;
+    // RENDER-PREP DEFERRAL: true when _RefreshChunkDerivedData was skipped at finalize because the
+    // chunk generated outside the render distance (data-gen margin). The derived caches above are
+    // stale/unallocated until materialised at mesh-build entry (_EnsureChunkDerivedData clears this).
+    public bool _derivedDirty = false;
     public byte[] torchMountData;
 
     // --- Block Metadata (Beta 1.7.3 style) ---

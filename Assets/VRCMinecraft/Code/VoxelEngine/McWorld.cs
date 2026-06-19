@@ -24,6 +24,22 @@ public class McWorld : UdonSharpBehaviour
     [Header("Chunk Management")]
     [Tooltip("Prefab for chunks. Must have 3 child objects named 'Opaque', 'Transparent', 'Cutout' with MeshFilters, and a root MeshCollider.")]
     public GameObject chunkPrefab;
+    // CHUNK GAMEOBJECT POOL: render GameObjects are acquired lazily at mesh time (_EnsureChunkGo) and
+    // recycled when a chunk leaves the render distance (_RecycleChunkGo), instead of Instantiate-per-
+    // chunk-and-never-free. This bounds the live GameObject count to the render set, moves the
+    // Instantiate cost off the data-gen hot path (so the coordinator's "assign work" isn't dominated
+    // by Instantiate), and means a chunk that's generated-but-not-rendered (the data-gen margin ring,
+    // or a fully-enclosed chunk) never gets a GameObject at all. Free-list of parked, inactive GOs.
+    private GameObject[] _chunkGoPool;
+    private int _chunkGoPoolCount = 0;
+    private int _chunkGoRecycleCursor = 0;
+    [Tooltip("CHUNK GO POOL: render GameObjects Instantiated per frame during the startup pool pre-warm. The pool is filled to the render-distance set up front (time-sliced) so chunks pop a ready GameObject during load instead of Instantiating one each as they generate.")]
+    public int chunkGoPrewarmPerFrame = 24;
+    private int _chunkGoPrewarmTarget = 0;  // render-distance set size to pre-instantiate at startup
+    private int _chunkGoTotalCreated = 0;   // total chunk GOs ever Instantiated (pre-warm + lazy fallback)
+    private bool _chunkGoPrewarmDone = false;
+    [Tooltip("CHUNK GO POOL: chunk slots scanned per frame for render GameObjects to recycle once their chunk has moved beyond the render distance (returns them to the pool for reuse). Higher reclaims memory faster as the player moves; lower spreads the cost.")]
+    public int chunkGoRecycleScanPerFrame = 64;
     public ChunkData[] chunks_1D; // OPTIMIZED: Public for direct coordinator access
 
     [Header("Performance Tuning")]
@@ -753,6 +769,11 @@ public class McWorld : UdonSharpBehaviour
     private int stats_gpuChunkUploads = 0;
     private float stats_gpuChunkUploadTime = 0f;
     private int stats_gpuChunkUploadBytes = 0;
+    // TEMP: split the ~27ms per-chunk finalize (StepChunkDataGeneration completion) into its phases.
+    private float stats_finalizeSliceTime = 0f;   // data acquisition (TryCopyCachedGpuChunkSlice / StepChunkGeneration)
+    private float stats_finalizeDerivedTime = 0f; // _RefreshChunkDerivedData (4096-voxel scan)
+    private float stats_finalizeGpuSyncTime = 0f; // _GpuSyncChunkBlocks (pack + atlas upload)
+    private int stats_finalizeCount = 0;
     private int stats_gpuFaceOccupancyUploads = 0;
     private float stats_gpuFaceOccupancyUploadTime = 0f;
     private int stats_gpuFaceOccupancyUploadBytes = 0;
@@ -794,6 +815,44 @@ public class McWorld : UdonSharpBehaviour
         _BuildLightingTables();
         _InitializeBetaWaterRendering();
         _InitializeGpuVoxelBackend();
+        // CHUNK GO POOL: size the free-list to the kept render set (radial render-distance + 2
+        // hysteresis ring, full Y column) so even a teleport that recycles the whole old view fits
+        // without Destroy churn. GameObjects are still acquired lazily at mesh time — this only
+        // bounds reuse. (_activeRenderDistanceChunks is final here: set in InitializeWorldParameters,
+        // capacity-clamped in _InitializeGpuVoxelBackend.)
+        {
+            int poolR = _activeRenderDistanceChunks + 2;
+            int poolRR = poolR * poolR;
+            int poolCols = 0;
+            for (int dz = -poolR; dz <= poolR; dz++)
+            {
+                for (int dx = -poolR; dx <= poolR; dx++)
+                {
+                    if (dx * dx + dz * dz <= poolRR) poolCols++;
+                }
+            }
+            _chunkGoPool = new GameObject[Mathf.Max(8, poolCols * Mathf.Max(1, worldDimensionY))];
+            _chunkGoPoolCount = 0;
+
+            // POOL PRE-WARM TARGET: the actual render-distance set (R, not the R+2 recycle ring),
+            // full Y column. Pre-instantiating this many GOs up front means every chunk that renders
+            // during the initial load pops a ready GameObject instead of Instantiate-as-generated.
+            // The hysteresis ring (R..R+2) only goes live transiently during movement; those few
+            // recycle into the pool and are reused, so we don't pre-pay for them.
+            int coreR = Mathf.Max(0, _activeRenderDistanceChunks);
+            int coreRR = coreR * coreR;
+            int coreCols = 0;
+            for (int dz = -coreR; dz <= coreR; dz++)
+            {
+                for (int dx = -coreR; dx <= coreR; dx++)
+                {
+                    if (dx * dx + dz * dz <= coreRR) coreCols++;
+                }
+            }
+            _chunkGoPrewarmTarget = Mathf.Min(_chunkGoPool.Length, coreCols * Mathf.Max(1, worldDimensionY));
+            _chunkGoTotalCreated = 0;
+            _chunkGoPrewarmDone = false;
+        }
         if (gpuBackendReady)
         {
             _readbackKind = new int[READBACK_KIND_CAP];
@@ -4127,11 +4186,6 @@ public class McWorld : UdonSharpBehaviour
         int chunk1DIndex = ChunkCenteredCoordsTo1D(centered_dx, centered_dy, centered_dz);
         if (chunk1DIndex == -1 || chunks_1D[chunk1DIndex] != null) return -1;
 
-        GameObject newChunkGO = Instantiate(chunkPrefab);
-        newChunkGO.name = $"Chunk_({centered_dx},{centered_dy},{centered_dz})";
-        newChunkGO.transform.SetParent(this.transform, false);
-        newChunkGO.transform.localPosition = new Vector3(centered_dx * chunkSizeXZ, centered_dy * chunkSizeY, centered_dz * chunkSizeXZ);
-
         ChunkData newChunkData = new ChunkData();
         chunks_1D[chunk1DIndex] = newChunkData;
 
@@ -4140,41 +4194,22 @@ public class McWorld : UdonSharpBehaviour
         newChunkData.chunkX_world = centered_dx;
         newChunkData.chunkY_world = centered_dy;
         newChunkData.chunkZ_world = centered_dz;
-        newChunkData.gameObject = newChunkGO;
-
-        // --- Assign Component References ---
-        // This is a bit fragile, relies on child object names. A more robust solution
-        // would be a simple script on the prefab to hold the references.
-        Transform opaqueTransform = newChunkGO.transform.Find("Opaque");
-        if (opaqueTransform == null) opaqueTransform = newChunkGO.transform;
-        Transform transparentTransform = newChunkGO.transform.Find("Transparent");
-        if (transparentTransform == null) transparentTransform = newChunkGO.transform.Find("trans");
-        Transform cutoutTransform = newChunkGO.transform.Find("Cutout");
-        if (cutoutTransform == null) cutoutTransform = newChunkGO.transform.Find("cutout");
-
-        _AssignSharedChunkMaterial(opaqueTransform, sharedOpaqueChunkMaterial);
-        _AssignSharedChunkMaterial(transparentTransform, sharedTransparentChunkMaterial);
-        _AssignSharedChunkMaterial(cutoutTransform, sharedCutoutChunkMaterial);
-
-        newChunkData.opaqueMeshFilter = opaqueTransform != null ? opaqueTransform.GetComponent<MeshFilter>() : null;
-        newChunkData.transparentMeshFilter = transparentTransform != null ? transparentTransform.GetComponent<MeshFilter>() : null;
-        newChunkData.cutoutMeshFilter = cutoutTransform != null ? cutoutTransform.GetComponent<MeshFilter>() : null;
-        newChunkData.meshCollider = newChunkGO.GetComponent<MeshCollider>();
-        if (newChunkData.meshCollider != null) { newChunkData.meshCollider.sharedMesh = null; newChunkData.meshCollider.enabled = false; }
+        // The render GameObject is acquired LAZILY at mesh time (_EnsureChunkGo) from the pool, so a
+        // chunk that's generated but never rendered (the data-gen margin ring, or a fully-enclosed
+        // chunk) never costs an Instantiate, and the coordinator's data-gen hot path no longer pays
+        // the per-chunk GameObject cost. The render-shell fields stay null until then (all deref
+        // sites are null-safe — audited).
 
         // --- Initialize Buffers & State ---
         newChunkData._chunkDataSize = chunkSizeXZ * chunkSizeY * chunkSizeXZ;
         newChunkData._cachedNeighbors = new ChunkData[6];
 
         // Mesh buffers are pooled — acquired in _AcquireMeshPool, released in _ReleaseMeshPool.
-        // This avoids ~2.7MB of allocation per chunk at creation time and means
-        // air-only/occluded chunks that skip meshing never allocate buffers at all.
 
         // Initialize biome data arrays (16x16 per chunk)
         newChunkData._biomeTemperatures = new double[chunkSizeXZ * chunkSizeXZ];
         newChunkData._biomeRainfall = new double[chunkSizeXZ * chunkSizeXZ];
 
-        newChunkGO.SetActive(true);
         _InvalidateNeighborCache(newChunkData);
 
 #if LOGGING
@@ -4182,6 +4217,133 @@ public class McWorld : UdonSharpBehaviour
 #endif
 
         return chunk1DIndex;
+    }
+
+    // Acquire a render GameObject for this chunk (pop from the pool, else Instantiate) and wire its
+    // child mesh filters + collider. Called lazily from the mesh-apply path so only chunks that
+    // actually render get one. No-op if the chunk already has a GameObject.
+    private void _EnsureChunkGo(ChunkData chunk)
+    {
+        if (chunk == null || chunk.gameObject != null) return;
+        GameObject go;
+        if (_chunkGoPool != null && _chunkGoPoolCount > 0)
+        {
+            _chunkGoPoolCount--;
+            go = _chunkGoPool[_chunkGoPoolCount];
+            _chunkGoPool[_chunkGoPoolCount] = null;
+        }
+        else
+        {
+            go = Instantiate(chunkPrefab);
+            _chunkGoTotalCreated++;
+        }
+        if (go == null) return;
+        go.name = $"Chunk_({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world})";
+        go.transform.SetParent(this.transform, false);
+        go.transform.localPosition = new Vector3(chunk.chunkX_world * chunkSizeXZ, chunk.chunkY_world * chunkSizeY, chunk.chunkZ_world * chunkSizeXZ);
+
+        Transform opaqueTransform = go.transform.Find("Opaque");
+        if (opaqueTransform == null) opaqueTransform = go.transform;
+        Transform transparentTransform = go.transform.Find("Transparent");
+        if (transparentTransform == null) transparentTransform = go.transform.Find("trans");
+        Transform cutoutTransform = go.transform.Find("Cutout");
+        if (cutoutTransform == null) cutoutTransform = go.transform.Find("cutout");
+
+        _AssignSharedChunkMaterial(opaqueTransform, sharedOpaqueChunkMaterial);
+        _AssignSharedChunkMaterial(transparentTransform, sharedTransparentChunkMaterial);
+        _AssignSharedChunkMaterial(cutoutTransform, sharedCutoutChunkMaterial);
+
+        chunk.gameObject = go;
+        chunk.opaqueMeshFilter = opaqueTransform != null ? opaqueTransform.GetComponent<MeshFilter>() : null;
+        chunk.transparentMeshFilter = transparentTransform != null ? transparentTransform.GetComponent<MeshFilter>() : null;
+        chunk.cutoutMeshFilter = cutoutTransform != null ? cutoutTransform.GetComponent<MeshFilter>() : null;
+        chunk.meshCollider = go.GetComponent<MeshCollider>();
+        if (chunk.meshCollider != null) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; }
+        go.SetActive(true);
+    }
+
+    // Return a chunk's render GameObject to the pool (parked, inactive) and null its shell fields.
+    // The chunk's block/light/biome DATA stays intact; it re-acquires a GameObject and re-meshes
+    // (isMeshDeferred) if the player returns and it re-enters the render distance.
+    private void _RecycleChunkGo(ChunkData chunk)
+    {
+        GameObject go = chunk != null ? chunk.gameObject : null;
+        if (go == null) return;
+        if (chunk.opaqueMeshFilter != null && chunk.opaqueMeshFilter.sharedMesh != null) chunk.opaqueMeshFilter.sharedMesh.Clear();
+        if (chunk.transparentMeshFilter != null && chunk.transparentMeshFilter.sharedMesh != null) chunk.transparentMeshFilter.sharedMesh.Clear();
+        if (chunk.cutoutMeshFilter != null && chunk.cutoutMeshFilter.sharedMesh != null) chunk.cutoutMeshFilter.sharedMesh.Clear();
+        if (chunk.meshCollider != null) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; }
+        go.SetActive(false);
+        if (_chunkGoPool != null && _chunkGoPoolCount < _chunkGoPool.Length) { _chunkGoPool[_chunkGoPoolCount] = go; _chunkGoPoolCount++; }
+        else Destroy(go);
+        chunk.gameObject = null;
+        chunk.opaqueMeshFilter = null;
+        chunk.transparentMeshFilter = null;
+        chunk.cutoutMeshFilter = null;
+        chunk.meshCollider = null;
+        chunk.selectionCollider = null;
+        chunk.isMeshDeferred = true; // re-mesh (re-acquires a GO) when it comes back into render distance
+    }
+
+    // CHUNK GO POOL: time-sliced startup pre-warm. Instantiate render GameObjects into the pool (parked,
+    // inactive) up to the render-distance set size, a few per frame, so chunks pop a ready GameObject
+    // during the initial load instead of Instantiate-as-generated. Runs only until the target is met,
+    // then never again. _chunkGoTotalCreated counts BOTH pre-warm and lazy-fallback creates, so the
+    // total GameObjects ever made converges to the render set even if a pop races ahead of the pre-warm.
+    private void _PrewarmChunkGoPool(float frameStart)
+    {
+        if (_chunkGoPrewarmDone || _chunkGoPool == null || chunkPrefab == null) return;
+        if (_chunkGoTotalCreated >= _chunkGoPrewarmTarget) { _chunkGoPrewarmDone = true; return; }
+
+        float prewarmBudget = 0.002f; // 2ms slice/frame so the pool fills in ~the first second without a stall
+        int cap = Mathf.Max(1, chunkGoPrewarmPerFrame);
+        int made = 0;
+        while (made < cap
+               && _chunkGoTotalCreated < _chunkGoPrewarmTarget
+               && _chunkGoPoolCount < _chunkGoPool.Length)
+        {
+            GameObject go = Instantiate(chunkPrefab);
+            if (go == null) break;
+            go.SetActive(false);
+            go.transform.SetParent(this.transform, false);
+            _chunkGoPool[_chunkGoPoolCount] = go;
+            _chunkGoPoolCount++;
+            _chunkGoTotalCreated++;
+            made++;
+            if (Time.realtimeSinceStartup - frameStart > prewarmBudget) break;
+        }
+
+        if (_chunkGoTotalCreated >= _chunkGoPrewarmTarget)
+        {
+            _chunkGoPrewarmDone = true;
+#if LOGGING
+            if (enableVerboseLogging)
+                Debug.Log($"[McWorld] Chunk GO pool pre-warmed: {_chunkGoTotalCreated} GameObjects (render-distance set, pool capacity {_chunkGoPool.Length}).");
+#endif
+        }
+    }
+
+    // CHUNK GO POOL: scan chunks_1D (rolling cursor, time-sliced) and recycle the render GameObject
+    // of any chunk that has moved beyond the render distance (+ a hysteresis ring so a chunk at the
+    // boundary doesn't thrash). Returns GameObjects to the pool for reuse by chunks entering the view.
+    private void _ProcessChunkGoRecycle(float frameStart, float frameBudget)
+    {
+        if (chunks_1D == null || !_streamPlayerKnown) return;
+        int keepR = _activeRenderDistanceChunks + 2; // GOs exist only for rendered chunks (render distance); +2 hysteresis
+        int keepRR = keepR * keepR;
+        int total = chunks_1D.Length;
+        int scan = Mathf.Max(1, chunkGoRecycleScanPerFrame);
+        while (scan-- > 0)
+        {
+            int idx = _chunkGoRecycleCursor;
+            _chunkGoRecycleCursor++;
+            if (_chunkGoRecycleCursor >= total) _chunkGoRecycleCursor = 0;
+            ChunkData chunk = chunks_1D[idx];
+            if (chunk == null || chunk.gameObject == null) continue;
+            int dx = chunk.chunkX_world - _streamPlayerChunkX;
+            int dz = chunk.chunkZ_world - _streamPlayerChunkZ;
+            if (dx * dx + dz * dz > keepRR) _RecycleChunkGo(chunk);
+        }
     }
 
     void Update()
@@ -4257,6 +4419,11 @@ public class McWorld : UdonSharpBehaviour
 #if LOGGING
         float processStartTime = frameStart;
 #endif
+
+        // CHUNK GO POOL: pre-warm the pool to the render-distance set at startup (time-sliced), before
+        // the heavy GPU maintain/lighting work, so chunks pop a ready GameObject during the initial
+        // load rather than Instantiate one each as they generate. No-op once the target is reached.
+        _PrewarmChunkGoPool(frameStart);
 
         // Flush any batched slot lookup changes from this or previous frames
         if (gpuSlotLookupDirty)
@@ -4403,6 +4570,7 @@ public class McWorld : UdonSharpBehaviour
         }
 
         _ScheduleDeferredInteriorMeshUpdates(frameStart, frameBudget);
+        _ProcessChunkGoRecycle(frameStart, frameBudget);
         _HealStaleBorderChunks();
         _PostWorldGenBorderCleanup();
 
@@ -4981,6 +5149,9 @@ public class McWorld : UdonSharpBehaviour
             return;
         }
 
+#if LOGGING
+        float _finSliceT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         if (useGpuWorldgen && gen.TryCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world, out generatedData))
         {
             isComplete = true;
@@ -4996,6 +5167,9 @@ public class McWorld : UdonSharpBehaviour
                 if (Time.realtimeSinceStartup - stepStart > stepBudget) break;
             }
         }
+#if LOGGING
+        if (enableDetailedTimings) stats_finalizeSliceTime += (Time.realtimeSinceStartup - _finSliceT0) * 1000f;
+#endif
 
         if (isComplete)
         {
@@ -5058,7 +5232,40 @@ public class McWorld : UdonSharpBehaviour
                 chunk._decompCacheValid = true;
             }
             chunk._cachedDataVersion++;
-            _RefreshChunkDerivedData(chunk, generatedData);
+#if LOGGING
+            // Count EVERY finalize (eager + deferred) so the slice/derived/gpuSync per-chunk averages
+            // share one denominator: derived/gpuSync averages fall toward 0 as the deferral kicks in,
+            // directly showing how many finalizes skipped the expensive render-prep.
+            if (enableDetailedTimings) stats_finalizeCount++;
+#endif
+
+            // RENDER-PREP DEFERRAL: _RefreshChunkDerivedData (4096-voxel CPU scan, ~16ms) and
+            // _GpuSyncChunkBlocks (pack + atlas upload, ~12ms) are only needed once a chunk is in the
+            // render distance. The derived caches feed the chunk's OWN mesh build (all consumers are
+            // self-reads — neighbours cull from CPU border data, not these caches); the atlas slot
+            // feeds GPU lighting/meshing of the render set. For a chunk generated in the data-gen
+            // margin (outside render distance) both are pure waste until it is approached, and they
+            // dominate the per-chunk finalize cost that starves meshing during load. Defer them:
+            //   - derived is materialised at BuildChunkMesh entry (_EnsureChunkDerivedData),
+            //   - the atlas slot is synced on demand by _GpuMaintainResidentChunks / the mesh dispatch.
+            // Gated on GPU lighting being active: the CPU lighting path (InitializeChunkLighting, run
+            // below at finalize) reads _hasEmissiveBlocks, which only _RefreshChunkDerivedData produces.
+            bool deferRenderPrep = gpuBackendReady && _UsesGpuTerrainLightSampling() && !_IsChunkWithinMeshRenderDistance(chunk);
+
+            if (!deferRenderPrep)
+            {
+#if LOGGING
+                float _finDerivedT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+                _RefreshChunkDerivedData(chunk, generatedData);
+#if LOGGING
+                if (enableDetailedTimings) stats_finalizeDerivedTime += (Time.realtimeSinceStartup - _finDerivedT0) * 1000f;
+#endif
+            }
+            else
+            {
+                chunk._derivedDirty = true;
+            }
 
             if (debugTerrainChecksum) _DebugRecordChunkChecksum(chunk, generatedData);
 
@@ -5077,18 +5284,27 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
 
-            _GpuSyncChunkBlocks(chunk, generatedData);
-
-            // DEBUG (gpuDebugRepackAfterUpload): GPU->GPU repack the same column slice over the
-            // atlas. If the repack mapping is correct the atlas is unchanged (world renders the
-            // same); if wrong, rendering corrupts. Validates the migration's repack before it
-            // replaces the readback path.
-            if (gpuDebugRepackAfterUpload)
+            if (!deferRenderPrep)
             {
-                McTerrainGenerator repackGen = _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world);
-                if (repackGen != null && repackGen.gpuLastReadbackSource != null)
+#if LOGGING
+                float _finGpuSyncT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+                _GpuSyncChunkBlocks(chunk, generatedData);
+#if LOGGING
+                if (enableDetailedTimings) stats_finalizeGpuSyncTime += (Time.realtimeSinceStartup - _finGpuSyncT0) * 1000f;
+#endif
+
+                // DEBUG (gpuDebugRepackAfterUpload): GPU->GPU repack the same column slice over the
+                // atlas. If the repack mapping is correct the atlas is unchanged (world renders the
+                // same); if wrong, rendering corrupts. Validates the migration's repack before it
+                // replaces the readback path.
+                if (gpuDebugRepackAfterUpload)
                 {
-                    _GpuRepackChunkSliceToAtlas(chunk, repackGen.gpuLastReadbackSource);
+                    McTerrainGenerator repackGen = _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world);
+                    if (repackGen != null && repackGen.gpuLastReadbackSource != null)
+                    {
+                        _GpuRepackChunkSliceToAtlas(chunk, repackGen.gpuLastReadbackSource);
+                    }
                 }
             }
 
@@ -6472,6 +6688,12 @@ public class McWorld : UdonSharpBehaviour
             MarkChunkMeshDeferred(chunkIndex);
             return;
         }
+
+        // RENDER-PREP DEFERRAL: the chunk is confirmed in render distance and about to build — make
+        // sure its derived caches exist. They were skipped at finalize if it generated out of range
+        // (data-gen margin); every derived-cache consumer below is behind this single barrier.
+        _EnsureChunkDerivedData(chunk);
+
 #if LOGGING
         if (enableDetailedTimings && chunk.profile_waitingForFirstMesh)
         {
@@ -10340,6 +10562,13 @@ public class McWorld : UdonSharpBehaviour
 
     private void _ApplyAllMeshData(ChunkData chunk)
     {
+        // Lazily acquire a pooled render GameObject — only for chunks that actually have geometry to
+        // show (skips the data-gen margin ring and fully-enclosed chunks). Recycled on leave-range.
+        if (chunk.gameObject == null
+            && (chunk._opaqueVertexCount > 0 || chunk._transparentVertexCount > 0 || chunk._cutoutVertexCount > 0))
+        {
+            _EnsureChunkGo(chunk);
+        }
 #if LOGGING
         if (enableDetailedTimings)
         {
@@ -10394,9 +10623,13 @@ public class McWorld : UdonSharpBehaviour
         }
 #endif
 
+        // A solid chunk can need a collider even when its render faces are culled; acquire a pooled
+        // GameObject if there is collision geometry but no GameObject yet (mesh-apply usually does
+        // this first, but guard the collider-only case).
+        if (chunk.meshCollider == null && chunk.gameObject == null && chunk._collisionVertexCount > 0) _EnsureChunkGo(chunk);
         if (chunk.meshCollider == null) return;
         Mesh colMesh = chunk.meshCollider.sharedMesh;
-        if (colMesh == null) { colMesh = new Mesh(); colMesh.name = $"ChunkCollisionMesh_{chunk.gameObject.name}"; colMesh.MarkDynamic(); }
+        if (colMesh == null) { colMesh = new Mesh(); colMesh.name = $"ChunkCollisionMesh_{(chunk.gameObject != null ? chunk.gameObject.name : "chunk")}"; colMesh.MarkDynamic(); }
 
         colMesh.Clear();
         if (chunk._collisionVertexCount == 0 || chunk._collisionVertices == null || chunk._collisionVertices.Length < chunk._collisionVertexCount) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; return; }
@@ -12933,6 +13166,21 @@ public class McWorld : UdonSharpBehaviour
                 }
             }
         }
+        chunk._derivedDirty = false;
+    }
+
+    // RENDER-PREP DEFERRAL: materialise the per-chunk derived caches for a chunk whose finalize skipped
+    // them (generated in the data-gen margin, outside render distance). Called at mesh-build entry —
+    // every derived-cache consumer lives in the mesh build, so this is the single barrier they sit
+    // behind. No-op once materialised (the flag is cleared by _RefreshChunkDerivedData). Note that
+    // _GetDecompressedData itself derives on the RLE/homogeneous decompress path, so the flag re-check
+    // avoids a redundant second 4096-voxel scan.
+    private void _EnsureChunkDerivedData(ChunkData chunk)
+    {
+        if (chunk == null || !chunk._derivedDirty) return;
+        byte[] data = _GetDecompressedData(chunk);
+        if (data == null) return; // data unavailable (e.g. resident rehydrate pending) — stays dirty
+        if (chunk._derivedDirty) _RefreshChunkDerivedData(chunk, data);
     }
 
     // OPTIMIZATION: Optimized biome color calculation that avoids allocations
@@ -14480,6 +14728,8 @@ public class McWorld : UdonSharpBehaviour
             if (enableDetailedTimings)
             {
                 logBuilder.AppendLine($"  Active processing: {stats_processActiveChunksTime:F2}ms total, reconciliation {stats_reconciliationTime:F2}ms total");
+                if (stats_finalizeCount > 0)
+                    logBuilder.AppendLine($"  Chunk finalize (per chunk, {stats_finalizeCount} done): slice {stats_finalizeSliceTime / stats_finalizeCount:F2}ms, derived {stats_finalizeDerivedTime / stats_finalizeCount:F2}ms, gpuSync {stats_finalizeGpuSyncTime / stats_finalizeCount:F2}ms");
             }
             if (enableAdaptiveBudgets)
             {
@@ -14788,6 +15038,10 @@ public class McWorld : UdonSharpBehaviour
         stats_gpuChunkUploads = 0;
         stats_gpuChunkUploadTime = 0f;
         stats_gpuChunkUploadBytes = 0;
+        stats_finalizeSliceTime = 0f;
+        stats_finalizeDerivedTime = 0f;
+        stats_finalizeGpuSyncTime = 0f;
+        stats_finalizeCount = 0;
         stats_gpuFaceOccupancyUploads = 0;
         stats_gpuFaceOccupancyUploadTime = 0f;
         stats_gpuFaceOccupancyUploadBytes = 0;
