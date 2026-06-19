@@ -26,6 +26,8 @@ public class McCoordinator : UdonSharpBehaviour
     [Header("Performance")]
     [Tooltip("How many chunks can be processed (data-gen or meshing) concurrently. On the GPU path a high count overlapped GPU readback latency (each mesh worker held one of 48 in-flight readbacks). On the CPU-only path there is NO latency to overlap — all workers share the single Udon thread, so too many just fragments the per-frame budget across more partially-done chunks and adds per-cycle overhead. 16 concentrates the budget (each chunk finishes sooner) while still allowing gen+mesh overlap (~8 generators + ~8 mesh).")]
     public int maxConcurrentWorkers = 16;
+    [Tooltip("THROTTLE: max NEW worldgen columns generating concurrently (of the ~8 generators). Each new column holds a generator + an in-flight GPU base-readback; capping below the generator count leaves GPU readback bandwidth so mesh face-readbacks aren't starved during load (the visible world meshes WHILE data-gen streams in, instead of only after it finishes). Siblings copied from an already-generated column cache don't count. Raise toward 8 for fastest data-gen at the cost of slower meshing during load.")]
+    public int maxConcurrentWorldgenColumns = 4;
     [Tooltip("During the ONE-TIME bulk load, cap how many workers may be MESHING at once so the rest stay free to feed the generators. Meshing otherwise expands to fill the whole worker pool and starves data generation (which is the slow, readback-bound phase on Quest). Only chunks whose neighbours are all data-ready ever reach the cap, so the deferred ones drain safely (shell chunks wake eagerly) and the visible world does not fragment. Lifts automatically once data-gen completes. Default OFF — enable and headset-benchmark before relying on it.")]
     public bool reserveWorkersForDataGenDuringLoad = false;
     [Tooltip("Max workers allowed to mesh concurrently during the bulk load when reserveWorkersForDataGenDuringLoad is on. The remaining (maxConcurrentWorkers - this) feed data generation. ~8 leaves one worker per generator.")]
@@ -228,31 +230,40 @@ public class McCoordinator : UdonSharpBehaviour
     private bool _TryPickDataGenPosition()
     {
         if (radialChunkOrder == null || _positionAssigned == null) return false;
+        // THROTTLE: how many NEW worldgen columns may be in flight concurrently. Each new column holds
+        // a generator + an in-flight GPU base-readback; capping below the generator count leaves GPU
+        // readback bandwidth for mesh face-readbacks (which were being starved during load → the world
+        // didn't mesh until data-gen finished). Computed once per call — genSlotBusy only changes when
+        // a column is actually started, which happens after this returns. Sibling chunks copied from an
+        // already-generated column cache add NO readback, so they bypass the cap.
+        bool canStartNewColumn = _BusyGeneratorCount() < maxConcurrentWorldgenColumns;
         int scanEnd = nextChunkIndexToAssign + dataGenLookaheadWindow;
         if (scanEnd > totalWorldChunks) scanEnd = totalWorldChunks;
         for (int p = nextChunkIndexToAssign; p < scanEnd; p++)
         {
             if (_positionAssigned[p]) continue;
             int ci = radialChunkOrder[p];
-            if (!genSlotBusy[world.GeneratorSlotForChunkIndex(ci)] || world.CanStartChunkDataGenerationWithoutExclusiveGenerator(ci))
+            if (!world.ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin); picker re-scans each cycle so they stream in on approach
+            if (!genSlotBusy[world.GeneratorSlotForChunkIndex(ci)])
             {
-                _lastPickedDataGenPos = p;
-                return true;
+                if (canStartNewColumn) { _lastPickedDataGenPos = p; return true; } // new column (concurrency-capped)
+            }
+            else if (world.CanStartChunkDataGenerationWithoutExclusiveGenerator(ci))
+            {
+                _lastPickedDataGenPos = p; return true; // sibling from column cache — no new readback, bypasses the cap
             }
         }
 
         // FALLBACK (anti-stall): the windowed scan can come up empty when the next
         // dataGenLookaheadWindow positions are all already-assigned or map to the few busy
         // generator slots, while the pickable (unassigned + FREE-slot) positions sit further ahead.
-        // That froze data-gen with idle workers and unassigned chunks remaining (observed: idle
-        // workers, free slots, completed stuck). Scan the whole remaining order for an unassigned
-        // position whose generator slot is FREE. Using a free slot evicts no in-use column cache,
-        // so the close-sibling-first invariant the window protects is preserved.
+        // Scan the whole remaining order for an unassigned position whose generator slot is FREE.
         for (int p = scanEnd; p < totalWorldChunks; p++)
         {
             if (_positionAssigned[p]) continue;
             int ci = radialChunkOrder[p];
-            if (!genSlotBusy[world.GeneratorSlotForChunkIndex(ci)])
+            if (!world.ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin)
+            if (!genSlotBusy[world.GeneratorSlotForChunkIndex(ci)] && canStartNewColumn)
             {
                 _lastPickedDataGenPos = p;
                 return true;
@@ -260,7 +271,23 @@ public class McCoordinator : UdonSharpBehaviour
         }
         return false;
     }
+
+    // Number of generator slots currently mid-column (each = one in-flight GPU base-readback).
+    private int _BusyGeneratorCount()
+    {
+        if (genSlotBusy == null) return 0;
+        int n = 0;
+        for (int i = 0; i < genSlotBusy.Length; i++) if (genSlotBusy[i]) n++;
+        return n;
+    }
     
+    // DATA-GEN STREAMING: one-way latch + progress tracking marking the one-time initial load "done"
+    // once chunk completion plateaus. Because data-gen is now capped to the render-distance set,
+    // chunksCompletedCount never reaches totalWorldChunks, so completion is detected by plateau instead.
+    private bool _initialBulkLoadDone = false;
+    private int _lastProgressCompletedCount = -1;
+    private float _lastGenProgressTime = -1f;
+
     /// <summary>
     /// Called every frame by Unity. Processes worker states and assigns new work.
     /// OPTIMIZED: Using Update() instead of SendCustomEventDelayedSeconds eliminates 50-100ms overhead per cycle!
@@ -271,10 +298,29 @@ public class McCoordinator : UdonSharpBehaviour
         if (world == null || worker_state == null || radialChunkOrder == null) return;
         
         float cycleStartTime = Time.realtimeSinceStartup;
-        // Load-phase budget boost: terrain data-gen drains faster at a larger budget during
+
+        // DATA-GEN STREAMING: detect the end of the one-time initial load by completion PLATEAU
+        // (with streaming, chunksCompletedCount never reaches totalWorldChunks). Once completion has
+        // not advanced for 5s the render-distance set around spawn is finished; latch one-way so the
+        // load-phase budget boost drops to steady-state and later streaming-on-approach stays smooth.
+        if (!_initialBulkLoadDone)
+        {
+            if (chunksCompletedCount != _lastProgressCompletedCount)
+            {
+                _lastProgressCompletedCount = chunksCompletedCount;
+                _lastGenProgressTime = cycleStartTime;
+            }
+            else if (chunksCompletedCount > 0 && _lastGenProgressTime >= 0f
+                     && cycleStartTime - _lastGenProgressTime > 5f)
+            {
+                _initialBulkLoadDone = true;
+            }
+        }
+
+        // Load-phase budget boost: terrain data-gen + meshing drain faster at a larger budget during
         // the one-time initial generation; revert to the normal budget once complete so
         // steady-state frame rate is protected. Accuracy is unaffected.
-        float effectiveBudgetMs = (chunksCompletedCount < totalWorldChunks && loadPhaseUpdateBudgetMs > updateTimeBudgetMs)
+        float effectiveBudgetMs = (!_initialBulkLoadDone && loadPhaseUpdateBudgetMs > updateTimeBudgetMs)
             ? loadPhaseUpdateBudgetMs : updateTimeBudgetMs;
         float cycleBudget = effectiveBudgetMs * 0.001f;
 
@@ -935,7 +981,7 @@ public class McCoordinator : UdonSharpBehaviour
 
     public bool IsWorldGenComplete()
     {
-        return chunksCompletedCount >= totalWorldChunks && totalWorldChunks > 0;
+        return _initialBulkLoadDone || (chunksCompletedCount >= totalWorldChunks && totalWorldChunks > 0);
     }
 
     /// <summary>
