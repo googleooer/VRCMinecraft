@@ -38,6 +38,23 @@ public class McWorld : UdonSharpBehaviour
     private int _chunkGoPrewarmTarget = 0;  // render-distance set size to pre-instantiate at startup
     private int _chunkGoTotalCreated = 0;   // total chunk GOs ever Instantiated (pre-warm + lazy fallback)
     private bool _chunkGoPrewarmDone = false;
+
+    [Header("Box Collider Collision (experimental)")]
+    [Tooltip("When ON: player collision comes from a small grid of BoxColliders that follow the player and snap to solid voxels, and per-chunk MeshColliders are NOT built (the mesh-emit path skips collision geometry). Block targeting switches to a voxel raycast (collider-independent). When OFF: classic per-chunk MeshCollider + Physics.Raycast (unchanged). Requires voxelColliderPrefab assigned.")]
+    public bool useBoxColliderCollision = false;
+    [Tooltip("Prefab with a single BoxCollider (size 1,1,1, center 0), no renderer, on the same layer the player collides with. Instantiated (2*radius+1)^2 * (down+up+1) times to form the moving collision grid.")]
+    public GameObject voxelColliderPrefab;
+    [Tooltip("Horizontal radius (in voxels) of the collision grid around the player. 2 => 5x5 footprint.")]
+    public int collisionGridRadiusXZ = 2;
+    [Tooltip("How many voxels BELOW the player's feet the collision grid extends. Larger survives faster falls at low FPS (a deep solid stack can't be tunneled in one physics step).")]
+    public int collisionGridDown = 6;
+    [Tooltip("How many voxels ABOVE the player's feet the collision grid extends (headroom / ceilings).")]
+    public int collisionGridUp = 3;
+    private GameObject[] _voxelColliders;
+    private bool[] _voxelColliderActive;
+    private bool _collisionGridInitialized = false;
+    private int _collisionPlayerVoxelX = -2147483648, _collisionPlayerVoxelY = -2147483648, _collisionPlayerVoxelZ = -2147483648;
+    private bool[] _blockHasCollisionCache; // per blockID: full-cube, opaque/cutout, non-fluid => has box collision
     [Tooltip("CHUNK GO POOL: chunk slots scanned per frame for render GameObjects to recycle once their chunk has moved beyond the render distance (returns them to the pool for reuse). Higher reclaims memory faster as the player moves; lower spreads the cost.")]
     public int chunkGoRecycleScanPerFrame = 64;
     public ChunkData[] chunks_1D; // OPTIMIZED: Public for direct coordinator access
@@ -863,6 +880,7 @@ public class McWorld : UdonSharpBehaviour
         }
         _InitializeGpuDebugHud();
         _InitializeMeshPool();
+        _InitVoxelColliderGrid();
         // Runtime override: keep the update budget above the irreducible baseline
         // so the adaptive system has room to scale decode budgets.
         if (updateTimeBudgetMs < 16f) updateTimeBudgetMs = 16f;
@@ -968,9 +986,16 @@ public class McWorld : UdonSharpBehaviour
             // intended throughput-fix values (8 steps / 12ms) so a stale low serialized config can't pin
             // meshing at the floor while worldgen floods — that imbalance left the visible world unmeshed
             // for minutes. With data-gen now streamed to the render distance, worldgen has far less to do.
-            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(gpuMeshDecodeStepsPerFrame, 8);
+            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(gpuMeshDecodeStepsPerFrame, 16);
             adaptiveGpuMeshDecodeStepBudgetMs = gpuMeshDecodeStepBudgetMs;
-            adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Max(gpuMeshDecodeFrameBudgetMs, 12f);
+            // Mesh decode was floored at 12ms while the LOAD frame budget (loadPhaseUpdateBudgetMs) is
+            // far larger — so meshing used a fraction of the budget already allotted for load and the
+            // world sat unmeshed for minutes ("fragmented" load). Floor the decode budget near the load
+            // budget (leaving ~18ms for finalize/lighting/worldgen) so meshing uses the headroom that
+            // already exists. No NEW FPS tradeoff: load FPS is governed by loadPhaseUpdateBudgetMs, which
+            // the user already set — lower THAT to trade load speed for load FPS.
+            float loadMeshBudget = Mathf.Max(12f, loadPhaseUpdateBudgetMs - 18f);
+            adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Max(gpuMeshDecodeFrameBudgetMs, loadMeshBudget);
             return;
         }
 
@@ -1259,6 +1284,7 @@ public class McWorld : UdonSharpBehaviour
             _GpuBuildBlockFaceSliceTexture();
             _GpuBuildVoxelCubeMesh();
         }
+        _GpuPublishStaticGlobals(); // publish the never-changing globals ONCE
         _GpuPublishGlobals();
         _ApplyTerrainLightingSourceToSharedMaterials();
 #if LOGGING
@@ -1340,25 +1366,42 @@ public class McWorld : UdonSharpBehaviour
         gpuBlockPropertyTexture.Apply(false, false);
     }
 
-    private void _GpuPublishGlobals()
+    // Static GPU globals — values & texture refs that NEVER change after init: dimensions, offsets,
+    // and the stable Texture2D slot-lookup / slot-meta / block-props refs (those are updated in place
+    // via SetPixels32, the object ref doesn't change). Published ONCE when the backend becomes ready,
+    // so the per-chunk / per-lighting-pass publish below only re-sends the 3 atlas refs that actually move.
+    private void _GpuPublishStaticGlobals()
     {
         if (gpuSlotLookupTexture == null || gpuLightAtlas == null) return;
 
         VRCShader.SetGlobalFloat(gpuPropGpuEnabledId, enableGpuVoxelBackend && gpuBackendReady ? 1f : 0f);
-        VRCShader.SetGlobalTexture(gpuPropBlockAtlasGlobalId, gpuBlockAtlas);
-        VRCShader.SetGlobalTexture(gpuPropLightAtlasId, gpuLightAtlas);
         VRCShader.SetGlobalTexture(gpuPropSlotLookupId, gpuSlotLookupTexture);
         VRCShader.SetGlobalTexture(gpuPropSlotMetaGlobalId, gpuSlotMetaTexture);
         VRCShader.SetGlobalTexture(gpuPropBlockPropsGlobalId, gpuBlockPropertyTexture);
         VRCShader.SetGlobalVector(gpuPropAtlasInfoId, new Vector4(gpuAtlasWidth, gpuAtlasHeight, gpuAtlasSlotsX, gpuAtlasSlotsY));
         if (gpuFaceOccupancyAtlas != null)
         {
-            VRCShader.SetGlobalTexture(gpuPropFaceOccupancyAtlasGlobalId, gpuFaceOccupancyAtlas);
             VRCShader.SetGlobalVector(gpuPropFaceOccupancyInfoId, new Vector4(gpuFaceOccupancyAtlasWidth, gpuFaceOccupancyAtlasHeight, gpuFaceOccupancySlotWidth, gpuFaceOccupancySlotHeight));
         }
         VRCShader.SetGlobalVector(gpuPropWorldInfoId, new Vector4(worldDimensionX, worldDimensionY, worldDimensionZ, worldDimensionY * worldDimensionZ));
         VRCShader.SetGlobalVector(gpuPropChunkInfoId, new Vector4(chunkSizeXZ, chunkSizeY, chunkOffsetX, chunkOffsetZ));
         VRCShader.SetGlobalVector(gpuPropVoxelOffsetId, new Vector4(globalVoxelOffsetX, globalVoxelOffsetY, globalVoxelOffsetZ, gpuChunkSlotCapacity));
+    }
+
+    // Dynamic GPU globals — ONLY the atlas RenderTexture refs, which change every time an atlas
+    // ping-pongs (block/light/occupancy overlays swap current<->scratch in _GpuOverlayTextureIntoAtlas).
+    // Re-published after each atlas mutation: 3 externs instead of the old 13 (static globals above are
+    // no longer re-sent per chunk sync / per lighting pass).
+    private void _GpuPublishGlobals()
+    {
+        if (gpuSlotLookupTexture == null || gpuLightAtlas == null) return;
+
+        VRCShader.SetGlobalTexture(gpuPropBlockAtlasGlobalId, gpuBlockAtlas);
+        VRCShader.SetGlobalTexture(gpuPropLightAtlasId, gpuLightAtlas);
+        if (gpuFaceOccupancyAtlas != null)
+        {
+            VRCShader.SetGlobalTexture(gpuPropFaceOccupancyAtlasGlobalId, gpuFaceOccupancyAtlas);
+        }
     }
 
     public Texture GetGpuBlockAtlasDebugTexture()
@@ -1686,10 +1729,9 @@ public class McWorld : UdonSharpBehaviour
     {
         if (blockData == null || gpuFaceOccupancyUploadPixels == null) return;
 
-        for (int i = 0; i < gpuFaceOccupancyUploadPixels.Length; i++)
-        {
-            gpuFaceOccupancyUploadPixels[i] = new Color32(0, 0, 0, 0);
-        }
+        // Array.Clear zeroes the struct (Color32 default = (0,0,0,0)) in one native memset — avoids
+        // ~4096 Color32-constructor Udon externs per chunk that the per-element loop cost.
+        System.Array.Clear(gpuFaceOccupancyUploadPixels, 0, gpuFaceOccupancyUploadPixels.Length);
 
         int stride = chunkSizeXZ * chunkSizeXZ;
         int rowPairsXZ = (chunkSizeXZ + 1) >> 1;
@@ -4337,6 +4379,106 @@ public class McWorld : UdonSharpBehaviour
         }
     }
 
+    // BOX COLLIDER COLLISION: true if this block id is collided against (full-cube opaque/cutout
+    // non-fluid). Exposed so the interaction voxel-raycast (ModifyTerrain) targets the same set.
+    public bool BlockHasCollision(byte blockId)
+    {
+        return _blockHasCollisionCache != null && blockId < _blockHasCollisionCache.Length && _blockHasCollisionCache[blockId];
+    }
+
+    // BOX COLLIDER COLLISION: instantiate the moving collision grid once at startup. The grid is a
+    // flat pool of BoxColliders parked inactive; _UpdateVoxelColliderGrid positions/activates them on
+    // the solid voxels around the player each frame. No-op unless enabled + a prefab is assigned.
+    private void _InitVoxelColliderGrid()
+    {
+        if (!useBoxColliderCollision || voxelColliderPrefab == null) return;
+        int R = collisionGridRadiusXZ < 0 ? 0 : collisionGridRadiusXZ;
+        int gridXZ = 2 * R + 1;
+        int gridY = (collisionGridDown < 0 ? 0 : collisionGridDown) + (collisionGridUp < 0 ? 0 : collisionGridUp) + 1;
+        int count = gridXZ * gridXZ * gridY;
+        _voxelColliders = new GameObject[count];
+        _voxelColliderActive = new bool[count];
+        for (int i = 0; i < count; i++)
+        {
+            GameObject go = Instantiate(voxelColliderPrefab);
+            if (go == null) continue;
+            go.transform.SetParent(this.transform, false);
+            go.SetActive(false);
+            _voxelColliders[i] = go;
+            _voxelColliderActive[i] = false;
+        }
+        _collisionGridInitialized = true;
+#if LOGGING
+        if (enableVerboseLogging) Debug.Log($"[McWorld] Box-collider collision grid initialized: {count} colliders ({gridXZ}x{gridY}x{gridXZ}).");
+#endif
+    }
+
+    // BOX COLLIDER COLLISION: each frame, snap the collider grid onto the solid voxels around the
+    // player. Scans every cell (so collision tracks blocks placed/broken or chunks streaming in under
+    // a stationary player); positions are only re-set on cells that change state or when the player
+    // moved a voxel, keeping the per-frame extern count near zero while standing still. Placing a
+    // collider on EVERY solid voxel in the grid (not just exposed faces) gives a deep solid stack that
+    // can't be tunneled through in one physics step during a fast fall.
+    private void _UpdateVoxelColliderGrid()
+    {
+        if (!useBoxColliderCollision || !_collisionGridInitialized || _voxelColliders == null) return;
+        VRCPlayerApi lp = Networking.LocalPlayer;
+        if (lp == null) return;
+        Vector3 pp = lp.GetPosition();
+        int pvx = Mathf.FloorToInt(pp.x);
+        int pvy = Mathf.FloorToInt(pp.y);
+        int pvz = Mathf.FloorToInt(pp.z);
+        bool moved = pvx != _collisionPlayerVoxelX || pvy != _collisionPlayerVoxelY || pvz != _collisionPlayerVoxelZ;
+        _collisionPlayerVoxelX = pvx; _collisionPlayerVoxelY = pvy; _collisionPlayerVoxelZ = pvz;
+
+        int R = collisionGridRadiusXZ < 0 ? 0 : collisionGridRadiusXZ;
+        int down = collisionGridDown < 0 ? 0 : collisionGridDown;
+        int up = collisionGridUp < 0 ? 0 : collisionGridUp;
+        int collisionLen = _blockHasCollisionCache != null ? _blockHasCollisionCache.Length : 0;
+        int idx = 0;
+        for (int dy = -down; dy <= up; dy++)
+        {
+            int wy = pvy + dy;
+            for (int dz = -R; dz <= R; dz++)
+            {
+                int wz = pvz + dz;
+                for (int dx = -R; dx <= R; dx++)
+                {
+                    int wx = pvx + dx;
+                    bool solid = false;
+                    if (wy >= 0)
+                    {
+                        int bid = GetBlock(wx, wy, wz) & 0xFF;
+                        solid = bid != 0 && bid < collisionLen && _blockHasCollisionCache[bid];
+                    }
+                    GameObject go = idx < _voxelColliders.Length ? _voxelColliders[idx] : null;
+                    if (go != null)
+                    {
+                        if (solid)
+                        {
+                            if (!_voxelColliderActive[idx])
+                            {
+                                go.transform.position = new Vector3(wx + 0.5f, wy + 0.5f, wz + 0.5f);
+                                go.SetActive(true);
+                                _voxelColliderActive[idx] = true;
+                            }
+                            else if (moved)
+                            {
+                                go.transform.position = new Vector3(wx + 0.5f, wy + 0.5f, wz + 0.5f);
+                            }
+                        }
+                        else if (_voxelColliderActive[idx])
+                        {
+                            go.SetActive(false);
+                            _voxelColliderActive[idx] = false;
+                        }
+                    }
+                    idx++;
+                }
+            }
+        }
+    }
+
     // CHUNK GO POOL: scan chunks_1D (rolling cursor, time-sliced) and recycle the render GameObject
     // of any chunk that has moved beyond the render distance (+ a hysteresis ring so a chunk at the
     // boundary doesn't thrash). Returns GameObjects to the pool for reuse by chunks entering the view.
@@ -4364,6 +4506,11 @@ public class McWorld : UdonSharpBehaviour
     {
         // Safety check: Don't process if not initialized
         if (chunks_1D == null || terrainGenerator == null) return;
+
+        // BOX COLLIDER COLLISION: keep the player's collision grid current every frame, before (and
+        // independent of) the budgeted chunk processing below — collision must never be skipped on a
+        // heavy frame or the player falls through the world. No-op unless useBoxColliderCollision.
+        _UpdateVoxelColliderGrid();
 
         // Load-phase budget boost: while the one-time initial world generation is still
         // running we keep the larger updateTimeBudgetMs set at init (lets the idle GPU +
@@ -8435,10 +8582,15 @@ public class McWorld : UdonSharpBehaviour
         float colorB = ((packedColor >> 16) & 0xFF) / 255f;
         if (useAo)
         {
-            targetColors[currentVertexCount + 0] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 0));
-            targetColors[currentVertexCount + 1] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 1));
-            targetColors[currentVertexCount + 2] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 2));
-            targetColors[currentVertexCount + 3] = new Color(colorR, colorG, colorB, _UnpackAoBrightness(aoSignature, 3));
+            // Inline the 4 AO-brightness unpacks (was 4 _UnpackAoBrightness method-call externs/quad).
+            float ao0 = (aoSignature & 0xFF) * (1f / 255f);
+            float ao1 = ((aoSignature >> 8) & 0xFF) * (1f / 255f);
+            float ao2 = ((aoSignature >> 16) & 0xFF) * (1f / 255f);
+            float ao3 = ((aoSignature >> 24) & 0xFF) * (1f / 255f);
+            targetColors[currentVertexCount + 0] = new Color(colorR, colorG, colorB, ao0);
+            targetColors[currentVertexCount + 1] = new Color(colorR, colorG, colorB, ao1);
+            targetColors[currentVertexCount + 2] = new Color(colorR, colorG, colorB, ao2);
+            targetColors[currentVertexCount + 3] = new Color(colorR, colorG, colorB, ao3);
         }
         else
         {
@@ -8478,7 +8630,7 @@ public class McWorld : UdonSharpBehaviour
         if (visibility == BlockVisibilityType.Opaque) { chunk._opaqueVertexCount += 4; chunk._opaqueTriangleCount += 6; }
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
         else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
-        if (!chunk.pendingColliderMeshRebuild && visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4)
+        if (!useBoxColliderCollision && !chunk.pendingColliderMeshRebuild && visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4)
         {
             chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
             chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
@@ -9237,7 +9389,7 @@ public class McWorld : UdonSharpBehaviour
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
         else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
 
-        if (visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4) {
+        if (!useBoxColliderCollision && visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4) {
             chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
             chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
             chunk._collisionVertices[chunk._collisionVertexCount + 2] = targetVertices[currentVertexCount + 2];
@@ -9326,7 +9478,7 @@ public class McWorld : UdonSharpBehaviour
         else if (visibility == BlockVisibilityType.Transparent) { chunk._transparentVertexCount += 4; chunk._transparentTriangleCount += 6; }
         else { chunk._cutoutVertexCount += 4; chunk._cutoutTriangleCount += 6; }
 
-        if (visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4) {
+        if (!useBoxColliderCollision && visibility != BlockVisibilityType.Transparent && chunk._collisionVertexCount < MAX_VERTS * 3 - 4) {
             chunk._collisionVertices[chunk._collisionVertexCount + 0] = targetVertices[currentVertexCount + 0];
             chunk._collisionVertices[chunk._collisionVertexCount + 1] = targetVertices[currentVertexCount + 1];
             chunk._collisionVertices[chunk._collisionVertexCount + 2] = targetVertices[currentVertexCount + 2];
@@ -11162,11 +11314,19 @@ public class McWorld : UdonSharpBehaviour
         cullingCache = new BlockCullingType[maxId];
         shapeTypeCache = new McBlockShapeType[maxId]; // NEW: Initialize shape type cache
         biomeTintModeCache = new byte[maxId];
+        _blockHasCollisionCache = new bool[maxId];
         for (int i = 0; i < maxId; i++)
         {
             visibilityCache[i] = (BlockVisibilityType)((blockDataCache[i] >> 1) & 0x3);
             cullingCache[i] = (BlockCullingType)((blockDataCache[i] >> 3) & 0x7);
             shapeTypeCache[i] = (McBlockShapeType)((blockDataCache[i] >> 6) & 0x3); // NEW: Cache shape type (bits 6-7)
+            // Box-collision set = exactly the blocks the per-chunk collision MESH included: a full-cube,
+            // opaque-or-cutout, non-fluid block. (Cross plants, torches, fluids, and invisible blocks
+            // never got a collision mesh, so they get no box collider either — preserves current feel.)
+            _blockHasCollisionCache[i] = i != 0
+                && (visibilityCache[i] == BlockVisibilityType.Opaque || visibilityCache[i] == BlockVisibilityType.Cutout)
+                && shapeTypeCache[i] == McBlockShapeType.Cube
+                && !_IsFluidBlock((byte)i);
             if (i == 2 || i == 31) biomeTintModeCache[i] = 1;
             else if (i == 18) biomeTintModeCache[i] = 2;
             else if (i == 8 || i == 9) biomeTintModeCache[i] = 3;

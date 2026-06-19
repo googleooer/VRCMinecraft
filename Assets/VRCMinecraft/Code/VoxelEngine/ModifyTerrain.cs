@@ -211,20 +211,34 @@ public class ModifyTerrain : UdonSharpBehaviour
         }
 #endif
 
-        RaycastHit physicsHit;
-        currentFrameHitValid = Physics.Raycast(
-            rayOrigin,
-            rayDirection,
-            out physicsHit,
-            blockInteractionRange,
-            terrainLayerMask
-        );
+        if (world != null && world.useBoxColliderCollision)
+        {
+            // Box-collider mode: terrain has no full chunk mesh colliders to hit, so target blocks with
+            // a voxel DDA raycast (steps the block grid, stops at the first block BlockHasCollision marks
+            // — the same set the colliders use). Produces the same hit point/normal/distance contract.
+            float vDist; Vector3 vPoint; Vector3 vNormal;
+            currentFrameHitValid = _TryGetVoxelBlockHit(rayOrigin, rayDirection, blockInteractionRange, out vDist, out vPoint, out vNormal);
+            currentFrameHitPoint = currentFrameHitValid ? vPoint : Vector3.zero;
+            currentFrameHitNormal = currentFrameHitValid ? vNormal : Vector3.zero;
+            currentFrameHitDistance = currentFrameHitValid ? vDist : blockInteractionRange;
+        }
+        else
+        {
+            RaycastHit physicsHit;
+            currentFrameHitValid = Physics.Raycast(
+                rayOrigin,
+                rayDirection,
+                out physicsHit,
+                blockInteractionRange,
+                terrainLayerMask
+            );
 
-        currentFrameHitPoint = currentFrameHitValid ? physicsHit.point : Vector3.zero;
-        currentFrameHitNormal = currentFrameHitValid ? physicsHit.normal : Vector3.zero;
-        currentFrameHitDistance = currentFrameHitValid ? physicsHit.distance : blockInteractionRange;
+            currentFrameHitPoint = currentFrameHitValid ? physicsHit.point : Vector3.zero;
+            currentFrameHitNormal = currentFrameHitValid ? physicsHit.normal : Vector3.zero;
+            currentFrameHitDistance = currentFrameHitValid ? physicsHit.distance : blockInteractionRange;
+        }
 
-        float maxTorchDistance = currentFrameHitValid ? physicsHit.distance : blockInteractionRange;
+        float maxTorchDistance = currentFrameHitValid ? currentFrameHitDistance : blockInteractionRange;
         float torchHitDistance;
         Vector3 torchHitPoint;
         Vector3 torchHitNormal;
@@ -503,6 +517,61 @@ public class ModifyTerrain : UdonSharpBehaviour
             Debug.Log(logBuilder.ToString());
         }
 #endif
+    }
+
+    // Voxel DDA raycast against solid (collidable) blocks. Used when box-collider collision is on, so
+    // block targeting is independent of chunk mesh colliders (which aren't built in that mode). Mirrors
+    // the torch-hit DDA stepping but checks world.BlockHasCollision; returns the entry hit point, the
+    // entry face normal, and distance — same contract _UpdateTargetedBlock/placement expect.
+    private bool _TryGetVoxelBlockHit(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out float hitDistance, out Vector3 hitPoint, out Vector3 hitNormal)
+    {
+        hitDistance = 0f;
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.zero;
+        if (world == null || maxDistance <= 0f) return false;
+
+        Vector3 dir = rayDirection.normalized;
+        int vx = Mathf.FloorToInt(rayOrigin.x);
+        int vy = Mathf.FloorToInt(rayOrigin.y);
+        int vz = Mathf.FloorToInt(rayOrigin.z);
+
+        int stepX = dir.x > 0f ? 1 : (dir.x < 0f ? -1 : 0);
+        int stepY = dir.y > 0f ? 1 : (dir.y < 0f ? -1 : 0);
+        int stepZ = dir.z > 0f ? 1 : (dir.z < 0f ? -1 : 0);
+
+        float nbX = stepX > 0 ? vx + 1f : vx;
+        float nbY = stepY > 0 ? vy + 1f : vy;
+        float nbZ = stepZ > 0 ? vz + 1f : vz;
+
+        float tMaxX = stepX != 0 ? (nbX - rayOrigin.x) / dir.x : float.PositiveInfinity;
+        float tMaxY = stepY != 0 ? (nbY - rayOrigin.y) / dir.y : float.PositiveInfinity;
+        float tMaxZ = stepZ != 0 ? (nbZ - rayOrigin.z) / dir.z : float.PositiveInfinity;
+        float tDeltaX = stepX != 0 ? 1f / Mathf.Abs(dir.x) : float.PositiveInfinity;
+        float tDeltaY = stepY != 0 ? 1f / Mathf.Abs(dir.y) : float.PositiveInfinity;
+        float tDeltaZ = stepZ != 0 ? 1f / Mathf.Abs(dir.z) : float.PositiveInfinity;
+
+        float t = 0f;
+        int lastAxis = -1; // 0=x,1=y,2=z; -1 = still in the origin voxel
+        int budget = 0;
+        while (t <= maxDistance && budget < 256)
+        {
+            byte bid = (byte)(world.GetBlock(vx, vy, vz) & 0xFF);
+            if (world.BlockHasCollision(bid))
+            {
+                hitDistance = t;
+                hitPoint = rayOrigin + dir * t;
+                if (lastAxis == 0) hitNormal = new Vector3(-stepX, 0f, 0f);
+                else if (lastAxis == 1) hitNormal = new Vector3(0f, -stepY, 0f);
+                else if (lastAxis == 2) hitNormal = new Vector3(0f, 0f, -stepZ);
+                else hitNormal = -dir; // ray started inside a solid block
+                return true;
+            }
+            if (tMaxX <= tMaxY && tMaxX <= tMaxZ) { vx += stepX; t = tMaxX; tMaxX += tDeltaX; lastAxis = 0; }
+            else if (tMaxY <= tMaxZ) { vy += stepY; t = tMaxY; tMaxY += tDeltaY; lastAxis = 1; }
+            else { vz += stepZ; t = tMaxZ; tMaxZ += tDeltaZ; lastAxis = 2; }
+            budget++;
+        }
+        return false;
     }
 
     private bool _TryGetTorchHit(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out float hitDistance, out Vector3 hitPoint, out Vector3 hitNormal)
