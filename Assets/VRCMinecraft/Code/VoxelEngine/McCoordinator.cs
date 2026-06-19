@@ -78,6 +78,10 @@ public class McCoordinator : UdonSharpBehaviour
     // dispatch-order-independent (fingerprint-validated: sum=2213895521).
     private bool[] _positionAssigned;
     private int _lastPickedDataGenPos = -1;
+    // GeneratorSlotForChunkIndex is a deterministic function of chunkIndex (column -> generator slot),
+    // but it's a cross-VM Udon call (McCoordinator -> McWorld) — expensive, and the data-gen picker
+    // queried it for many positions every cycle. Memoize per chunkIndex: -1 = not yet cached.
+    private int[] _genSlotCache;
     [Tooltip("How many positions ahead of the assignment low-water-mark to scan for a chunk that can start now (free generator for a new column, or a sibling whose column cache is ready). Larger = more concurrent columns in flight, up to the generator count. ~12 columns (96) covers 8 generators.")]
     public int dataGenLookaheadWindow = 96;
     // Per-generator-slot busy flags (size = world.GetGeneratorCount()). Replaces the old single
@@ -190,6 +194,8 @@ public class McCoordinator : UdonSharpBehaviour
         chunkRebuildQueue = new int[MAX_REBUILD_QUEUE_SIZE];
         deferredMeshQueue = new int[MAX_DEFERRED_MESH_QUEUE_SIZE];
         _positionAssigned = new bool[totalWorldChunks];
+        _genSlotCache = new int[totalWorldChunks];
+        for (int i = 0; i < _genSlotCache.Length; i++) _genSlotCache[i] = -1;
 
         // No longer using SendCustomEventDelayedSeconds - Update() will handle processing
     }
@@ -249,6 +255,15 @@ public class McCoordinator : UdonSharpBehaviour
 #endif
     }
 
+    // Memoized GeneratorSlotForChunkIndex — avoids a cross-VM call per scanned position each cycle.
+    private int _GenSlotForChunk(int ci)
+    {
+        if (_genSlotCache == null || ci < 0 || ci >= _genSlotCache.Length) return world.GeneratorSlotForChunkIndex(ci);
+        int s = _genSlotCache[ci];
+        if (s < 0) { s = world.GeneratorSlotForChunkIndex(ci); _genSlotCache[ci] = s; }
+        return s;
+    }
+
     private bool _TryPickDataGenPositionImpl()
     {
         if (radialChunkOrder == null || _positionAssigned == null) return false;
@@ -266,7 +281,7 @@ public class McCoordinator : UdonSharpBehaviour
             if (_positionAssigned[p]) continue;
             int ci = radialChunkOrder[p];
             if (!world.ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin); picker re-scans each cycle so they stream in on approach
-            if (!genSlotBusy[world.GeneratorSlotForChunkIndex(ci)])
+            if (!genSlotBusy[_GenSlotForChunk(ci)])
             {
                 if (canStartNewColumn) { _lastPickedDataGenPos = p; return true; } // new column (concurrency-capped)
             }
@@ -285,7 +300,7 @@ public class McCoordinator : UdonSharpBehaviour
             if (_positionAssigned[p]) continue;
             int ci = radialChunkOrder[p];
             if (!world.ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin)
-            if (!genSlotBusy[world.GeneratorSlotForChunkIndex(ci)] && canStartNewColumn)
+            if (!genSlotBusy[_GenSlotForChunk(ci)] && canStartNewColumn)
             {
                 _lastPickedDataGenPos = p;
                 return true;
@@ -824,7 +839,7 @@ public class McCoordinator : UdonSharpBehaviour
                     worker_isDeferredMeshWake[i] = false;
                     if (worker_usesExclusiveGenerator[i])
                     {
-                        int genSlot = world.GeneratorSlotForChunkIndex(newChunkIndex);
+                        int genSlot = _GenSlotForChunk(newChunkIndex);
                         worker_generatorSlot[i] = genSlot;
                         if (genSlot >= 0 && genSlot < genSlotBusy.Length) genSlotBusy[genSlot] = true;
                     }
