@@ -27,8 +27,6 @@ public class McWorld : UdonSharpBehaviour
     public ChunkData[] chunks_1D; // OPTIMIZED: Public for direct coordinator access
 
     [Header("Performance Tuning")]
-    [Tooltip("How many voxels to check for meshing per step inside a chunk. Higher values build meshes faster but may cause lag spikes.")]
-    public int voxelsPerMeshStep = 4096;
     [Tooltip("Approximate time budget per mesh step in milliseconds. Raised to 12ms on the CPU-only path to do more meshing per step before yielding (fewer, larger steps = less Udon loop overhead).")]
     public float meshStepTimeBudgetMs = 12.0f;
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
@@ -72,8 +70,6 @@ public class McWorld : UdonSharpBehaviour
     public int shellMeshPriorityRadiusY = 1;
     [Tooltip("RENDER DISTANCE CULL: when on, a chunk only meshes if its column is within the active render distance (renderDistanceChunksPC/Mobile, radial, full Y column) of the player; farther chunks defer until the player approaches. Player edits and rebuilds bypass it.")]
     public bool enableMeshRenderDistanceCull = true;
-    [Tooltip("LEGACY/superseded by renderDistanceChunksPC/Mobile. Kept for serialization compatibility; no longer read.")]
-    public int meshRenderDistanceChunksXZ = 10;
     [Tooltip("RENDER DISTANCE (PC): radial chunk radius (full Y columns) within which terrain meshes AND stays GPU-lit. Minecraft-style. Used on standalone/desktop builds. Auto-clamped at init so the radial column set fits the GPU light-slot capacity.")]
     public int renderDistanceChunksPC = 8;
     [Tooltip("RENDER DISTANCE (Android/iOS): radial chunk radius (full Y columns) used on mobile/Quest builds. Lower than PC to fit Quest memory/perf.")]
@@ -153,7 +149,6 @@ public class McWorld : UdonSharpBehaviour
 
     [Header("Debugging")]
     public bool enableVerboseLogging = false;
-    public bool enableGenerationTimings = false;
 
     [Header("GPU Voxel Backend")]
     public bool enableGpuVoxelBackend = true;
@@ -166,8 +161,6 @@ public class McWorld : UdonSharpBehaviour
     public int gpuChunkSlotCapacity = 2047;
     public int gpuLightingIterationsPerUpdate = 64;
     public int gpuLightingTotalIterations = 128;
-    public int gpuResidentRadiusXZ = 6;
-    public int gpuResidentRadiusY = 2;
     public int gpuResidentSyncsPerFrame = 32;
     [Tooltip("Experimental: export per-slice face bounds instead of dense face pixels for GPU meshing. Disabled by default until validated.")]
     public bool useCompactGpuFaceExport = false;
@@ -588,7 +581,6 @@ public class McWorld : UdonSharpBehaviour
     public bool enableAggregateLogging = true;
     public bool enableDetailedTimings = true;
     public bool enableCounters = true;
-    public bool enableMemoryTracking = true;
     public bool enableCacheTracking = true;
     public int aggregateLogInterval = 300; // frames
 
@@ -825,6 +817,35 @@ public class McWorld : UdonSharpBehaviour
             }
         }
 
+#if LOGGING
+        // CONSOLIDATED LOGGING: McWorld is the single source of truth for the profiling flags.
+        // Push them to the coordinator and every terrain generator so ONE set of toggles on McWorld
+        // drives the whole Performance Summary (each component used to carry its own duplicate copy,
+        // which is why the same flag had to be set in several places to see any output).
+        if (coordinator != null)
+        {
+            coordinator.enableVerboseLogging = enableVerboseLogging;
+            coordinator.enableDetailedTimings = enableDetailedTimings;
+            coordinator.enableAggregateLogging = enableAggregateLogging;
+        }
+        if (terrainGenerator != null)
+        {
+            terrainGenerator.enableVerboseLogging = enableVerboseLogging;
+            terrainGenerator.enableDetailedTimings = enableDetailedTimings;
+        }
+        if (extraGenerators != null)
+        {
+            for (int gi = 0; gi < extraGenerators.Length; gi++)
+            {
+                if (extraGenerators[gi] != null)
+                {
+                    extraGenerators[gi].enableVerboseLogging = enableVerboseLogging;
+                    extraGenerators[gi].enableDetailedTimings = enableDetailedTimings;
+                }
+            }
+        }
+#endif
+
         int[] radialChunkOrder = GenerateRadialChunkOrder();
         coordinator.InitializeAndStartProcessing(this, radialChunkOrder, totalWorldChunks);
         _nearGenStartTime = Time.realtimeSinceStartup;
@@ -986,8 +1007,6 @@ public class McWorld : UdonSharpBehaviour
         }
 
         gpuChunkSlotCapacity = Mathf.Clamp(gpuChunkSlotCapacity, 1, 4095);
-        if (gpuResidentRadiusXZ <= 0) gpuResidentRadiusXZ = 6;
-        if (gpuResidentRadiusY <= 0) gpuResidentRadiusY = 2;
 
         // Clamp the render distance so the radial full-column lit set fits the GPU light-slot
         // capacity. If the visible set exceeded capacity, the farthest visible chunks couldn't all
