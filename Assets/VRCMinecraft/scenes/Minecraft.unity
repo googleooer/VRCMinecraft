@@ -7331,11 +7331,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -7362,14 +7358,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647
@@ -7754,11 +7747,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -7785,14 +7774,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647
@@ -14395,11 +14381,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -14426,14 +14408,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647
@@ -15030,11 +15009,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -15061,14 +15036,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647
@@ -16562,11 +16534,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -16593,14 +16561,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647
@@ -35961,11 +35926,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -35992,14 +35953,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647
@@ -41080,11 +41038,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -41111,14 +41065,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647
@@ -41186,19 +41137,13 @@ MonoBehaviour:
   debugGenSlotHoldFrames: 0
   updateTimeBudgetMs: 16
   loadPhaseUpdateBudgetMs: 33
-  skipCheckCycles: 1
   deferredMeshWakeQueueThreshold: 32
   deferredMeshWakeBurstPerCycle: 1
   maxChunkInstantiationsPerCycle: 24
-  columnsPerDataGenStep: 2
-  voxelsPerMeshStep: 16384
-  voxelsPerTerrainStep: 16384
   dataGenLookaheadWindow: 96
   enableVerboseLogging: 0
   enableDetailedTimings: 1
-  enableCounters: 0
-  enableAggregateLogging: 0
-  aggregateLogInterval: 300
+  enableAggregateLogging: 1
 --- !u!114 &1156113853
 MonoBehaviour:
   m_ObjectHideFlags: 2
@@ -63551,7 +63496,6 @@ MonoBehaviour:
   chunkSizeXZ: 16
   chunkSizeY: 16
   chunkPrefab: {fileID: 1697751968}
-  voxelsPerMeshStep: 2048
   meshStepTimeBudgetMs: 8
   updateTimeBudgetMs: 22
   loadPhaseUpdateBudgetMs: 33
@@ -63566,7 +63510,6 @@ MonoBehaviour:
   shellMeshPriorityRadiusXZ: 2
   shellMeshPriorityRadiusY: 1
   enableMeshRenderDistanceCull: 1
-  meshRenderDistanceChunksXZ: 10
   renderDistanceChunksPC: 8
   renderDistanceChunksMobile: 4
   requireAllNeighborsForMesh: 1
@@ -63604,13 +63547,10 @@ MonoBehaviour:
   lavaStripTexture: {fileID: 2800000, guid: 0769ee0a4e2a07e49b3f67e709e9985c, type: 3}
   ambientOcclusion: 1
   enableVerboseLogging: 0
-  enableGenerationTimings: 1
   enableGpuVoxelBackend: 1
   gpuChunkSlotCapacity: 1023
   gpuLightingIterationsPerUpdate: 15
   gpuLightingTotalIterations: 15
-  gpuResidentRadiusXZ: 6
-  gpuResidentRadiusY: 2
   gpuResidentSyncsPerFrame: 32
   useCompactGpuFaceExport: 1
   enableBatchedFaceReadback: 0
@@ -63662,10 +63602,9 @@ MonoBehaviour:
   skylightSubtracted: 0
   gpuDebugRepackAfterUpload: 0
   enableFrameLogging: 0
-  enableAggregateLogging: 0
-  enableDetailedTimings: 0
+  enableAggregateLogging: 1
+  enableDetailedTimings: 1
   enableCounters: 0
-  enableMemoryTracking: 0
   enableCacheTracking: 0
   aggregateLogInterval: 300
   cpuMirrorRadiusXZ: 5
@@ -90623,11 +90562,7 @@ MonoBehaviour:
   match1to1TerrainBaseline: 0
   flipXAxis: 1
   generateDebugPillar: 0
-  terrainHeightMultiplier: 1
-  caveFrequency: 0.14
   generateCaves: 1
-  generateBedrock: 1
-  acknowledgeVRChatPerformance: 0
   enableGpuWorldgen: 1
   useSingleChannelGpuColumnReadback: 1
   gpuNoiseOctaveMaterial: {fileID: 2100000, guid: 4ad44bd2b6904f12bb119fe90330188a,
@@ -90654,14 +90589,11 @@ MonoBehaviour:
   structureTemplates: []
   enableVerboseLogging: 0
   enableDetailedTimings: 0
-  enableCounters: 0
-  enableMemoryTracking: 0
   world: {fileID: 1596987940}
   coordinator: {fileID: 1156113852}
   blockTypeManager: {fileID: 1410233257}
   gpuLastReadbackSource: {fileID: 0}
   gpuSkipReadbackForColumn: 0
-  gpuSkipClimateReadback: 0
   lastChunkGpuResident: 0
   gpuResidentColumnX: 2147483647
   gpuResidentColumnZ: 2147483647

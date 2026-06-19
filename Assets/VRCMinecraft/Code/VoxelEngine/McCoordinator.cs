@@ -37,23 +37,12 @@ public class McCoordinator : UdonSharpBehaviour
     public float updateTimeBudgetMs = 16.0f;
     [Tooltip("While the ONE-TIME initial world generation is running, use this larger per-cycle budget so terrain data-gen completes faster (frame rate during the load matters far less than total load time). Reverts to updateTimeBudgetMs automatically once gen completes. Set <= updateTimeBudgetMs to disable.")]
     public float loadPhaseUpdateBudgetMs = 60.0f;
-    [Tooltip("Skip N state checks per worker to reduce overhead (higher = less responsive but faster)")]
-    public int skipCheckCycles = 0;
     [Tooltip("When the main rebuild queue is this small or smaller, allow a few deferred interior wakes to drain in the same cycle.")]
     public int deferredMeshWakeQueueThreshold = 32;
     [Tooltip("Maximum deferred interior wake assignments per coordinator cycle while the main rebuild queue still has work.")]
     public int deferredMeshWakeBurstPerCycle = 1;
     [Tooltip("How many brand-new chunks may be instantiated per coordinator cycle. Larger values let an idle column drain into multiple workers in one frame after a readback completes (worldgen throughput multiplier).")]
     public int maxChunkInstantiationsPerCycle = 16;
-
-    [Header("Workload Per Step")]
-    [Tooltip("How many Z-columns of voxels to generate per step inside a chunk. Higher values generate chunks faster but may cause lag spikes.")]
-    public int columnsPerDataGenStep = 4;
-    [Tooltip("How many voxels to check for meshing per step inside a chunk. Higher values build meshes faster but may cause lag spikes.")]
-    public int voxelsPerMeshStep = 2048;
-    [Tooltip("How many voxels to process when generating data.")]
-    public int voxelsPerTerrainStep = 2048;
-
 
     // --- Worker Pool State ---
     private int[] worker_targetChunkIndex;
@@ -123,9 +112,7 @@ public class McCoordinator : UdonSharpBehaviour
     
     [Header("Performance Profiling")]
     public bool enableDetailedTimings = false;
-    public bool enableCounters = true;
     public bool enableAggregateLogging = true;
-    public int aggregateLogInterval = 300; // frames
     
     private int lastLoggedPercent = -1;
     

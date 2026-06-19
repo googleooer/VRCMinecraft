@@ -92,14 +92,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     [Header("Debug Features")]
     [Tooltip("Generate a debug pillar at world origin (0,0) spanning full height")]
     public bool generateDebugPillar = true;
-    [Range(0.1f, 2.0f)] public float terrainHeightMultiplier = 1.0f;
-    [Range(0.0f, 1.0f)] public float caveFrequency = 0.14f;
     public bool generateCaves = true;
-    public bool generateBedrock = true;
-    
-    [Header("Performance (VRChat)")]
-    [Tooltip("WARN: Noise generation takes 400-500ms in VRChat (3-4x slower than editor). This is a known Udon limitation. First chunk per column will stutter.")]
-    public bool acknowledgeVRChatPerformance = false;
 
     [Header("GPU Worldgen")]
     public bool enableGpuWorldgen = true;
@@ -130,8 +123,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     
     [Header("Performance Profiling")]
     public bool enableDetailedTimings = true;
-    public bool enableCounters = true;
-    public bool enableMemoryTracking = true;
 
     // CPU/GPU path tracing one-shot guard
     private bool dbg_loggedFirstGpuChunkCopy = false;
@@ -413,11 +404,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // gpuResidentColumnX/Z let sibling chunks repack their Y-slice straight from the still-valid
     // column final texture (gpuLastReadbackSource) without re-running the column gen.
     public bool gpuSkipReadbackForColumn = false;
-    // (a) When set, compute biome climate on the CPU (wcm.getBiomeBlock) directly instead of the
-    // GPU climate pass + per-column GPU->CPU readback. Profiling showed the climate readback is the
-    // dominant gen stall (~36 step-frames/column waiting in Prepare_GetBiomes). CPU climate is the
-    // accurate Minecraft biome (also the existing fallback), so the terrain fingerprint is preserved.
-    public bool gpuSkipClimateReadback = false;
     public bool lastChunkGpuResident = false;
     public int gpuResidentColumnX = int.MaxValue;
     public int gpuResidentColumnZ = int.MaxValue;
@@ -3847,7 +3833,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                     else
                     {
-                        if (gpuWorldgenReady && !gpuSkipClimateReadback)
+                        if (gpuWorldgenReady)
                         {
                             if (gpuClimateReadbackFailed && currentChunkX == gpuClimatePendingChunkX && currentChunkZ == gpuClimatePendingChunkZ)
                             {
