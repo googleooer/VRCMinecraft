@@ -1989,33 +1989,47 @@ public class McWorld : UdonSharpBehaviour
         // seed values;  alpha >= 0.5 → pass through existing propagated values.
         _GpuClearSlotLight(slotIndex);
 
-        int stride = chunkSizeXZ * chunkSizeXZ;
-        int packedWidth = chunkSizeXZ / 4;
-        for (int y = 0; y < chunkSizeY; y++)
-        {
-            int yBase = y * stride;
-            for (int z = 0; z < chunkSizeXZ; z++)
-            {
-                int row = y * chunkSizeXZ + z;
-                int packedRowBase = row * packedWidth;
-                int zBase = yBase + z * chunkSizeXZ;
-                for (int px = 0; px < packedWidth; px++)
-                {
-                    int x = px * 4;
-                    gpuUploadBlockPixels[packedRowBase + px] = new Color32(
-                        blockData[zBase + x],
-                        blockData[zBase + x + 1],
-                        blockData[zBase + x + 2],
-                        blockData[zBase + x + 3]
-                    );
-                }
-            }
-        }
-
 #if LOGGING
         float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
-        gpuUploadBlockTexture.SetPixels32(gpuUploadBlockPixels);
+        // FAST UPLOAD: the RGBA32 upload texture packs 4 block ids per pixel (R,G,B,A) and its native
+        // byte layout is byte-identical to blockData's voxel order — pixel (row,px) holds blockData
+        // [y*256 + z*16 + px*4 .. +3], which is exactly the raw byte order. So the chunk's raw byte
+        // array IS the texture's native data: LoadRawTextureData uploads it directly, skipping the
+        // 4096-iteration Color32 pack loop (4096 Udon extern ctor calls) AND the SetPixels32 marshal.
+        // This — not batching the small SetPixels32/Apply (already ~0.03ms) — is where the gpuSync
+        // time went. Falls back to the explicit pack only if the buffer size ever mismatches the
+        // texture (defensive; a full chunk is always chunkSizeXZ*chunkSizeY*chunkSizeXZ bytes).
+        if (blockData.Length == gpuUploadBlockPixels.Length * 4)
+        {
+            gpuUploadBlockTexture.LoadRawTextureData(blockData);
+        }
+        else
+        {
+            int stride = chunkSizeXZ * chunkSizeXZ;
+            int packedWidth = chunkSizeXZ / 4;
+            for (int y = 0; y < chunkSizeY; y++)
+            {
+                int yBase = y * stride;
+                for (int z = 0; z < chunkSizeXZ; z++)
+                {
+                    int row = y * chunkSizeXZ + z;
+                    int packedRowBase = row * packedWidth;
+                    int zBase = yBase + z * chunkSizeXZ;
+                    for (int px = 0; px < packedWidth; px++)
+                    {
+                        int x = px * 4;
+                        gpuUploadBlockPixels[packedRowBase + px] = new Color32(
+                            blockData[zBase + x],
+                            blockData[zBase + x + 1],
+                            blockData[zBase + x + 2],
+                            blockData[zBase + x + 3]
+                        );
+                    }
+                }
+            }
+            gpuUploadBlockTexture.SetPixels32(gpuUploadBlockPixels);
+        }
         gpuUploadBlockTexture.Apply(false, false);
 #if LOGGING
         if (enableDetailedTimings)
