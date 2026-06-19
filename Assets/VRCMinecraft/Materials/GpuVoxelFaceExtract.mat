@@ -23,6 +23,14 @@ Material:
   m_SavedProperties:
     serializedVersion: 3
     m_TexEnvs:
+    - _BatchBorderTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _BatchSlotMapTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _BlockPropsTex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
@@ -83,11 +91,14 @@ Material:
     - _ChunkZ: 1
     - _FlipXAxis: 1
     - _Mode: 2
-    - _ReadSlotIndex: 166
+    - _ReadSlotIndex: 102
+    - _UseCrossSlotNeighbors: 0
     - _XSize: 5
     - _YSize: 17
     - _ZSize: 5
     m_Colors:
+    - _BatchBorderInfo: {r: 16, g: 96, b: 16, a: 16}
+    - _BatchInfo: {r: 1, g: 16, b: 16, a: 256}
     - _BorderInfo: {r: 16, g: 96, b: 16, a: 0}
     - _Color: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []

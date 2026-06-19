@@ -6,6 +6,9 @@ Shader "VRCM/GpuAtlasOverlay"
         _OverlayTex ("Overlay", 2D) = "black" {}
         _OverlayRect ("Overlay Rect", Vector) = (0,0,1,1)
         _OverlayPackedWidth ("Packed Width (px)", Float) = 0
+        _OverlayColumnRepack ("Column Repack Mode", Float) = 0
+        _OverlayColumnY ("Column Y Chunk Index", Float) = 0
+        _OverlayNumYChunks ("Num Y Chunks (column height / chunk height)", Float) = 8
     }
 
     SubShader
@@ -42,6 +45,9 @@ Shader "VRCM/GpuAtlasOverlay"
             sampler2D _OverlayTex;
             float4 _OverlayRect;
             float _OverlayPackedWidth;
+            float _OverlayColumnRepack;  // 1 = read the source as a generator column final texture
+            float _OverlayColumnY;       // this chunk's Y index within the column
+            float _OverlayNumYChunks;    // column height (px) / chunk height (px) = worldDimensionY
 
             v2f vert(appdata v)
             {
@@ -60,6 +66,19 @@ Shader "VRCM/GpuAtlasOverlay"
 
                 // Local UV within the overlay rect (0..1)
                 float2 localUv = (i.uv - minUv) / _OverlayRect.zw;
+
+                if (_OverlayColumnRepack > 0.5)
+                {
+                    // GPU->GPU repack: copy one chunk's Y-slice out of a generator COLUMN final
+                    // texture (16 x numYChunks*256, block id in R) straight into this atlas slot —
+                    // no GPU->CPU readback. Slot pixel (x, row_local) <- column pixel
+                    // (x, columnY*256 + row_local). Since slot and column-slice are the same 256-row
+                    // resolution, the X/row map 1:1 and only Y is offset by the chunk index.
+                    float colU = localUv.x;
+                    float colV = (_OverlayColumnY + localUv.y) / _OverlayNumYChunks;
+                    float colBlock = tex2D(_OverlayTex, float2(colU, colV)).r;
+                    return fixed4(colBlock, 0.0, 0.0, 1.0);
+                }
 
                 if (_OverlayPackedWidth > 0.5)
                 {

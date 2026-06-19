@@ -99,6 +99,7 @@ Material:
     m_Floats:
     - PixelSnap: 0
     - _AmbientOcclusionStrength: 1
+    - _AoFullDistance: 48
     - _ApplyGamma: 0
     - _AtlasCellSize: 0
     - _BumpScale: 1
@@ -140,6 +141,7 @@ Material:
     - _StereoEnabled: 0
     - _SurfaceType: 1
     - _UVSec: 0
+    - _UseBakedAo: 0
     - _UseGpuExactAo: 1
     - _UseUIAlphaClip: 0
     - _UseVertexLight: 0

@@ -36,7 +36,8 @@ public enum GenerationState
     GeneratingTerrain,
     ReplacingBiomeBlocks,
     DecoratingTerrain,
-    Complete
+    Complete,
+    GpuResidentComplete
 }
 
 public enum GpuWorldgenReadbackPhase
@@ -52,7 +53,11 @@ public enum GpuWorldgenReadbackPhase
     DiagnosticDensity
 }
 
-[Singleton]
+// [Singleton] removed: McWorld now supports a 2nd terrain generator instance
+// (terrainGenerator2) for concurrent column generation. VRRefAssist auto-injects all
+// fields whose type is a registered singleton, which would force terrainGenerator2 to
+// point at the single instance. terrainGenerator / terrainGenerator2 are serialized refs
+// on McWorld instead. The generator's own `world` field is still injected (McWorld remains [Singleton]).
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class McTerrainGenerator : UdonSharpBehaviour
 {
@@ -396,6 +401,32 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private RenderTexture gpuColumnBaseTexture;
     private RenderTexture gpuColumnSurfaceInfoTexture;
     private RenderTexture gpuColumnFinalTexture;
+    // The exact texture the last base-column readback sampled (= gpuColumnFinalTexture, or the
+    // decoration output). Exposed so McWorld can GPU->GPU repack the column straight into the
+    // atlas (no readback) for GPU-resident chunks. Valid for this column until the next column
+    // overwrites it; a generator is single-column, so it's valid while this column's chunks finish.
+    public RenderTexture gpuLastReadbackSource;
+
+    // GPU-RESIDENT (#2 migration, step 2): when McWorld sets gpuSkipReadbackForColumn before
+    // StartChunkGeneration, the generator finalizes the column on the GPU and then SKIPS the
+    // GPU->CPU readback. lastChunkGpuResident signals the resident completion to McWorld;
+    // gpuResidentColumnX/Z let sibling chunks repack their Y-slice straight from the still-valid
+    // column final texture (gpuLastReadbackSource) without re-running the column gen.
+    public bool gpuSkipReadbackForColumn = false;
+    // (a) When set, compute biome climate on the CPU (wcm.getBiomeBlock) directly instead of the
+    // GPU climate pass + per-column GPU->CPU readback. Profiling showed the climate readback is the
+    // dominant gen stall (~36 step-frames/column waiting in Prepare_GetBiomes). CPU climate is the
+    // accurate Minecraft biome (also the existing fallback), so the terrain fingerprint is preserved.
+    public bool gpuSkipClimateReadback = false;
+    public bool lastChunkGpuResident = false;
+    public int gpuResidentColumnX = int.MaxValue;
+    public int gpuResidentColumnZ = int.MaxValue;
+    // Diagnostic: counts _StartGpuColumnFinalize calls (= column gens incl. sibling re-gens).
+    // Compare to the column count to detect redundant re-gen under the look-ahead.
+    public int dbgColumnFinalizeCount = 0;
+    // Diagnostic: StepChunkGeneration step count per GenerationState (index = (int)state).
+    // The state with the most steps = where the gen spends its frames (the stall).
+    public int[] dbgStateSteps = new int[20];
     private RenderTexture gpuSandNoiseTexture;
     private RenderTexture gpuGravelNoiseTexture;
     private RenderTexture gpuStoneNoiseTexture;
@@ -2092,6 +2123,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private bool _BeginGpuBaseColumnReadback(RenderTexture source = null, bool containsFinalColumn = false)
     {
         if (source == null) source = gpuColumnBaseTexture;
+        if (containsFinalColumn) gpuLastReadbackSource = source; // remember the final column texture for GPU->GPU repack
         gpuDiagnosticReadbackStallFrames = 0;
         gpuReadbackPhase = GpuWorldgenReadbackPhase.BaseColumn;
         gpuColumnReadbackPending = true;
@@ -2524,6 +2556,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private bool _StartGpuColumnFinalize()
     {
         if (!gpuWorldgenReady || gpuColumnSurfaceReplaceMaterial == null || currentChunkBiomes == null) return false;
+        dbgColumnFinalizeCount++;
 
         int sizeXZ = world.chunkSizeXZ;
         int noiseX = _GetTerrainBlockStartX(currentChunkX);
@@ -2638,6 +2671,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuCachedColumnZ = gpuPendingColumnZ;
         gpuCachedChunkSlicesReady = false;
         gpuFinalColumnSliceCachePending = false;
+
+        if (gpuSkipReadbackForColumn)
+        {
+            // GPU-RESIDENT (#2): the column final texture is GPU-ready right now — skip the
+            // GPU->CPU readback entirely. McWorld repacks each Y-slice from this texture into
+            // the chunk's atlas slot; CPU access rehydrates on demand. The X/Z markers let
+            // sibling chunks repack without re-running the column gen.
+            gpuLastReadbackSource = readbackSource;
+            gpuResidentColumnX = gpuPendingColumnX;
+            gpuResidentColumnZ = gpuPendingColumnZ;
+            return true;
+        }
+
         return _BeginGpuBaseColumnReadback(readbackSource, true);
     }
 
@@ -3499,6 +3545,22 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
     }
 
+    // One-line generation breakdown (the multi-line Performance Summary gets truncated by the
+    // MCP console). Call via SendCustomEvent("DebugLogGenBreakdown") with timing flags on.
+    public void DebugLogGenBreakdown()
+    {
+#if LOGGING
+        Debug.Log("[GENBRK] colsStarted=" + agg_gpuColumnsStarted + " finalized=" + agg_gpuColumnsFinalized
+            + " fallbacks=" + agg_gpuFallbacks
+            + " | wallClock=" + agg_time_WallClock.ToString("F0") + "ms actualWork=" + agg_time_ActualChunkWork.ToString("F0") + "ms"
+            + " | prep=" + agg_time_Preparation.ToString("F0") + " genTerrain=" + agg_time_GeneratingTerrain.ToString("F0")
+            + " replaceBiome=" + agg_time_ReplacingBiomes.ToString("F0") + " decoration=" + agg_time_Decoration.ToString("F0")
+            + " | gpuBlit noise=" + agg_gpuNoiseBlitTime.ToString("F0") + " base=" + agg_gpuBaseFillBlitTime.ToString("F0")
+            + " surf=" + agg_gpuSurfaceInfoBlitTime.ToString("F0") + " final=" + agg_gpuFinalizeBlitTime.ToString("F0")
+            + " upload=" + agg_gpuNoiseInputUploadTime.ToString("F0"));
+#endif
+    }
+
     public void StartChunkGeneration(int chunkX, int chunkY, int chunkZ)
     {
         if (!isInitialized)
@@ -3513,6 +3575,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
         currentChunkX = chunkX + (chunkOffsetX / world.chunkSizeXZ);
         currentChunkY = chunkY;
         currentChunkZ = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+        lastChunkGpuResident = false;
 
         if (!_HasBiomeInputsReady())
         {
@@ -3622,6 +3685,31 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
     }
 
+    // GPU-RESIDENT (#2): true when this generator just finalized the given column as a
+    // skip-readback (resident) column and its final texture (gpuLastReadbackSource) is still
+    // valid. Lets sibling Y-chunks repack their slice straight from the texture without
+    // re-running the column gen. If a newer column has overwritten the texture, the X/Z no
+    // longer match and this returns false (caller falls back to a normal gen — correct, just
+    // slower), so this is safe even under the data-gen look-ahead.
+    public bool CanRepackGpuResidentColumn(int chunkX, int chunkZ)
+    {
+        if (gpuLastReadbackSource == null) return false;
+        int gx = chunkX + (chunkOffsetX / world.chunkSizeXZ);
+        int gz = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+        return gpuResidentColumnX == gx && gpuResidentColumnZ == gz;
+    }
+
+    // True while this generator is mid-gen on exactly this chunk (the column's "trigger"/holder).
+    // McWorld uses it so the holder drives its state machine to Idle (and resident completion)
+    // instead of being short-circuited by the sibling repack fast-path on its final step.
+    public bool IsGeneratingChunk(int chunkX, int chunkY, int chunkZ)
+    {
+        if (currentState == GenerationState.Idle) return false;
+        int gx = chunkX + (chunkOffsetX / world.chunkSizeXZ);
+        int gz = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+        return currentChunkX == gx && currentChunkY == chunkY && currentChunkZ == gz;
+    }
+
     public bool CanCopyCachedGpuChunkSlice(int chunkX, int chunkY, int chunkZ)
     {
         if (!isInitialized || !enableGpuWorldgen || !gpuWorldgenReady || !gpuColumnReadbackReady || !gpuCachedChunkSlicesReady || gpuCachedChunkSlices == null || world == null)
@@ -3729,12 +3817,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
         
         bool isComplete = false;
-        
+
         // Declare coordinate variables once for all case statements
         int noiseX = 0;
         int noiseZ = 0;
         int noiseChunkX = 0;
-        
+
+        if (dbgStateSteps != null && (int)currentState < dbgStateSteps.Length) dbgStateSteps[(int)currentState]++;
+
         switch (currentState)
         {
             case GenerationState.Prepare_GetBiomes:
@@ -3757,7 +3847,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     }
                     else
                     {
-                        if (gpuWorldgenReady)
+                        if (gpuWorldgenReady && !gpuSkipClimateReadback)
                         {
                             if (gpuClimateReadbackFailed && currentChunkX == gpuClimatePendingChunkX && currentChunkZ == gpuClimatePendingChunkZ)
                             {
@@ -3924,7 +4014,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         break;
                     }
 
-                    currentState = GenerationState.Prepare_GpuReadback;
+                    currentState = gpuSkipReadbackForColumn ? GenerationState.GpuResidentComplete : GenerationState.Prepare_GpuReadback;
                 }
                 break;
 
@@ -3997,6 +4087,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         currentState = GenerationState.Complete;
                     }
                 }
+                break;
+
+            case GenerationState.GpuResidentComplete:
+                // GPU-RESIDENT (#2): the column was finalized on the GPU and the readback was
+                // skipped. There is no CPU block array for this chunk — its data lives only in
+                // the column final texture (gpuLastReadbackSource). Signal completion with no
+                // data; McWorld repacks the Y-slice into the atlas and marks the chunk resident.
+                completedData = null;
+                lastChunkGpuResident = true;
+                currentState = GenerationState.Idle;
+                isComplete = true;
                 break;
 
             case GenerationState.Prepare_AllocCache:
