@@ -206,6 +206,10 @@ public class ChunkData
     // Per-chunk bounds for instanced draw (used as Bounds for culling).
     public UnityEngine.Bounds _gpuQuadDrawBounds;
 
+    // (c) GPU instanced voxel render: when true, this chunk renders via per-voxel instancing
+    // straight from the atlas (no CPU mesh, no readback) and is NOT meshed on the CPU.
+    public bool _isInstancedRendered;
+
     // GPU OFFLOAD #2: GPU-resident chunk flag. True for chunks whose authoritative block
     // data lives in the GPU atlas slot — `_chunkData` may be null and `_cachedDecompressedData`
     // may be stale. Mesh + lighting passes sample from the GPU atlas directly.

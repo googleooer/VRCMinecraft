@@ -200,6 +200,7 @@ public class ModifyTerrain : UdonSharpBehaviour
             // for future use (debug HUD overlay, network-replicated targeting, etc.).
         }
 
+#if LOGGING
         if (enableVerboseLogging && !dbg_loggedRaycastPath)
         {
             dbg_loggedRaycastPath = true;
@@ -208,6 +209,7 @@ public class ModifyTerrain : UdonSharpBehaviour
             else
                 Debug.Log("[ModifyTerrain][CPU] Raycast targeting uses CPU Physics.Raycast (GPU raycast material not wired).");
         }
+#endif
 
         RaycastHit physicsHit;
         currentFrameHitValid = Physics.Raycast(

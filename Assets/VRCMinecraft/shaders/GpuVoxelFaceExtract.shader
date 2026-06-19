@@ -11,6 +11,12 @@ Shader "VRCM/GpuVoxelFaceExtract"
         _BorderInfo ("Border Info", Vector) = (16, 96, 16, 0)
         _Mode ("Mode", Float) = 0
         _ReadSlotIndex ("Read Slot Index", Float) = 0
+        _UseCrossSlotNeighbors ("Use Cross-Slot Neighbor Reads (1=atlas, 0=border tex)", Float) = 0
+        // --- Mode 3 (batched) inputs: extract N chunks' faces in ONE blit over a tiled RT ---
+        _BatchSlotMapTex ("Batch Slot Map (tileCount x 1)", 2D) = "black" {}
+        _BatchBorderTex ("Batch Border Atlas (tiled)", 2D) = "black" {}
+        _BatchInfo ("Batch Info (cols, rows, tileW, tileH)", Vector) = (1, 16, 16, 256)
+        _BatchBorderInfo ("Batch Border Info (borderW, borderH, stride, tileCount)", Vector) = (16, 96, 16, 16)
     }
 
     SubShader
@@ -53,6 +59,11 @@ Shader "VRCM/GpuVoxelFaceExtract"
             float4 _BorderInfo;       // (width, height, stride, 0)
             float _Mode;
             float _ReadSlotIndex;
+            float _UseCrossSlotNeighbors; // 1 = read neighbours from the atlas via slot lookup; 0 = legacy CPU-packed border texture
+            sampler2D _BatchSlotMapTex;   // Mode 3: per-tile atlas slot (R=low,G=high byte, A=valid)
+            sampler2D _BatchBorderTex;    // Mode 3: tiled border atlas (one chunk's border per tile region)
+            float4 _BatchInfo;            // Mode 3: (cols, rows, tileW, tileH)
+            float4 _BatchBorderInfo;      // Mode 3: (borderW, borderH, stride, tileCount)
             float4 _UdonVRCM_GpuAtlasInfo;   // (atlasWidth, atlasHeight, atlasSlotsX, atlasSlotsY)
             float4 _UdonVRCM_GpuFaceOccupancyInfo; // (atlasWidth, atlasHeight, slotWidth, slotHeight)
             float4 _UdonVRCM_GpuWorldInfo;    // (worldDimX, worldDimY, worldDimZ, worldDimY*worldDimZ)
@@ -137,7 +148,27 @@ Shader "VRCM/GpuVoxelFaceExtract"
                     return SampleBlockId(slotIndex, nx, ny, nz);
                 }
 
-                // Cross-chunk boundary — read from border texture
+                // Cross-chunk boundary, atlas path: read the neighbour directly from its atlas
+                // slot via the slot-lookup table. Works for GPU-resident neighbours (which have
+                // no CPU mirror to pack a border from) and removes the per-chunk CPU border pack.
+                // Exactly one of nx/ny/nz is out of [0,size) here, so only that axis steps a chunk.
+                if (_UseCrossSlotNeighbors > 0.5)
+                {
+                    float ncx = chunkX, ncy = chunkY, ncz = chunkZ;
+                    float wx = nx, wy = ny, wz = nz;
+                    if (nx < 0.0)          { ncx = chunkX - 1.0; wx = width - 1.0; }
+                    else if (nx >= width)  { ncx = chunkX + 1.0; wx = 0.0; }
+                    if (ny < 0.0)          { ncy = chunkY - 1.0; wy = height - 1.0; }
+                    else if (ny >= height) { ncy = chunkY + 1.0; wy = 0.0; }
+                    if (nz < 0.0)          { ncz = chunkZ - 1.0; wz = width - 1.0; }
+                    else if (nz >= width)  { ncz = chunkZ + 1.0; wz = 0.0; }
+                    float nvalid;
+                    float nSlot = LookupNeighborSlot(ncx, ncy, ncz, nvalid);
+                    if (nvalid < 0.5) return 0; // neighbour not resident → air → draw the face
+                    return SampleBlockId(nSlot, wx, wy, wz);
+                }
+
+                // Cross-chunk boundary — read from border texture (legacy CPU-packed path)
                 float borderU, borderV;
                 float stride = _BorderInfo.z;
 
@@ -157,6 +188,44 @@ Shader "VRCM/GpuVoxelFaceExtract"
                 return floor(borderSample.r * 255.0 + 0.5);
             }
 
+            // Mode 3 neighbour read: same-chunk reads come from the atlas slot; cross-chunk
+            // reads come from this chunk's tile region inside the shared batch border atlas.
+            // (tileCol,tileRow) selects the tile; the per-face layout matches the legacy border tex.
+            float GetNeighborBlockIdBatch(float slotIndex, float localX, float localY, float localZ,
+                                          float dx, float dy, float dz, float tileCol, float tileRow)
+            {
+                float nx = localX + dx;
+                float ny = localY + dy;
+                float nz = localZ + dz;
+
+                float width = _UdonVRCM_GpuChunkInfo.x;
+                float height = _UdonVRCM_GpuChunkInfo.y;
+
+                if (nx >= 0.0 && nx < width && ny >= 0.0 && ny < height && nz >= 0.0 && nz < width)
+                {
+                    return SampleBlockId(slotIndex, nx, ny, nz);
+                }
+
+                float borderU = 0.0, borderV = 0.0;
+                float stride = _BatchBorderInfo.z;
+                if (dy > 0.5)        { borderU = localX; borderV = 0.0 * stride + localZ; }  // +Y
+                else if (dy < -0.5)  { borderU = localX; borderV = 1.0 * stride + localZ; }  // -Y
+                else if (dz > 0.5)   { borderU = localX; borderV = 2.0 * stride + localY; }  // +Z
+                else if (dz < -0.5)  { borderU = localX; borderV = 3.0 * stride + localY; }  // -Z
+                else if (dx > 0.5)   { borderU = localZ; borderV = 4.0 * stride + localY; }  // +X
+                else                 { borderU = localZ; borderV = 5.0 * stride + localY; }  // -X
+
+                float bw = _BatchBorderInfo.x;
+                float bh = _BatchBorderInfo.y;
+                float2 borderUv = float2(
+                    (tileCol * bw + borderU + 0.5) / (_BatchInfo.x * bw),
+                    (tileRow * bh + borderV + 0.5) / (_BatchInfo.y * bh)
+                );
+                float4 borderSample = tex2D(_BatchBorderTex, borderUv);
+                if (borderSample.a < 0.5) return 0; // neighbor not available → air → draw face
+                return floor(borderSample.r * 255.0 + 0.5);
+            }
+
             // Look up the shouldDraw table: selfId on X axis, neighborId on Y axis
             float ShouldDrawFace(float selfId, float neighborId)
             {
@@ -169,6 +238,61 @@ Shader "VRCM/GpuVoxelFaceExtract"
 
             float4 frag(v2f i) : SV_Target
             {
+                // Mode 3: BATCHED per-voxel face extract. One blit fills a tiled RT (cols x rows
+                // tiles); each output pixel maps to a tile, the tile maps to an atlas slot via the
+                // batch slot map, and cross-chunk neighbours come from this tile's region of the
+                // shared batch border atlas. Output layout per tile is identical to Mode 1, so the
+                // CPU demux can copy each tile straight into the per-chunk face buffer.
+                if (_Mode > 2.5)
+                {
+                    float bigW = _BatchInfo.x * _BatchInfo.z;
+                    float bigH = _BatchInfo.y * _BatchInfo.w;
+                    float bpx = floor(i.uv.x * bigW);
+                    float bpy = floor(i.uv.y * bigH);
+                    float tileCol = floor(bpx / _BatchInfo.z);
+                    float tileRow = floor(bpy / _BatchInfo.w);
+                    float tileIndex = tileRow * _BatchInfo.x + tileCol;
+
+                    float2 slotMapUv = float2((tileIndex + 0.5) / (_BatchInfo.x * _BatchInfo.y), 0.5);
+                    float4 slotMap = tex2D(_BatchSlotMapTex, slotMapUv);
+                    if (slotMap.a < 0.5) return 0; // unused tile
+
+                    float slotIndex = floor(slotMap.r * 255.0 + 0.5) + floor(slotMap.g * 255.0 + 0.5) * 256.0;
+
+                    float localX = bpx - tileCol * _BatchInfo.z;
+                    float packedYZ = bpy - tileRow * _BatchInfo.w;
+                    float localY = floor(packedYZ / _UdonVRCM_GpuChunkInfo.x);
+                    float localZ = packedYZ - localY * _UdonVRCM_GpuChunkInfo.x;
+
+                    float selfId = SampleBlockId(slotIndex, localX, localY, localZ);
+                    if (selfId < 0.5) return 0;
+
+                    float2 propUv = float2((selfId + 0.5) / 256.0, 0.5);
+                    float4 blockProps = tex2D(_BlockPropsTex, propUv);
+                    float shapeType = floor(blockProps.b * 255.0 + 0.5);
+                    if (shapeType >= 1.0)
+                    {
+                        return float4(0.0, selfId / 255.0, shapeType / 255.0, 1.0);
+                    }
+
+                    float faceMask = 0.0;
+                    float nId;
+                    nId = GetNeighborBlockIdBatch(slotIndex, localX, localY, localZ, 0, 1, 0, tileCol, tileRow);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 1.0;
+                    nId = GetNeighborBlockIdBatch(slotIndex, localX, localY, localZ, 0, -1, 0, tileCol, tileRow);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 2.0;
+                    nId = GetNeighborBlockIdBatch(slotIndex, localX, localY, localZ, 0, 0, 1, tileCol, tileRow);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 4.0;
+                    nId = GetNeighborBlockIdBatch(slotIndex, localX, localY, localZ, 0, 0, -1, tileCol, tileRow);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 8.0;
+                    nId = GetNeighborBlockIdBatch(slotIndex, localX, localY, localZ, 1, 0, 0, tileCol, tileRow);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 16.0;
+                    nId = GetNeighborBlockIdBatch(slotIndex, localX, localY, localZ, -1, 0, 0, tileCol, tileRow);
+                    if (ShouldDrawFace(selfId, nId) > 0.5) faceMask += 32.0;
+
+                    return float4(faceMask / 255.0, selfId / 255.0, shapeType / 255.0, 1.0);
+                }
+
                 if (_Mode > 1.5)
                 {
                     float slotIndex = floor(_ReadSlotIndex + 0.5);

@@ -17,7 +17,9 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
         _Cutoff ("Alpha Cutoff", Range(0.0, 1.0)) = 0.5 // ADDED: Alpha cutoff for Cutout mode
         _UseVertexLight ("Use Vertex Light", Float) = 1
         [HideInInspector] _UseGpuExactAo ("Use GPU Exact AO", Float) = 0
-        
+        [HideInInspector] _UseBakedAo ("Use Baked Vertex AO (light x vertex.a)", Float) = 0
+        _AoFullDistance ("AO Full-Quality Distance (m)", Float) = 48
+
         // MINECRAFT-STYLE RADIAL FOG PROPERTIES
         _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0) // Default sky fog color
         _FogDensity ("Fog Density", Range(0.0, 0.1)) = 0.02 // Controls fog thickness
@@ -111,6 +113,8 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             half _FogMode;
             float _UseVertexLight;
             float _UseGpuExactAo;
+            float _UseBakedAo;
+            float _AoFullDistance;
             sampler2D _UdonVRCM_GpuLightAtlas;
             sampler2D _UdonVRCM_GpuBlockAtlas;
             sampler2D _UdonVRCM_GpuSlotLookup;
@@ -257,9 +261,36 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                     }
                     else
                     {
-                        half aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
+                        // AO distance LOD: the full 4-corner exact AO is ~16 atlas samples per
+                        // fragment. Past _AoFullDistance, fall back to a single light sample — fog
+                        // hides the transition and the per-fragment cost drops a lot. Set
+                        // _AoFullDistance very large to disable the LOD (always full AO).
+                        half aoBrightness;
+                        if (distance(i.worldPos, _WorldSpaceCameraPos) > _AoFullDistance)
+                        {
+                            aoBrightness = gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
+                            // Atlas miss (e.g. a far chunk whose light slot has been evicted) returns
+                            // -1. The exact-AO path returns a dim floor on a miss; match it here so
+                            // far chunks stay dimly lit instead of dropping to i.color.a, which is ~0
+                            // on GPU-exact-AO meshes (vertex light isn't baked) and renders them BLACK.
+                            if (aoBrightness < 0.0) aoBrightness = gpuVoxelCalcBetaLightBrightnessFromLevel(0.0);
+                        }
+                        else
+                            aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
                         lightBrightness = max(minLightLevel, aoBrightness >= 0.0 ? aoBrightness : i.color.a);
                     }
+                }
+                else if (_UseBakedAo > 0.5)
+                {
+                    // Geometric AO baked into vertex-color alpha at mesh time; light is ONE GPU atlas
+                    // sample. brightness = light x bakedAO. Cross blocks carry no baked AO -> light only.
+                    bool isCrossNormalB = max(max(abs(i.normal.x), abs(i.normal.y)), abs(i.normal.z)) < 0.9;
+                    half oneLight = isCrossNormalB
+                        ? gpuVoxelSampleLightBrightnessAtPosition(i.worldPos)
+                        : gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
+                    if (oneLight < 0.0) oneLight = gpuVoxelCalcBetaLightBrightnessFromLevel(0.0); // atlas miss floor
+                    half bakedAo = isCrossNormalB ? 1.0 : i.color.a;
+                    lightBrightness = max(minLightLevel, oneLight * bakedAo);
                 }
                 else if (_UseVertexLight > 0.5)
                 {

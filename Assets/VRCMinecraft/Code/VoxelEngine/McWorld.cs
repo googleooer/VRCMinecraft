@@ -28,13 +28,13 @@ public class McWorld : UdonSharpBehaviour
 
     [Header("Performance Tuning")]
     [Tooltip("How many voxels to check for meshing per step inside a chunk. Higher values build meshes faster but may cause lag spikes.")]
-    public int voxelsPerMeshStep = 2048;
-    [Tooltip("Approximate time budget per mesh step in milliseconds. OPTIMIZATION Phase 4: Increased from 1.5ms to 8.0ms to reduce loop overhead (fewer, larger steps).")]
-    public float meshStepTimeBudgetMs = 8.0f;
+    public int voxelsPerMeshStep = 4096;
+    [Tooltip("Approximate time budget per mesh step in milliseconds. Raised to 12ms on the CPU-only path to do more meshing per step before yielding (fewer, larger steps = less Udon loop overhead).")]
+    public float meshStepTimeBudgetMs = 12.0f;
     [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
     public float updateTimeBudgetMs = 22.0f;
     [Tooltip("During the ONE-TIME initial world generation, updateTimeBudgetMs is temporarily raised to this value so the (profiled ~92% idle) GPU + async readback pipeline can drain far more work per frame. Frame rate during the load matters much less than total load time. Automatically restored to updateTimeBudgetMs once world gen completes. Set <= updateTimeBudgetMs to disable the boost.")]
-    public float loadPhaseUpdateBudgetMs = 45.0f;
+    public float loadPhaseUpdateBudgetMs = 60.0f;
     // Runtime state for the load-phase budget boost (see Update()).
     private bool _loadPhaseBudgetRestored = false;
     private float _runtimeUpdateBudgetMs = 0f;
@@ -47,12 +47,19 @@ public class McWorld : UdonSharpBehaviour
     public bool debugTerrainChecksum = false;
     private int[] _dbgCsCx; private int[] _dbgCsCy; private int[] _dbgCsCz;
     private uint[] _dbgCsHash; private bool[] _dbgCsDone; private int _dbgCsN;
+
+    // --- Near-region generation benchmark: time until all columns within nearRegionRadius
+    // (Chebyshev, centered chunk coords) are DATA-READY. This is the user-facing target.
+    public int nearRegionRadius = 8;
+    private float _nearGenStartTime = -1f;
+    private int _nearChunksReady = 0;
+    private bool _nearGenLogged = false;
     [Tooltip("Budget per incremental GPU mesh decode step in milliseconds. Lower values reduce hitches from GPU mesh completion.")]
     public float gpuMeshDecodeStepBudgetMs = 1.5f;
-    [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame.")]
-    public int gpuMeshDecodeStepsPerFrame = 2;
-    [Tooltip("Total GPU mesh decode budget per frame in milliseconds. Caps aggregate decode work across all chunks.")]
-    public float gpuMeshDecodeFrameBudgetMs = 2.5f;
+    [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame. Higher = each chunk's readback decodes into a mesh in fewer frames (frees the worker sooner -> more readback concurrency). The adaptive budget below still caps aggregate work.")]
+    public int gpuMeshDecodeStepsPerFrame = 8;
+    [Tooltip("Total GPU mesh decode budget per frame in milliseconds (aggregate across all chunks). The proven path is mesh-bound on the readback->CPU-decode while data-gen sits at ~0% during load, leaving this budget's frame-share unused — so it is set generously to spend the idle CPU on draining mesh decodes. The adaptive system shrinks it if frames get heavy.")]
+    public float gpuMeshDecodeFrameBudgetMs = 12.0f;
     [Tooltip("Budget per GPU worldgen step in milliseconds. Lower values reduce frame spikes during terrain generation.")]
     public float gpuWorldgenStepBudgetMs = 3.0f;
     [Tooltip("Maximum GPU worldgen steps per chunk each frame.")]
@@ -63,6 +70,12 @@ public class McWorld : UdonSharpBehaviour
     public int shellMeshPriorityRadiusXZ = 2;
     [Tooltip("Chunks within this Y radius of the player are always eligible for meshing.")]
     public int shellMeshPriorityRadiusY = 1;
+    [Tooltip("MESH RENDER DISTANCE: when on, a chunk is only meshed for the first time if its column is within meshRenderDistanceChunksXZ of the player; farther chunks defer until the player approaches. Cuts initial meshing from the whole 32x32 world to the visible set (the player can't see far chunks anyway). Player edits and rebuilds bypass it. Set the radius >= nearRegionRadius so the near region still meshes immediately.")]
+    public bool enableMeshRenderDistanceCull = true;
+    [Tooltip("Chunk XZ radius around the player within which chunks get their first mesh. <=0 disables the cap (mesh the whole world). 10 ~= 160m view.")]
+    public int meshRenderDistanceChunksXZ = 10;
+    [Tooltip("Require all 6 in-world neighbour chunks to be data-ready before meshing a chunk, so chunk-boundary faces are always culled correctly (eliminates the transient un-culled boundary 'walls' that a chunk draws toward a not-yet-generated neighbour and waits for a heal re-mesh to fix). Costs a little meshing latency at the frontier. The coordinator falls back to air-boundary meshing if ALL workers are waiting, to avoid deadlock. Turn OFF to restore the old draw-now-heal-later behaviour.")]
+    public bool requireAllNeighborsForMesh = true;
     [Tooltip("How many deferred interior chunks to reconsider per frame when headroom is available.")]
     public int deferredInteriorMeshRequestsPerFrame = 1;
     [Tooltip("How many chunk slots to scan per frame when looking for deferred interior meshes to wake up.")]
@@ -105,6 +118,8 @@ public class McWorld : UdonSharpBehaviour
     [Header("System References")]
     [SerializeField, FindObjectOfType(true)]
     public McTerrainGenerator terrainGenerator;
+    [Tooltip("Extra terrain generator instances (slots 1..N-1; slot 0 is terrainGenerator). Worldgen is ~100% async-GPU-readback-latency bound, so each extra generator lets one more column's readback be in flight concurrently. More generators ≈ proportionally faster gen, until readbacks/CPU saturate. Each generator allocates its own column RTs (modest VRAM). Excluded from VRRefAssist injection ([Singleton] removed from McTerrainGenerator).")]
+    public McTerrainGenerator[] extraGenerators;
     [SerializeField, FindObjectOfType(true)]
     public McBlockTypeManager blockTypeManager;
     [SerializeField, FindObjectOfType(true)]
@@ -132,7 +147,13 @@ public class McWorld : UdonSharpBehaviour
 
     [Header("GPU Voxel Backend")]
     public bool enableGpuVoxelBackend = true;
-    public int gpuChunkSlotCapacity = 1023;
+    // Atlas resident-chunk capacity. Bumped 1023->2047 so far chunks keep their light-atlas slot
+    // longer (evicted chunks lose GPU light -> dim/black, see MCTerrain AO-LOD miss path). Cost:
+    // the 5 capacity-scaled atlases grow ~2x (2048^2 -> ~2896x3072, ~+90MB total VRAM) and the
+    // per-sync full-atlas overlay blit (_GpuOverlayTextureIntoAtlas) does ~2x the fill — absorbed
+    // by the idle gen-phase GPU here, but DIAL BACK toward 1023 if Quest VRAM/load regresses.
+    // Clamped to [1,4095] in _InitializeGpuVoxelBackend.
+    public int gpuChunkSlotCapacity = 2047;
     public int gpuLightingIterationsPerUpdate = 64;
     public int gpuLightingTotalIterations = 128;
     public int gpuResidentRadiusXZ = 6;
@@ -140,6 +161,28 @@ public class McWorld : UdonSharpBehaviour
     public int gpuResidentSyncsPerFrame = 32;
     [Tooltip("Experimental: export per-slice face bounds instead of dense face pixels for GPU meshing. Disabled by default until validated.")]
     public bool useCompactGpuFaceExport = false;
+    [Tooltip("Experimental (default OFF): extract many chunks' faces in ONE blit over a tiled RT + ONE region readback, then demux on the CPU. Cuts the per-chunk readback request/callback count by the batch tile count. Falls back to the per-chunk path for interaction/resident chunks. Off = unchanged per-chunk path.")]
+    public bool enableBatchedFaceReadback = false;
+    [Tooltip("Default OFF: bake GEOMETRIC ambient occlusion (block-only, light-independent) into vertex-color alpha at decode time and let the shader do light x bakedAO with ONE light sample/fragment, instead of the ~16-sample per-fragment GPU-exact AO. Big render-fps win; keeps GPU lighting. Only active when ambientOcclusion + the GPU lighting backend are on. Off = unchanged per-fragment exact AO.")]
+    public bool useBakedVertexAo = false;
+    [Tooltip("GPU-resident chunks (#2 migration, STEP 1 safety net — default OFF). When on, chunks outside cpuMirrorRadius drop their CPU block mirror after gen and rehydrate on demand from the atlas via rehydrateReceiver. Off = unchanged behaviour.")]
+    public bool enableGpuResidentChunks = false;
+
+    [Tooltip("GPU-resident #2 STEP 2 (default OFF): skip the GPU->CPU column readback at gen-time for chunks that don't need a CPU mirror. Their blocks live only in the atlas (repacked GPU->GPU from the column final texture) and rehydrate on demand. Requires enableGpuResidentChunks. This is what actually eliminates the data-gen readback latency.")]
+    public bool gpuSkipReadbackResident = false;
+    [Tooltip("Debug (default OFF): force EVERY column (incl. near/center) onto the skip-readback resident path, ignoring cpuMirrorRadius. For validating the resident data path end-to-end via the rehydrate fingerprint. Leave OFF for normal play.")]
+    public bool gpuForceAllColumnsSkipReadback = false;
+    [Tooltip("(b) GPU mesh-from-atlas (default OFF): let GPU-resident chunks (no CPU mirror) build their render mesh straight from the atlas via the GPU face extractor with cross-slot neighbor reads — no _GpuSyncChunkBlocks, no CPU border pack. Requires the chunk's blocks + its neighbors to be present in the atlas. With ambientOcclusion off this is geometry-only; GPU AO is the accuracy follow-up.")]
+    public bool gpuResidentMeshFromAtlas = false;
+    // Rehydrate readbacks share McWorld's OnAsyncGpuReadbackComplete with face-extract
+    // readbacks; a parallel "kind" FIFO (pushed at every Request, popped at every completion,
+    // in global request order) distinguishes them so the face-extract path is unaffected.
+    // Falls back to pure face handling if the kind FIFO is empty/unallocated.
+    private int[] _readbackKind; private int _readbackKindHead, _readbackKindTail, _readbackKindCount;
+    private const int READBACK_KIND_CAP = 256;
+    private int[] _rehydrateInflightChunk; private int _rehydrateInflightHead, _rehydrateInflightTail, _rehydrateInflightCount;
+    private const int REHYDRATE_INFLIGHT_CAP = 64;
+    private Color32[] _gpuRehydratePixels;
     public Material gpuAtlasOverlayMaterial;
     public Material gpuLightingSeedMaterial;
     public Material gpuLightingPropagateMaterial;
@@ -165,6 +208,21 @@ public class McWorld : UdonSharpBehaviour
     public Material gpuVoxelQuadDrawMaterial;
     // Unit quad mesh used as the instance template by GpuVoxelQuadDraw.
     public Mesh gpuVoxelQuadMesh;
+
+    // (c) GPU INSTANCED VOXEL RENDER — atlas-reading per-voxel instancing (no per-chunk readback,
+    // no CPU mesh). Material uses Unlit/MCVoxelInstanced. Default OFF; opt-in for the resident path.
+    [Tooltip("(c) Render opaque voxels via per-voxel GPU instancing straight from the atlas (no readback, no CPU mesh). Needs gpuVoxelInstancedMaterial assigned. Default OFF.")]
+    public bool enableInstancedVoxelRender = false;
+    [Tooltip("(c) Material using Unlit/MCVoxelInstanced for the instanced voxel render path.")]
+    public Material gpuVoxelInstancedMaterial;
+    [Tooltip("(c) Chunk XZ radius around the player to issue instanced draws for. Keep modest to bound draw-call count.")]
+    public int gpuInstancedRenderRadius = 4;
+    [Tooltip("(c) Chunk Y radius around the player to draw. The deep underground is never visible from the surface; this skips it (follows the player vertically). Raise if you fly/descend a lot.")]
+    public int gpuInstancedRenderRadiusY = 2;
+    // 6-face unit cube (24 verts) built in code; the instance template for the instanced voxel path.
+    private Mesh gpuVoxelCubeMesh;
+    // Per-block face-slice LUT (256x1 RGBA32): R=topSlice G=bottomSlice B=sideSlice A=isOpaque(255).
+    private Texture2D gpuBlockFaceSliceTexture;
 
     [Header("GPU Debug HUD")]
     public bool enableGpuDebugHud = true;
@@ -282,6 +340,7 @@ public class McWorld : UdonSharpBehaviour
     private Material sharedCutoutChunkMaterial;
     private int terrainPropUseVertexLightId = -1;
     private int terrainPropUseGpuExactAoId = -1;
+    private int terrainPropUseBakedAoId = -1;
     private RenderTexture betaWaterStillStateA;
     private RenderTexture betaWaterStillStateB;
     private RenderTexture betaWaterStillColor;
@@ -350,12 +409,12 @@ public class McWorld : UdonSharpBehaviour
     // that's ~1-2 chunks per frame meshed via the GPU pipeline regardless of how fast
     // the rest of the system runs. 16 lifts this to ~5-8 chunks/frame. Each buffer is
     // a small RT — negligible VRAM cost.
-    private const int GPU_FACE_READBACK_BUFFER_COUNT = 16;
+    private const int GPU_FACE_READBACK_BUFFER_COUNT = 48;
     // Was 2 — that capped GPU-meshed chunks at ~2/frame regardless of available
     // GPU/pipeline headroom (profiling showed the GPU ~92% idle during worldgen).
     // The processing loop is still bounded by frameBudget + mesh-pool availability,
     // so raising this only lets ready readbacks drain faster when there's spare time.
-    private const int GPU_FACE_READBACKS_PER_FRAME = 8;
+    private const int GPU_FACE_READBACKS_PER_FRAME = 32;
     private const int GPU_FACE_COMPACT_DIRECTIONS = 6;
     private Texture2D gpuShouldDrawTexture;
     private RenderTexture gpuFaceAtlas;
@@ -373,6 +432,7 @@ public class McWorld : UdonSharpBehaviour
     private int gpuPropFaceReadSlotId;
     private int gpuPropBorderTexId;
     private int gpuPropBorderInfoId;
+    private int gpuPropUseCrossSlotId;
     private int gpuPropFaceOccupancyAtlasGlobalId;
     private int gpuPropFaceOccupancyInfoId;
     private Texture2D[] gpuBorderTextures;
@@ -394,6 +454,44 @@ public class McWorld : UdonSharpBehaviour
     private int gpuFaceReadbackReadyHead = 0;
     private int gpuFaceReadbackReadyTail = 0;
     private int gpuFaceReadbackReadyCount = 0;
+
+    // --- Batched face readback (enableBatchedFaceReadback) ---
+    // Extract GPU_BATCH_TILE_COUNT chunks' faces in ONE blit over a tiled RT, then ONE region
+    // readback, then demux each tile into the existing per-chunk face buffers. Cuts the readback
+    // request/callback count by the batch tile count. GPU_BATCH_INFLIGHT_COUNT batches can be
+    // in flight at once; each owns its own tiled RT + border atlas + slot-map texture so an
+    // in-flight batch's textures are never overwritten before its blit has executed.
+    // Vertical-stack layout (1 column): each tile is a CONTIGUOUS run in the readback array, so a
+    // tile demuxes with a single native System.Array.Copy instead of a 64K-element Udon loop (which
+    // would cost more main-thread time than the batch saves). Keep GPU_BATCH_COLS == 1.
+    private const int GPU_BATCH_COLS = 1;
+    private const int GPU_BATCH_ROWS = 16;
+    private const int GPU_BATCH_TILE_COUNT = 16;  // GPU_BATCH_COLS * GPU_BATCH_ROWS
+    private const int GPU_BATCH_INFLIGHT_COUNT = 3;
+    private RenderTexture[] gpuBatchReadbackTextures;  // [GPU_BATCH_INFLIGHT_COUNT] tiled RTs
+    private Color32[][] gpuBatchReadbackPixels;        // [GPU_BATCH_INFLIGHT_COUNT] readback dest
+    private Texture2D[] gpuBatchBorderTextures;        // [GPU_BATCH_INFLIGHT_COUNT] tiled border atlas
+    private Texture2D[] gpuBatchSlotMapTextures;       // [GPU_BATCH_INFLIGHT_COUNT] tileCount x 1
+    private bool[] gpuBatchRtInflight;                 // [GPU_BATCH_INFLIGHT_COUNT] awaiting readback
+    private int[][] gpuBatchBuffers;                   // [GPU_BATCH_INFLIGHT_COUNT][TILE_COUNT] face-buffer index per tile
+    private int[] gpuBatchBufferCount;                 // [GPU_BATCH_INFLIGHT_COUNT] valid tiles
+    private int[] gpuBatchInflightOrder;               // FIFO of RT indices in request order
+    private int gpuBatchInflightHead = 0;
+    private int gpuBatchInflightTail = 0;
+    private int gpuBatchInflightCount = 0;
+    // Pending (not-yet-dispatched) batch: chunks accumulate here, then flush once per frame.
+    private ChunkData[] gpuBatchPendingChunks;         // [GPU_BATCH_TILE_COUNT]
+    private int[] gpuBatchPendingBuffers;              // [GPU_BATCH_TILE_COUNT] reserved face buffer per pending chunk
+    private int gpuBatchPendingCount = 0;
+    // Staging CPU arrays for the pending batch (uploaded to the chosen RT's textures at dispatch).
+    private Color32[] gpuBatchStagingBorderPixels;     // (cols*borderW) x (rows*borderH)
+    private Color32[] gpuBatchStagingSlotMapPixels;    // GPU_BATCH_TILE_COUNT
+    private int gpuBatchBorderAtlasWidth = 0;
+    private int gpuBatchBorderAtlasHeight = 0;
+    private int gpuPropBatchSlotMapId;
+    private int gpuPropBatchBorderId;
+    private int gpuPropBatchInfoId;
+    private int gpuPropBatchBorderInfoId;
     private int gpuPropGpuEnabledId;
     private int gpuPropLightAtlasId;
     private int gpuPropBlockAtlasGlobalId;
@@ -411,6 +509,11 @@ public class McWorld : UdonSharpBehaviour
     private int gpuPropOverlayTexId;
     private int gpuPropOverlayRectId;
     private int gpuPropOverlayPackedWidthId;
+    private int gpuPropOverlayColumnRepackId;
+    private int gpuPropOverlayColumnYId;
+    private int gpuPropOverlayNumYChunksId;
+    [Tooltip("DEBUG/validation for the GPU-resident migration: after the normal CPU atlas upload, ALSO GPU->GPU repack the chunk's column slice straight into its atlas slot (overwriting). If the repack mapping is correct the world renders identically; if wrong it renders corrupt. 0 cost when off. Leave OFF.")]
+    public bool gpuDebugRepackAfterUpload = false;
     private int gpuPropTopSkyLightId;
     private GameObject gpuDebugHudRoot;
     private RectTransform gpuDebugHudRect;
@@ -679,6 +782,14 @@ public class McWorld : UdonSharpBehaviour
         _BuildLightingTables();
         _InitializeBetaWaterRendering();
         _InitializeGpuVoxelBackend();
+        if (gpuBackendReady)
+        {
+            _readbackKind = new int[READBACK_KIND_CAP];
+            _rehydrateInflightChunk = new int[REHYDRATE_INFLIGHT_CAP];
+            _gpuRehydratePixels = new Color32[gpuTileWidth * gpuTileHeight];
+            _readbackKindHead = 0; _readbackKindTail = 0; _readbackKindCount = 0;
+            _rehydrateInflightHead = 0; _rehydrateInflightTail = 0; _rehydrateInflightCount = 0;
+        }
         _InitializeGpuDebugHud();
         _InitializeMeshPool();
         // Runtime override: keep the update budget above the irreducible baseline
@@ -696,9 +807,19 @@ public class McWorld : UdonSharpBehaviour
         _ResetAdaptiveBudgets();
         
         terrainGenerator.init(McUtils.GetMinecraftSeed(worldSeedString));
+        if (extraGenerators != null)
+        {
+            for (int gi = 0; gi < extraGenerators.Length; gi++)
+            {
+                if (extraGenerators[gi] != null) extraGenerators[gi].init(McUtils.GetMinecraftSeed(worldSeedString));
+            }
+        }
 
         int[] radialChunkOrder = GenerateRadialChunkOrder();
         coordinator.InitializeAndStartProcessing(this, radialChunkOrder, totalWorldChunks);
+        _nearGenStartTime = Time.realtimeSinceStartup;
+        _nearChunksReady = 0;
+        _nearGenLogged = false;
 
 #if LOGGING
         stats_aggregateWindowStart = Time.realtimeSinceStartup;
@@ -730,6 +851,20 @@ public class McWorld : UdonSharpBehaviour
         {
             _ResetAdaptiveBudgets();
             lastUpdateDurationMs = updateTimeMs;
+            return;
+        }
+
+        // LOAD PHASE: during the one-time initial world generation, do NOT throttle GPU
+        // worldgen / mesh-decode for frame rate — total load time matters far more than load
+        // FPS. Keeping steps/budget high lets the 8 generators pipeline their column readbacks
+        // instead of the shrink-to-1-step/frame serializing them. Adaptive resumes after load.
+        if (!_loadPhaseBudgetRestored)
+        {
+            adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(gpuWorldgenStepsPerFrame, 12);
+            adaptiveGpuWorldgenStepBudgetMs = Mathf.Max(gpuWorldgenStepBudgetMs, 30f);
+            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(1, gpuMeshDecodeStepsPerFrame);
+            adaptiveGpuMeshDecodeStepBudgetMs = gpuMeshDecodeStepBudgetMs;
+            adaptiveGpuMeshDecodeFrameBudgetMs = gpuMeshDecodeFrameBudgetMs;
             return;
         }
 
@@ -924,12 +1059,20 @@ public class McWorld : UdonSharpBehaviour
         gpuPropOverlayTexId = VRCShader.PropertyToID("_OverlayTex");
         gpuPropOverlayRectId = VRCShader.PropertyToID("_OverlayRect");
         gpuPropOverlayPackedWidthId = VRCShader.PropertyToID("_OverlayPackedWidth");
+        gpuPropOverlayColumnRepackId = VRCShader.PropertyToID("_OverlayColumnRepack");
+        gpuPropOverlayColumnYId = VRCShader.PropertyToID("_OverlayColumnY");
+        gpuPropOverlayNumYChunksId = VRCShader.PropertyToID("_OverlayNumYChunks");
         gpuPropTopSkyLightId = VRCShader.PropertyToID("_TopSkyLight");
         gpuPropDrawTableTexId = VRCShader.PropertyToID("_DrawTableTex");
         gpuPropFaceModeId = VRCShader.PropertyToID("_Mode");
         gpuPropFaceReadSlotId = VRCShader.PropertyToID("_ReadSlotIndex");
         gpuPropBorderTexId = VRCShader.PropertyToID("_BorderTex");
         gpuPropBorderInfoId = VRCShader.PropertyToID("_BorderInfo");
+        gpuPropUseCrossSlotId = VRCShader.PropertyToID("_UseCrossSlotNeighbors");
+        gpuPropBatchSlotMapId = VRCShader.PropertyToID("_BatchSlotMapTex");
+        gpuPropBatchBorderId = VRCShader.PropertyToID("_BatchBorderTex");
+        gpuPropBatchInfoId = VRCShader.PropertyToID("_BatchInfo");
+        gpuPropBatchBorderInfoId = VRCShader.PropertyToID("_BatchBorderInfo");
 
         // --- GPU Border Texture Init ---
         int borderStride = Mathf.Max(chunkSizeXZ, chunkSizeY);
@@ -970,8 +1113,15 @@ public class McWorld : UdonSharpBehaviour
 
         // Readback buffers
 
+        if (enableBatchedFaceReadback) _GpuInitBatchedReadback();
+
         gpuBackendReady = true;
         _GpuBuildShouldDrawTexture();
+        if (enableInstancedVoxelRender)
+        {
+            _GpuBuildBlockFaceSliceTexture();
+            _GpuBuildVoxelCubeMesh();
+        }
         _GpuPublishGlobals();
         _ApplyTerrainLightingSourceToSharedMaterials();
 #if LOGGING
@@ -1316,6 +1466,31 @@ public class McWorld : UdonSharpBehaviour
 
         if (targetSlot == -1)
         {
+            // Fallback: every slot holds a data-ready chunk. Prefer evicting a NON-resident
+            // (CPU-backed) chunk — it re-uploads from its CPU mirror on the next mesh. A
+            // GPU-resident chunk's blocks live ONLY in the atlas, so evicting it destroys its
+            // data and it renders empty. Protect resident chunks here.
+            int oldestStamp = int.MaxValue;
+            for (int i = 0; i < gpuChunkSlotCapacity; i++)
+            {
+                int ci = gpuSlotToChunkIndex[i];
+                if (ci >= 0 && ci < totalWorldChunks)
+                {
+                    ChunkData c = chunks_1D[ci];
+                    if (c != null && c._isGpuResident) continue; // never evict resident here
+                }
+                if (gpuSlotUseStamp[i] < oldestStamp)
+                {
+                    oldestStamp = gpuSlotUseStamp[i];
+                    targetSlot = i;
+                }
+            }
+        }
+
+        if (targetSlot == -1)
+        {
+            // Last resort: every slot is GPU-resident. Evict the oldest (it loses its GPU-only
+            // data — it will need a re-gen to render again). Avoids a hard allocation deadlock.
             int oldestStamp = int.MaxValue;
             for (int i = 0; i < gpuChunkSlotCapacity; i++)
             {
@@ -1642,6 +1817,31 @@ public class McWorld : UdonSharpBehaviour
         _meshDeferredDirtyCount = 0;
     }
 
+    // GPU-resident migration: copy this chunk's Y-slice straight out of its generator column
+    // final texture into its atlas slot (GPU->GPU, no readback). Mapping is derived to byte-match
+    // the CPU upload path below: atlas slot (x,row_local) <- column (x, chunkY*256 + row_local),
+    // i.e. _OverlayColumnY = chunk.chunkY_world (array Y, 0..worldDimensionY-1).
+    private void _GpuRepackChunkSliceToAtlas(ChunkData chunk, RenderTexture columnTex)
+    {
+        if (!gpuBackendReady || chunk == null || columnTex == null || gpuAtlasOverlayMaterial == null) return;
+        int slotIndex = _GpuFindOrAssignSlot(chunk);
+        if (slotIndex < 0) return;
+        gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetSlotRect(slotIndex));
+        gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayColumnYId, (float)chunk.chunkY_world);
+        gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayNumYChunksId, (float)worldDimensionY);
+        gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayColumnRepackId, 1f);
+        _GpuOverlayTextureIntoAtlas(columnTex, ref gpuBlockAtlas, ref gpuBlockAtlasScratch);
+        gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayColumnRepackId, 0f);
+
+        // Resident chunks skip the readback + _GpuSyncChunkBlocks, so they also miss the light
+        // seeding that path does. Without this the slot's light-atlas alpha stays <0.5 and the seed
+        // shader never fills it — the chunk renders unlit (GPU-exact AO samples light 0 → black,
+        // the non-AO path only looked OK because it falls back to baked constant vertex light).
+        // Mark the slot's light dirty (alpha=0) and request a seed, exactly like _GpuSyncChunkBlocks.
+        _GpuClearSlotLight(slotIndex);
+        _GpuRequestLightingRebuild();
+    }
+
     private void _GpuSyncChunkBlocks(ChunkData chunk, byte[] blockData)
     {
         if (!gpuBackendReady || chunk == null || blockData == null || gpuUploadBlockTexture == null) return;
@@ -1868,7 +2068,8 @@ public class McWorld : UdonSharpBehaviour
 
         int iterations = Mathf.Max(0, gpuLightingIterationsPerUpdate);
         int guaranteedIterations = seededThisFrame ? 8 : 2;
-        int lightingPressure = activeMeshingCount + gpuFaceReadbackReadyCount + gpuFaceReadbackInflightCount;
+        int lightingPressure = activeMeshingCount + gpuFaceReadbackReadyCount + gpuFaceReadbackInflightCount
+            + gpuBatchPendingCount + gpuBatchInflightCount * GPU_BATCH_TILE_COUNT;
         if (lightingPressure >= 6 || activeDataGenCount >= 3)
         {
             iterations = Mathf.Max(guaranteedIterations, iterations / 2);
@@ -1982,6 +2183,240 @@ public class McWorld : UdonSharpBehaviour
         gpuShouldDrawTexture.Apply(false, false);
     }
 
+    // (c) Bake the per-block face-slice LUT used by Unlit/MCVoxelInstanced:
+    //   256x1 RGBA32, pixel[blockId] = (topSlice, bottomSlice, sideSlice, isOpaque ? 255 : 0).
+    // Slices are texture-array indices (beta sheet <256, so they fit in a byte). isOpaque gates the
+    // instanced OPAQUE pass — only opaque cube blocks draw here; air/cross/cutout/transparent
+    // degenerate in the vertex shader (handled by their existing paths).
+    private void _GpuBuildBlockFaceSliceTexture()
+    {
+        if (blockTypeManager == null) return;
+        if (gpuBlockFaceSliceTexture == null)
+        {
+            gpuBlockFaceSliceTexture = new Texture2D(256, 1, TextureFormat.RGBA32, false, true);
+            gpuBlockFaceSliceTexture.filterMode = FilterMode.Point;
+            gpuBlockFaceSliceTexture.wrapMode = TextureWrapMode.Clamp;
+        }
+        Color32[] pixels = new Color32[256];
+        for (int id = 0; id < 256; id++)
+        {
+            byte top = (byte)Mathf.Clamp(blockTypeManager.GetFinalBlockTextureSlice((byte)id, FACE_INDEX_TOP), 0, 255);
+            byte bottom = (byte)Mathf.Clamp(blockTypeManager.GetFinalBlockTextureSlice((byte)id, FACE_INDEX_BOTTOM), 0, 255);
+            byte side = (byte)Mathf.Clamp(blockTypeManager.GetFinalBlockTextureSlice((byte)id, FACE_INDEX_SIDE), 0, 255);
+            bool opaque = id != 0
+                && blockTypeManager.GetBlockVisibilityType((byte)id) == BlockVisibilityType.Opaque
+                && blockTypeManager.GetBlockShapeType((byte)id) == McBlockShapeType.Cube;
+            pixels[id] = new Color32(top, bottom, side, opaque ? (byte)255 : (byte)0);
+        }
+        gpuBlockFaceSliceTexture.SetPixels32(pixels);
+        gpuBlockFaceSliceTexture.Apply(false, false);
+    }
+
+    // (c) Build the 24-vert unit cube (6 faces) used as the instance template by the instanced
+    // voxel render. Positions are 0/1 corners, normals the face normal, uv the 0/1 in-face corner.
+    // Winding is irrelevant (shader is Cull Off). Faces order has no significance — the shader
+    // derives everything from the per-vertex normal.
+    private void _GpuBuildVoxelCubeMesh()
+    {
+        if (gpuVoxelCubeMesh != null) return;
+        // 6 faces: normal, then two in-plane unit axes (tangent u, tangent v).
+        Vector3[] normals6 = new Vector3[6] {
+            new Vector3(0,1,0), new Vector3(0,-1,0),
+            new Vector3(0,0,1), new Vector3(0,0,-1),
+            new Vector3(1,0,0), new Vector3(-1,0,0)
+        };
+        Vector3[] tanU6 = new Vector3[6] {
+            new Vector3(1,0,0), new Vector3(1,0,0),
+            new Vector3(1,0,0), new Vector3(1,0,0),
+            new Vector3(0,0,1), new Vector3(0,0,1)
+        };
+        Vector3[] tanV6 = new Vector3[6] {
+            new Vector3(0,0,1), new Vector3(0,0,1),
+            new Vector3(0,1,0), new Vector3(0,1,0),
+            new Vector3(0,1,0), new Vector3(0,1,0)
+        };
+
+        // COLUMN mesh: chunkSizeY stacked unit cubes (one per voxel in a column). Instanced once
+        // per (x,z) column = chunkSizeXZ^2 instances (<=1023 => ONE DrawMeshInstanced per chunk
+        // instead of 4 with per-voxel instancing). Each vertex carries its voxel's local Y in uv.z;
+        // the shader reads instanceID -> (lx,lz) and uv.z -> ly. Total vertex count is unchanged.
+        int ySize = chunkSizeY;
+        int vCount = 24 * ySize;
+        int tCount = 36 * ySize;
+        Vector3[] verts = new Vector3[vCount];
+        Vector3[] norms = new Vector3[vCount];
+        Vector3[] uvs = new Vector3[vCount]; // Vector3 channel; shader reads .xy = corner, .z = ly
+        int[] tris = new int[tCount];
+        for (int ly = 0; ly < ySize; ly++)
+        {
+            for (int f = 0; f < 6; f++)
+            {
+                Vector3 n = normals6[f];
+                Vector3 u = tanU6[f];
+                Vector3 vv = tanV6[f];
+                // unit cube for this face, lifted to the voxel's Y slab [ly, ly+1].
+                Vector3 baseCorner = new Vector3(
+                    n.x > 0 ? 1 : 0,
+                    ly + (n.y > 0 ? 1 : 0),
+                    n.z > 0 ? 1 : 0);
+                int vbase = (ly * 6 + f) * 4;
+                verts[vbase + 0] = baseCorner;            uvs[vbase + 0] = new Vector3(0, 0, ly);
+                verts[vbase + 1] = baseCorner + u;        uvs[vbase + 1] = new Vector3(1, 0, ly);
+                verts[vbase + 2] = baseCorner + u + vv;   uvs[vbase + 2] = new Vector3(1, 1, ly);
+                verts[vbase + 3] = baseCorner + vv;       uvs[vbase + 3] = new Vector3(0, 1, ly);
+                norms[vbase + 0] = n; norms[vbase + 1] = n; norms[vbase + 2] = n; norms[vbase + 3] = n;
+                int tbase = (ly * 6 + f) * 6;
+                tris[tbase + 0] = vbase + 0; tris[tbase + 1] = vbase + 1; tris[tbase + 2] = vbase + 2;
+                tris[tbase + 3] = vbase + 0; tris[tbase + 4] = vbase + 2; tris[tbase + 5] = vbase + 3;
+            }
+        }
+        gpuVoxelCubeMesh = new Mesh();
+        gpuVoxelCubeMesh.name = "GpuVoxelColumn";
+        if (vCount > 65535) gpuVoxelCubeMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+        gpuVoxelCubeMesh.SetVertices(verts, 0, vCount);
+        gpuVoxelCubeMesh.SetNormals(norms, 0, vCount);
+        gpuVoxelCubeMesh.SetUVs(0, uvs, 0, vCount);
+        gpuVoxelCubeMesh.SetTriangles(tris, 0, tCount, 0, false);
+        // The vertex shader positions geometry in ABSOLUTE world space (instance matrices are
+        // identity), so Unity's per-instance frustum cull (mesh.bounds x matrix) would wrongly cull
+        // everything to the origin. Give the mesh huge bounds so it's never CPU-culled; per-chunk
+        // visibility is decided by the render driver before it calls GpuRenderInstancedVoxelChunk.
+        gpuVoxelCubeMesh.bounds = new Bounds(Vector3.zero, Vector3.one * 100000f);
+    }
+
+    // (c) Bind the shared (same-for-all-chunks) textures onto the instanced material once. The
+    // 2DArrays are pulled from the shared opaque chunk material so they stay in sync with the
+    // CPU mesh path. Returns true when the material is ready to draw.
+    private bool _gpuVoxelInstancedBound = false;
+    private bool _GpuBindInstancedMaterial()
+    {
+        if (gpuVoxelInstancedMaterial == null || gpuVoxelCubeMesh == null
+            || gpuBlockFaceSliceTexture == null || gpuShouldDrawTexture == null) return false;
+        if (_gpuVoxelInstancedBound) return true;
+        gpuVoxelInstancedMaterial.SetTexture("_ShouldDrawTex", gpuShouldDrawTexture);
+        gpuVoxelInstancedMaterial.SetTexture("_BlockFaceSliceTex", gpuBlockFaceSliceTexture);
+        if (sharedOpaqueChunkMaterial != null)
+        {
+            Texture mainTex = sharedOpaqueChunkMaterial.GetTexture("_MainTex");
+            Texture tintMask = sharedOpaqueChunkMaterial.GetTexture("_TintMask");
+            if (mainTex != null) gpuVoxelInstancedMaterial.SetTexture("_MainTex", mainTex);
+            if (tintMask != null) gpuVoxelInstancedMaterial.SetTexture("_TintMask", tintMask);
+        }
+        gpuVoxelInstancedMaterial.enableInstancing = true;
+        _gpuVoxelInstancedBound = true;
+        return true;
+    }
+
+    // (c) Draw one chunk's opaque voxels via per-voxel GPU instancing — reads the block atlas in
+    // the vertex shader to cull/place faces. No readback, no CPU mesh. Call once per visible chunk
+    // per frame from the render path. The shader resolves the chunk's atlas slot from world pos via
+    // the global slot lookup, so a chunk only renders correctly while its blocks are in the atlas.
+    private MaterialPropertyBlock _gpuVoxelMPB;
+    public void GpuRenderInstancedVoxelChunk(ChunkData chunk)
+    {
+        if (chunk == null || !enableInstancedVoxelRender) return;
+        if (!_GpuBindInstancedMaterial()) return;
+
+        if (_gpuVoxelMPB == null) _gpuVoxelMPB = new MaterialPropertyBlock();
+        _gpuVoxelMPB.Clear();
+        _gpuVoxelMPB.SetFloat("_ChunkOriginX", chunk.chunkX_world * chunkSizeXZ);
+        _gpuVoxelMPB.SetFloat("_ChunkOriginY", chunk.chunkY_world * chunkSizeY);
+        _gpuVoxelMPB.SetFloat("_ChunkOriginZ", chunk.chunkZ_world * chunkSizeXZ);
+        _gpuVoxelMPB.SetInt("_ChunkSizeXZ", chunkSizeXZ);
+        _gpuVoxelMPB.SetInt("_ChunkSizeY", chunkSizeY);
+        if (chunk._gpuBiomeGrassRT != null) _gpuVoxelMPB.SetTexture("_BiomeColorRT", chunk._gpuBiomeGrassRT);
+
+        // Per-COLUMN instancing: one instance per (x,z) column (chunkSizeXZ^2 <= 1023 => 1 batch).
+        // The column mesh carries all chunkSizeY voxels; the shader reads instanceID -> (lx,lz).
+        int columnsPerChunk = chunkSizeXZ * chunkSizeXZ;
+        const int BATCH = 1023;
+        int batches = (columnsPerChunk + BATCH - 1) / BATCH;
+        if (_gpuVoxelInstanceXforms == null || _gpuVoxelInstanceXforms.Length != BATCH)
+        {
+            _gpuVoxelInstanceXforms = new Matrix4x4[BATCH];
+            for (int i = 0; i < BATCH; i++) _gpuVoxelInstanceXforms[i] = Matrix4x4.identity;
+        }
+        for (int b = 0; b < batches; b++)
+        {
+            int batchSize = (b == batches - 1) ? (columnsPerChunk - b * BATCH) : BATCH;
+            _gpuVoxelMPB.SetInt("_InstanceOffset", b * BATCH);
+            VRCGraphics.DrawMeshInstanced(gpuVoxelCubeMesh, 0, gpuVoxelInstancedMaterial,
+                _gpuVoxelInstanceXforms, batchSize, _gpuVoxelMPB);
+        }
+    }
+    private Matrix4x4[] _gpuVoxelInstanceXforms;
+
+    // (c) Registry of chunks rendered via instancing (set when BuildChunkMesh marks a resident
+    // chunk instanced). The driver iterates this instead of scanning all chunks every frame.
+    private int[] _instancedChunks;
+    private int _instancedChunkCount;
+    private void _GpuRegisterInstancedChunk(int chunkIndex)
+    {
+        if (_instancedChunks == null)
+            _instancedChunks = new int[totalWorldChunks > 0 ? totalWorldChunks : 8192];
+        if (_instancedChunkCount < _instancedChunks.Length)
+        {
+            _instancedChunks[_instancedChunkCount] = chunkIndex;
+            _instancedChunkCount++;
+        }
+    }
+
+    // (c) Per-frame driver: issue one instanced draw per visible instanced chunk. Called from
+    // Update after ProcessActiveChunks. Distance-culled to gpuInstancedRenderRadius (XZ) around the
+    // resident center (player) to bound draw-call count. DrawMeshInstanced is immediate-mode, so
+    // this must run every frame the chunk should be visible.
+    public void GpuRenderInstancedVoxels()
+    {
+        if (!enableInstancedVoxelRender || _instancedChunkCount == 0 || chunks_1D == null) return;
+        if (!_GpuBindInstancedMaterial()) return;
+        int cx = gpuResidentCenterChunkX;
+        int cy = gpuResidentCenterChunkY;
+        int cz = gpuResidentCenterChunkZ;
+        int r = Mathf.Max(1, gpuInstancedRenderRadius);
+        int ry = Mathf.Max(0, gpuInstancedRenderRadiusY);
+
+        // View-direction cull: skip chunks well behind the player's head — DrawMeshInstanced has
+        // real per-call overhead and per-voxel instancing is heavy, so not issuing the back
+        // hemisphere roughly halves the draw count. Adjacent chunks (close) are never direction-
+        // culled so peripheral/just-behind blocks don't pop while turning.
+        VRCPlayerApi lp = Networking.LocalPlayer;
+        bool haveView = false;
+        Vector3 camPos = Vector3.zero;
+        Vector3 camFwd = Vector3.forward;
+        if (lp != null && lp.IsValid())
+        {
+            VRCPlayerApi.TrackingData hd = lp.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
+            camPos = hd.position;
+            camFwd = hd.rotation * Vector3.forward;
+            haveView = true;
+        }
+        float halfChunk = chunkSizeXZ * 0.5f;
+
+        for (int i = 0; i < _instancedChunkCount; i++)
+        {
+            int ci = _instancedChunks[i];
+            if (ci < 0 || ci >= chunks_1D.Length) continue;
+            ChunkData chunk = chunks_1D[ci];
+            if (chunk == null || !chunk._isInstancedRendered) continue;
+            if (Mathf.Abs(chunk.chunkX_world - cx) > r || Mathf.Abs(chunk.chunkZ_world - cz) > r) continue;
+            if (Mathf.Abs(chunk.chunkY_world - cy) > ry) continue;
+
+            if (haveView)
+            {
+                Vector3 center = new Vector3(
+                    chunk.chunkX_world * chunkSizeXZ + halfChunk,
+                    chunk.chunkY_world * chunkSizeY + chunkSizeY * 0.5f,
+                    chunk.chunkZ_world * chunkSizeXZ + halfChunk);
+                Vector3 toChunk = center - camPos;
+                float dist = toChunk.magnitude;
+                // keep chunks within ~1.5 chunks regardless (peripheral); cull the rest if behind.
+                if (dist > chunkSizeXZ * 1.5f && Vector3.Dot(toChunk / dist, camFwd) < -0.25f) continue;
+            }
+
+            GpuRenderInstancedVoxelChunk(chunk);
+        }
+    }
+
     private bool _GpuFaceExtractionReady()
     {
         return gpuBackendReady && gpuFaceExtractMaterial != null && gpuShouldDrawTexture != null && gpuFaceReadbackTextures != null;
@@ -2056,6 +2491,335 @@ public class McWorld : UdonSharpBehaviour
 #endif
     }
 
+    // ===================== Batched face readback (enableBatchedFaceReadback) =====================
+    // Many chunks share ONE blit (shader Mode 3 over a tiled RT) + ONE region readback, then each
+    // tile is demuxed into the per-chunk face buffer so the existing decode/ready-queue is reused
+    // unchanged. Cuts the readback request/callback count by the batch tile count.
+
+    private void _GpuInitBatchedReadback()
+    {
+        int bigW = GPU_BATCH_COLS * gpuTileWidth;
+        int bigH = GPU_BATCH_ROWS * gpuTileHeight;
+        gpuBatchBorderAtlasWidth = GPU_BATCH_COLS * gpuBorderWidth;
+        gpuBatchBorderAtlasHeight = GPU_BATCH_ROWS * gpuBorderHeight;
+
+        gpuBatchReadbackTextures = new RenderTexture[GPU_BATCH_INFLIGHT_COUNT];
+        gpuBatchReadbackPixels = new Color32[GPU_BATCH_INFLIGHT_COUNT][];
+        gpuBatchBorderTextures = new Texture2D[GPU_BATCH_INFLIGHT_COUNT];
+        gpuBatchSlotMapTextures = new Texture2D[GPU_BATCH_INFLIGHT_COUNT];
+        gpuBatchRtInflight = new bool[GPU_BATCH_INFLIGHT_COUNT];
+        gpuBatchBuffers = new int[GPU_BATCH_INFLIGHT_COUNT][];
+        gpuBatchBufferCount = new int[GPU_BATCH_INFLIGHT_COUNT];
+        for (int r = 0; r < GPU_BATCH_INFLIGHT_COUNT; r++)
+        {
+            gpuBatchReadbackTextures[r] = _CreateGpuRenderTexture(bigW, bigH, "GPU_BatchFaceReadback_" + r);
+            VRCGraphics.Blit(gpuClearTexture, gpuBatchReadbackTextures[r]);
+            gpuBatchReadbackPixels[r] = new Color32[bigW * bigH];
+            gpuBatchBorderTextures[r] = _CreateGpuTexture2D(gpuBatchBorderAtlasWidth, gpuBatchBorderAtlasHeight);
+            gpuBatchSlotMapTextures[r] = _CreateGpuTexture2D(GPU_BATCH_TILE_COUNT, 1);
+            gpuBatchBuffers[r] = new int[GPU_BATCH_TILE_COUNT];
+            gpuBatchBufferCount[r] = 0;
+            gpuBatchRtInflight[r] = false;
+        }
+        gpuBatchInflightOrder = new int[GPU_BATCH_INFLIGHT_COUNT];
+        gpuBatchInflightHead = 0;
+        gpuBatchInflightTail = 0;
+        gpuBatchInflightCount = 0;
+        gpuBatchPendingChunks = new ChunkData[GPU_BATCH_TILE_COUNT];
+        gpuBatchPendingBuffers = new int[GPU_BATCH_TILE_COUNT];
+        gpuBatchPendingCount = 0;
+        gpuBatchStagingBorderPixels = new Color32[gpuBatchBorderAtlasWidth * gpuBatchBorderAtlasHeight];
+        gpuBatchStagingSlotMapPixels = new Color32[GPU_BATCH_TILE_COUNT];
+    }
+
+    // Pack one chunk's neighbour-boundary blocks into its tile region of the staging border atlas.
+    // Mirrors _GpuPackBorderData's per-face layout exactly, but writes at a tile offset and returns
+    // the missing-neighbour mask so the caller can apply the same defer-if-incomplete policy.
+    private byte _GpuPackBorderIntoStaging(ChunkData chunk, int pendingIndex)
+    {
+        int tileCol = pendingIndex % GPU_BATCH_COLS;
+        int tileRow = pendingIndex / GPU_BATCH_COLS;
+        int originX = tileCol * gpuBorderWidth;
+        int originY = tileRow * gpuBorderHeight;
+        int atlasW = gpuBatchBorderAtlasWidth;
+        int SX = chunkSizeXZ;
+        int SY = chunkSizeY;
+        int stride = gpuBorderStride;
+
+        // Fill this tile region with air+valid; available faces overwrite below.
+        Color32 airValid = new Color32(0, 0, 0, 255);
+        for (int row = 0; row < gpuBorderHeight; row++)
+        {
+            int baseIdx = (originY + row) * atlasW + originX;
+            for (int u = 0; u < gpuBorderWidth; u++) gpuBatchStagingBorderPixels[baseIdx + u] = airValid;
+        }
+
+        byte missingMask = 0;
+        ChunkData n;
+
+        // +Y (face 0): PY neighbor at (x, 0, z)
+        n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world + 1, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int z = 0; z < SX; z++)
+                for (int x = 0; x < SX; x++)
+                    gpuBatchStagingBorderPixels[(originY + 0 * stride + z) * atlasW + originX + x] = new Color32(_GetBlockLocal(n, x, 0, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world + 1, chunk.chunkZ_world) != -1)
+            missingMask |= 4;
+
+        // -Y (face 1): NY neighbor at (x, SY-1, z)
+        n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world - 1, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int z = 0; z < SX; z++)
+                for (int x = 0; x < SX; x++)
+                    gpuBatchStagingBorderPixels[(originY + 1 * stride + z) * atlasW + originX + x] = new Color32(_GetBlockLocal(n, x, SY - 1, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world - 1, chunk.chunkZ_world) != -1)
+            missingMask |= 8;
+
+        // +Z (face 2): PZ neighbor at (x, y, 0)
+        n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world + 1);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int x = 0; x < SX; x++)
+                    gpuBatchStagingBorderPixels[(originY + 2 * stride + y) * atlasW + originX + x] = new Color32(_GetBlockLocal(n, x, y, 0), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world + 1) != -1)
+            missingMask |= 16;
+
+        // -Z (face 3): NZ neighbor at (x, y, SX-1)
+        n = GetChunkAt(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world - 1);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int x = 0; x < SX; x++)
+                    gpuBatchStagingBorderPixels[(originY + 3 * stride + y) * atlasW + originX + x] = new Color32(_GetBlockLocal(n, x, y, SX - 1), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world - 1) != -1)
+            missingMask |= 32;
+
+        // +X (face 4): PX neighbor at (0, y, z)
+        n = GetChunkAt(chunk.chunkX_world + 1, chunk.chunkY_world, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int z = 0; z < SX; z++)
+                    gpuBatchStagingBorderPixels[(originY + 4 * stride + y) * atlasW + originX + z] = new Color32(_GetBlockLocal(n, 0, y, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world + 1, chunk.chunkY_world, chunk.chunkZ_world) != -1)
+            missingMask |= 1;
+
+        // -X (face 5): NX neighbor at (SX-1, y, z)
+        n = GetChunkAt(chunk.chunkX_world - 1, chunk.chunkY_world, chunk.chunkZ_world);
+        if (n != null && n.isDataReady)
+            for (int y = 0; y < SY; y++)
+                for (int z = 0; z < SX; z++)
+                    gpuBatchStagingBorderPixels[(originY + 5 * stride + y) * atlasW + originX + z] = new Color32(_GetBlockLocal(n, SX - 1, y, z), 0, 0, 255);
+        else if (ChunkCenteredCoordsTo1D(chunk.chunkX_world - 1, chunk.chunkY_world, chunk.chunkZ_world) != -1)
+            missingMask |= 2;
+
+        return missingMask;
+    }
+
+    // Accept a background chunk into the pending batch. Returns true if accepted (its mesh will be
+    // built when the batch readback completes), false if the caller should defer/retry. Packs the
+    // chunk's border into staging (same defer-if-incomplete policy as the single path), bakes its
+    // biome colours, and reserves a face buffer for the demuxed pixels. Dispatches when full.
+    private bool _GpuTryAccumulateBatchChunk(ChunkData chunk, int bufferIndex)
+    {
+        if (chunk == null || bufferIndex < 0 || gpuBatchPendingChunks == null) return false;
+
+        if (gpuBatchPendingCount >= GPU_BATCH_TILE_COUNT) _GpuDispatchPendingBatch();
+        if (gpuBatchPendingCount >= GPU_BATCH_TILE_COUNT) return false; // all batches in flight
+
+        int pendingIndex = gpuBatchPendingCount;
+        byte missingMask = _GpuPackBorderIntoStaging(chunk, pendingIndex);
+        chunk._borderMissingMask = missingMask;
+        if (_ShouldDeferIncompleteBackgroundMesh(chunk, missingMask)) return false;
+
+        if (!_GpuBakeBiomeColors(chunk)) _PreComputeBiomeColors(chunk);
+
+        // Reserve the face buffer (state=1) so _GpuFindAvailableReadbackBuffer won't hand it out
+        // again; it is NOT placed in the single-readback FIFO — the batch FIFO drives its callback.
+        gpuFaceReadbackChunks[bufferIndex] = chunk;
+        gpuFaceReadbackBuildVersion[bufferIndex] = chunk._meshBuildVersion;
+        gpuFaceReadbackState[bufferIndex] = 1;
+        gpuFaceReadbackStartMs[bufferIndex] = -1f;
+
+        gpuBatchPendingChunks[pendingIndex] = chunk;
+        gpuBatchPendingBuffers[pendingIndex] = bufferIndex;
+        gpuBatchPendingCount = pendingIndex + 1;
+
+        if (gpuBatchPendingCount >= GPU_BATCH_TILE_COUNT) _GpuDispatchPendingBatch();
+        return true;
+    }
+
+    // Flush the pending batch: re-sync each chunk (refreshes its LRU stamp so the slot can't be
+    // evicted before the blit, and gives the CURRENT slot), build the slot map, upload the border
+    // atlas + slot map, run ONE Mode-3 blit, and request ONE readback over the whole tiled RT.
+    private void _GpuDispatchPendingBatch()
+    {
+        if (gpuBatchPendingCount <= 0 || !_GpuFaceExtractionReady()) return;
+
+        int rt = -1;
+        for (int r = 0; r < GPU_BATCH_INFLIGHT_COUNT; r++)
+        {
+            if (!gpuBatchRtInflight[r]) { rt = r; break; }
+        }
+        if (rt < 0) return; // all in flight — leave pending, retry next frame
+
+        int count = gpuBatchPendingCount;
+        for (int j = 0; j < count; j++)
+        {
+            ChunkData chunk = gpuBatchPendingChunks[j];
+            int buf = gpuBatchPendingBuffers[j];
+            int slotIndex = -1;
+            if (chunk != null && chunk.isBuildingMesh && gpuFaceReadbackBuildVersion[buf] == chunk._meshBuildVersion)
+            {
+                byte[] data = _GetDecompressedData(chunk);
+                if (data != null)
+                {
+                    _GpuSyncChunkBlocks(chunk, data);
+                    int ci = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+                    if (ci >= 0 && ci < totalWorldChunks)
+                    {
+                        int s = gpuChunkIndexToSlot[ci];
+                        if (s >= 0 && s < gpuChunkSlotCapacity) slotIndex = s;
+                    }
+                }
+            }
+            if (slotIndex >= 0)
+            {
+                chunk._gpuFaceSlotIndex = slotIndex;
+                gpuFaceReadbackSlots[buf] = slotIndex;
+                gpuBatchBuffers[rt][j] = buf;
+                gpuBatchStagingSlotMapPixels[j] = new Color32((byte)(slotIndex & 255), (byte)((slotIndex >> 8) & 255), 0, 255);
+            }
+            else
+            {
+                // Could not resolve this chunk's atlas slot — drop it from the batch and re-defer
+                // (never mesh it from the zeroed tile).
+                gpuBatchBuffers[rt][j] = -1;
+                gpuBatchStagingSlotMapPixels[j] = new Color32(0, 0, 0, 0);
+                _ResetGpuFaceReadbackBuffer(buf);
+                if (chunk != null && chunk.isBuildingMesh)
+                {
+                    chunk.isBuildingMesh = false;
+                    chunk.interactionMeshPriority = false;
+                    MarkChunkMeshDeferred(ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world));
+                }
+            }
+        }
+        for (int j = count; j < GPU_BATCH_TILE_COUNT; j++)
+        {
+            gpuBatchBuffers[rt][j] = -1;
+            gpuBatchStagingSlotMapPixels[j] = new Color32(0, 0, 0, 0);
+        }
+        gpuBatchBufferCount[rt] = count;
+
+        // A sync may have evicted/reused a slot — flush the lookup so neighbour atlas reads stay correct.
+        if (gpuSlotLookupDirty) { _GpuApplyLookupTextures(); gpuSlotLookupDirty = false; }
+
+        gpuBatchBorderTextures[rt].SetPixels32(gpuBatchStagingBorderPixels);
+        gpuBatchBorderTextures[rt].Apply(false, false);
+        gpuBatchSlotMapTextures[rt].SetPixels32(gpuBatchStagingSlotMapPixels);
+        gpuBatchSlotMapTextures[rt].Apply(false, false);
+
+        gpuFaceExtractMaterial.SetFloat(gpuPropFaceModeId, 3f);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBlockPropsId, gpuBlockPropertyTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropSlotLookupTexId, gpuSlotLookupTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropSlotMetaId, gpuSlotMetaTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropDrawTableTexId, gpuShouldDrawTexture);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBatchSlotMapId, gpuBatchSlotMapTextures[rt]);
+        gpuFaceExtractMaterial.SetTexture(gpuPropBatchBorderId, gpuBatchBorderTextures[rt]);
+        gpuFaceExtractMaterial.SetVector(gpuPropBatchInfoId, new Vector4(GPU_BATCH_COLS, GPU_BATCH_ROWS, gpuTileWidth, gpuTileHeight));
+        gpuFaceExtractMaterial.SetVector(gpuPropBatchBorderInfoId, new Vector4(gpuBorderWidth, gpuBorderHeight, gpuBorderStride, GPU_BATCH_TILE_COUNT));
+#if LOGGING
+        float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+        VRCGraphics.Blit(gpuBlockAtlas, gpuBatchReadbackTextures[rt], gpuFaceExtractMaterial);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceExtractBlits++;
+            stats_gpuFaceExtractBlitTime += (Time.realtimeSinceStartup - blitStart) * 1000f;
+        }
+#endif
+
+        gpuBatchRtInflight[rt] = true;
+        gpuBatchInflightOrder[gpuBatchInflightTail] = rt;
+        gpuBatchInflightTail = (gpuBatchInflightTail + 1) % GPU_BATCH_INFLIGHT_COUNT;
+        gpuBatchInflightCount++;
+
+        VRCAsyncGPUReadback.Request(gpuBatchReadbackTextures[rt], 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        if (_readbackKind != null && _readbackKindCount < READBACK_KIND_CAP) { _readbackKind[_readbackKindTail] = 2; _readbackKindTail = (_readbackKindTail + 1) % READBACK_KIND_CAP; _readbackKindCount++; }
+#if LOGGING
+        if (enableDetailedTimings) stats_gpuFaceReadbackRequests++;
+#endif
+
+        gpuBatchPendingCount = 0;
+    }
+
+    // Copy one tile's pixels out of the big batch RT into the per-chunk face buffer. The tile layout
+    // is identical to the Mode-1 per-chunk output, so downstream decode is unchanged.
+    private void _GpuDemuxBatchTile(int rtIndex, int tileIndex, int bufferIndex)
+    {
+        Color32[] big = gpuBatchReadbackPixels[rtIndex];
+        Color32[] dst = gpuFaceReadbackPixels[bufferIndex];
+        if (big == null || dst == null) return;
+
+        // Vertical-stack (1 column): tile `tileIndex` is a contiguous run of tileW*tileH pixels,
+        // and its in-tile pixel order matches the per-chunk Mode-1 layout exactly — one native copy.
+        int tileLen = gpuTileWidth * gpuTileHeight;
+        int srcOffset = tileIndex * tileLen;
+        int len = tileLen;
+        if (len > dst.Length) len = dst.Length;
+        if (srcOffset + len > big.Length) len = big.Length - srcOffset;
+        if (len <= 0) return;
+        System.Array.Copy(big, srcOffset, dst, 0, len);
+    }
+
+    // Batch readback completed: demux each valid tile into its per-chunk face buffer and push it to
+    // the existing ready-queue so the normal decode runs unchanged.
+    private void _HandleBatchReadbackCompletion(VRCAsyncGPUReadbackRequest request)
+    {
+        if (gpuBatchInflightCount <= 0) return;
+        int rt = gpuBatchInflightOrder[gpuBatchInflightHead];
+        gpuBatchInflightHead = (gpuBatchInflightHead + 1) % GPU_BATCH_INFLIGHT_COUNT;
+        gpuBatchInflightCount--;
+        gpuBatchRtInflight[rt] = false;
+
+        int count = gpuBatchBufferCount[rt];
+        gpuBatchBufferCount[rt] = 0;
+
+        bool ok = !request.hasError && request.TryGetData(gpuBatchReadbackPixels[rt], 0);
+        if (!ok)
+        {
+            for (int j = 0; j < count; j++)
+            {
+                int buf = gpuBatchBuffers[rt][j];
+                if (buf >= 0) _ResetGpuFaceReadbackBuffer(buf);
+            }
+#if LOGGING
+            if (enableDetailedTimings) stats_gpuFaceReadbackFailures++;
+#endif
+            return;
+        }
+
+        for (int j = 0; j < count; j++)
+        {
+            int buf = gpuBatchBuffers[rt][j];
+            if (buf < 0) continue;
+            ChunkData chunk = gpuFaceReadbackChunks[buf];
+            if (chunk == null || !chunk.isBuildingMesh || gpuFaceReadbackBuildVersion[buf] != chunk._meshBuildVersion)
+            {
+                _ResetGpuFaceReadbackBuffer(buf);
+                continue;
+            }
+            _GpuDemuxBatchTile(rt, j, buf);
+            gpuFaceReadbackState[buf] = 2;
+            gpuFaceReadbackReadyOrder[gpuFaceReadbackReadyTail] = buf;
+            gpuFaceReadbackReadyTail = (gpuFaceReadbackReadyTail + 1) % GPU_FACE_READBACK_BUFFER_COUNT;
+            gpuFaceReadbackReadyCount++;
+        }
+#if LOGGING
+        if (enableDetailedTimings) stats_gpuFaceReadbacksCompleted += count;
+#endif
+    }
+
     private bool _GpuRequestChunkFaceReadback(ChunkData chunk, int bufferIndex)
     {
         if (!_GpuFaceExtractionReady() || chunk == null) return false;
@@ -2093,9 +2857,14 @@ public class McWorld : UdonSharpBehaviour
             _GpuApplyLookupTextures();
             gpuSlotLookupDirty = false;
         }
-        if (useCompactGpuFaceExport) _GpuRunFaceSummaryExportDirect(bufferIndex, slotIndex);
+        // The compact/summary export's build reads selfData (chunk._decompSelf) — null for
+        // GPU-resident chunks. Force the DIRECT per-voxel export for resident chunks, whose build
+        // reads only the face readback (facePixels), needing no CPU mirror.
+        bool useSummaryExport = useCompactGpuFaceExport && !chunk._isGpuResident;
+        if (useSummaryExport) _GpuRunFaceSummaryExportDirect(bufferIndex, slotIndex);
         else _GpuRunFaceExtractionDirect(bufferIndex, slotIndex);
         VRCAsyncGPUReadback.Request(gpuFaceReadbackTextures[bufferIndex], 0, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        if (_readbackKind != null && _readbackKindCount < READBACK_KIND_CAP) { _readbackKind[_readbackKindTail] = 0; _readbackKindTail = (_readbackKindTail + 1) % READBACK_KIND_CAP; _readbackKindCount++; }
 #if LOGGING
         if (enableVerboseLogging && !dbg_loggedFirstFaceReadback)
         {
@@ -2119,6 +2888,17 @@ public class McWorld : UdonSharpBehaviour
 
     public override void OnAsyncGpuReadbackComplete(VRCAsyncGPUReadbackRequest request)
     {
+        // Route by request kind (FIFO in global request order). Rehydrate readbacks are
+        // handled here and must NOT fall through to the face-extract path.
+        if (_readbackKindCount > 0)
+        {
+            int kind = _readbackKind[_readbackKindHead];
+            _readbackKindHead = (_readbackKindHead + 1) % READBACK_KIND_CAP;
+            _readbackKindCount--;
+            if (kind == 1) { _HandleRehydrateCompletion(request); return; }
+            if (kind == 2) { _HandleBatchReadbackCompletion(request); return; }
+        }
+
         if (gpuFaceReadbackInflightCount <= 0) return;
 
         int bufferIndex = gpuFaceReadbackInflightOrder[gpuFaceReadbackInflightHead];
@@ -2198,6 +2978,10 @@ public class McWorld : UdonSharpBehaviour
     /// </summary>
     private void _ProcessGpuFaceReadback(float frameStart, float frameBudget)
     {
+        // Flush any partially-filled batch from this frame's accumulation so a non-full batch waits
+        // at most one frame before its single readback is issued.
+        if (enableBatchedFaceReadback && gpuBatchPendingCount > 0) _GpuDispatchPendingBatch();
+
         int processedThisFrame = 0;
         while (gpuFaceReadbackReadyCount > 0)
         {
@@ -2325,6 +3109,7 @@ public class McWorld : UdonSharpBehaviour
     }
 
 
+    private bool _dbgLoggedResidentFaces = false;
     private void _StartGpuBuildMeshFromFaceData(ChunkData chunk, Color32[] facePixels, int bufferIndex, int buildVersion)
     {
         if (chunk == null || facePixels == null) return;
@@ -2333,11 +3118,26 @@ public class McWorld : UdonSharpBehaviour
             _ResetGpuFaceReadbackBuffer(bufferIndex);
             return;
         }
+        // DECISIVE PROBE: for the first GPU-resident chunk to build, report what the face extractor
+        // produced — block pixels vs opaque-face pixels. Tells us if the extract sees the atlas data
+        // (anyBlock>0) and whether opaque faces survive culling (opaque>0).
+        if (chunk._isGpuResident && !_dbgLoggedResidentFaces)
+        {
+            int op=0, anyBlock=0, cross=0, water=0;
+            for (int di=0; di<facePixels.Length; di++){ var p=facePixels[di]; if(p.a<128) continue; if(p.g!=0) anyBlock++; if(p.r!=0 && p.g!=0 && p.b<1) op++; if(p.b>=1) cross++; }
+            Debug.LogWarning("[DBG_RESIDENT_FACES] chunk("+chunk.chunkX_world+","+chunk.chunkY_world+","+chunk.chunkZ_world
+                + ") anyBlockPixels="+anyBlock+" opaqueFacePixels="+op+" crossPixels="+cross+" total="+facePixels.Length);
+            _dbgLoggedResidentFaces = true;
+        }
         if (!_AcquireMeshPool(chunk)) return;
 
         _ClearAllMeshBuffers(chunk);
         _PreComputeBiomeColors(chunk);
-        if (useCompactGpuFaceExport || ambientOcclusion)
+        // Resident chunks (no CPU mirror) never use CPU brightness/AO/selfData — the direct build
+        // emits constant light and the terrain shader does GPU-exact AO/light from the atlas. So
+        // skip the (null) neighbor decompression entirely; otherwise enabling ambientOcclusion would
+        // drag every resident build through a pointless decomp of null neighbor data.
+        if ((useCompactGpuFaceExport || ambientOcclusion) && !chunk._isGpuResident)
         {
             ChunkData[] neighbors = _GetCachedNeighbors(chunk);
             chunk.neighborPX = neighbors[0];
@@ -2374,7 +3174,9 @@ public class McWorld : UdonSharpBehaviour
             chunk._cachedBrightness = null;
         }
 
-        if (useCompactGpuFaceExport)
+        // Match the export path chosen in _GpuRequestChunkFaceReadback: resident chunks use the
+        // DIRECT build (reads facePixels only), since the summary build needs selfData (null here).
+        if (useCompactGpuFaceExport && !chunk._isGpuResident)
         {
             if (chunk._gpuFacePixels == null || chunk._gpuFacePixels.Length != facePixels.Length)
             {
@@ -2705,17 +3507,28 @@ public class McWorld : UdonSharpBehaviour
                         chunk._gpuFaceSlice++;
                         continue;
                     }
+                    // Hoist the mask arrays (this.field) into locals: Udon reloads the field ref on
+                    // every indexed access, and this is the hot per-face-pixel emit loop. ~200-1000x
+                    // per-op cost makes the field-load worth eliminating from the inner loop.
+                    byte[] maskBlockIds = greedyMaskBlockIds;
+                    byte[] maskLightLevels = greedyMaskLightLevels;
+                    int[] maskAoSignatures = greedyMaskAoSignatures;
+                    int[] maskPackedColors = greedyMaskPackedColors;
                     int clearWidth = maxU - minU + 1;
                     for (int clearV = minV; clearV <= maxV; clearV++)
                     {
-                        System.Array.Clear(greedyMaskBlockIds, clearV * maskWidth + minU, clearWidth);
+                        System.Array.Clear(maskBlockIds, clearV * maskWidth + minU, clearWidth);
                     }
                     int[] packedGrassColors = chunk._cachedPackedGrassBiomeColors;
                     byte[] tintModes = biomeTintModeCache;
-                    bool nsUseAo = _UsesCpuAmbientOcclusion();
+                    bool nsCpuAo = _UsesCpuAmbientOcclusion();
+                    bool nsBakedAo = _UsesBakedVertexAo();
+                    bool nsUseAo = nsCpuAo || nsBakedAo;          // build + bake an AO signature
                     bool nsHasTintModes = tintModes != null;
                     bool nsHasGrassColors = packedGrassColors != null;
-                    bool nsConstantLight = !nsUseAo && _UsesGpuTerrainLightSampling();
+                    // Light stays GPU-sampled whenever the GPU lighting backend is on (incl. baked-AO
+                    // mode); only the CPU-AO path replaces it with per-vertex light levels.
+                    bool nsConstantLight = !nsCpuAo && _UsesGpuTerrainLightSampling();
                     _greedyConstantLight = nsConstantLight;
 
                     for (int v = minV; v <= maxV; v++)
@@ -2742,31 +3555,33 @@ public class McWorld : UdonSharpBehaviour
                             if ((faceMask & bit) == 0) continue;
 
                             int maskIndex = maskRowOffset + u;
-                            greedyMaskBlockIds[maskIndex] = (byte)blockID;
+                            maskBlockIds[maskIndex] = (byte)blockID;
                             if (nsUseAo)
                             {
-                                greedyMaskLightLevels[maskIndex] = 0;
-                                greedyMaskAoSignatures[maskIndex] = _BuildAoSignature(chunk, (byte)blockID, direction, x, y, z);
+                                maskLightLevels[maskIndex] = 0;
+                                maskAoSignatures[maskIndex] = nsBakedAo
+                                    ? _BuildGeometricAoSignature(chunk, direction, x, y, z)
+                                    : _BuildAoSignature(chunk, (byte)blockID, direction, x, y, z);
                             }
                             else if (!nsConstantLight)
                             {
-                                greedyMaskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
+                                maskLightLevels[maskIndex] = _GetCachedLightLevelForDirection(chunk, direction, x, y, z);
                             }
                             byte tintMode = (nsHasTintModes && blockID < tintModes.Length) ? tintModes[blockID] : (byte)0;
                             if (tintMode == 0)
                             {
-                                greedyMaskPackedColors[maskIndex] = PACKED_WHITE_RGB;
+                                maskPackedColors[maskIndex] = PACKED_WHITE_RGB;
                             }
                             else
                             {
                                 int biomeIndex = z * sizeXZ + x;
                                 if (tintMode == 1 && nsHasGrassColors && biomeIndex < packedGrassColors.Length)
                                 {
-                                    greedyMaskPackedColors[maskIndex] = packedGrassColors[biomeIndex];
+                                    maskPackedColors[maskIndex] = packedGrassColors[biomeIndex];
                                 }
                                 else
                                 {
-                                    greedyMaskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, (byte)blockID, x, z));
+                                    maskPackedColors[maskIndex] = _PackColorRGB(_GetCachedBiomeColor(chunk, (byte)blockID, x, z));
                                 }
                             }
                         }
@@ -3164,7 +3979,18 @@ public class McWorld : UdonSharpBehaviour
 
     private bool _UsesGpuExactAmbientOcclusion()
     {
-        return ambientOcclusion && UsesGpuLightingBackend();
+        // Per-fragment exact AO only when baked AO is NOT taking over.
+        return ambientOcclusion && UsesGpuLightingBackend() && !useBakedVertexAo;
+    }
+
+    // Baked geometric AO: occlusion is light-independent, so we compute it from block data at
+    // decode time and bake it into vertex-color alpha; the shader then does (1 GPU light sample)
+    // x (baked AO) instead of the ~16-sample per-fragment exact AO. Only meaningful alongside the
+    // GPU lighting backend (which owns the light); with CPU lighting the existing _UsesCpuAmbientOcclusion
+    // path already bakes the (light-combined) signature.
+    private bool _UsesBakedVertexAo()
+    {
+        return ambientOcclusion && UsesGpuLightingBackend() && useBakedVertexAo;
     }
 
     private bool _UsesCpuAmbientOcclusion()
@@ -3182,8 +4008,10 @@ public class McWorld : UdonSharpBehaviour
         if (material == null) return;
         if (terrainPropUseVertexLightId == -1) terrainPropUseVertexLightId = VRCShader.PropertyToID("_UseVertexLight");
         if (terrainPropUseGpuExactAoId == -1) terrainPropUseGpuExactAoId = VRCShader.PropertyToID("_UseGpuExactAo");
+        if (terrainPropUseBakedAoId == -1) terrainPropUseBakedAoId = VRCShader.PropertyToID("_UseBakedAo");
         material.SetFloat(terrainPropUseVertexLightId, _UsesGpuTerrainLightSampling() ? 0f : 1f);
         material.SetFloat(terrainPropUseGpuExactAoId, _UsesGpuExactAmbientOcclusion() ? 1f : 0f);
+        material.SetFloat(terrainPropUseBakedAoId, _UsesBakedVertexAo() ? 1f : 0f);
     }
 
     private void _ApplyTerrainLightingSourceToSharedMaterials()
@@ -3285,6 +4113,9 @@ public class McWorld : UdonSharpBehaviour
             updateTimeBudgetMs = _runtimeUpdateBudgetMs;
         }
 
+        // Drain pending GPU-resident chunk rehydrations (cheap no-op when the queue is empty).
+        GpuMaintainRehydrationQueue(8);
+
 #if LOGGING
         float updateStartTime = 0f;
         if (enableAdaptiveBudgets || enableDetailedTimings || enableFrameLogging || enableAggregateLogging)
@@ -3295,6 +4126,7 @@ public class McWorld : UdonSharpBehaviour
 
         _UpdateBetaWaterAnimation();
         ProcessActiveChunks();
+        if (enableInstancedVoxelRender) GpuRenderInstancedVoxels();
         if (blockTicker != null) blockTicker.Tick();
         _UpdateGpuDebugHud();
 
@@ -3388,9 +4220,15 @@ public class McWorld : UdonSharpBehaviour
         // --- Process Meshing ---
         float gpuMeshDecodeFrameBudgetSec = Mathf.Max(0.25f, adaptiveGpuMeshDecodeFrameBudgetMs) * 0.001f;
         float gpuMeshDecodeSpentSec = 0f;
+        // GUARANTEE meshing a minimum slice each frame even when the data-gen loop above ate the
+        // entire frame budget. Without this, active GPU face-builds sit completely un-stepped for
+        // the hundreds of frames the load-phase gen storm runs, then trip the 300-frame mesh
+        // watchdog and get force-released — losing chunks. Mirrors the readback guarantee above:
+        // the slice is only consumed when there is actually mesh work queued (activeMeshingCount>0).
+        float meshDeadline = Mathf.Max(frameStart + frameBudget, Time.realtimeSinceStartup + gpuMeshDecodeFrameBudgetSec);
         for (int i = 0; i < activeMeshingCount; i++)
         {
-            if (Time.realtimeSinceStartup - frameStart > frameBudget) break; // Don't exceed budget
+            if (Time.realtimeSinceStartup > meshDeadline) break; // Don't exceed budget
 
             ChunkData chunk = activeMeshingChunks[i];
             if (chunk == null || !chunk.isBuildingMesh)
@@ -3431,7 +4269,7 @@ public class McWorld : UdonSharpBehaviour
             for (int step = 0; step < maxMeshStepsPerFrame; step++)
             {
                 if (!chunk.isBuildingMesh) break; // Mesh complete
-                if (Time.realtimeSinceStartup - frameStart > frameBudget) break; // Don't exceed budget
+                if (Time.realtimeSinceStartup > meshDeadline) break; // Don't exceed budget
 
                 bool isGpuDecodeStep = chunk._gpuFaceBuildActive;
                 if (isGpuDecodeStep && gpuMeshDecodeSpentSec >= gpuMeshDecodeFrameBudgetSec) break;
@@ -3520,6 +4358,9 @@ public class McWorld : UdonSharpBehaviour
             }
 
             if (!chunk.isMeshDeferred) continue;
+            // MESH RENDER DISTANCE: leave far chunks deferred — don't re-queue them (which would
+            // just bounce off the cap in BuildChunkMesh). They wake when the player comes in range.
+            if (!_IsChunkWithinMeshRenderDistance(chunk)) continue;
             if (chunk._borderMissingMask != 0 && !_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask)) continue;
             if (!AreAllNeighborsReady(chunkIndex)) continue;
 
@@ -3824,12 +4665,50 @@ public class McWorld : UdonSharpBehaviour
         }
     }
 
+    // Routes a column to one of the N terrain generators (slot 0 = terrainGenerator, slots 1+ =
+    // extraGenerators). All Y of a column share a generator so its column cache stays hot.
+    // Failure mode of a routing mistake is a cache miss (slower), NOT terrain corruption — each
+    // generator is independently deterministic for the same seed. Validate with debugTerrainChecksum.
+    public int GetGeneratorCount() { return 1 + (extraGenerators != null ? extraGenerators.Length : 0); }
+
+    // Slot (0..N-1) a column maps to. Spread hash so spatially-adjacent columns (consecutive in
+    // the radial order) land on different generators → their readbacks overlap instead of serializing.
+    private int _GeneratorSlotForColumn(int cx, int cz)
+    {
+        int n = GetGeneratorCount();
+        if (n <= 1) return 0;
+        int h = cx * 2 + cz;
+        int s = h % n;
+        if (s < 0) s += n;
+        return s;
+    }
+
+    private McTerrainGenerator _GeneratorForColumn(int cx, int cz)
+    {
+        int slot = _GeneratorSlotForColumn(cx, cz);
+        if (slot == 0) return terrainGenerator;
+        return extraGenerators[slot - 1];
+    }
+
+    // Generator slot for a chunks_1D index, computed from the index ALONE so the coordinator can
+    // check slot availability BEFORE the chunk is instantiated. Mirrors Chunk1DToArrrayCoords +
+    // the same column hash used by _GeneratorForColumn, so the gate reservation matches gen time.
+    public int GeneratorSlotForChunkIndex(int chunkIndex)
+    {
+        if (GetGeneratorCount() <= 1) return 0;
+        int ax = chunkIndex % worldDimensionX;
+        int az = chunkIndex / (worldDimensionX * worldDimensionY);
+        int cx = ax - chunkOffsetX;
+        int cz = az - chunkOffsetZ;
+        return _GeneratorSlotForColumn(cx, cz);
+    }
+
     public bool CanStartChunkDataGenerationWithoutExclusiveGenerator(int chunkIndex)
     {
         if (chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length || terrainGenerator == null) return false;
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null) return false;
-        return terrainGenerator.CanCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        return _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world).CanCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
     }
 
     // Called by Coordinator
@@ -3844,9 +4723,20 @@ public class McWorld : UdonSharpBehaviour
 
         // Pass centered chunk coordinates directly - they ARE the Minecraft chunk coordinates
         // Engine centered coords (e.g., -2,-1,0,1) map to Minecraft chunks (-2,-1,0,1)
-        if (!terrainGenerator.CanCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world))
+        McTerrainGenerator gen = _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world);
+        // GPU-RESIDENT (#2 step 2): latch the per-column skip-readback policy before any gen.
+        // All Y-chunks of a column share XZ, so the policy is consistent across the column.
+        gen.gpuSkipReadbackForColumn = _ColumnShouldSkipReadback(chunk);
+        if (gen.gpuSkipReadbackForColumn && gen.CanRepackGpuResidentColumn(chunk.chunkX_world, chunk.chunkZ_world))
         {
-            terrainGenerator.StartChunkGeneration(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            // Sibling of a column this generator already finalized as resident: it repacks its
+            // Y-slice straight from the still-valid column texture in StepChunkDataGeneration —
+            // no exclusive generator, no readback, no re-gen.
+            usesExclusiveGenerator = false;
+        }
+        else if (!gen.CanCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world))
+        {
+            gen.StartChunkGeneration(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
         }
         else
         {
@@ -3861,19 +4751,108 @@ public class McWorld : UdonSharpBehaviour
         return usesExclusiveGenerator;
     }
 
+    // GPU-RESIDENT (#2 step 2): does this chunk's column skip the GPU->CPU readback at gen-time?
+    private bool _ColumnShouldSkipReadback(ChunkData chunk)
+    {
+        if (!gpuSkipReadbackResident || !gpuBackendReady) return false;
+        if (gpuForceAllColumnsSkipReadback)
+        {
+            // Resident for the near region (+1 border ring) ONLY. Far columns stay on the CPU path
+            // so they DON'T flood the atlas and evict the near resident chunks before they render.
+            // The near region (+border) fits in the (expanded) atlas, so resident chunks are pinned.
+            int r = nearRegionRadius + 1;
+            return chunk.chunkX_world >= -r && chunk.chunkX_world <= r
+                && chunk.chunkZ_world >= -r && chunk.chunkZ_world <= r;
+        }
+        return enableGpuResidentChunks && !ChunkNeedsCpuMirror(chunk);
+    }
+
+    // GPU-RESIDENT (#2 step 2): finish a chunk whose column skipped the GPU->CPU readback.
+    // Its blocks live only in the atlas (repacked GPU->GPU from the column final texture); there
+    // is no CPU mirror. Derived caches are intentionally left empty — ApplyRehydratedChunk ->
+    // _RefreshChunkDerivedData rebuilds them when the chunk is rehydrated on approach/meshing.
+    private void _GpuResidentCompleteChunk(ChunkData chunk, McTerrainGenerator gen)
+    {
+        if (gen != null && gen.gpuLastReadbackSource != null)
+        {
+            _GpuRepackChunkSliceToAtlas(chunk, gen.gpuLastReadbackSource);
+        }
+
+        chunk._chunkData = null;
+        chunk._chunkDataKind = ChunkData.CHUNK_KIND_NULL;
+        chunk._cachedDecompressedData = null;
+        chunk._decompCacheValid = false;
+        chunk._isGpuResident = true;
+        chunk._cachedDataVersion++;
+
+        // No CPU block array -> derived flags are unknown until rehydrate. Conservative defaults:
+        // treat as non-empty so the chunk isn't culled as all-air before it's rehydrated.
+        chunk._isAllAir = false;
+        chunk.isSingleOpaqueSolid = false;
+        // Full occupied-bounds so the GPU mesh-from-atlas builder (stage 0) doesn't skip slices.
+        // Without CPU data we don't know the real bounds; the GPU face mask drives what's drawn,
+        // so processing all slices is correct (just skips the bounds optimization).
+        chunk._chunkGlobalMinX = 0; chunk._chunkGlobalMaxX = (byte)(chunkSizeXZ - 1);
+        chunk._chunkGlobalMinY = 0; chunk._chunkGlobalMaxY = (byte)(chunkSizeY - 1);
+        chunk._chunkGlobalMinZ = 0; chunk._chunkGlobalMaxZ = (byte)(chunkSizeXZ - 1);
+
+        _InvalidateNeighborCache(chunk);
+        _StoreBiomeData(chunk);
+
+        // GPU light-sampling state (resident chunks carry no CPU light data).
+        chunk.lightData = null;
+        chunk.isProcessingLighting = false;
+        chunk.lightingPhase = 2;
+        chunk.lightingQueueStart = 0;
+        chunk.lightingQueueEnd = 0;
+        chunk.lightingIteration = 0;
+
+        chunk.isDataReady = true;
+        chunk.isGeneratingData = false;
+
+        // Near-region DATA-READY benchmark (mirror the CPU completion path's counter).
+        if (!_nearGenLogged && _nearGenStartTime >= 0f
+            && chunk.chunkX_world >= -nearRegionRadius && chunk.chunkX_world <= nearRegionRadius
+            && chunk.chunkZ_world >= -nearRegionRadius && chunk.chunkZ_world <= nearRegionRadius)
+        {
+            _nearChunksReady++;
+            int nearTotal = (nearRegionRadius * 2 + 1) * (nearRegionRadius * 2 + 1) * worldDimensionY;
+            if (_nearChunksReady >= nearTotal)
+            {
+                _nearGenLogged = true;
+                float el = Time.realtimeSinceStartup - _nearGenStartTime;
+                Debug.Log("[NEAR_BENCHMARK] " + nearRegionRadius + "-radius region (" + nearTotal + " chunks / "
+                    + ((nearRegionRadius * 2 + 1) * (nearRegionRadius * 2 + 1)) + " columns) DATA-READY in " + el.ToString("F2") + "s");
+            }
+        }
+    }
+
     // Called by Coordinator or ProcessActiveChunks loop
     public void StepChunkDataGeneration(ChunkData chunk)
     {
         if (!chunk.isGeneratingData) return;
 
-        bool useGpuWorldgen = terrainGenerator != null && terrainGenerator.enableGpuWorldgen;
+        McTerrainGenerator gen = _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world);
+        bool useGpuWorldgen = gen != null && gen.enableGpuWorldgen;
         byte[] generatedData = null;
         bool isComplete = false;
         float stepStart = Time.realtimeSinceStartup;
         float stepBudget = useGpuWorldgen ? Mathf.Max(0.5f, adaptiveGpuWorldgenStepBudgetMs) * 0.001f : 0.008f;
         int maxStepsPerFrame = useGpuWorldgen ? Mathf.Max(1, adaptiveGpuWorldgenStepsPerFrame) : 1;
 
-        if (useGpuWorldgen && terrainGenerator.TryCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world, out generatedData))
+        // GPU-RESIDENT (#2 step 2): a sibling of an already-finalized resident column — the
+        // generator is NOT currently mid-gen on this chunk — repacks its Y-slice straight from
+        // the still-valid column texture and is done. No readback, no re-gen.
+        if (useGpuWorldgen
+            && !gen.IsGeneratingChunk(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world)
+            && _ColumnShouldSkipReadback(chunk)
+            && gen.CanRepackGpuResidentColumn(chunk.chunkX_world, chunk.chunkZ_world))
+        {
+            _GpuResidentCompleteChunk(chunk, gen);
+            return;
+        }
+
+        if (useGpuWorldgen && gen.TryCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world, out generatedData))
         {
             isComplete = true;
         }
@@ -3881,7 +4860,7 @@ public class McWorld : UdonSharpBehaviour
         {
             for (int step = 0; step < maxStepsPerFrame; step++)
             {
-                isComplete = terrainGenerator.StepChunkGeneration(out generatedData);
+                isComplete = gen.StepChunkGeneration(out generatedData);
                 if (isComplete) break;
 
                 // Stop if we've used our budget (prevents stutters)
@@ -3891,6 +4870,16 @@ public class McWorld : UdonSharpBehaviour
 
         if (isComplete)
         {
+            // GPU-RESIDENT (#2 step 2): the generator finished a skip-readback column (the
+            // trigger/holder chunk). There is no CPU data — repack from the column texture and
+            // mark the chunk resident, skipping the entire CPU mirror path below (which would
+            // null-deref on generatedData).
+            if (gen.lastChunkGpuResident)
+            {
+                _GpuResidentCompleteChunk(chunk, gen);
+                return;
+            }
+
             // Check homogeneous cheaply — full RLE is deferred
             bool isHomogeneous = true;
             byte firstBlock = generatedData[0];
@@ -3944,7 +4933,35 @@ public class McWorld : UdonSharpBehaviour
 
             if (debugTerrainChecksum) _DebugRecordChunkChecksum(chunk, generatedData);
 
+            if (!_nearGenLogged && _nearGenStartTime >= 0f
+                && chunk.chunkX_world >= -nearRegionRadius && chunk.chunkX_world <= nearRegionRadius
+                && chunk.chunkZ_world >= -nearRegionRadius && chunk.chunkZ_world <= nearRegionRadius)
+            {
+                _nearChunksReady++;
+                int nearTotal = (nearRegionRadius * 2 + 1) * (nearRegionRadius * 2 + 1) * worldDimensionY;
+                if (_nearChunksReady >= nearTotal)
+                {
+                    _nearGenLogged = true;
+                    float el = Time.realtimeSinceStartup - _nearGenStartTime;
+                    Debug.Log("[NEAR_BENCHMARK] " + nearRegionRadius + "-radius region (" + nearTotal + " chunks / "
+                        + ((nearRegionRadius * 2 + 1) * (nearRegionRadius * 2 + 1)) + " columns) DATA-READY in " + el.ToString("F2") + "s");
+                }
+            }
+
             _GpuSyncChunkBlocks(chunk, generatedData);
+
+            // DEBUG (gpuDebugRepackAfterUpload): GPU->GPU repack the same column slice over the
+            // atlas. If the repack mapping is correct the atlas is unchanged (world renders the
+            // same); if wrong, rendering corrupts. Validates the migration's repack before it
+            // replaces the readback path.
+            if (gpuDebugRepackAfterUpload)
+            {
+                McTerrainGenerator repackGen = _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world);
+                if (repackGen != null && repackGen.gpuLastReadbackSource != null)
+                {
+                    _GpuRepackChunkSliceToAtlas(chunk, repackGen.gpuLastReadbackSource);
+                }
+            }
 
             // OPTIMIZATION: Invalidate neighbor cache since chunk data changed
             _InvalidateNeighborCache(chunk);
@@ -3982,6 +4999,18 @@ public class McWorld : UdonSharpBehaviour
             // Mark chunk as ready and data gen complete
             chunk.isDataReady = true;
             chunk.isGeneratingData = false;
+
+            // GPU OFFLOAD #2 (step 1): drop the CPU block mirror for chunks the CPU won't touch
+            // soon (outside cpuMirrorRadius). Derived caches + atlas sync are already done above;
+            // CPU reads rehydrate on demand, GPU meshing uses the atlas + the kept derived caches.
+            if (enableGpuResidentChunks && !ChunkNeedsCpuMirror(chunk))
+            {
+                chunk._chunkData = null;
+                chunk._chunkDataKind = ChunkData.CHUNK_KIND_NULL;
+                chunk._cachedDecompressedData = null;
+                chunk._decompCacheValid = false;
+                chunk._isGpuResident = true;
+            }
 #if LOGGING
             chunk.profile_dataReadyTime = Time.realtimeSinceStartup;
             chunk.profile_waitingForFirstMesh = true;
@@ -4064,6 +5093,104 @@ public class McWorld : UdonSharpBehaviour
             if (_dbgCsDone[i]) { sum += _dbgCsHash[i]; done++; }
         }
         Debug.Log("[TERRAIN_FP] sum=" + sum + " done=" + done + "/" + _dbgCsN);
+    }
+
+    // --- Rehydrate round-trip self-test: null the sample chunks' CPU mirror, rehydrate from
+    // the atlas, and compare. Validates the ApplyRehydratedChunk unpack (channel/orientation). ---
+    private uint[] _dbgRehydOrig; private int[] _dbgRehydIdx; private int _dbgRehydN;
+
+    private uint _DbgFnvBlocks(byte[] d, ChunkData c)
+    {
+        uint h = 2166136261u;
+        h = (h ^ (uint)(c.chunkX_world & 0xFF)) * 16777619u;
+        h = (h ^ (uint)(c.chunkY_world & 0xFF)) * 16777619u;
+        h = (h ^ (uint)(c.chunkZ_world & 0xFF)) * 16777619u;
+        for (int k = 0; k < d.Length; k++) h = (h ^ (uint)d[k]) * 16777619u;
+        return h;
+    }
+
+    public void DebugRehydrateStart()
+    {
+        if (_dbgCsCx == null) _DebugInitChecksumSet();
+        _dbgRehydOrig = new uint[_dbgCsN];
+        _dbgRehydIdx = new int[_dbgCsN];
+        _dbgRehydN = 0;
+        for (int i = 0; i < _dbgCsN; i++)
+        {
+            ChunkData c = GetChunkAt(_dbgCsCx[i], _dbgCsCy[i], _dbgCsCz[i]);
+            if (c == null || !c.isDataReady) continue;
+            byte[] d = _GetDecompressedData(c);
+            if (d == null) continue;
+            int ci = ChunkCenteredCoordsTo1D(c.chunkX_world, c.chunkY_world, c.chunkZ_world);
+            _dbgRehydOrig[_dbgRehydN] = _DbgFnvBlocks(d, c);
+            _dbgRehydIdx[_dbgRehydN] = ci;
+            _dbgRehydN++;
+            // Drop the CPU mirror and request a rehydrate from the atlas.
+            c._chunkData = null; c._chunkDataKind = ChunkData.CHUNK_KIND_NULL;
+            c._cachedDecompressedData = null; c._decompCacheValid = false;
+            c._isGpuResident = true;
+            _GpuRequestRehydrate(c);
+        }
+        Debug.Log("[REHYD_TEST] started: nulled+requested " + _dbgRehydN + " chunks. Call DebugRehydrateCheck after a few frames.");
+    }
+
+    public void DebugRehydrateCheck()
+    {
+        int ok = 0, bad = 0, pending = 0;
+        for (int i = 0; i < _dbgRehydN; i++)
+        {
+            int ci = _dbgRehydIdx[i];
+            if (chunks_1D == null || ci < 0 || ci >= chunks_1D.Length) continue;
+            ChunkData c = chunks_1D[ci];
+            if (c == null) continue;
+            if (c._isGpuResident || !c._decompCacheValid || c._cachedDecompressedData == null) { pending++; continue; }
+            uint h = _DbgFnvBlocks(c._cachedDecompressedData, c);
+            if (h == _dbgRehydOrig[i]) ok++; else bad++;
+        }
+        Debug.Log("[REHYD_TEST] ok=" + ok + " bad=" + bad + " pending=" + pending + " / " + _dbgRehydN
+            + (bad == 0 && pending == 0 && _dbgRehydN > 0 ? "  <-- UNPACK CORRECT" : ""));
+    }
+
+    // GPU-RESIDENT (#2 step 2) validation: request a rehydrate for every sample chunk that is
+    // still GPU-resident (skip-readback chunks that never had a CPU mirror). The rehydrate queue
+    // drains over the next few frames via GpuMaintainRehydrationQueue.
+    public void DebugRehydrateResidentSample()
+    {
+        if (_dbgCsCx == null) _DebugInitChecksumSet();
+        int n = 0, ready = 0;
+        for (int i = 0; i < _dbgCsN; i++)
+        {
+            ChunkData c = GetChunkAt(_dbgCsCx[i], _dbgCsCy[i], _dbgCsCz[i]);
+            if (c == null || !c.isDataReady) continue;
+            ready++;
+            if (!c._isGpuResident) continue;
+            _GpuRequestRehydrate(c);
+            n++;
+        }
+        Debug.Log("[REHYD_SAMPLE] requested rehydrate for " + n + " resident / " + ready + " ready / " + _dbgCsN + " sample chunks");
+    }
+
+    // GPU-RESIDENT (#2 step 2) validation: compute the terrain fingerprint from the CURRENT
+    // (live) block data of the sample chunks — works for rehydrated resident chunks whose data
+    // came from the GPU->GPU repack + atlas, not the gen-time readback. Compare to the CPU-path
+    // reference 2213895521 to confirm the skip-readback path is byte-correct end-to-end.
+    public void DebugLogLiveTerrainFingerprint()
+    {
+        if (_dbgCsCx == null) _DebugInitChecksumSet();
+        uint sum = 0; int done = 0, resident = 0, missing = 0;
+        for (int i = 0; i < _dbgCsN; i++)
+        {
+            ChunkData c = GetChunkAt(_dbgCsCx[i], _dbgCsCy[i], _dbgCsCz[i]);
+            if (c == null || !c.isDataReady) { missing++; continue; }
+            if (c._isGpuResident) { resident++; continue; }
+            byte[] d = _GetDecompressedData(c);
+            if (d == null) { missing++; continue; }
+            sum += _DbgFnvBlocks(d, c);
+            done++;
+        }
+        Debug.Log("[TERRAIN_FP_LIVE] sum=" + sum + " done=" + done + "/" + _dbgCsN
+            + " stillResident=" + resident + " missing=" + missing
+            + (done == _dbgCsN && sum == 2213895521 ? "  <-- MATCHES CPU REFERENCE" : ""));
     }
 
     // FIXED: Called by Coordinator to start incremental lighting (STATE_LIGHTING)
@@ -4951,7 +6078,22 @@ public class McWorld : UdonSharpBehaviour
         return !_GpuFaceExtractionReady() || _GpuHasAvailableReadbackBuffer();
     }
 
+    // Lenient: treats unallocated (null) in-world neighbours as ready (mesh now with an air
+    // boundary, heal later). The coordinator uses this as the deadlock fallback when all workers
+    // are stuck waiting and none is free to instantiate the missing neighbour.
+    public bool AreAllNeighborsReadyLenient(int chunkIndex)
+    {
+        return _NeighborsReady(chunkIndex, false);
+    }
+
+    // Default: strict when requireAllNeighborsForMesh is on (wait for unallocated in-world
+    // neighbours too, so boundary faces cull correctly with no draw-now-heal-later walls).
     public bool AreAllNeighborsReady(int chunkIndex)
+    {
+        return _NeighborsReady(chunkIndex, requireAllNeighborsForMesh);
+    }
+
+    private bool _NeighborsReady(int chunkIndex, bool strict)
     {
         if (chunkIndex == -1) return false;
         ChunkData chunk = chunks_1D[chunkIndex];
@@ -4964,16 +6106,19 @@ public class McWorld : UdonSharpBehaviour
             int n_cz = chunk.chunkZ_world + neighbor_dz_offsets[i];
 
             int neighbor_1D_index = ChunkCenteredCoordsTo1D(n_cx, n_cy, n_cz);
-            if (neighbor_1D_index == -1) continue;
+            if (neighbor_1D_index == -1) continue; // out of world — no neighbour, treated as ready
 
             ChunkData neighborChunk = GetChunkAt(n_cx, n_cy, n_cz);
 
-            // Null (unallocated) neighbors are deliberately treated as ready
-            // to avoid deadlocking the coordinator — all worker slots can be stuck
-            // in STATE_WAITING_FOR_MESH while no idle worker can instantiate
-            // the missing neighbor. The mesh is built with air on that boundary
-            // and _borderMissingMask is set so the heal loop fixes it later.
-            if (neighborChunk != null && !neighborChunk.isDataReady) return false;
+            if (neighborChunk == null)
+            {
+                // Unallocated in-world neighbour. Strict: wait for it (clean culling once it
+                // generates). Lenient: treat as ready (mesh with air boundary, heal later) —
+                // the deadlock-avoidance fallback. See AreAllNeighborsReady* callers.
+                if (strict) return false;
+                continue;
+            }
+            if (!neighborChunk.isDataReady) return false;
         }
         return true;
     }
@@ -5005,6 +6150,19 @@ public class McWorld : UdonSharpBehaviour
         int dy = Mathf.Abs(chunk.chunkY_world - playerChunkY);
         int dz = Mathf.Abs(chunk.chunkZ_world - playerChunkZ);
         return dx <= shellMeshPriorityRadiusXZ && dz <= shellMeshPriorityRadiusXZ && dy <= shellMeshPriorityRadiusY;
+    }
+
+    // MESH RENDER DISTANCE: is this chunk's column within meshRenderDistanceChunksXZ of the player?
+    // Used to cap INITIAL meshing to the visible set; farther chunks defer until the player nears
+    // them. No Y cap — the world is short and fully-buried interiors already defer via
+    // _ShouldPrioritizeChunkMesh. Returns true (no cap) when disabled or the player isn't known yet.
+    private bool _IsChunkWithinMeshRenderDistance(ChunkData chunk)
+    {
+        if (!enableMeshRenderDistanceCull || meshRenderDistanceChunksXZ <= 0 || chunk == null) return true;
+        if (!_TryGetPlayerChunkCoords(out int pcx, out int pcy, out int pcz)) return true;
+        int dx = Mathf.Abs(chunk.chunkX_world - pcx);
+        int dz = Mathf.Abs(chunk.chunkZ_world - pcz);
+        return dx <= meshRenderDistanceChunksXZ && dz <= meshRenderDistanceChunksXZ;
     }
 
     // GPU OFFLOAD #1: Radius beyond which a chunk does NOT need a CPU mirror of its blocks.
@@ -5094,13 +6252,67 @@ public class McWorld : UdonSharpBehaviour
 
     #region Mesh Building Logic (Moved from McChunk)
 
+    // WATCHDOG: called by the coordinator when a worker has sat in STATE_MESHING far too long
+    // (a build that never completes — e.g. a wedged GPU readback/build). Releases EVERY resource
+    // the stuck build could be holding (the GPU face-build buffer AND the mesh-pool slot) and
+    // clears the build flags, so the worker frees and the pool/buffers can't deadlock. The chunk
+    // is left un-meshed; the normal deferred-mesh scan re-queues it. Workers can never hang.
+    public void ForceCompleteStuckMesh(int chunkIndex)
+    {
+        if (chunks_1D == null || chunkIndex < 0 || chunkIndex >= chunks_1D.Length) return;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk == null) return;
+        Debug.LogWarning("[McWorld] Mesh watchdog force-released a stuck build at chunk ("
+            + chunk.chunkX_world + "," + chunk.chunkY_world + "," + chunk.chunkZ_world
+            + ") resident=" + chunk._isGpuResident + " faceBuildActive=" + chunk._gpuFaceBuildActive
+            + " stage=" + chunk._gpuFaceBuildStage + " poolSlot=" + chunk._meshPoolSlot);
+        if (chunk._gpuFaceBuildActive) _ReleaseGpuFaceBuildBuffer(chunk);
+        _ReleaseMeshPool(chunk);
+        chunk._gpuFaceBuildActive = false;
+        chunk._gpuMeshPending = false;
+        chunk.isBuildingMesh = false;
+        chunk.interactionMeshPriority = false;
+    }
+
     public void BuildChunkMesh(int chunkIndex)
     {
         if (chunkIndex == -1) return;
         ChunkData chunk = chunks_1D[chunkIndex];
-        if (chunk == null || chunk.isBuildingMesh || chunk._chunkData == null) return;
+        if (chunk == null || chunk.isBuildingMesh) return;
+
+        // (c) GPU instanced voxel render: a resident chunk (blocks live only in the atlas) renders
+        // straight from the atlas via per-voxel instancing — no CPU mesh, no face readback, no build
+        // wedge. Mark it + complete immediately (isBuildingMesh stays false) so the worker frees and
+        // the chunk counts done; the per-frame driver issues its DrawMeshInstanced. Player edits
+        // (interactionMeshPriority) still take the normal path so the edit re-meshes accurately.
+        if (enableInstancedVoxelRender && gpuVoxelInstancedMaterial != null
+            && chunk._isGpuResident && chunk._chunkData == null && !chunk.interactionMeshPriority)
+        {
+            bool wasInstanced = chunk._isInstancedRendered;
+            chunk._isInstancedRendered = true;
+            chunk.isMeshDeferred = false;
+            chunk.isBuildingMesh = false;
+            if (!wasInstanced) _GpuRegisterInstancedChunk(chunkIndex);
+            return;
+        }
+        // (b) GPU mesh-from-atlas: a resident chunk has no CPU mirror — it builds its mesh from
+        // the atlas (GPU face extract, cross-slot neighbours). Otherwise _chunkData is required.
+        bool residentMeshFromAtlas = chunk._chunkData == null && chunk._isGpuResident
+            && gpuResidentMeshFromAtlas && _GpuFaceExtractionReady() && !chunk.interactionMeshPriority;
+        if (chunk._chunkData == null && !residentMeshFromAtlas) return;
 
         bool interactionPriority = chunk.interactionMeshPriority;
+
+        // MESH RENDER DISTANCE cap: don't spend a mesh build on a far chunk the player can't see —
+        // defer it until they approach (the deferred-mesh scan re-meshes it once it's in range).
+        // Player edits (interactionMeshPriority) and explicit rebuilds bypass so they always update.
+        // This caps INITIAL meshing from the whole 32x32 world to the visible set — the main load win.
+        if (!interactionPriority && !chunk.pendingChunkMeshRebuild && !_IsChunkWithinMeshRenderDistance(chunk))
+        {
+            chunk.isBuildingMesh = false;
+            MarkChunkMeshDeferred(chunkIndex);
+            return;
+        }
 #if LOGGING
         if (enableDetailedTimings && chunk.profile_waitingForFirstMesh)
         {
@@ -5202,7 +6414,7 @@ public class McWorld : UdonSharpBehaviour
         }
 
         byte[] chunkData = _GetDecompressedData(chunk);
-        if (chunkData == null)
+        if (chunkData == null && !residentMeshFromAtlas)
         {
             chunk.isBuildingMesh = false;
             chunk.interactionMeshPriority = false;
@@ -5221,22 +6433,54 @@ public class McWorld : UdonSharpBehaviour
             stats_meshInteractionPriorityCpuBypass++;
         }
 #endif
-        if (!interactionPriority && gpuFaceExtractionReady)
+        if ((!interactionPriority && gpuFaceExtractionReady) || residentMeshFromAtlas)
         {
+            // BATCHED readback: accumulate this background chunk into a shared batch (one blit +
+            // one readback for many chunks). Resident/interaction chunks keep the per-chunk path.
+            if (enableBatchedFaceReadback && !residentMeshFromAtlas)
+            {
+                int batchBuf = _GpuFindAvailableReadbackBuffer();
+                if (batchBuf != -1 && _GpuTryAccumulateBatchChunk(chunk, batchBuf))
+                {
+                    return; // mesh will be built when the batch readback completes
+                }
+                // No free buffer / no free in-flight batch / incomplete borders → defer + retry,
+                // matching the single-path busy/border-defer behaviour.
+#if LOGGING
+                if (enableDetailedTimings) stats_meshGpuBusyDefers++;
+#endif
+                chunk._gpuMeshPending = true;
+                chunk.isBuildingMesh = false;
+                chunk.interactionMeshPriority = false;
+                MarkChunkMeshDeferred(chunkIndex);
+                return;
+            }
+
             int gpuReadbackBufferIndex = _GpuFindAvailableReadbackBuffer();
             if (gpuReadbackBufferIndex != -1)
             {
-                _GpuSyncChunkBlocks(chunk, chunkData);
-                _GpuPackBorderData(chunk, gpuReadbackBufferIndex);
-                if (_ShouldDeferIncompleteBackgroundMesh(chunk, chunk._borderMissingMask))
+                if (residentMeshFromAtlas)
                 {
+                    // (b) Blocks already live in the atlas (repacked at gen time). Read neighbours
+                    // cross-slot from the atlas; no CPU sync / border pack. Missing neighbours are
+                    // handled as air by the cross-slot path, so no border-defer.
+                    gpuFaceExtractMaterial.SetFloat(gpuPropUseCrossSlotId, 1f);
+                }
+                else
+                {
+                    _GpuSyncChunkBlocks(chunk, chunkData);
+                    _GpuPackBorderData(chunk, gpuReadbackBufferIndex);
+                    gpuFaceExtractMaterial.SetFloat(gpuPropUseCrossSlotId, 0f);
+                    if (_ShouldDeferIncompleteBackgroundMesh(chunk, chunk._borderMissingMask))
+                    {
 #if LOGGING
-                    if (enableDetailedTimings) stats_meshGpuBorderDefers++;
+                        if (enableDetailedTimings) stats_meshGpuBorderDefers++;
 #endif
-                    chunk.isBuildingMesh = false;
-                    chunk.interactionMeshPriority = false;
-                    MarkChunkMeshDeferred(chunkIndex);
-                    return;
+                        chunk.isBuildingMesh = false;
+                        chunk.interactionMeshPriority = false;
+                        MarkChunkMeshDeferred(chunkIndex);
+                        return;
+                    }
                 }
                 // GPU OFFLOAD #3: try GPU bake first; fall back to CPU if material missing.
                 if (!_GpuBakeBiomeColors(chunk)) _PreComputeBiomeColors(chunk);
@@ -5256,6 +6500,16 @@ public class McWorld : UdonSharpBehaviour
                 if (enableDetailedTimings) stats_meshGpuBusyDefers++;
 #endif
                 chunk._gpuMeshPending = true;
+            }
+            // (b) Resident chunks have no CPU mirror — never fall through to the CPU mesh path
+            // below (it needs _chunkData). If the GPU request couldn't be issued this frame,
+            // defer + retry via BuildChunkMesh (which handles resident).
+            if (residentMeshFromAtlas)
+            {
+                chunk.isBuildingMesh = false;
+                chunk.interactionMeshPriority = false;
+                MarkChunkMeshDeferred(chunkIndex);
+                return;
             }
         }
 
@@ -6377,6 +7631,67 @@ public class McWorld : UdonSharpBehaviour
         return true;
     }
 
+    // ao level 0..3 (3=unoccluded) -> per-corner brightness byte. Minecraft-style ~0.2/occluder.
+    private readonly byte[] aoLevelBrightness = { 102, 153, 204, 255 };
+
+    // Is the block at chunk-local (lx,ly,lz) a full opaque cube that casts AO? Out-of-bounds by one
+    // axis reads the pre-decompressed neighbour arrays (_decompNX/PX/...); chunk corners (2 axes out)
+    // and unloaded neighbours are treated as air (no AO) — only a minor seam at chunk corners.
+    private bool _AoBlockOccludes(ChunkData chunk, int lx, int ly, int lz)
+    {
+        int SX = chunkSizeXZ;
+        int SY = chunkSizeY;
+        int stride = SX * SX;
+        byte b;
+        if (lx >= 0 && lx < SX && ly >= 0 && ly < SY && lz >= 0 && lz < SX)
+        {
+            byte[] self = chunk._decompSelf;
+            if (self == null) return false;
+            b = self[ly * stride + lz * SX + lx];
+        }
+        else
+        {
+            byte[] nb;
+            int nx = lx, ny = ly, nz = lz;
+            if (lx < 0) { nb = chunk._decompNX; nx = SX - 1; }
+            else if (lx >= SX) { nb = chunk._decompPX; nx = 0; }
+            else if (ly < 0) { nb = chunk._decompNY; ny = SY - 1; }
+            else if (ly >= SY) { nb = chunk._decompPY; ny = 0; }
+            else if (lz < 0) { nb = chunk._decompNZ; nz = SX - 1; }
+            else { nb = chunk._decompPZ; nz = 0; }
+            if (nb == null) return false;
+            if (nx < 0 || nx >= SX || ny < 0 || ny >= SY || nz < 0 || nz >= SX) return false; // chunk corner (2 axes out)
+            b = nb[ny * stride + nz * SX + nx];
+        }
+        return b != 0 && b < visibilityCache.Length && visibilityCache[b] == BlockVisibilityType.Opaque;
+    }
+
+    // Pure geometric AO (light-independent): for each of the 4 face corners, darken by the count of
+    // solid neighbours among {side1, side2, diagonal}. Packs 4 corner brightness bytes into an int in
+    // the same format as _BuildAoSignature, so the greedy merge + _AddGreedyQuad (vertex-alpha bake)
+    // and _UnpackAoBrightness all work unchanged. The shader multiplies a GPU light sample by this.
+    private int _BuildGeometricAoSignature(ChunkData chunk, int direction, int localX, int localY, int localZ)
+    {
+        int nX = aoNormalX[direction], nY = aoNormalY[direction], nZ = aoNormalZ[direction];
+        int uX = aoTangentUX[direction], uY = aoTangentUY[direction], uZ = aoTangentUZ[direction];
+        int vX = aoTangentVX[direction], vY = aoTangentVY[direction], vZ = aoTangentVZ[direction];
+        int fx = localX + nX, fy = localY + nY, fz = localZ + nZ; // air block in front of the face
+        int signBase = direction * 4;
+        int sig = 0;
+        for (int c = 0; c < 4; c++)
+        {
+            int su = aoCornerUSigns[signBase + c];
+            int sv = aoCornerVSigns[signBase + c];
+            bool side1 = _AoBlockOccludes(chunk, fx + su * uX, fy + su * uY, fz + su * uZ);
+            bool side2 = _AoBlockOccludes(chunk, fx + sv * vX, fy + sv * vY, fz + sv * vZ);
+            bool corner = _AoBlockOccludes(chunk, fx + su * uX + sv * vX, fy + su * uY + sv * vY, fz + su * uZ + sv * vZ);
+            int level = (side1 && side2) ? 0 : (3 - (side1 ? 1 : 0) - (side2 ? 1 : 0) - (corner ? 1 : 0));
+            if (level < 0) level = 0;
+            sig |= ((int)aoLevelBrightness[level]) << (c * 8);
+        }
+        return sig;
+    }
+
     private int _BuildAoSignature(ChunkData chunk, byte blockID, int direction, int localX, int localY, int localZ)
     {
         if (!_UsesCpuAmbientOcclusion()) return 0;
@@ -7346,7 +8661,7 @@ public class McWorld : UdonSharpBehaviour
         byte[] lightLevels = greedyMaskLightLevels;
         int[] packedColors = greedyMaskPackedColors;
         int[] aoSignatures = greedyMaskAoSignatures;
-        bool useAo = _UsesCpuAmbientOcclusion();
+        bool useAo = _UsesCpuAmbientOcclusion() || _UsesBakedVertexAo();
         bool constantLight = _greedyConstantLight;
 
         for (int v = minV; v <= maxV; v++)
@@ -8694,6 +10009,12 @@ public class McWorld : UdonSharpBehaviour
         if (enableCacheTracking) stats_decompCacheMisses++;
 #endif
 
+        if (chunk._isGpuResident)
+        {
+            if (!chunk._gpuMirrorRehydratePending) _GpuRequestRehydrate(chunk);
+            return chunk._cachedDecompressedData; // null/stale until the atlas readback completes
+        }
+
         byte[] decompressed = _DecompressChunkColumnRLE(chunk);
         chunk._cachedDecompressedData = decompressed;
         chunk._decompCacheValid = true;
@@ -8921,10 +10242,18 @@ public class McWorld : UdonSharpBehaviour
         if (enableCounters) stats_getBlockCalls++;
 #endif
 
-        // GPU OFFLOAD #2 NOTE: The "return 0 for GPU-resident chunks" path was removed.
-        // No chunk is currently marked GPU-resident (see chunk completion logic). The
-        // rehydration queue + _GpuRequestRehydrate helper are kept for when the full
-        // GPU-resident path lands.
+        // GPU OFFLOAD #2: GPU-resident chunks have no CPU block mirror. Queue an async rehydrate
+        // from the atlas; serve the cache once available (else air until the readback completes).
+        if (chunk._isGpuResident)
+        {
+            if (!chunk._gpuMirrorRehydratePending) _GpuRequestRehydrate(chunk);
+            if (chunk._decompCacheValid && chunk._cachedDecompressedData != null
+                && x >= 0 && x < chunkSizeXZ && y >= 0 && y < chunkSizeY && z >= 0 && z < chunkSizeXZ)
+            {
+                return chunk._cachedDecompressedData[y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x];
+            }
+            return 0;
+        }
 
         if (chunk._chunkData == null || !chunk.isDataReady) return 0;
         if (x < 0 || x >= chunkSizeXZ || y < 0 || y >= chunkSizeY || z < 0 || z >= chunkSizeXZ) return 0;
@@ -11339,7 +12668,7 @@ public class McWorld : UdonSharpBehaviour
 
         // Request the current biome data from terrain generator
         // The terrain generator should have this cached for the current chunk
-        terrainGenerator.GetBiomeDataForChunk(chunk.chunkX_world, chunk.chunkZ_world, chunk._biomeTemperatures, chunk._biomeRainfall);
+        _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world).GetBiomeDataForChunk(chunk.chunkX_world, chunk.chunkZ_world, chunk._biomeTemperatures, chunk._biomeRainfall);
         chunk._cachedBiomeColorsValid = false;
     }
 
@@ -11941,21 +13270,75 @@ public class McWorld : UdonSharpBehaviour
 
     private void _GpuRehydrateInline(ChunkData chunk)
     {
-        // Allocate the CPU mirror if missing.
-        int chunkBytes = chunkSizeXZ * chunkSizeXZ * chunkSizeY;
-        if (chunk._cachedDecompressedData == null || chunk._cachedDecompressedData.Length != chunkBytes)
-        {
-            chunk._cachedDecompressedData = new byte[chunkBytes];
-        }
+        // Issue a region readback of the chunk's atlas slot. McWorld is the receiver; the
+        // kind FIFO routes the completion to _HandleRehydrateCompletion, which unpacks via
+        // ApplyRehydratedChunk into _cachedDecompressedData.
+        if (!gpuBackendReady || gpuBlockAtlas == null || _gpuRehydratePixels == null) return;
+        if (_rehydrateInflightCount >= REHYDRATE_INFLIGHT_CAP || _readbackKindCount >= READBACK_KIND_CAP - 1) return;
+        int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        if (chunkIndex < 0) return;
+        int slot = (gpuChunkIndexToSlot != null && chunkIndex < gpuChunkIndexToSlot.Length) ? gpuChunkIndexToSlot[chunkIndex] : -1;
+        if (slot < 0 || slot >= gpuChunkSlotCapacity) return;
+        int tileX = slot % gpuAtlasSlotsX;
+        int tileY = slot / gpuAtlasSlotsX;
+        VRCAsyncGPUReadback.Request(gpuBlockAtlas, 0, tileX * gpuTileWidth, gpuTileWidth, tileY * gpuTileHeight, gpuTileHeight, 0, 1, TextureFormat.RGBA32, (IUdonEventReceiver)this);
+        _rehydrateInflightChunk[_rehydrateInflightTail] = chunkIndex;
+        _rehydrateInflightTail = (_rehydrateInflightTail + 1) % REHYDRATE_INFLIGHT_CAP;
+        _rehydrateInflightCount++;
+        _readbackKind[_readbackKindTail] = 1; // REHYDRATE
+        _readbackKindTail = (_readbackKindTail + 1) % READBACK_KIND_CAP;
+        _readbackKindCount++;
+    }
 
-        // For now, if face-extract has already populated the chunk via the existing
-        // readback path, just mark the cache valid. The full atlas → CPU bytes readback
-        // would require a dedicated shader pass to repack from the atlas tile back to
-        // chunk-local byte order; that's out of scope here. Inline rehydration is a
-        // safety net — most chunks will already have a CPU mirror from worldgen.
+    private void _HandleRehydrateCompletion(VRCAsyncGPUReadbackRequest request)
+    {
+        if (_rehydrateInflightCount <= 0) return;
+        int chunkIndex = _rehydrateInflightChunk[_rehydrateInflightHead];
+        _rehydrateInflightHead = (_rehydrateInflightHead + 1) % REHYDRATE_INFLIGHT_CAP;
+        _rehydrateInflightCount--;
+        if (request.hasError) { OnChunkRehydrateFailed(chunkIndex); return; }
+        if (!request.TryGetData(_gpuRehydratePixels, 0)) { OnChunkRehydrateFailed(chunkIndex); return; }
+        ApplyRehydratedChunk(chunkIndex, _gpuRehydratePixels);
+    }
+
+    // Async-readback completion: unpack the atlas-slot pixels (1 block per pixel, id in R)
+    // back into the chunk's CPU mirror. Layout mirrors _GpuSyncChunkBlocks' upload row order
+    // (row = y*chunkSizeXZ + z, columns = x). Block id in R is validated by the fingerprint harness.
+    public void ApplyRehydratedChunk(int chunkIndex, Color32[] pixels)
+    {
+        if (chunks_1D == null || chunkIndex < 0 || chunkIndex >= chunks_1D.Length || pixels == null) return;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk == null) return;
+        int stride = chunkSizeXZ * chunkSizeXZ;
+        int chunkBytes = stride * chunkSizeY;
+        if (chunk._cachedDecompressedData == null || chunk._cachedDecompressedData.Length != chunkBytes)
+            chunk._cachedDecompressedData = new byte[chunkBytes];
+        byte[] data = chunk._cachedDecompressedData;
+        int w = gpuTileWidth;
+        for (int y = 0; y < chunkSizeY; y++)
+        {
+            for (int z = 0; z < chunkSizeXZ; z++)
+            {
+                int pixBase = (y * chunkSizeXZ + z) * w;
+                int dataBase = y * stride + z * chunkSizeXZ;
+                for (int x = 0; x < chunkSizeXZ; x++)
+                {
+                    data[dataBase + x] = pixels[pixBase + x].r;
+                }
+            }
+        }
         chunk._decompCacheValid = true;
+        chunk._cachedDataVersion++;
         chunk._isGpuResident = false;
         chunk._gpuMirrorRehydratePending = false;
+        _RefreshChunkDerivedData(chunk, data);
+    }
+
+    public void OnChunkRehydrateFailed(int chunkIndex)
+    {
+        if (chunks_1D == null || chunkIndex < 0 || chunkIndex >= chunks_1D.Length) return;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk != null) chunk._gpuMirrorRehydratePending = false; // leave _isGpuResident so a later access retries
     }
 
     // GPU OFFLOAD #6: Localized light poke for a single block change. Runs N iterations

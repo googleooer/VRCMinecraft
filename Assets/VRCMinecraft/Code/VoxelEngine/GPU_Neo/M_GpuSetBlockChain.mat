@@ -115,18 +115,18 @@ Material:
     - _GlossMapScale: 1
     - _Glossiness: 0.5
     - _GlossyReflections: 1
-    - _LocalX: 4
-    - _LocalY: 6
-    - _LocalZ: 1
+    - _LocalX: 1
+    - _LocalY: 15
+    - _LocalZ: 11
     - _Metallic: 0
     - _Mode: 0
-    - _NewBlockId: 51
+    - _NewBlockId: 0
     - _OcclusionStrength: 1
     - _Parallax: 0.02
     - _SelfChunkX: 0
     - _SelfChunkY: 0
     - _SelfChunkZ: 0
-    - _SlotIndex: 3
+    - _SlotIndex: 23
     - _SmoothnessTextureChannel: 0
     - _SpecularHighlights: 1
     - _SrcBlend: 1
