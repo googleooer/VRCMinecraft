@@ -121,6 +121,14 @@ public class McCoordinator : UdonSharpBehaviour
     // Detailed timing metrics
     private float time_UpdateWorkers;
     private float time_AssignWork;
+    // TEMP instrumentation: sub-timers to pinpoint what dominates "assign work" (the data-gen
+    // assignment phase). Remove once the 35ms is diagnosed.
+    private float time_AssignPick;      // _TryPickDataGenPosition (the position scan + its cross-VM calls)
+    private float time_AssignStartGen;  // world.StartChunkDataGeneration (new exclusive column setup)
+    private float time_AssignStepGen;   // world.StepChunkDataGeneration for cached-sibling chunks (~line 817)
+    private int assign_PickCalls;
+    private int assign_NewColumns;
+    private int assign_SiblingSteps;
     private float time_RebuildQueue;
     private float time_WorldGen;
     private float time_TotalCycle;
@@ -228,6 +236,20 @@ public class McCoordinator : UdonSharpBehaviour
     // are picked before any later column that would reuse the same generator, so the single-column
     // cache is never evicted out from under un-drained siblings.
     private bool _TryPickDataGenPosition()
+    {
+#if LOGGING
+        if (!enableDetailedTimings && !enableAggregateLogging) return _TryPickDataGenPositionImpl();
+        System.DateTime _pickT = System.DateTime.UtcNow;
+        bool _pickR = _TryPickDataGenPositionImpl();
+        time_AssignPick += (float)(System.DateTime.UtcNow - _pickT).TotalMilliseconds;
+        assign_PickCalls++;
+        return _pickR;
+#else
+        return _TryPickDataGenPositionImpl();
+#endif
+    }
+
+    private bool _TryPickDataGenPositionImpl()
     {
         if (radialChunkOrder == null || _positionAssigned == null) return false;
         // THROTTLE: how many NEW worldgen columns may be in flight concurrently. Each new column holds
@@ -792,7 +814,13 @@ public class McCoordinator : UdonSharpBehaviour
                 {
                     worker_targetChunkIndex[i] = newChunkIndex;
                     worker_state[i] = STATE_DATA_GEN;
+#if LOGGING
+                    System.DateTime _startGenT = (enableDetailedTimings || enableAggregateLogging) ? System.DateTime.UtcNow : System.DateTime.MinValue;
+#endif
                     worker_usesExclusiveGenerator[i] = world.StartChunkDataGeneration(newChunkIndex);
+#if LOGGING
+                    if (enableDetailedTimings || enableAggregateLogging) { time_AssignStartGen += (float)(System.DateTime.UtcNow - _startGenT).TotalMilliseconds; assign_NewColumns++; }
+#endif
                     worker_isDeferredMeshWake[i] = false;
                     if (worker_usesExclusiveGenerator[i])
                     {
@@ -814,7 +842,13 @@ public class McCoordinator : UdonSharpBehaviour
                         ChunkData assignedChunk = chunks != null && newChunkIndex >= 0 && newChunkIndex < chunksLen ? chunks[newChunkIndex] : null;
                         if (assignedChunk != null && assignedChunk.isGeneratingData)
                         {
+#if LOGGING
+                            System.DateTime _stepGenT = (enableDetailedTimings || enableAggregateLogging) ? System.DateTime.UtcNow : System.DateTime.MinValue;
+#endif
                             world.StepChunkDataGeneration(assignedChunk);
+#if LOGGING
+                            if (enableDetailedTimings || enableAggregateLogging) { time_AssignStepGen += (float)(System.DateTime.UtcNow - _stepGenT).TotalMilliseconds; assign_SiblingSteps++; }
+#endif
 
                             if (!assignedChunk.isGeneratingData)
                             {
@@ -941,6 +975,11 @@ public class McCoordinator : UdonSharpBehaviour
         sb.AppendLine("Coordinator:");
         sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms, update workers {2:F3}ms, assign work {3:F3}ms\n",
             cycles_Processed, avgCycle, avgUpdate, avgAssign);
+        sb.AppendFormat("  Assign breakdown (per cycle): pick {0:F3}ms ({1} calls), startGen {2:F3}ms ({3} cols), siblingStep {4:F3}ms ({5}), rest {6:F3}ms\n",
+            time_AssignPick / cycles_Processed, assign_PickCalls,
+            time_AssignStartGen / cycles_Processed, assign_NewColumns,
+            time_AssignStepGen / cycles_Processed, assign_SiblingSteps,
+            (time_AssignWork - time_AssignPick - time_AssignStartGen - time_AssignStepGen) / cycles_Processed);
         sb.AppendFormat("  Worker completions: data {0}, mesh {1}, deferred {2}, rebuilds {3}, deferred wakes {4}, world assigns {5}\n",
             workers_DataGenCompleted, workers_MeshCompleted, workers_MeshDeferred, rebuilds_Processed, deferredMeshWakeAssignments, worldChunks_Assigned);
         sb.AppendFormat("  Peaks: active {0}/{1}, data {2}, meshing {3}, rebuild queue {4}/{5}, deferred queue {6}/{7}\n",
@@ -954,6 +993,12 @@ public class McCoordinator : UdonSharpBehaviour
     {
         time_UpdateWorkers = 0f;
         time_AssignWork = 0f;
+        time_AssignPick = 0f;
+        time_AssignStartGen = 0f;
+        time_AssignStepGen = 0f;
+        assign_PickCalls = 0;
+        assign_NewColumns = 0;
+        assign_SiblingSteps = 0;
         time_TotalCycle = 0f;
         cycles_Processed = 0;
         workers_DataGenCompleted = 0;

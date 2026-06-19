@@ -41132,6 +41132,7 @@ MonoBehaviour:
     SerializationNodes: []
   _udonSharpBackingUdonBehaviour: {fileID: 1156113853}
   maxConcurrentWorkers: 16
+  maxConcurrentWorldgenColumns: 4
   reserveWorkersForDataGenDuringLoad: 0
   loadPhaseMeshWorkerCap: 8
   debugGenSlotHoldFrames: 0
@@ -63496,6 +63497,7 @@ MonoBehaviour:
   chunkSizeXZ: 16
   chunkSizeY: 16
   chunkPrefab: {fileID: 1697751968}
+  chunkGoRecycleScanPerFrame: 64
   meshStepTimeBudgetMs: 8
   updateTimeBudgetMs: 22
   loadPhaseUpdateBudgetMs: 33
@@ -63504,6 +63506,7 @@ MonoBehaviour:
   gpuMeshDecodeStepBudgetMs: 1.5
   gpuMeshDecodeStepsPerFrame: 2
   gpuMeshDecodeFrameBudgetMs: 4
+  gpuNearMeshDecodeFrameBudgetMs: 6
   gpuWorldgenStepBudgetMs: 10
   gpuWorldgenStepsPerFrame: 32
   prioritizeVisibleShellMeshing: 1
@@ -63512,6 +63515,7 @@ MonoBehaviour:
   enableMeshRenderDistanceCull: 1
   renderDistanceChunksPC: 8
   renderDistanceChunksMobile: 4
+  dataGenRenderDistanceMarginChunks: 2
   requireAllNeighborsForMesh: 1
   deferredInteriorMeshRequestsPerFrame: 8
   deferredInteriorMeshScanCountPerFrame: 128
