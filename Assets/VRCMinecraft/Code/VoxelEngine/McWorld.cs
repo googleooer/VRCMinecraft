@@ -70,10 +70,20 @@ public class McWorld : UdonSharpBehaviour
     public int shellMeshPriorityRadiusXZ = 2;
     [Tooltip("Chunks within this Y radius of the player are always eligible for meshing.")]
     public int shellMeshPriorityRadiusY = 1;
-    [Tooltip("MESH RENDER DISTANCE: when on, a chunk is only meshed for the first time if its column is within meshRenderDistanceChunksXZ of the player; farther chunks defer until the player approaches. Cuts initial meshing from the whole 32x32 world to the visible set (the player can't see far chunks anyway). Player edits and rebuilds bypass it. Set the radius >= nearRegionRadius so the near region still meshes immediately.")]
+    [Tooltip("RENDER DISTANCE CULL: when on, a chunk only meshes if its column is within the active render distance (renderDistanceChunksPC/Mobile, radial, full Y column) of the player; farther chunks defer until the player approaches. Player edits and rebuilds bypass it.")]
     public bool enableMeshRenderDistanceCull = true;
-    [Tooltip("Chunk XZ radius around the player within which chunks get their first mesh. <=0 disables the cap (mesh the whole world). 10 ~= 160m view.")]
+    [Tooltip("LEGACY/superseded by renderDistanceChunksPC/Mobile. Kept for serialization compatibility; no longer read.")]
     public int meshRenderDistanceChunksXZ = 10;
+    [Tooltip("RENDER DISTANCE (PC): radial chunk radius (full Y columns) within which terrain meshes AND stays GPU-lit. Minecraft-style. Used on standalone/desktop builds. Auto-clamped at init so the radial column set fits the GPU light-slot capacity.")]
+    public int renderDistanceChunksPC = 8;
+    [Tooltip("RENDER DISTANCE (Android/iOS): radial chunk radius (full Y columns) used on mobile/Quest builds. Lower than PC to fit Quest memory/perf.")]
+    public int renderDistanceChunksMobile = 4;
+    // The active render distance, selected at init from the build target (InitializeWorldParameters)
+    // then capacity-clamped (_InitializeGpuVoxelBackend). Drives BOTH the mesh cull
+    // (_IsChunkWithinMeshRenderDistance) and the GPU lit/resident set (eviction protection +
+    // maintenance), so everything visible is always lit — no slot eviction of on-screen chunks.
+    // Radial in XZ, full Y column. Private + assigned at init (no serialization/Udon-heap surprises).
+    private int _activeRenderDistanceChunks = 8;
     [Tooltip("Require all 6 in-world neighbour chunks to be data-ready before meshing a chunk, so chunk-boundary faces are always culled correctly (eliminates the transient un-culled boundary 'walls' that a chunk draws toward a not-yet-generated neighbour and waits for a heal re-mesh to fix). Costs a little meshing latency at the frontier. The coordinator falls back to air-boundary meshing if ALL workers are waiting, to avoid deadlock. Turn OFF to restore the old draw-now-heal-later behaviour.")]
     public bool requireAllNeighborsForMesh = true;
     [Tooltip("How many deferred interior chunks to reconsider per frame when headroom is available.")]
@@ -935,6 +945,16 @@ public class McWorld : UdonSharpBehaviour
         globalVoxelOffsetX = (worldDimensionX * chunkSizeXZ) / 2;
         globalVoxelOffsetY = 0;
         globalVoxelOffsetZ = (worldDimensionZ * chunkSizeXZ) / 2;
+
+        // RENDER DISTANCE: pick the platform default from the build target. VRChat builds PC and
+        // Android/iOS separately and Udon exposes no runtime platform query, so the active build
+        // target's compile symbols are the reliable selector. The capacity-fit clamp happens later
+        // in _InitializeGpuVoxelBackend once the GPU light-slot capacity is known.
+#if UNITY_ANDROID || UNITY_IOS
+        _activeRenderDistanceChunks = Mathf.Max(1, renderDistanceChunksMobile);
+#else
+        _activeRenderDistanceChunks = Mathf.Max(1, renderDistanceChunksPC);
+#endif
     }
 
     void InitializeChunkStorage()
@@ -968,6 +988,29 @@ public class McWorld : UdonSharpBehaviour
         gpuChunkSlotCapacity = Mathf.Clamp(gpuChunkSlotCapacity, 1, 4095);
         if (gpuResidentRadiusXZ <= 0) gpuResidentRadiusXZ = 6;
         if (gpuResidentRadiusY <= 0) gpuResidentRadiusY = 2;
+
+        // Clamp the render distance so the radial full-column lit set fits the GPU light-slot
+        // capacity. If the visible set exceeded capacity, the farthest visible chunks couldn't all
+        // hold a light slot and would go dark — the exact eviction bug this system fixes. One-time
+        // init cost; worldDimensionY chunks per column.
+        while (_activeRenderDistanceChunks > 1)
+        {
+            int rr = _activeRenderDistanceChunks * _activeRenderDistanceChunks;
+            int cols = 0;
+            for (int dz = -_activeRenderDistanceChunks; dz <= _activeRenderDistanceChunks; dz++)
+            {
+                for (int dx = -_activeRenderDistanceChunks; dx <= _activeRenderDistanceChunks; dx++)
+                {
+                    if (dx * dx + dz * dz <= rr) cols++;
+                }
+            }
+            if (cols * worldDimensionY <= gpuChunkSlotCapacity) break;
+            _activeRenderDistanceChunks--;
+        }
+#if LOGGING
+        Debug.Log("[McWorld] Active render distance = " + _activeRenderDistanceChunks
+            + " chunks (radial, full column); GPU light-slot capacity = " + gpuChunkSlotCapacity);
+#endif
         if (gpuResidentSyncsPerFrame <= 0) gpuResidentSyncsPerFrame = 32;
         gpuTileWidth = chunkSizeXZ;
         gpuTileHeight = chunkSizeY * chunkSizeXZ;
@@ -1445,60 +1488,42 @@ public class McWorld : UdonSharpBehaviour
 
         if (targetSlot == -1)
         {
-            int oldestStamp = int.MaxValue;
+            // No free slot: evict the chunk FARTHEST from the player (greatest XZ distance from the
+            // resident center) that is NOT protected — i.e. outside the render-distance disc. This
+            // keeps every on-screen chunk lit; only far/off-screen chunks ever lose a slot. With
+            // enableGpuResidentChunks off every chunk keeps a CPU mirror, so an evicted far chunk
+            // re-syncs losslessly from CPU (via _GpuMaintainResidentChunks) when re-approached.
+            int bestDist = -1;
             for (int i = 0; i < gpuChunkSlotCapacity; i++)
             {
                 int residentChunkIndex = gpuSlotToChunkIndex[i];
-                if (residentChunkIndex >= 0 && residentChunkIndex < totalWorldChunks)
-                {
-                    ChunkData residentChunk = chunks_1D[residentChunkIndex];
-                    // Protect ALL chunks with valid data from eviction,
-                    // not just nearby ones. GPU lighting covers the whole world.
-                    if (residentChunk != null && residentChunk.isDataReady) continue;
-                }
-                if (gpuSlotUseStamp[i] < oldestStamp)
-                {
-                    oldestStamp = gpuSlotUseStamp[i];
-                    targetSlot = i;
-                }
+                if (residentChunkIndex < 0 || residentChunkIndex >= totalWorldChunks) { targetSlot = i; break; }
+                ChunkData residentChunk = chunks_1D[residentChunkIndex];
+                if (residentChunk == null) { targetSlot = i; break; }
+                if (_GpuIsChunkProtectedFromEviction(residentChunk)) continue; // never evict on-screen chunks
+                int ddx = residentChunk.chunkX_world - gpuResidentCenterChunkX;
+                int ddz = residentChunk.chunkZ_world - gpuResidentCenterChunkZ;
+                int dist = ddx * ddx + ddz * ddz;
+                if (dist > bestDist) { bestDist = dist; targetSlot = i; }
             }
         }
 
         if (targetSlot == -1)
         {
-            // Fallback: every slot holds a data-ready chunk. Prefer evicting a NON-resident
-            // (CPU-backed) chunk — it re-uploads from its CPU mirror on the next mesh. A
-            // GPU-resident chunk's blocks live ONLY in the atlas, so evicting it destroys its
-            // data and it renders empty. Protect resident chunks here.
-            int oldestStamp = int.MaxValue;
+            // Every slot holds a protected (on-screen) chunk — only reachable if the render-distance
+            // column set exceeds capacity, which the init clamp (_InitializeGpuVoxelBackend) prevents.
+            // Fall back to evicting the farthest overall so allocation never deadlocks.
+            int bestDist = -1;
             for (int i = 0; i < gpuChunkSlotCapacity; i++)
             {
                 int ci = gpuSlotToChunkIndex[i];
-                if (ci >= 0 && ci < totalWorldChunks)
-                {
-                    ChunkData c = chunks_1D[ci];
-                    if (c != null && c._isGpuResident) continue; // never evict resident here
-                }
-                if (gpuSlotUseStamp[i] < oldestStamp)
-                {
-                    oldestStamp = gpuSlotUseStamp[i];
-                    targetSlot = i;
-                }
-            }
-        }
-
-        if (targetSlot == -1)
-        {
-            // Last resort: every slot is GPU-resident. Evict the oldest (it loses its GPU-only
-            // data — it will need a re-gen to render again). Avoids a hard allocation deadlock.
-            int oldestStamp = int.MaxValue;
-            for (int i = 0; i < gpuChunkSlotCapacity; i++)
-            {
-                if (gpuSlotUseStamp[i] < oldestStamp)
-                {
-                    oldestStamp = gpuSlotUseStamp[i];
-                    targetSlot = i;
-                }
+                if (ci < 0 || ci >= totalWorldChunks) { targetSlot = i; break; }
+                ChunkData c = chunks_1D[ci];
+                if (c == null) { targetSlot = i; break; }
+                int ddx = c.chunkX_world - gpuResidentCenterChunkX;
+                int ddz = c.chunkZ_world - gpuResidentCenterChunkZ;
+                int dist = ddx * ddx + ddz * ddz;
+                if (dist > bestDist) { bestDist = dist; targetSlot = i; }
             }
         }
 
@@ -1533,10 +1558,12 @@ public class McWorld : UdonSharpBehaviour
     private bool _GpuIsChunkProtectedFromEviction(ChunkData chunk)
     {
         if (!gpuBackendReady || chunk == null) return false;
-        int dx = Mathf.Abs(chunk.chunkX_world - gpuResidentCenterChunkX);
-        int dy = Mathf.Abs(chunk.chunkY_world - gpuResidentCenterChunkY);
-        int dz = Mathf.Abs(chunk.chunkZ_world - gpuResidentCenterChunkZ);
-        return dx <= gpuResidentRadiusXZ && dy <= gpuResidentRadiusY && dz <= gpuResidentRadiusXZ;
+        // On-screen = within the render-distance disc (radial XZ, full Y column). These must never
+        // lose their GPU light slot, so "old chunks go dark when new chunks generate" cannot happen.
+        // Only chunks BEYOND render distance are eviction candidates.
+        int dx = chunk.chunkX_world - gpuResidentCenterChunkX;
+        int dz = chunk.chunkZ_world - gpuResidentCenterChunkZ;
+        return (dx * dx + dz * dz) <= (_activeRenderDistanceChunks * _activeRenderDistanceChunks);
     }
 
     private Vector4 _GpuGetSlotRect(int slotIndex)
@@ -1966,21 +1993,29 @@ public class McWorld : UdonSharpBehaviour
 
         int syncBudget = Mathf.Max(1, gpuResidentSyncsPerFrame);
         int touched = 0;
-        int maxDistance = Mathf.Max(gpuResidentRadiusXZ, gpuResidentRadiusY);
+        int R = _activeRenderDistanceChunks;
+        int rr = R * R;
+        // Keep the WHOLE render-distance set GPU-lit: radial XZ disc, full Y column. Any visible
+        // chunk lacking a light slot (e.g. just walked into view, or evicted while far and now
+        // back in range) gets re-synced here so it lights up. Closest-first by XZ ring so the
+        // nearest columns fill first when the per-frame sync budget is tight.
+        int minChunkY = -chunkOffsetY;
+        int maxChunkY = worldDimensionY - chunkOffsetY - 1;
 
-        for (int distance = 0; distance <= maxDistance; distance++)
+        for (int distance = 0; distance <= R; distance++)
         {
-            for (int dy = -gpuResidentRadiusY; dy <= gpuResidentRadiusY; dy++)
+            for (int dz = -distance; dz <= distance; dz++)
             {
-                for (int dz = -gpuResidentRadiusXZ; dz <= gpuResidentRadiusXZ; dz++)
+                for (int dx = -distance; dx <= distance; dx++)
                 {
-                    for (int dx = -gpuResidentRadiusXZ; dx <= gpuResidentRadiusXZ; dx++)
-                    {
-                        if (Mathf.Max(Mathf.Abs(dx), Mathf.Abs(dy), Mathf.Abs(dz)) != distance) continue;
+                    if (Mathf.Max(Mathf.Abs(dx), Mathf.Abs(dz)) != distance) continue; // XZ ring shell
+                    if (dx * dx + dz * dz > rr) continue;                               // radial disc
 
-                        int chunkX = gpuResidentCenterChunkX + dx;
-                        int chunkY = gpuResidentCenterChunkY + dy;
-                        int chunkZ = gpuResidentCenterChunkZ + dz;
+                    int chunkX = gpuResidentCenterChunkX + dx;
+                    int chunkZ = gpuResidentCenterChunkZ + dz;
+
+                    for (int chunkY = minChunkY; chunkY <= maxChunkY; chunkY++)
+                    {
                         int chunkIndex = ChunkCenteredCoordsTo1D(chunkX, chunkY, chunkZ);
                         if (chunkIndex == -1) continue;
 
@@ -1988,11 +2023,7 @@ public class McWorld : UdonSharpBehaviour
                         if (chunk == null || !chunk.isDataReady) continue;
 
                         int slotIndex = gpuChunkIndexToSlot[chunkIndex];
-                        if (slotIndex >= 0 && slotIndex < gpuChunkSlotCapacity)
-                        {
-                            gpuSlotUseStamp[slotIndex] = gpuSlotUseCounter++;
-                            continue;
-                        }
+                        if (slotIndex >= 0 && slotIndex < gpuChunkSlotCapacity) continue; // already lit
 
                         if (touched >= syncBudget) return;
                         if (Time.realtimeSinceStartup - frameStart > frameBudget) return;
@@ -3706,7 +3737,11 @@ public class McWorld : UdonSharpBehaviour
                 if (chunk._collisionVertexCount == 0) _DisableChunkCollider(chunk, false);
                 else if (interactionPriority) _ApplyDataToCollider(chunk);
                 else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
-                else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
+                // Collider-eligible chunks are within the player's reach radius (incl. up to
+                // colliderPriorityBelowRadiusY layers below). Cook the collider in the SAME step
+                // the render mesh becomes visible so the player can never fall through a
+                // rendered-but-collider-less near chunk. Far chunks disabled collision above; the
+                // deferred pump still applies their colliders as the player approaches.
                 else _ApplyDataToCollider(chunk);
                 _ReleaseMeshPool(chunk);
 #if LOGGING
@@ -4337,9 +4372,19 @@ public class McWorld : UdonSharpBehaviour
         int totalChunks = chunks_1D.Length;
         while (scansRemaining-- > 0)
         {
-            int chunkIndex = deferredInteriorMeshScanCursor;
+            int rawScanIndex = deferredInteriorMeshScanCursor;
             deferredInteriorMeshScanCursor++;
             if (deferredInteriorMeshScanCursor >= totalChunks) deferredInteriorMeshScanCursor = 0;
+
+            // Flip Y so the deferred-interior fill drains TOP-DOWN instead of bottom-up. The array
+            // layout is index = az*Xdim*Ydim + ay*Xdim + ax (Y ascending as the cursor advances),
+            // so decompose, invert Y, recompose. Bijective over [0,totalChunks) — every chunk is
+            // still scanned exactly once per sweep, just top-to-bottom.
+            int scanAx = rawScanIndex % worldDimensionX;
+            int scanAy = (rawScanIndex / worldDimensionX) % worldDimensionY;
+            int scanAz = rawScanIndex / (worldDimensionX * worldDimensionY);
+            int chunkIndex = (scanAz * worldDimensionX * worldDimensionY)
+                + (((worldDimensionY - 1) - scanAy) * worldDimensionX) + scanAx;
 
             ChunkData chunk = chunks_1D[chunkIndex];
             if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh) continue;
@@ -5463,7 +5508,11 @@ public class McWorld : UdonSharpBehaviour
             && !chunk.isBuildingMesh
             && chunk._chunkData != null
             && activeMeshingCount < MAX_ACTIVE_CHUNKS
-            && AreAllNeighborsReady(chunkIndex)
+            // Player edits must respond NOW. Use lenient neighbour readiness (this whole branch
+            // is interaction-only) so the edit isn't dropped into the worker-starved coordinator
+            // queue during heavy load just because an unallocated frontier neighbour isn't ready.
+            // Any transient air-boundary face self-heals via _borderMissingMask / _TryImmediateBorderHeal.
+            && AreAllNeighborsReadyLenient(chunkIndex)
             && (coordinator == null || !coordinator.IsChunkScheduledForMeshUpdate(chunkIndex)))
         {
             BuildChunkMesh(chunkIndex);
@@ -5618,25 +5667,11 @@ public class McWorld : UdonSharpBehaviour
     /// </summary>
     public void SetBlockAndMetadata(int globalX, int globalY, int globalZ, byte blockType, byte metadata)
     {
-        // Pre-write metadata so it's correct when notifications fire
-        int cx = globalX >> CHUNK_SIZE_SHIFT;
-        int cy = globalY >> CHUNK_SIZE_SHIFT;
-        int cz = globalZ >> CHUNK_SIZE_SHIFT;
-        ChunkData chunk = GetChunkAt(cx, cy, cz);
-        if (chunk != null && chunk.isDataReady)
-        {
-            if (chunk.blockMetadata == null)
-                chunk.blockMetadata = new byte[chunk._chunkDataSize];
-            int lx = globalX & CHUNK_SIZE_MASK;
-            int ly = globalY & CHUNK_SIZE_MASK;
-            int lz = globalZ & CHUNK_SIZE_MASK;
-            int idx = ly * (chunkSizeXZ * chunkSizeXZ) + lz * chunkSizeXZ + lx;
-            if (idx >= 0 && idx < chunk.blockMetadata.Length)
-                chunk.blockMetadata[idx] = metadata;
-        }
-
-        // Now set block type — this triggers notifications with metadata already correct
-        _SetBlockGlobal(globalX, globalY, globalZ, blockType, false);
+        // Set the block ID, then re-apply the metadata after _SetBlockLocal zeroes the nibble,
+        // all BEFORE neighbor notifications fire (MC's setBlockAndMetadataWithNotify ordering).
+        // The old code pre-wrote the metadata, but _SetBlockLocal then clobbered it back to 0,
+        // turning every flowing-fluid cell into a full source block.
+        _SetBlockGlobalWithMeta(globalX, globalY, globalZ, blockType, false, true, metadata);
     }
 
     /// <summary>
@@ -5662,22 +5697,31 @@ public class McWorld : UdonSharpBehaviour
         ChunkData chunk = GetChunkAt(cx, cy, cz);
         if (chunk == null) return;
 
-        // Write metadata
         if (chunk.blockMetadata == null)
             chunk.blockMetadata = new byte[chunk._chunkDataSize];
         int lx = globalX & CHUNK_SIZE_MASK;
         int ly = globalY & CHUNK_SIZE_MASK;
         int lz = globalZ & CHUNK_SIZE_MASK;
         int idx = ly * (chunkSizeXZ * chunkSizeXZ) + lz * chunkSizeXZ + lx;
+
+        // Write block type FIRST (this zeroes the nibble for MC parity), THEN the metadata, so the
+        // flowing-fluid decay level survives instead of being clobbered to 0 (a full source block).
+        _SetBlockLocal(chunk, lx, ly, lz, blockType, true, false);
         if (idx >= 0 && idx < chunk.blockMetadata.Length)
             chunk.blockMetadata[idx] = metadata;
-
-        // Write block type + trigger mesh rebuild (no notifications)
-        _SetBlockLocal(chunk, lx, ly, lz, blockType, true, false);
         if (blockTicker != null) blockTicker.InvalidateBlockCache(globalX, globalY, globalZ);
     }
 
     private void _SetBlockGlobal(int globalX, int globalY, int globalZ, byte blockType, bool interactionPriority)
+    {
+        _SetBlockGlobalWithMeta(globalX, globalY, globalZ, blockType, interactionPriority, false, 0);
+    }
+
+    // Variant that writes a metadata nibble AFTER _SetBlockLocal (which zeroes it for MC parity)
+    // but BEFORE neighbor notifications fire — so a flowing-fluid decay level survives instead of
+    // being clobbered to 0 (which turned every cell water flowed into into a full SOURCE block).
+    // applyMeta=false reproduces plain _SetBlockGlobal (nibble left at the parity-zeroed value).
+    private void _SetBlockGlobalWithMeta(int globalX, int globalY, int globalZ, byte blockType, bool interactionPriority, bool applyMeta, byte metaValue)
     {
         // OPTIMIZATION: Use bitwise operations instead of division/modulus
         int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;
@@ -5693,6 +5737,17 @@ public class McWorld : UdonSharpBehaviour
 
         byte oldBlockType = _GetBlockLocal(chunk, localX, localY, localZ);
         _SetBlockLocal(chunk, localX, localY, localZ, blockType, true, interactionPriority);
+
+        // Re-apply the requested metadata AFTER _SetBlockLocal zeroed the nibble, so the value
+        // survives and is correct before the neighbor-notify block below reads it.
+        if (applyMeta)
+        {
+            if (chunk.blockMetadata == null)
+                chunk.blockMetadata = new byte[chunk._chunkDataSize];
+            int metaIdx = localY * (chunkSizeXZ * chunkSizeXZ) + localZ * chunkSizeXZ + localX;
+            if (metaIdx >= 0 && metaIdx < chunk.blockMetadata.Length)
+                chunk.blockMetadata[metaIdx] = metaValue;
+        }
 
         // Update lighting if block changed — skip for fluid transitions to avoid
         // cascading propagation corruption that turns chunks black
@@ -6152,17 +6207,18 @@ public class McWorld : UdonSharpBehaviour
         return dx <= shellMeshPriorityRadiusXZ && dz <= shellMeshPriorityRadiusXZ && dy <= shellMeshPriorityRadiusY;
     }
 
-    // MESH RENDER DISTANCE: is this chunk's column within meshRenderDistanceChunksXZ of the player?
+    // RENDER DISTANCE: is this chunk's column within the active render distance (radial) of the player?
     // Used to cap INITIAL meshing to the visible set; farther chunks defer until the player nears
     // them. No Y cap — the world is short and fully-buried interiors already defer via
     // _ShouldPrioritizeChunkMesh. Returns true (no cap) when disabled or the player isn't known yet.
     private bool _IsChunkWithinMeshRenderDistance(ChunkData chunk)
     {
-        if (!enableMeshRenderDistanceCull || meshRenderDistanceChunksXZ <= 0 || chunk == null) return true;
+        if (!enableMeshRenderDistanceCull || _activeRenderDistanceChunks <= 0 || chunk == null) return true;
         if (!_TryGetPlayerChunkCoords(out int pcx, out int pcy, out int pcz)) return true;
-        int dx = Mathf.Abs(chunk.chunkX_world - pcx);
-        int dz = Mathf.Abs(chunk.chunkZ_world - pcz);
-        return dx <= meshRenderDistanceChunksXZ && dz <= meshRenderDistanceChunksXZ;
+        // Radial XZ, full Y column: a chunk renders if its column is within the render-distance disc.
+        int dx = chunk.chunkX_world - pcx;
+        int dz = chunk.chunkZ_world - pcz;
+        return (dx * dx + dz * dz) <= (_activeRenderDistanceChunks * _activeRenderDistanceChunks);
     }
 
     // GPU OFFLOAD #1: Radius beyond which a chunk does NOT need a CPU mirror of its blocks.
@@ -6616,11 +6672,13 @@ public class McWorld : UdonSharpBehaviour
 
         if (interactionPriority)
         {
-            // Player edits should start responding immediately, but finishing the
-            // whole rebuild on the interaction call path causes visible spikes.
-            // Kick a single step here, then let ProcessActiveChunks finish under
-            // the normal frame budget on subsequent updates.
-            int immediateStepBudget = 1;
+            // Player edits must update THIS frame. Finish the whole rebuild on the interaction
+            // call path (bounded) so the placed/broken block — and its collider, applied at the
+            // finalize branch above — appear immediately instead of being parked behind the
+            // load-starved ProcessActiveChunks mesh budget. A single chunk rebuild is a few ms;
+            // that's the right trade for a deliberate user action. The bound is a safety cap
+            // (well above any real per-chunk step count), not an expected limit.
+            int immediateStepBudget = 4096;
             while (chunk.isBuildingMesh && immediateStepBudget-- > 0)
             {
                 _BuildChunkMeshStep(chunk);
@@ -6717,6 +6775,23 @@ public class McWorld : UdonSharpBehaviour
             {
                 return; // GPU still busy, retry next frame
             }
+        }
+
+        // POOL-OWNERSHIP INVARIANT: the CPU greedy build below writes directly into the pooled
+        // mesh buffers (_opaque/_transparent/_cutout/_collision vertices). Normally isBuildingMesh
+        // implies a held pool slot, but the mesh watchdog (ForceCompleteStuckMesh) can release the
+        // slot under a stale activeMeshingChunks entry, and a re-mesh can re-arm isBuildingMesh on a
+        // no-pool return path — leaving the buffers null and crashing _AddWaterBlocks / _ApplyAllMeshData
+        // with an NRE. If the slot isn't held, bail and re-queue a clean rebuild (BuildChunkMesh
+        // re-acquires the pool and resets _greedyAxis) instead of writing into null arrays.
+        if (chunk._meshPoolSlot < 0)
+        {
+            chunk.isBuildingMesh = false;
+            chunk.interactionMeshPriority = false;
+            int reqIdx = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            if (reqIdx != -1) MarkChunkMeshDeferred(reqIdx);
+            else chunk.isMeshDeferred = true;
+            return;
         }
 
         chunk._lastMeshStepFrame = Time.frameCount;
@@ -6884,13 +6959,14 @@ public class McWorld : UdonSharpBehaviour
             chunk._decompNY = null; chunk._decompPY = null;
             chunk._decompNZ = null; chunk._decompPZ = null;
 
-            // Can't use SendCustomEventDelayedFrames here easily without more state,
-            // so we'll just apply the collider directly after a few frames in the main loop.
-            // A more robust solution might involve another queue. For now, this is simpler.
             if (chunk._collisionVertexCount == 0) _DisableChunkCollider(chunk, false);
             else if (interactionPriority) _ApplyDataToCollider(chunk);
             else if (!_ShouldEnableChunkCollider(chunk)) _DisableChunkCollider(chunk, true);
-            else if (_ShouldDeferChunkSecondaryWork(chunk)) _QueueDeferredColliderApply(chunk);
+            // Collider-eligible chunks are within the player's reach radius (incl. up to
+            // colliderPriorityBelowRadiusY layers below). Cook the collider in the SAME step
+            // the render mesh becomes visible so the player can never fall through a
+            // rendered-but-collider-less near chunk. Far chunks disabled collision above; the
+            // deferred pump still applies their colliders as the player approaches.
             else _ApplyDataToCollider(chunk);
             _ReleaseMeshPool(chunk);
 

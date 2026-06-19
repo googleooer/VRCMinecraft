@@ -97,7 +97,7 @@ Material:
     m_Floats:
     - PixelSnap: 0
     - _AmbientOcclusionStrength: 1
-    - _AoFullDistance: 48
+    - _AoFullDistance: 128
     - _ApplyGamma: 0
     - _AtlasCellSize: -0
     - _BumpScale: 1
