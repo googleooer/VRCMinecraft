@@ -18,7 +18,7 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
         _UseVertexLight ("Use Vertex Light", Float) = 1
         [HideInInspector] _UseGpuExactAo ("Use GPU Exact AO", Float) = 0
         [HideInInspector] _UseBakedAo ("Use Baked Vertex AO (light x vertex.a)", Float) = 0
-        _AoFullDistance ("AO Full-Quality Distance (m)", Float) = 48
+        _AoFullDistance ("AO Full-Quality Distance (m)", Float) = 128
 
         // MINECRAFT-STYLE RADIAL FOG PROPERTIES
         _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0) // Default sky fog color

@@ -91,7 +91,7 @@ Material:
     - _ChunkZ: 1
     - _FlipXAxis: 1
     - _Mode: 2
-    - _ReadSlotIndex: 102
+    - _ReadSlotIndex: 116
     - _UseCrossSlotNeighbors: 0
     - _XSize: 5
     - _YSize: 17
