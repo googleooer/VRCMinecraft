@@ -13094,6 +13094,45 @@ public class McWorld : UdonSharpBehaviour
             chunk._columnMinY = new byte[columnCount];
             chunk._columnMaxY = new byte[columnCount];
         }
+
+        // FAST-PATH: a homogeneous chunk is a single repeated block id, so its derived data is
+        // computable WITHOUT scanning 4096 voxels — column bounds are uniform, and a homogeneous
+        // chunk can never contain cross/torch blocks (those are sparse decorations the generator
+        // only places on a surface), so those counts are 0 and their big per-voxel position arrays
+        // are never allocated. Flags come straight from the single block id's caches. This is the
+        // ~40-50% of chunks (all-air above terrain, all-stone deep) that the full scan wastes time on.
+        if (chunk._chunkDataKind == ChunkData.CHUNK_KIND_HOMOGENEOUS)
+        {
+            byte hb = fullData[0];
+            chunk._crossBlockCount = 0;
+            chunk._torchBlockCount = 0;
+            chunk._hasTorchBlocks = false;
+            if (hb == 0)
+            {
+                chunk._isAllAir = true;
+                chunk._hasWaterBlocks = false;
+                chunk._hasEmissiveBlocks = false;
+                for (int i = 0; i < columnCount; i++) { chunk._columnMinY[i] = 255; chunk._columnMaxY[i] = 255; }
+                chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
+                chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
+                chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
+            }
+            else
+            {
+                chunk._isAllAir = false;
+                chunk._hasWaterBlocks = _IsWaterBlock(hb) || _IsLavaBlock(hb);
+                chunk._hasEmissiveBlocks = (hb < lightEmissionCache.Length && lightEmissionCache[hb] > 0);
+                byte maxYb = (byte)(chunkSizeY - 1);
+                byte maxXZb = (byte)(chunkSizeXZ - 1);
+                for (int i = 0; i < columnCount; i++) { chunk._columnMinY[i] = 0; chunk._columnMaxY[i] = maxYb; }
+                chunk._chunkGlobalMinY = 0; chunk._chunkGlobalMaxY = maxYb;
+                chunk._chunkGlobalMinX = 0; chunk._chunkGlobalMaxX = maxXZb;
+                chunk._chunkGlobalMinZ = 0; chunk._chunkGlobalMaxZ = maxXZb;
+            }
+            chunk._derivedDirty = false;
+            return;
+        }
+
         if (chunk._crossBlockPackedPositions == null || chunk._crossBlockPackedPositions.Length != fullData.Length)
         {
             chunk._crossBlockPackedPositions = new int[fullData.Length];
