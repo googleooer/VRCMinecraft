@@ -58,6 +58,8 @@ public class McWorld : UdonSharpBehaviour
     public int gpuMeshDecodeStepsPerFrame = 8;
     [Tooltip("Total GPU mesh decode budget per frame in milliseconds (aggregate across all chunks). The proven path is mesh-bound on the readback->CPU-decode while data-gen sits at ~0% during load, leaving this budget's frame-share unused — so it is set generously to spend the idle CPU on draining mesh decodes. The adaptive system shrinks it if frames get heavy.")]
     public float gpuMeshDecodeFrameBudgetMs = 12.0f;
+    [Tooltip("Minecraft-style NEAR meshing guarantee: per-frame GPU mesh-decode time reserved EXCLUSIVELY for chunks near the player, drained BEFORE and independently of the shared aggregate budget above. MC rebuilds near chunks unconditionally each frame (under a time budget) so a far-chunk backlog can never starve the chunk you're standing on. Bounded so it can't spike frames; lower it if the headset overshoots.")]
+    public float gpuNearMeshDecodeFrameBudgetMs = 6.0f;
     [Tooltip("Budget per GPU worldgen step in milliseconds. Lower values reduce frame spikes during terrain generation.")]
     public float gpuWorldgenStepBudgetMs = 3.0f;
     [Tooltip("Maximum GPU worldgen steps per chunk each frame.")]
@@ -80,6 +82,14 @@ public class McWorld : UdonSharpBehaviour
     // maintenance), so everything visible is always lit — no slot eviction of on-screen chunks.
     // Radial in XZ, full Y column. Private + assigned at init (no serialization/Udon-heap surprises).
     private int _activeRenderDistanceChunks = 8;
+    [Tooltip("DATA-GEN STREAMING: extra chunk margin beyond the render distance within which terrain DATA is generated. Minecraft only generates chunks in the player's loading radius and streams the rest on approach; this gate stops the coordinator from generating all ~8192 chunks up front (which starves meshing). The margin keeps a ring of ready-but-unmeshed chunks just past the visible edge so meshing never waits on data.")]
+    public int dataGenRenderDistanceMarginChunks = 2;
+    // Per-frame cached player chunk for the data-gen streaming gate (avoids a GetPosition() per
+    // scanned position). Updated once per ProcessActiveChunks. _streamPlayerKnown=false (no player
+    // yet) => generate everything, so the initial spawn load is never gated away before the player exists.
+    private int _streamPlayerChunkX = 0;
+    private int _streamPlayerChunkZ = 0;
+    private bool _streamPlayerKnown = false;
     [Tooltip("Require all 6 in-world neighbour chunks to be data-ready before meshing a chunk, so chunk-boundary faces are always culled correctly (eliminates the transient un-culled boundary 'walls' that a chunk draws toward a not-yet-generated neighbour and waits for a heal re-mesh to fix). Costs a little meshing latency at the frontier. The coordinator falls back to air-boundary meshing if ALL workers are waiting, to avoid deadlock. Turn OFF to restore the old draw-now-heal-later behaviour.")]
     public bool requireAllNeighborsForMesh = true;
     [Tooltip("How many deferred interior chunks to reconsider per frame when headroom is available.")]
@@ -885,17 +895,23 @@ public class McWorld : UdonSharpBehaviour
             return;
         }
 
-        // LOAD PHASE: during the one-time initial world generation, do NOT throttle GPU
-        // worldgen / mesh-decode for frame rate — total load time matters far more than load
-        // FPS. Keeping steps/budget high lets the 8 generators pipeline their column readbacks
-        // instead of the shrink-to-1-step/frame serializing them. Adaptive resumes after load.
+        // LOAD PHASE: during the one-time initial world generation, raise budgets vs steady-state —
+        // total load time matters more than load FPS — but DON'T let worldgen monopolize the GPU:
+        // worldgen base-readbacks were saturating the GPU and starving mesh face-readbacks, so the
+        // visible world only meshed AFTER data-gen finished. Worldgen is now moderated (and the
+        // coordinator caps concurrent columns via maxConcurrentWorldgenColumns) to leave GPU readback
+        // bandwidth for meshing, while mesh decode is boosted so the near world fills in during gen.
         if (!_loadPhaseBudgetRestored)
         {
-            adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(gpuWorldgenStepsPerFrame, 12);
-            adaptiveGpuWorldgenStepBudgetMs = Mathf.Max(gpuWorldgenStepBudgetMs, 30f);
-            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(1, gpuMeshDecodeStepsPerFrame);
+            adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(gpuWorldgenStepsPerFrame, 8);
+            adaptiveGpuWorldgenStepBudgetMs = Mathf.Max(gpuWorldgenStepBudgetMs, 16f);
+            // Boost mesh decode during load too (Minecraft never starves near meshing). Floored to the
+            // intended throughput-fix values (8 steps / 12ms) so a stale low serialized config can't pin
+            // meshing at the floor while worldgen floods — that imbalance left the visible world unmeshed
+            // for minutes. With data-gen now streamed to the render distance, worldgen has far less to do.
+            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(gpuMeshDecodeStepsPerFrame, 8);
             adaptiveGpuMeshDecodeStepBudgetMs = gpuMeshDecodeStepBudgetMs;
-            adaptiveGpuMeshDecodeFrameBudgetMs = gpuMeshDecodeFrameBudgetMs;
+            adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Max(gpuMeshDecodeFrameBudgetMs, 12f);
             return;
         }
 
@@ -1727,6 +1743,7 @@ public class McWorld : UdonSharpBehaviour
         gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetSlotRect(slotIndex));
         gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayPackedWidthId, 0f);
         _GpuOverlayTextureIntoAtlas(gpuClearTexture, ref gpuLightAtlas, ref gpuLightAtlasScratch);
+        _gpuLightDirtySinceConverge = true; // a cleared slot needs (re)propagation before the atlas is converged
     }
 
     // Pack 1-block-deep boundary faces from all 6 neighbors into the readback buffer's border texture.
@@ -2062,6 +2079,7 @@ public class McWorld : UdonSharpBehaviour
     {
         if (!gpuBackendReady) return;
         gpuLightingSeedPending = true;
+        _gpuLightDirtySinceConverge = true; // real light change -> full propagation allowed until it converges
         // Multiple chunk uploads often collapse into the same atlas-wide seed pass.
         // Top up to one full convergence window instead of stacking another full
         // budget per upload, which keeps propagation saturated for long stretches.
@@ -2072,6 +2090,12 @@ public class McWorld : UdonSharpBehaviour
     }
 
     private int gpuLightingKeepAliveCounter = 0;
+    // QUIESCE: true while there is genuine light work pending (a chunk uploaded/edited, or RT content
+    // lost) since the atlas last fully converged. When false (converged, nothing changed) the periodic
+    // keep-alive does only a cheap defensive re-seed and SKIPS topping up the propagation budget, so
+    // lighting idles instead of re-propagating the whole atlas every ~10s (the continuous GPU tax that
+    // inflated readback latency). Cleared when the propagation budget drains to 0.
+    private bool _gpuLightDirtySinceConverge = false;
 
     private void _ProcessGpuLighting(float frameStart, float frameBudget)
     {
@@ -2098,8 +2122,11 @@ public class McWorld : UdonSharpBehaviour
         if (contentLost || gpuLightingKeepAliveCounter >= 600)
         {
             gpuLightingKeepAliveCounter = 0;
-            gpuLightingSeedPending = true;
-            if (gpuLightingIterationsRemaining < gpuLightingTotalIterations)
+            gpuLightingSeedPending = true; // cheap defensive re-seed (recomputes any silently-zeroed slots)
+            // Only force a full propagation budget when there is real dirty work or a detected content
+            // loss. When converged and clean, skip it so lighting QUIESCES instead of re-propagating the
+            // whole atlas every ~10s.
+            if ((contentLost || _gpuLightDirtySinceConverge) && gpuLightingIterationsRemaining < gpuLightingTotalIterations)
                 gpuLightingIterationsRemaining = gpuLightingTotalIterations;
         }
         bool runVerticalSeedPass = gpuLightingSeedPending;
@@ -2109,8 +2136,9 @@ public class McWorld : UdonSharpBehaviour
             _GpuRunLightingSeedPass();
             gpuLightingSeedPending = false;
             seededThisFrame = true;
-            // Ensure at least a minimum propagation budget after seeding
-            if (gpuLightingIterationsRemaining < gpuLightingTotalIterations)
+            // Ensure a propagation budget after a REAL seed (dirty work / content loss). A clean
+            // keep-alive re-seed leaves the budget at 0 so lighting stays quiesced.
+            if ((contentLost || _gpuLightDirtySinceConverge) && gpuLightingIterationsRemaining < gpuLightingTotalIterations)
             {
                 gpuLightingIterationsRemaining = gpuLightingTotalIterations;
             }
@@ -2177,6 +2205,11 @@ public class McWorld : UdonSharpBehaviour
             // are invisible to the terrain shader since it only reads at render time
             _GpuPublishGlobals();
         }
+
+        // QUIESCE: once the propagation budget is fully drained the atlas is converged — clear the
+        // dirty flag so the next periodic keep-alive does only the cheap re-seed and lighting idles
+        // (no continuous full-atlas propagation when nothing has changed).
+        if (gpuLightingIterationsRemaining == 0) _gpuLightDirtySinceConverge = false;
     }
 
     private void _GpuRunLightingSeedPass()
@@ -4254,6 +4287,13 @@ public class McWorld : UdonSharpBehaviour
         float readbackBudget = Mathf.Max(frameBudget, Time.realtimeSinceStartup - frameStart + 0.001f);
         _ProcessGpuFaceReadback(frameStart, readbackBudget);
 
+        // DATA-GEN STREAMING: refresh the cached player chunk once per frame so the coordinator's
+        // data-gen picker (which calls ShouldGenerateChunkData per scanned position) never does a
+        // GetPosition() per position.
+        bool _spKnown = _TryGetPlayerChunkCoords(out int _spX, out int _spY, out int _spZ);
+        _streamPlayerKnown = _spKnown;
+        if (_spKnown) { _streamPlayerChunkX = _spX; _streamPlayerChunkZ = _spZ; }
+
         // --- Process Data Generation ---
         for (int i = 0; i < activeDataGenCount; i++)
         {
@@ -4269,6 +4309,31 @@ public class McWorld : UdonSharpBehaviour
                 continue;
             }
             StepChunkDataGeneration(chunk);
+        }
+
+        // --- NEAR meshing guarantee (Minecraft: near chunks rebuild unconditionally each frame) ---
+        // Runs BEFORE the shared budget loop, with its OWN time budget that the shared aggregate cap
+        // does not deduct from, so a far-chunk backlog (the deferred mesh queue can sit at 256/256)
+        // can never starve meshing the chunks right around the player. Bounded by
+        // gpuNearMeshDecodeFrameBudgetMs so it can't spike frames (MC bounds its near rebuilds by a
+        // per-frame deadline the same way).
+        float nearMeshBudgetSec = Mathf.Max(0.25f, gpuNearMeshDecodeFrameBudgetMs) * 0.001f;
+        float nearMeshDeadline = Time.realtimeSinceStartup + nearMeshBudgetSec;
+        for (int ni = 0; ni < activeMeshingCount; ni++)
+        {
+            if (Time.realtimeSinceStartup > nearMeshDeadline) break;
+            ChunkData nearChunk = activeMeshingChunks[ni];
+            if (nearChunk == null || !nearChunk.isBuildingMesh) continue; // finalize/cleanup handled by the shared loop below
+            if (!_IsChunkNearPlayer(nearChunk)) continue;                 // near-only lane
+            int nearSteps = nearChunk._gpuFaceBuildActive
+                ? Mathf.Max(adaptiveGpuMeshDecodeStepsPerFrame, gpuMeshDecodeStepsPerFrame)
+                : 20;
+            for (int nstep = 0; nstep < nearSteps; nstep++)
+            {
+                if (!nearChunk.isBuildingMesh) break;
+                if (Time.realtimeSinceStartup > nearMeshDeadline) break;
+                _BuildChunkMeshStep(nearChunk);
+            }
         }
 
         // --- Process Meshing ---
@@ -6238,6 +6303,25 @@ public class McWorld : UdonSharpBehaviour
         int dx = chunk.chunkX_world - pcx;
         int dz = chunk.chunkZ_world - pcz;
         return (dx * dx + dz * dz) <= (_activeRenderDistanceChunks * _activeRenderDistanceChunks);
+    }
+
+    // DATA-GEN STREAMING gate (Minecraft-style): should this chunk INDEX have its terrain DATA
+    // generated right now? Player-relative radial XZ test (render distance + margin), full Y column.
+    // Operates on a radialChunkOrder 1D index so far chunks DEFER without being instantiated, and the
+    // coordinator's picker re-scans every cycle so they stream in as the player approaches. Uses the
+    // per-frame cached player chunk (no GetPosition per call). Returns true (generate) when the cull
+    // is off or the player isn't known yet — preserving the initial spawn load. Determinism-safe:
+    // terrain content is independent of WHEN a chunk generates.
+    public bool ShouldGenerateChunkData(int chunk1DIndex)
+    {
+        if (!enableMeshRenderDistanceCull || _activeRenderDistanceChunks <= 0) return true;
+        if (!_streamPlayerKnown) return true;
+        Chunk1DToArrrayCoords(chunk1DIndex, out int ax, out int ay, out int az);
+        int dx = (ax - chunkOffsetX) - _streamPlayerChunkX;
+        int dz = (az - chunkOffsetZ) - _streamPlayerChunkZ;
+        int margin = dataGenRenderDistanceMarginChunks > 0 ? dataGenRenderDistanceMarginChunks : 0;
+        int R = _activeRenderDistanceChunks + margin;
+        return (dx * dx + dz * dz) <= (R * R);
     }
 
     // GPU OFFLOAD #1: Radius beyond which a chunk does NOT need a CPU mirror of its blocks.
@@ -13498,6 +13582,7 @@ public class McWorld : UdonSharpBehaviour
         // (Calling N iterations here would stall the frame; one is enough to seed the
         // change correctly.)
         gpuLightingSeedPending = true;
+        _gpuLightDirtySinceConverge = true; // real light change (block edit) -> propagate until converged
         if (gpuLightingIterationsRemaining < gpuLightingTotalIterations)
         {
             gpuLightingIterationsRemaining = gpuLightingTotalIterations;
