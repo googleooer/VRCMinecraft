@@ -1033,4 +1033,165 @@ public partial class McWorld
     private int   sch_peak_RebuildQueue;
     private int   sch_peak_DeferredMeshQueue;
 #endif
+
+    // =========================================================================
+    // Scheduler API methods — moved from McCoordinator (Task 7 / Part A)
+    // =========================================================================
+
+    // 1. IsWorldGenComplete — no clash with McWorld; kept original name.
+    private bool IsWorldGenComplete()
+    {
+        return _initialBulkLoadDone || (chunksCompletedCount >= totalWorldChunks && totalWorldChunks > 0);
+    }
+
+    // 2. RequestChunkMeshUpdate (scheduler/queue version) — McWorld already has a
+    //    public RequestChunkMeshUpdate that handles direct builds + delegates here;
+    //    this is the queue-side implementation, prefixed _Sched to avoid clash.
+    private void _SchedRequestChunkMeshUpdate(int chunkIndexToUpdate)
+    {
+        if (chunkIndexToUpdate == -1) return;
+
+        ChunkData[] chunks = chunks_1D;
+        ChunkData chunk = chunks != null && chunkIndexToUpdate >= 0 && chunkIndexToUpdate < chunks.Length ? chunks[chunkIndexToUpdate] : null;
+        if (chunk == null) return;
+        bool interactionPriority = chunk != null && chunk.interactionMeshPriority;
+        if (chunk.isBuildingMesh)
+        {
+            chunk.pendingChunkMeshRebuild = true;
+            return;
+        }
+        if (chunk.isQueuedForMeshRebuild) return;
+
+        if (chunkRebuildQueue_count >= MAX_REBUILD_QUEUE_SIZE) return;
+
+        // Quick check: Avoid adding if it's already being processed by a worker
+        // Only check first few workers since most of the time only 1-2 are active
+        int checkLimit = maxConcurrentWorkers < 4 ? maxConcurrentWorkers : 4;
+        for (int i = 0; i < checkLimit; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToUpdate) return;
+        }
+
+        if (interactionPriority)
+        {
+            chunkRebuildQueue_head = (chunkRebuildQueue_head - 1 + MAX_REBUILD_QUEUE_SIZE) % MAX_REBUILD_QUEUE_SIZE;
+            chunkRebuildQueue[chunkRebuildQueue_head] = chunkIndexToUpdate;
+        }
+        else
+        {
+            chunkRebuildQueue[chunkRebuildQueue_tail] = chunkIndexToUpdate;
+            chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+        }
+        chunk.isQueuedForMeshRebuild = true;
+        chunkRebuildQueue_count++;
+    }
+
+    // 3. RequestDeferredChunkMeshUpdate — no clash with McWorld; kept original name.
+    private bool RequestDeferredChunkMeshUpdate(int chunkIndexToUpdate)
+    {
+        if (chunkIndexToUpdate == -1 || deferredMeshQueue_count >= MAX_DEFERRED_MESH_QUEUE_SIZE) return false;
+
+        ChunkData[] chunks = chunks_1D;
+        ChunkData chunk = chunks != null && chunkIndexToUpdate >= 0 && chunkIndexToUpdate < chunks.Length ? chunks[chunkIndexToUpdate] : null;
+        if (chunk == null || !chunk.isMeshDeferred || chunk.isBuildingMesh) return false;
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToUpdate) return false;
+        }
+
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int queueIndex = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[queueIndex] == chunkIndexToUpdate) return false;
+        }
+
+        for (int i = 0; i < deferredMeshQueue_count; i++)
+        {
+            int queueIndex = (deferredMeshQueue_head + i) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+            if (deferredMeshQueue[queueIndex] == chunkIndexToUpdate) return false;
+        }
+
+        deferredMeshQueue[deferredMeshQueue_tail] = chunkIndexToUpdate;
+        deferredMeshQueue_tail = (deferredMeshQueue_tail + 1) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+        deferredMeshQueue_count++;
+        return true;
+    }
+
+    // 4. IsChunkScheduledForMeshUpdate — no clash with McWorld; kept original name.
+    private bool IsChunkScheduledForMeshUpdate(int chunkIndexToCheck)
+    {
+        if (chunkIndexToCheck == -1) return false;
+
+        ChunkData[] chunks = chunks_1D;
+        ChunkData chunk = chunks != null && chunkIndexToCheck >= 0 && chunkIndexToCheck < chunks.Length ? chunks[chunkIndexToCheck] : null;
+        if (chunk != null && chunk.isQueuedForMeshRebuild) return true;
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToCheck) return true;
+        }
+
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int queueIndex = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[queueIndex] == chunkIndexToCheck) return true;
+        }
+        return false;
+    }
+
+#if LOGGING
+    // 5. AppendAggregatePerformanceStats — McWorld has a same-named method that *calls* this
+    //    (coordinator.AppendAggregatePerformanceStats); prefixed _Sched to avoid clash.
+    private void _SchedAppendAggregatePerformanceStats(System.Text.StringBuilder sb)
+    {
+        if (sb == null || (!sch_enableDetailedTimings && !sch_enableAggregateLogging) || sch_cycles_Processed <= 0) return;
+
+        float avgCycle  = sch_time_TotalCycle   / sch_cycles_Processed;
+        float avgUpdate = sch_time_UpdateWorkers / sch_cycles_Processed;
+        float avgAssign = sch_time_AssignWork    / sch_cycles_Processed;
+
+        sb.AppendLine("Coordinator:");
+        sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms, update workers {2:F3}ms, assign work {3:F3}ms\n",
+            sch_cycles_Processed, avgCycle, avgUpdate, avgAssign);
+        sb.AppendFormat("  Assign breakdown (per cycle): pick {0:F3}ms ({1} calls), startGen {2:F3}ms ({3} cols), siblingStep {4:F3}ms ({5}), rest {6:F3}ms\n",
+            sch_time_AssignPick / sch_cycles_Processed, sch_assign_PickCalls,
+            sch_time_AssignStartGen / sch_cycles_Processed, sch_assign_NewColumns,
+            sch_time_AssignStepGen / sch_cycles_Processed, sch_assign_SiblingSteps,
+            (sch_time_AssignWork - sch_time_AssignPick - sch_time_AssignStartGen - sch_time_AssignStepGen) / sch_cycles_Processed);
+        sb.AppendFormat("  Worker completions: data {0}, mesh {1}, deferred {2}, rebuilds {3}, deferred wakes {4}, world assigns {5}\n",
+            sch_workers_DataGenCompleted, sch_workers_MeshCompleted, sch_workers_MeshDeferred, sch_rebuilds_Processed, sch_deferredMeshWakeAssignments, sch_worldChunks_Assigned);
+        sb.AppendFormat("  Peaks: active {0}/{1}, data {2}, meshing {3}, rebuild queue {4}/{5}, deferred queue {6}/{7}\n",
+            sch_peak_ActiveWorkers, maxConcurrentWorkers, sch_peak_DataGenWorkers, sch_peak_MeshingWorkers, sch_peak_RebuildQueue, MAX_REBUILD_QUEUE_SIZE, sch_peak_DeferredMeshQueue, MAX_DEFERRED_MESH_QUEUE_SIZE);
+        sb.AppendFormat("  Progress: {0}/{1} chunks ({2:F1}%)\n",
+            chunksCompletedCount, totalWorldChunks,
+            totalWorldChunks > 0 ? (chunksCompletedCount * 100f / totalWorldChunks) : 0f);
+    }
+
+    // 6. ResetAggregatePerformanceStats — prefixed _Sched to avoid clash.
+    private void _SchedResetAggregatePerformanceStats()
+    {
+        sch_time_UpdateWorkers        = 0f;
+        sch_time_AssignWork           = 0f;
+        sch_time_AssignPick           = 0f;
+        sch_time_AssignStartGen       = 0f;
+        sch_time_AssignStepGen        = 0f;
+        sch_assign_PickCalls          = 0;
+        sch_assign_NewColumns         = 0;
+        sch_assign_SiblingSteps       = 0;
+        sch_time_TotalCycle           = 0f;
+        sch_cycles_Processed          = 0;
+        sch_workers_DataGenCompleted  = 0;
+        sch_workers_MeshCompleted     = 0;
+        sch_workers_MeshDeferred      = 0;
+        sch_rebuilds_Processed        = 0;
+        sch_deferredMeshWakeAssignments = 0;
+        sch_worldChunks_Assigned      = 0;
+        sch_peak_ActiveWorkers        = 0;
+        sch_peak_DataGenWorkers       = 0;
+        sch_peak_MeshingWorkers       = 0;
+        sch_peak_RebuildQueue         = 0;
+        sch_peak_DeferredMeshQueue    = 0;
+    }
+#endif
 }

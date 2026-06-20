@@ -909,12 +909,9 @@ public partial class McWorld : UdonSharpBehaviour
         // Push them to the coordinator and every terrain generator so ONE set of toggles on McWorld
         // drives the whole Performance Summary (each component used to carry its own duplicate copy,
         // which is why the same flag had to be set in several places to see any output).
-        if (coordinator != null)
-        {
-            coordinator.enableVerboseLogging = enableVerboseLogging;
-            coordinator.enableDetailedTimings = enableDetailedTimings;
-            coordinator.enableAggregateLogging = enableAggregateLogging;
-        }
+        sch_enableVerboseLogging = enableVerboseLogging;
+        sch_enableDetailedTimings = enableDetailedTimings;
+        sch_enableAggregateLogging = enableAggregateLogging;
         if (terrainGenerator != null)
         {
             terrainGenerator.enableVerboseLogging = enableVerboseLogging;
@@ -933,8 +930,7 @@ public partial class McWorld : UdonSharpBehaviour
         }
 #endif
 
-        int[] radialChunkOrder = GenerateRadialChunkOrder();
-        coordinator.InitializeAndStartProcessing(this, radialChunkOrder, totalWorldChunks);
+        _SchedulerInit();
         _nearGenStartTime = Time.realtimeSinceStartup;
         _nearChunksReady = 0;
         _nearGenLogged = false;
@@ -4517,7 +4513,7 @@ public partial class McWorld : UdonSharpBehaviour
         // readback pipeline do much more per frame). Once gen completes, restore the normal
         // runtime budget so steady-state frame rate is protected. Accuracy is unaffected —
         // this only changes how much already-scheduled work runs per frame.
-        if (!_loadPhaseBudgetRestored && coordinator != null && coordinator.IsWorldGenComplete())
+        if (!_loadPhaseBudgetRestored && IsWorldGenComplete())
         {
             _loadPhaseBudgetRestored = true;
             updateTimeBudgetMs = _runtimeUpdateBudgetMs;
@@ -4533,6 +4529,9 @@ public partial class McWorld : UdonSharpBehaviour
             updateStartTime = Time.realtimeSinceStartup;
         }
 #endif
+
+        // Run the merged in-VM scheduler (formerly McCoordinator.Update).
+        _RunSchedulerOnce();
 
         _UpdateBetaWaterAnimation();
         ProcessActiveChunks();
@@ -4828,7 +4827,7 @@ public partial class McWorld : UdonSharpBehaviour
                 if (!hasHeadroom) continue;
             }
 
-            if (coordinator != null && coordinator.RequestDeferredChunkMeshUpdate(chunkIndex))
+            if (RequestDeferredChunkMeshUpdate(chunkIndex))
             {
                 scheduled++;
                 if (scheduled >= requestLimit) break;
@@ -4859,7 +4858,7 @@ public partial class McWorld : UdonSharpBehaviour
     private void _PostWorldGenBorderCleanup()
     {
         if (_postWorldGenBorderCleanupDone) return;
-        if (coordinator == null || !coordinator.IsWorldGenComplete()) return;
+        if (!IsWorldGenComplete()) return;
         if (chunks_1D == null || chunks_1D.Length == 0) return;
 
         // Wait until no chunks are actively building a mesh so we don't race.
@@ -5974,13 +5973,13 @@ public partial class McWorld : UdonSharpBehaviour
             // queue during heavy load just because an unallocated frontier neighbour isn't ready.
             // Any transient air-boundary face self-heals via _borderMissingMask / _TryImmediateBorderHeal.
             && AreAllNeighborsReadyLenient(chunkIndex)
-            && (coordinator == null || !coordinator.IsChunkScheduledForMeshUpdate(chunkIndex)))
+            && !IsChunkScheduledForMeshUpdate(chunkIndex))
         {
             BuildChunkMesh(chunkIndex);
             return;
         }
 
-        if (coordinator != null) coordinator.RequestChunkMeshUpdate(chunkIndex);
+        _SchedRequestChunkMeshUpdate(chunkIndex);
     }
 
     public byte GetBlock(int globalX, int globalY, int globalZ)
@@ -14950,10 +14949,7 @@ public partial class McWorld : UdonSharpBehaviour
             }
         }
 
-        if (coordinator != null)
-        {
-            coordinator.AppendAggregatePerformanceStats(logBuilder);
-        }
+        _SchedAppendAggregatePerformanceStats(logBuilder);
 
         if (terrainGenerator != null)
         {
@@ -15282,10 +15278,7 @@ public partial class McWorld : UdonSharpBehaviour
             stats_slowestMeshKind[i] = 0;
         }
 
-        if (coordinator != null)
-        {
-            coordinator.ResetAggregatePerformanceStats();
-        }
+        _SchedResetAggregatePerformanceStats();
 
         if (terrainGenerator != null)
         {

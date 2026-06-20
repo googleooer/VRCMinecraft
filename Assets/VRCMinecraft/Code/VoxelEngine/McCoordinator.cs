@@ -331,6 +331,10 @@ public class McCoordinator : UdonSharpBehaviour
     /// </summary>
     void Update()
     {
+        // McWorld.Update() now drives the scheduler directly via _RunSchedulerOnce().
+        // McCoordinator.Update() is a no-op — do not remove this return (McCoordinator
+        // is deleted in a later task; keeping the rest of the method intact ensures compile).
+        return;
         // Safety check: Don't process if not initialized
         if (world == null || worker_state == null || radialChunkOrder == null) return;
         
