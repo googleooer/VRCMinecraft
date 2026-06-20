@@ -257,6 +257,247 @@ public partial class McWorld
     }
 
     // =========================================================================
+    // Assignment loop (ported from McCoordinator.Update, lines 707–930)
+    // Assigns new work to idle workers: rebuilds (P1), border-heal (P1.5),
+    // initial worldgen (P2), deferred-mesh wakes (P3).
+    // =========================================================================
+    private void _SchedulerAssignWork(float cycleStartTime, float cycleBudget)
+    {
+        ChunkData[] chunks = chunks_1D;
+        int chunksLen = chunks != null ? chunks.Length : 0;
+
+#if LOGGING
+        System.DateTime _awStart = System.DateTime.MinValue;
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging) _awStart = System.DateTime.UtcNow;
+#endif
+
+        int assignedThisCycle = 0;
+        int rebuildAssignmentsThisCycle = 0;
+        int deferredWakeAssignmentsThisCycle = 0;
+        int chunkInstantiationsThisFrame = 0;
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break; // Don't exceed budget
+
+            if (worker_state[i] != SCH_STATE_IDLE) continue;
+
+            bool assigned = false;
+            bool canInterleaveDeferredWake =
+                deferredMeshQueue_count > 0
+                && chunkRebuildQueue_count > 0
+                && chunkRebuildQueue_count <= deferredMeshWakeQueueThreshold
+                && deferredWakeAssignmentsThisCycle < deferredMeshWakeBurstPerCycle
+                && rebuildAssignmentsThisCycle > deferredWakeAssignmentsThisCycle;
+
+            if (canInterleaveDeferredWake)
+            {
+                assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                if (assigned)
+                {
+                    assignedThisCycle++;
+                    deferredWakeAssignmentsThisCycle++;
+                }
+            }
+
+            // Priority 1: Process player-initiated rebuilds
+            if (!assigned && chunkRebuildQueue_count > 0)
+            {
+                int chunkIndexToRebuild = chunkRebuildQueue[chunkRebuildQueue_head];
+                chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
+                chunkRebuildQueue_count--;
+
+                if (chunkIndexToRebuild != -1)
+                {
+                    ChunkData rebuildChunk = chunks != null && chunkIndexToRebuild >= 0 && chunkIndexToRebuild < chunksLen ? chunks[chunkIndexToRebuild] : null;
+                    if (rebuildChunk != null) rebuildChunk.isQueuedForMeshRebuild = false;
+                    worker_targetChunkIndex[i] = chunkIndexToRebuild;
+                    worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                    worker_isDeferredMeshWake[i] = rebuildChunk != null && rebuildChunk.isMeshDeferred;
+                    if (rebuildChunk != null && rebuildChunk.isMeshDeferred)
+                    {
+                        rebuildChunk.isMeshDeferred = false;
+                        rebuildChunk.pendingNeighborMeshRebuild = true;
+                    }
+                    assigned = true;
+                    assignedThisCycle++;
+                    rebuildAssignmentsThisCycle++;
+#if LOGGING
+                    if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_rebuilds_Processed++;
+#endif
+                }
+            }
+            // Priority 1.5: Heal chunks with stale border data (bypass rebuild queue)
+            // Only after all chunks have been assigned for generation.
+            else if (!assigned && nextChunkIndexToAssign >= totalWorldChunks)
+            {
+                int scanLen = chunks != null ? chunksLen : 0;
+                for (int s = 0; s < 64 && scanLen > 0; s++)
+                {
+                    // Udon VM quirk: never post-increment a field as expression — split read/write.
+                    int healCursor = borderHealWorkerCursor;
+                    borderHealWorkerCursor = healCursor + 1;
+                    if (borderHealWorkerCursor >= scanLen) borderHealWorkerCursor = 0;
+                    ChunkData hc = chunks[borderHealWorkerCursor];
+                    if (hc == null || !hc.isDataReady || hc.isBuildingMesh || hc.isMeshDeferred) continue;
+                    if (hc._borderMissingMask == 0) continue;
+                    byte hm = hc._borderMissingMask;
+                    bool ready = true;
+                    for (int d = 0; d < 6; d++)
+                    {
+                        if ((hm & (1 << d)) == 0) continue;
+                        ChunkData nc = GetChunkAt(
+                            hc.chunkX_world + _healDx[d],
+                            hc.chunkY_world + _healDy[d],
+                            hc.chunkZ_world + _healDz[d]);
+                        if (nc == null || !nc.isDataReady) { ready = false; break; }
+                    }
+                    if (ready)
+                    {
+                        worker_targetChunkIndex[i] = borderHealWorkerCursor;
+                        worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                        assigned = true;
+                        assignedThisCycle++;
+                        break;
+                    }
+                }
+
+                // CRITICAL: once worldgen assignment is complete this border-heal branch is an
+                // else-if that captures every idle worker, so the chain never reaches Priority 3
+                // (deferred-mesh wake) below — leaving the deferred queue stranded at its cap and
+                // the world permanently incomplete. Drain it here when heal found nothing. (During
+                // load this branch isn't entered, so Priority 3 still drains the queue normally.)
+                if (!assigned && deferredMeshQueue_count > 0)
+                {
+                    assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                    if (assigned) assignedThisCycle++;
+                }
+            }
+            // Priority 2: Initial world generation
+            // Old limit was 1 instantiation per frame — that capped worldgen at framerate.
+            // With column caching (radial order visits all Y per (x,z) consecutively), the
+            // first chunk in a column waits for the GPU readback (~80ms), then 7 more
+            // sibling chunks can all be allocated to free workers immediately. Allowing
+            // a burst here removes the gap between readback completion and chunks actually
+            // entering the data-gen state.
+            else if (chunkInstantiationsThisFrame < maxChunkInstantiationsPerCycle && nextChunkIndexToAssign < totalWorldChunks && _TryPickDataGenPosition())
+            {
+                int pickedPos = _lastPickedDataGenPos;
+                _positionAssigned[pickedPos] = true;
+                int chunk1DIndex = radialChunkOrder[pickedPos];
+                // Advance the low-water-mark past any now-consumed leading positions.
+                while (nextChunkIndexToAssign < totalWorldChunks && _positionAssigned[nextChunkIndexToAssign]) nextChunkIndexToAssign++;
+
+                Chunk1DToArrrayCoords(chunk1DIndex, out int array_cx, out int array_cy, out int array_cz);
+
+                int newChunkIndex = InstantiateAndConfigureChunk(array_cx, array_cy, array_cz);
+                chunkInstantiationsThisFrame++;
+
+                if (newChunkIndex != -1)
+                {
+                    worker_targetChunkIndex[i] = newChunkIndex;
+                    worker_state[i] = SCH_STATE_DATA_GEN;
+#if LOGGING
+                    System.DateTime _startGenT = (sch_enableDetailedTimings || sch_enableAggregateLogging) ? System.DateTime.UtcNow : System.DateTime.MinValue;
+#endif
+                    worker_usesExclusiveGenerator[i] = StartChunkDataGeneration(newChunkIndex);
+#if LOGGING
+                    if (sch_enableDetailedTimings || sch_enableAggregateLogging) { sch_time_AssignStartGen += (float)(System.DateTime.UtcNow - _startGenT).TotalMilliseconds; sch_assign_NewColumns++; }
+#endif
+                    worker_isDeferredMeshWake[i] = false;
+                    if (worker_usesExclusiveGenerator[i])
+                    {
+                        int genSlot = _GenSlotForChunk(newChunkIndex);
+                        worker_generatorSlot[i] = genSlot;
+                        if (genSlot >= 0 && genSlot < genSlotBusy.Length) genSlotBusy[genSlot] = true;
+                    }
+                    assigned = true;
+                    assignedThisCycle++;
+#if LOGGING
+                    if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_worldChunks_Assigned++;
+#endif
+
+                    // Cached lower-Y GPU slices can complete immediately without holding the
+                    // exclusive generator. Collapse that handoff here so workers are freed
+                    // in the same coordinator cycle when possible.
+                    if (!worker_usesExclusiveGenerator[i])
+                    {
+                        ChunkData assignedChunk = chunks != null && newChunkIndex >= 0 && newChunkIndex < chunksLen ? chunks[newChunkIndex] : null;
+                        if (assignedChunk != null && assignedChunk.isGeneratingData)
+                        {
+#if LOGGING
+                            System.DateTime _stepGenT = (sch_enableDetailedTimings || sch_enableAggregateLogging) ? System.DateTime.UtcNow : System.DateTime.MinValue;
+#endif
+                            StepChunkDataGeneration(assignedChunk);
+#if LOGGING
+                            if (sch_enableDetailedTimings || sch_enableAggregateLogging) { sch_time_AssignStepGen += (float)(System.DateTime.UtcNow - _stepGenT).TotalMilliseconds; sch_assign_SiblingSteps++; }
+#endif
+
+                            if (!assignedChunk.isGeneratingData)
+                            {
+                                if (UsesGpuLightingBackend() && !RequiresCpuLightingForAmbientOcclusion())
+                                {
+                                    worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                                    worker_skipCheckCounter[i] = 0;
+                                    HandleChunkPostDataGpuLighting(assignedChunk);
+
+                                    if (AreAllNeighborsReady(newChunkIndex) && ShouldDeferChunkMesh(newChunkIndex))
+                                    {
+                                        MarkChunkMeshDeferred(newChunkIndex);
+                                        worker_targetChunkIndex[i] = -1;
+                                        worker_state[i] = SCH_STATE_IDLE;
+                                        worker_skipCheckCounter[i] = 0;
+
+                                        if (chunksCompletedCount < totalWorldChunks)
+                                        {
+                                            chunksCompletedCount++;
+                                        }
+#if LOGGING
+                                        if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_workers_MeshDeferred++;
+#endif
+                                    }
+                                }
+                                else
+                                {
+                                    worker_state[i] = SCH_STATE_LIGHTING;
+                                    worker_skipCheckCounter[i] = 0;
+                                    StartChunkLighting(newChunkIndex);
+                                }
+
+#if LOGGING
+                                if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_workers_DataGenCompleted++;
+#endif
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    chunksCompletedCount++; // already existed
+                }
+            }
+            // Priority 3: Wake deferred interior meshes on their own queue
+            else if (!assigned && deferredMeshQueue_count > 0)
+            {
+                assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                if (assigned)
+                {
+                    assignedThisCycle++;
+                }
+            }
+
+            // Keep filling idle workers until the frame budget says stop.
+            if (assignedThisCycle >= maxConcurrentWorkers) break;
+        }
+
+#if LOGGING
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging)
+        {
+            sch_time_AssignWork += (float)(System.DateTime.UtcNow - _awStart).TotalMilliseconds;
+        }
+#endif
+    }
+
+    // =========================================================================
     // Worker state-machine loop (ported from McCoordinator.Update, lines 393–676)
     // Called by _RunSchedulerOnce (wired in Task 6). McCoordinator still drives.
     // =========================================================================
