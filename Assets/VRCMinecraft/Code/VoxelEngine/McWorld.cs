@@ -11,7 +11,7 @@ using TMPro;
 
 [Singleton]
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
-public class McWorld : UdonSharpBehaviour
+public partial class McWorld : UdonSharpBehaviour
 {
     [Header("World Configuration")]
     public string worldSeedString = "DefaultSeed";
