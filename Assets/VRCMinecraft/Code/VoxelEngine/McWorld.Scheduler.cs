@@ -266,6 +266,10 @@ public partial class McWorld
         ChunkData[] chunks = chunks_1D;
         int chunksLen = chunks != null ? chunks.Length : 0;
 
+#if LOGGING
+        System.DateTime _swStart = System.DateTime.UtcNow;
+#endif
+
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
             if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break; // Don't exceed budget
@@ -554,7 +558,7 @@ public partial class McWorld
 #if LOGGING
         if (sch_enableDetailedTimings || sch_enableAggregateLogging)
         {
-            sch_time_UpdateWorkers += (float)(System.DateTime.UtcNow - System.DateTime.UtcNow).TotalMilliseconds; // placeholder; real timing wired in Task 6
+            sch_time_UpdateWorkers += (float)(System.DateTime.UtcNow - _swStart).TotalMilliseconds;
         }
 #endif
     }
