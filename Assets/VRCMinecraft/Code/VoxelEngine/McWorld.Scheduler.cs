@@ -805,6 +805,170 @@ public partial class McWorld
     }
 
     // =========================================================================
+    // Scheduler ready flag (set by _SchedulerInit; gates _RunSchedulerOnce)
+    // =========================================================================
+    private bool _schedulerReady = false;
+
+    // =========================================================================
+    // _SchedulerInit — ported from McCoordinator.InitializeAndStartProcessing.
+    // Allocates the worker-pool arrays and resets all scheduler cursors.
+    // Called by McWorld's init path (Task 7 will wire the call site).
+    // =========================================================================
+    private void _SchedulerInit()
+    {
+        // radialChunkOrder: generated fresh here because McWorld owns GenerateRadialChunkOrder()
+        // and _SchedulerInit is part of McWorld (partial class). In the original coordinator flow
+        // McWorld.Start() called GenerateRadialChunkOrder() then handed the result to the
+        // coordinator; here we do both steps in one place.
+        radialChunkOrder = GenerateRadialChunkOrder();
+
+        nextChunkIndexToAssign = 0;
+        chunksCompletedCount = 0;
+        benchmarkStartTime = Time.realtimeSinceStartup;
+        _nearMeshCounted = new bool[totalWorldChunks];
+        _nearMeshDone = 0;
+        _nearMeshLogged = false;
+#if LOGGING
+        sch_lastLoggedPercent = -1;
+#endif
+
+        worker_targetChunkIndex       = new int[maxConcurrentWorkers];
+        worker_state                  = new int[maxConcurrentWorkers];
+        worker_usesExclusiveGenerator = new bool[maxConcurrentWorkers];
+        worker_isDeferredMeshWake     = new bool[maxConcurrentWorkers];
+        worker_skipCheckCounter       = new int[maxConcurrentWorkers];
+        worker_meshFrames             = new int[maxConcurrentWorkers];
+
+        int genCount = Mathf.Max(1, GetGeneratorCount());
+        genSlotBusy         = new bool[genCount];
+        genSlotReleaseDelay = new int[genCount];
+        worker_generatorSlot = new int[maxConcurrentWorkers];
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            worker_targetChunkIndex[i]       = -1;
+            worker_state[i]                  = SCH_STATE_IDLE;
+            worker_usesExclusiveGenerator[i] = false;
+            worker_isDeferredMeshWake[i]     = false;
+            worker_skipCheckCounter[i]       = 0;
+            worker_generatorSlot[i]          = -1;
+        }
+
+        chunkRebuildQueue = new int[MAX_REBUILD_QUEUE_SIZE];
+        deferredMeshQueue = new int[MAX_DEFERRED_MESH_QUEUE_SIZE];
+        _positionAssigned = new bool[totalWorldChunks];
+        _genSlotCache     = new int[totalWorldChunks];
+        for (int i = 0; i < _genSlotCache.Length; i++) _genSlotCache[i] = -1;
+
+        _schedulerReady = true;
+    }
+
+    // =========================================================================
+    // _RunSchedulerOnce — ported from McCoordinator.Update().
+    // Contains: plateau/budget selection, debugGenSlotHoldFrames countdown,
+    // the three worker-loop calls, and the aggregate-log tail.
+    // NOT called anywhere yet — Task 7 wires this into McWorld.Update().
+    // =========================================================================
+    private void _RunSchedulerOnce()
+    {
+        if (!_schedulerReady) return;
+
+        float cycleStartTime = Time.realtimeSinceStartup;
+
+        // DATA-GEN STREAMING: detect end of the one-time initial load by completion PLATEAU.
+        // With streaming, chunksCompletedCount never reaches totalWorldChunks. Once completion
+        // has not advanced for 5 s the render-distance set around spawn is finished; latch
+        // one-way so the load-phase budget boost drops to steady-state.
+        if (!_initialBulkLoadDone)
+        {
+            if (chunksCompletedCount != _lastProgressCompletedCount)
+            {
+                _lastProgressCompletedCount = chunksCompletedCount;
+                _lastGenProgressTime = cycleStartTime;
+            }
+            else if (chunksCompletedCount > 0 && _lastGenProgressTime >= 0f
+                     && cycleStartTime - _lastGenProgressTime > 5f)
+            {
+                _initialBulkLoadDone = true;
+            }
+        }
+
+        // Load-phase budget boost: drain terrain faster at the larger budget during the one-time
+        // initial generation; revert to the normal budget once complete.
+        float effectiveBudgetMs = (!_initialBulkLoadDone && loadPhaseUpdateBudgetMs > updateTimeBudgetMs)
+            ? loadPhaseUpdateBudgetMs : updateTimeBudgetMs;
+        float cycleBudget = effectiveBudgetMs * 0.001f;
+
+        // DEBUG (debugGenSlotHoldFrames): release generator slots whose simulated
+        // readback-occupancy hold has elapsed. No-op when the knob is 0.
+        if (debugGenSlotHoldFrames > 0 && genSlotReleaseDelay != null && genSlotBusy != null)
+        {
+            for (int s = 0; s < genSlotReleaseDelay.Length; s++)
+            {
+                if (genSlotReleaseDelay[s] > 0)
+                {
+                    genSlotReleaseDelay[s] = genSlotReleaseDelay[s] - 1;
+                    if (genSlotReleaseDelay[s] == 0) genSlotBusy[s] = false;
+                }
+            }
+        }
+
+#if LOGGING
+        System.DateTime cycleStart = System.DateTime.MinValue;
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging)
+            cycleStart = System.DateTime.UtcNow;
+#endif
+
+        _SchedulerUpdateWorkers(cycleStartTime, cycleBudget);
+        _SchedulerGenSlotWatchdog();
+        _SchedulerAssignWork(cycleStartTime, cycleBudget);
+
+#if LOGGING
+        // Progress log (verbose)
+        if (chunksCompletedCount < totalWorldChunks)
+        {
+            int currentPercent = (chunksCompletedCount * 100) / totalWorldChunks;
+            if (currentPercent / 10 > sch_lastLoggedPercent / 10)
+            {
+                if (sch_enableVerboseLogging) Debug.Log($"[Scheduler] World Processing: ~{currentPercent}% complete ({chunksCompletedCount}/{totalWorldChunks} chunks finalized).");
+                sch_lastLoggedPercent = currentPercent;
+            }
+        }
+        else
+        {
+            if (sch_lastLoggedPercent != 100)
+            {
+                sch_lastLoggedPercent = 100;
+                if (sch_enableVerboseLogging) Debug.Log($"[Scheduler] Initial world generation complete. Now processing player edits.");
+            }
+        }
+
+        // Aggregate cycle stats
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging)
+        {
+            sch_time_TotalCycle += (float)(System.DateTime.UtcNow - cycleStart).TotalMilliseconds;
+            sch_cycles_Processed++;
+
+            int activeWorkers = 0;
+            int dataGenWorkers = 0;
+            int meshingWorkers = 0;
+            for (int i = 0; i < maxConcurrentWorkers; i++)
+            {
+                if (worker_state[i] != SCH_STATE_IDLE)      activeWorkers++;
+                if (worker_state[i] == SCH_STATE_DATA_GEN)  dataGenWorkers++;
+                if (worker_state[i] == SCH_STATE_MESHING)   meshingWorkers++;
+            }
+
+            if (activeWorkers  > sch_peak_ActiveWorkers)   sch_peak_ActiveWorkers  = activeWorkers;
+            if (dataGenWorkers > sch_peak_DataGenWorkers)  sch_peak_DataGenWorkers = dataGenWorkers;
+            if (meshingWorkers > sch_peak_MeshingWorkers)  sch_peak_MeshingWorkers = meshingWorkers;
+            if (chunkRebuildQueue_count > sch_peak_RebuildQueue)      sch_peak_RebuildQueue      = chunkRebuildQueue_count;
+            if (deferredMeshQueue_count > sch_peak_DeferredMeshQueue) sch_peak_DeferredMeshQueue = deferredMeshQueue_count;
+        }
+#endif
+    }
+
+    // =========================================================================
     // Generator-slot watchdog (ported from McCoordinator.Update, lines 692–705)
     // =========================================================================
     private void _SchedulerGenSlotWatchdog()
