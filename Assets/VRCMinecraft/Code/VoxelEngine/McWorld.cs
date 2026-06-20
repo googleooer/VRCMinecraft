@@ -789,6 +789,11 @@ public partial class McWorld : UdonSharpBehaviour
     private float stats_finalizeDerivedTime = 0f; // _RefreshChunkDerivedData (4096-voxel scan)
     private float stats_finalizeGpuSyncTime = 0f; // _GpuSyncChunkBlocks (pack + atlas upload)
     private int stats_finalizeCount = 0;
+    private float stats_stepGenChecksTime = 0f;       // the 3 cross-VM gen checks in the resident fast-path
+    private float stats_stepResidentCompleteTime = 0f; // _GpuResidentCompleteChunk (fast-path body)
+    private int   stats_stepFastPathCount = 0;         // times the early resident fast-path return was taken
+    private float stats_stepFinalizeTailTime = 0f;    // homogeneous scan + clone + cache after isComplete
+    private int   stats_stepFullCompleteCount = 0;     // times the full-gen completion path ran
     private int stats_gpuFaceOccupancyUploads = 0;
     private float stats_gpuFaceOccupancyUploadTime = 0f;
     private int stats_gpuFaceOccupancyUploadBytes = 0;
@@ -5298,12 +5303,25 @@ public partial class McWorld : UdonSharpBehaviour
         // GPU-RESIDENT (#2 step 2): a sibling of an already-finalized resident column — the
         // generator is NOT currently mid-gen on this chunk — repacks its Y-slice straight from
         // the still-valid column texture and is done. No readback, no re-gen.
-        if (useGpuWorldgen
+#if LOGGING
+        float _stepChecksT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+        bool _residentFastPath = useGpuWorldgen
             && !gen.IsGeneratingChunk(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world)
             && _ColumnShouldSkipReadback(chunk)
-            && gen.CanRepackGpuResidentColumn(chunk.chunkX_world, chunk.chunkZ_world))
+            && gen.CanRepackGpuResidentColumn(chunk.chunkX_world, chunk.chunkZ_world);
+#if LOGGING
+        if (enableDetailedTimings) stats_stepGenChecksTime += (Time.realtimeSinceStartup - _stepChecksT0) * 1000f;
+#endif
+        if (_residentFastPath)
         {
+#if LOGGING
+            float _residentT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
             _GpuResidentCompleteChunk(chunk, gen);
+#if LOGGING
+            if (enableDetailedTimings) { stats_stepResidentCompleteTime += (Time.realtimeSinceStartup - _residentT0) * 1000f; stats_stepFastPathCount++; }
+#endif
             return;
         }
 
@@ -5340,6 +5358,9 @@ public partial class McWorld : UdonSharpBehaviour
                 _GpuResidentCompleteChunk(chunk, gen);
                 return;
             }
+#if LOGGING
+            float _finTailT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
 
             // Check homogeneous cheaply — full RLE is deferred
             bool isHomogeneous = true;
@@ -5391,6 +5412,7 @@ public partial class McWorld : UdonSharpBehaviour
             }
             chunk._cachedDataVersion++;
 #if LOGGING
+            if (enableDetailedTimings) { stats_stepFinalizeTailTime += (Time.realtimeSinceStartup - _finTailT0) * 1000f; stats_stepFullCompleteCount++; }
             // Count EVERY finalize (eager + deferred) so the slice/derived/gpuSync per-chunk averages
             // share one denominator: derived/gpuSync averages fall toward 0 as the deferral kicks in,
             // directly showing how many finalizes skipped the expensive render-prep.
@@ -14940,6 +14962,7 @@ public partial class McWorld : UdonSharpBehaviour
                 logBuilder.AppendLine($"  Active processing: {stats_processActiveChunksTime:F2}ms total, reconciliation {stats_reconciliationTime:F2}ms total");
                 if (stats_finalizeCount > 0)
                     logBuilder.AppendLine($"  Chunk finalize (per chunk, {stats_finalizeCount} done): slice {stats_finalizeSliceTime / stats_finalizeCount:F2}ms, derived {stats_finalizeDerivedTime / stats_finalizeCount:F2}ms, gpuSync {stats_finalizeGpuSyncTime / stats_finalizeCount:F2}ms");
+                logBuilder.AppendLine($"  StepGen breakdown (totals): genChecks {stats_stepGenChecksTime:F2}ms, residentComplete {stats_stepResidentCompleteTime:F2}ms ({stats_stepFastPathCount} fast), finalizeTail {stats_stepFinalizeTailTime:F2}ms ({stats_stepFullCompleteCount} full)");
             }
             if (enableAdaptiveBudgets)
             {
@@ -15249,6 +15272,11 @@ public partial class McWorld : UdonSharpBehaviour
         stats_finalizeDerivedTime = 0f;
         stats_finalizeGpuSyncTime = 0f;
         stats_finalizeCount = 0;
+        stats_stepGenChecksTime = 0f;
+        stats_stepResidentCompleteTime = 0f;
+        stats_stepFastPathCount = 0;
+        stats_stepFinalizeTailTime = 0f;
+        stats_stepFullCompleteCount = 0;
         stats_gpuFaceOccupancyUploads = 0;
         stats_gpuFaceOccupancyUploadTime = 0f;
         stats_gpuFaceOccupancyUploadBytes = 0;
