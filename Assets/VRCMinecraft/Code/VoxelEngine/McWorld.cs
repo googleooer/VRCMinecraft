@@ -172,8 +172,6 @@ public partial class McWorld : UdonSharpBehaviour
     [SerializeField, FindObjectOfType(true)]
     public McBlockTypeManager blockTypeManager;
     [SerializeField, FindObjectOfType(true)]
-    private McCoordinator coordinator;
-    [SerializeField, FindObjectOfType(true)]
     private McBlockTicker blockTicker;
 
     [Header("Biome Color Textures (Beta 1.7.3)")]
@@ -809,7 +807,7 @@ public partial class McWorld : UdonSharpBehaviour
     void Start()
     {
         Debug.Log("[McWorld] ========== MCWORLD START ==========");
-        if (chunkPrefab == null || terrainGenerator == null || blockTypeManager == null || coordinator == null) {
+        if (chunkPrefab == null || terrainGenerator == null || blockTypeManager == null) {
             Debug.LogError("[McWorld] A critical component is not assigned! Aborting.");
             this.enabled = false;
             return;
@@ -4773,7 +4771,7 @@ public partial class McWorld : UdonSharpBehaviour
 
     private void _ScheduleDeferredInteriorMeshUpdates(float frameStart, float frameBudget)
     {
-        if (!prioritizeVisibleShellMeshing || coordinator == null || chunks_1D == null || chunks_1D.Length == 0) return;
+        if (!prioritizeVisibleShellMeshing || chunks_1D == null || chunks_1D.Length == 0) return;
         if (Time.realtimeSinceStartup - frameStart > frameBudget * 0.75f) return;
 
         bool hasHeadroom = !enableAdaptiveBudgets || lastUpdateDurationMs < Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
@@ -4901,7 +4899,7 @@ public partial class McWorld : UdonSharpBehaviour
 
     private void _HealStaleBorderChunks()
     {
-        if (coordinator == null || chunks_1D == null || chunks_1D.Length == 0) return;
+        if (chunks_1D == null || chunks_1D.Length == 0) return;
         int totalChunks = chunks_1D.Length;
         int scans = 256;
         int healed = 0;

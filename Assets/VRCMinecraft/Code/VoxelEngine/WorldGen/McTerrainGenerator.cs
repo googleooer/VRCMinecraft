@@ -260,9 +260,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private WorldChunkManagerOld biomeQueryWcm;
 
     [SerializeField, FindObjectOfType(true)]
-    private McCoordinator coordinator;
-
-    [SerializeField, FindObjectOfType(true)]
     private McBlockTypeManager blockTypeManager;
 
     // The random state for the generator, based on the seed
