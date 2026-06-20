@@ -98,6 +98,98 @@ public partial class McWorld
     private int    _nearMeshDone       = 0;
     private bool   _nearMeshLogged     = false;
 
+    // =========================================================================
+    // Picker methods (moved from McCoordinator — McCoordinator still drives;
+    // these are dormant copies for compile verification. Task 5/6 will wire them.)
+    // =========================================================================
+
+    // Scans forward from the assignment low-water-mark for the first chunk that
+    // can start data-gen RIGHT NOW: either its generator slot is free (a new
+    // column) or its column cache is already populated (a sibling Y-chunk of an
+    // in-flight/completed column). Returns true and sets _lastPickedDataGenPos on
+    // success. Forward order guarantees a column's cached siblings (earlier
+    // positions) are picked before any later column that would reuse the same
+    // generator, so the single-column cache is never evicted out from under
+    // un-drained siblings.
+    private bool _TryPickDataGenPosition()
+    {
+#if LOGGING
+        if (!sch_enableDetailedTimings && !sch_enableAggregateLogging) return _TryPickDataGenPositionImpl();
+        System.DateTime _pickT = System.DateTime.UtcNow;
+        bool _pickR = _TryPickDataGenPositionImpl();
+        sch_time_AssignPick += (float)(System.DateTime.UtcNow - _pickT).TotalMilliseconds;
+        sch_assign_PickCalls++;
+        return _pickR;
+#else
+        return _TryPickDataGenPositionImpl();
+#endif
+    }
+
+    // Memoized GeneratorSlotForChunkIndex — avoids a cross-VM call per scanned
+    // position each cycle.
+    private int _GenSlotForChunk(int ci)
+    {
+        if (_genSlotCache == null || ci < 0 || ci >= _genSlotCache.Length) return GeneratorSlotForChunkIndex(ci);
+        int s = _genSlotCache[ci];
+        if (s < 0) { s = GeneratorSlotForChunkIndex(ci); _genSlotCache[ci] = s; }
+        return s;
+    }
+
+    private bool _TryPickDataGenPositionImpl()
+    {
+        if (radialChunkOrder == null || _positionAssigned == null) return false;
+        // THROTTLE: how many NEW worldgen columns may be in flight concurrently. Each
+        // new column holds a generator + an in-flight GPU base-readback; capping below
+        // the generator count leaves GPU readback bandwidth for mesh face-readbacks
+        // (which were being starved during load). Sibling chunks copied from an
+        // already-generated column cache add NO readback, so they bypass the cap.
+        bool canStartNewColumn = _BusyGeneratorCount() < maxConcurrentWorldgenColumns;
+        int scanEnd = nextChunkIndexToAssign + dataGenLookaheadWindow;
+        if (scanEnd > totalWorldChunks) scanEnd = totalWorldChunks;
+        for (int p = nextChunkIndexToAssign; p < scanEnd; p++)
+        {
+            if (_positionAssigned[p]) continue;
+            int ci = radialChunkOrder[p];
+            if (!ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin)
+            if (!genSlotBusy[_GenSlotForChunk(ci)])
+            {
+                if (canStartNewColumn) { _lastPickedDataGenPos = p; return true; } // new column (concurrency-capped)
+            }
+            else if (CanStartChunkDataGenerationWithoutExclusiveGenerator(ci))
+            {
+                _lastPickedDataGenPos = p; return true; // sibling from column cache — no new readback, bypasses the cap
+            }
+        }
+
+        // FALLBACK (anti-stall): the windowed scan can come up empty when the next
+        // dataGenLookaheadWindow positions are all already-assigned or map to the few
+        // busy generator slots, while the pickable (unassigned + FREE-slot) positions
+        // sit further ahead. Scan the whole remaining order for an unassigned position
+        // whose generator slot is FREE.
+        for (int p = scanEnd; p < totalWorldChunks; p++)
+        {
+            if (_positionAssigned[p]) continue;
+            int ci = radialChunkOrder[p];
+            if (!ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin)
+            if (!genSlotBusy[_GenSlotForChunk(ci)] && canStartNewColumn)
+            {
+                _lastPickedDataGenPos = p;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Number of generator slots currently mid-column (each = one in-flight GPU
+    // base-readback).
+    private int _BusyGeneratorCount()
+    {
+        if (genSlotBusy == null) return 0;
+        int n = 0;
+        for (int i = 0; i < genSlotBusy.Length; i++) if (genSlotBusy[i]) n++;
+        return n;
+    }
+
 #if LOGGING
     // -------------------------------------------------------------------------
     // Scheduler aggregate-stat fields (#if LOGGING only)
