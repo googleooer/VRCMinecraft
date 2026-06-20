@@ -66,41 +66,15 @@ Captured: ClientSim, standing still, ~30s stream.
 <full Performance Summary block pasted here>
 ```
 
-- [ ] **Step 3: Add an explicit cross-VM call counter (the Phase 1 success metric)**
+- [ ] **Step 3: Use the existing cycle timing as the cross-VM proxy (no new counter)**
 
-In `McCoordinator.cs`, add a per-frame counter incremented at each call site that invokes a `world.*` method, and log it in the existing aggregate log. This is the metric that must reach ≈0 after the merge. Add near the other `#if LOGGING` aggregate fields:
+Do NOT add a dedicated cross-VM counter — McCoordinator is deleted in Task 9, so instrumenting it is wasted churn. The existing `Coordinator:` aggregate log already exposes the proxy: `update workers <A> ms` + `assign work <B> ms` per cycle is precisely the per-cycle cost that the merge collapses into in-VM work. After the merge, read the win from (a) the overall `Update: avg … ms`, and (b) the disappearance of a separate `McCoordinator.Update()` invoke in the Unity profiler. Record the baseline `update workers` / `assign work` numbers in the baseline doc.
 
-```csharp
-#if LOGGING
-    private int dbg_crossVmCallsThisCycle = 0;
-    private int dbg_crossVmCallsAccum = 0;
-    private int dbg_crossVmCycles = 0;
-#endif
-```
-
-Increment it (guarded by `#if LOGGING`) immediately before each `world.<Method>(...)` call in `Update()`/`UpdateWorkers()`/`AssignWork()`/the picker. In the aggregate log emit:
-
-```csharp
-#if LOGGING
-    Debug.Log($"[McCoordinator] cross-VM calls/cycle avg {(dbg_crossVmCycles>0 ? (float)dbg_crossVmCallsAccum/dbg_crossVmCycles : 0f):F1}");
-    dbg_crossVmCallsAccum = 0; dbg_crossVmCycles = 0;
-#endif
-```
-
-(If this is too invasive to thread through every call site, instead wrap the cross-VM surface — see Task 7 — and count there. Either way, record the baseline cross-VM/cycle number into the baseline doc.)
-
-- [ ] **Step 4: Compile gate**
-
-Run: UnityMCP `refresh_unity` then `read_console` (Error filter).
-Expected: zero errors.
-
-- [ ] **Step 5: Capture baseline cross-VM number, then commit**
-
-Re-run Step 1 briefly to capture `cross-VM calls/cycle avg <V>`; add `<V>` to the baseline doc.
+- [ ] **Step 4: Commit the baseline doc**
 
 ```bash
-git add docs/superpowers/baselines/2026-06-19-baseline.md Assets/VRCMinecraft/Code/VoxelEngine/McCoordinator.cs
-git commit -m "chore(voxel): lock pre-merge baseline + cross-VM call counter"
+git add docs/superpowers/baselines/2026-06-19-baseline.md
+git commit -m "chore(voxel): lock pre-merge baseline (Phase 0)"
 ```
 
 ---
@@ -324,8 +298,8 @@ Expected: zero errors.
 Enter ClientSim, stream ~30 s standing still, capture the Performance Summary. Compare to baseline (Task 0):
 - Chunk-load progress curve should match the baseline within noise.
 - No new console errors.
-- `Coordinator:` cycle metrics should now show the work happening inside McWorld's Update instead (the coordinator's own log may go quiet — that's expected).
-- The `cross-VM calls/cycle` counter (Task 0 Step 3) should now read **≈0** if you kept the counter on the now-dead McCoordinator path; if you moved counting into the wrapped surface, it should reflect in-VM calls.
+- `Coordinator:` cycle metrics should now show the work happening inside McWorld's Update instead (the coordinator's own log goes quiet — that's expected).
+- Cross-VM proxy: overall `Update: avg … ms` should drop versus baseline, and the Unity profiler should no longer show a separate `McCoordinator.Update()` invoke consuming time.
 
 If progress regresses or errors appear, revert this task and diagnose before continuing.
 
@@ -425,8 +399,8 @@ Enter ClientSim, stream ~30 s standing still, capture the Performance Summary.
 - [ ] **Step 2: Compare against baseline and record**
 
 Append a "Post-merge (Phase 1)" section to the baseline doc with the new numbers. Phase 1 go/no-go (from spec §10):
-- Cross-VM calls/frame ≈ 0 — **PASS/FAIL**
-- Coordinator/scheduler per-cycle cost reduced vs baseline — record delta.
+- No separate `McCoordinator.Update()` invoke in the profiler (cross-VM tax gone) — **PASS/FAIL**
+- Coordinator/scheduler per-cycle cost (`update workers` + `assign work`) reduced vs baseline — record delta.
 - World still loads correctly, no errors — **PASS/FAIL**.
 
 - [ ] **Step 3: Commit**
