@@ -314,6 +314,10 @@ public partial class McWorld : UdonSharpBehaviour
     private byte[] reusableByteArray = new byte[4096];
     private bool[] reusableBoolArray = new bool[4096];
     private int[] reusableIntArray = new int[4096];
+    [Tooltip("PERF TEST (default OFF): skip the greedy face-merge growth scan and emit one 1x1 quad per face. Tests whether the merge scan cost outweighs the vertex-count savings. ON = more verts, no merge scan; OFF = greedy merge (default).")]
+    public bool disableGreedyMeshing = false;
+    [Tooltip("PERF TEST (default 1 = original behavior): iterations between Time.realtimeSinceStartup budget checks in the GPU mesh-decode loop. Higher = fewer Time externs in the hot loop, slightly coarser per-frame budgeting. Try 8.")]
+    public int meshDecodeTimeCheckInterval = 1;
     private readonly byte[] greedyMaskBlockIds = new byte[256];
     private readonly byte[] greedyMaskLightLevels = new byte[256];
     private readonly int[] greedyMaskPackedColors = new int[256];
@@ -3556,8 +3560,18 @@ public partial class McWorld : UdonSharpBehaviour
         byte[] dataPZ = chunk._decompPZ;
         byte[] dataNZ = chunk._decompNZ;
 
-        while (Time.realtimeSinceStartup - budgetStart <= budgetSec)
+        int timeCheckInterval = meshDecodeTimeCheckInterval > 0 ? meshDecodeTimeCheckInterval : 1;
+        int timeCheckCountdown = timeCheckInterval;
+        while (true)
         {
+            // Budget check throttled to every Nth iteration to cut Time.realtimeSinceStartup externs
+            // in the hot decode loop. meshDecodeTimeCheckInterval=1 reproduces the original
+            // per-iteration check exactly; higher values trade frame-budget granularity for fewer externs.
+            if (--timeCheckCountdown <= 0)
+            {
+                timeCheckCountdown = timeCheckInterval;
+                if (Time.realtimeSinceStartup - budgetStart > budgetSec) break;
+            }
             if (chunk._gpuFaceBuildStage == -1)
             {
                 if (useSummary)
@@ -5338,6 +5352,12 @@ public partial class McWorld : UdonSharpBehaviour
             {
                 isComplete = gen.StepChunkGeneration(out generatedData);
                 if (isComplete) break;
+
+                // EVENT-DRIVEN GEN: the generator is parked on an async GPU readback (base-column or
+                // climate) that only its OnAsyncGpuReadbackComplete callback can finish. Re-stepping it
+                // this frame is wasted cross-VM work — ~32 calls spin-polling a 180-220ms readback.
+                // Break now; the worker stays in DATA_GEN and we poll exactly once next frame.
+                if (gen.gpuStepBlockedOnReadback) break;
 
                 // Stop if we've used our budget (prevents stutters)
                 if (Time.realtimeSinceStartup - stepStart > stepBudget) break;
@@ -9271,49 +9291,57 @@ public partial class McWorld : UdonSharpBehaviour
                 float emitScanStart = stats_trackCompactEmitInternals ? Time.realtimeSinceStartup : 0f;
 #endif
                 int quadWidth = 1;
-                while (u + quadWidth <= maxU)
+                // PERF TEST: greedy width-merge scan — skipped when disableGreedyMeshing (emit 1-wide quads).
+                if (!disableGreedyMeshing)
                 {
-                    int nextIndex = rowOffset + u + quadWidth;
-                    if (blockIds[nextIndex] != blockID || packedColors[nextIndex] != packedColor) break;
-                    if (useAo)
+                    while (u + quadWidth <= maxU)
                     {
-                        if (aoSignatures[nextIndex] != aoSignature) break;
+                        int nextIndex = rowOffset + u + quadWidth;
+                        if (blockIds[nextIndex] != blockID || packedColors[nextIndex] != packedColor) break;
+                        if (useAo)
+                        {
+                            if (aoSignatures[nextIndex] != aoSignature) break;
+                        }
+                        else if (!constantLight && lightLevels[nextIndex] != lightLevel)
+                        {
+                            break;
+                        }
+                        quadWidth++;
                     }
-                    else if (!constantLight && lightLevels[nextIndex] != lightLevel)
-                    {
-                        break;
-                    }
-                    quadWidth++;
                 }
 
                 int quadHeight = 1;
-                bool canGrow = true;
-                while (v + quadHeight <= maxV && canGrow)
+                // PERF TEST: greedy height-merge scan — skipped when disableGreedyMeshing (emit 1-tall quads).
+                if (!disableGreedyMeshing)
                 {
-                    int nextRowOffset = (v + quadHeight) * width;
-                    for (int checkU = 0; checkU < quadWidth; checkU++)
+                    bool canGrow = true;
+                    while (v + quadHeight <= maxV && canGrow)
                     {
-                        int nextIndex = nextRowOffset + u + checkU;
-                        if (blockIds[nextIndex] != blockID || packedColors[nextIndex] != packedColor)
+                        int nextRowOffset = (v + quadHeight) * width;
+                        for (int checkU = 0; checkU < quadWidth; checkU++)
                         {
-                            canGrow = false;
-                            break;
-                        }
-                        if (useAo)
-                        {
-                            if (aoSignatures[nextIndex] != aoSignature)
+                            int nextIndex = nextRowOffset + u + checkU;
+                            if (blockIds[nextIndex] != blockID || packedColors[nextIndex] != packedColor)
+                            {
+                                canGrow = false;
+                                break;
+                            }
+                            if (useAo)
+                            {
+                                if (aoSignatures[nextIndex] != aoSignature)
+                                {
+                                    canGrow = false;
+                                    break;
+                                }
+                            }
+                            else if (!constantLight && lightLevels[nextIndex] != lightLevel)
                             {
                                 canGrow = false;
                                 break;
                             }
                         }
-                        else if (!constantLight && lightLevels[nextIndex] != lightLevel)
-                        {
-                            canGrow = false;
-                            break;
-                        }
+                        if (canGrow) quadHeight++;
                     }
-                    if (canGrow) quadHeight++;
                 }
 
 #if LOGGING

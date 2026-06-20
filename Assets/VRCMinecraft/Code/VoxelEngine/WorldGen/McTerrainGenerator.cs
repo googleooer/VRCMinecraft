@@ -333,6 +333,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private bool gpuColumnReadbackPending = false;
     private bool gpuColumnReadbackReady = false;
     private bool gpuColumnReadbackFailed = false;
+    // EVENT-DRIVEN GEN: set true by StepChunkGeneration when the current column can make no progress
+    // this frame without an async GPU readback callback (base-column or climate readback in flight).
+    // McWorld's gen loop reads this to stop spin-polling a 180-220ms readback ~32x/frame. Reset at
+    // the top of every StepChunkGeneration call.
+    public bool gpuStepBlockedOnReadback = false;
     private bool gpuReadbackContainsFinalColumn = false;
     private int gpuCachedColumnX = int.MaxValue;
     private int gpuCachedColumnZ = int.MaxValue;
@@ -3800,6 +3805,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #endif
         
         bool isComplete = false;
+        // EVENT-DRIVEN GEN: cleared each step; set true below only if we end this call parked on an
+        // async GPU readback wait. McWorld's gen loop breaks its step loop when it sees this.
+        gpuStepBlockedOnReadback = false;
 
         // Declare coordinate variables once for all case statements
         int noiseX = 0;
@@ -3875,11 +3883,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
                                     }
                                     else
                                     {
+                                        gpuStepBlockedOnReadback = true; // climate readback just kicked off — wait for callback, don't spin
                                         break;
                                     }
                                 }
                                 else
                                 {
+                                    gpuStepBlockedOnReadback = true; // climate readback in flight — wait for callback, don't spin
                                     break;
                                 }
                             }
@@ -4044,6 +4054,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
                             currentState = GenerationState.Copy_GpuChunkSlice;
                         }
                     }
+
+                    // EVENT-DRIVEN GEN: still parked in the base-column readback wait (callback not in
+                    // yet) — tell McWorld to stop re-stepping us this frame; only OnAsyncGpuReadbackComplete
+                    // can advance us. (Diagnostic phases keep stepping so their stall watchdog still runs.)
+                    gpuStepBlockedOnReadback = (currentState == GenerationState.Prepare_GpuReadback)
+                        && !gpuColumnReadbackFailed
+                        && gpuReadbackPhase == GpuWorldgenReadbackPhase.BaseColumn;
                 }
                 break;
 
