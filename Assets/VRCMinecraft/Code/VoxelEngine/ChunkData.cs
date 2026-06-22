@@ -15,6 +15,11 @@ public class ChunkData
     public MeshFilter opaqueMeshFilter;
     public MeshFilter transparentMeshFilter;
     public MeshFilter cutoutMeshFilter;
+    public MeshRenderer opaqueRenderer;     // (c) GPU chunk-mesh render path: cached opaque renderer
+    public MeshRenderer transparentRenderer; // cutout/transparent renderers for the GPU passes
+    public MeshRenderer cutoutRenderer;
+    public Material opaqueOriginalMaterial; // sharedOpaque material to restore if a chunk leaves GPU render
+    public bool _isGpuMeshRendered = false; // true while this chunk shows the shared GPU voxel mesh
     public MeshCollider meshCollider; // Player collision (solid blocks only)
     public MeshCollider selectionCollider; // Selection/focus collision (includes focusable non-solid blocks)
 
@@ -175,6 +180,9 @@ public class ChunkData
     // GPU OFFLOAD #3: Per-chunk biome tint RTs (16x16) baked by GpuBiomeColorBake shader.
     // Sampled directly by mesh shader (no CPU readback). Only allocated when GPU bake is enabled.
     public UnityEngine.RenderTexture _gpuBiomeGrassRT;
+    // (c) GPU chunk-mesh render: per-column biome tint as a LINEAR texture holding the EXACT CPU
+    // _cachedBiomeColors (so the shader samples the same raw values MCTerrain uses as vertex colours).
+    public UnityEngine.Texture2D _gpuBiomeCpuTex;
     public UnityEngine.RenderTexture _gpuBiomeFoliageRT;
     public UnityEngine.RenderTexture _gpuBiomeWaterRT;
     public bool _gpuBiomeColorsBaked = false;

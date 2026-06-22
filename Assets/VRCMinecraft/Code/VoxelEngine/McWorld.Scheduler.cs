@@ -26,7 +26,10 @@ public partial class McWorld
     // -------------------------------------------------------------------------
     [Header("Scheduler: Performance")]
     public int maxConcurrentWorkers = 16;
-    public int maxConcurrentWorldgenColumns = 4;
+    // Concurrent GPU worldgen columns (each = one in-flight base readback + a burst of blits). Lower
+    // reduces GPU saturation, which shrinks the per-step blit-submit stalls that were spiking the frame
+    // to 100-300ms during load. 2 trades load throughput for smooth load FPS.
+    public int maxConcurrentWorldgenColumns = 2;
     public bool reserveWorkersForDataGenDuringLoad = false;
     public int loadPhaseMeshWorkerCap = 8;
     public int debugGenSlotHoldFrames = 0;
@@ -57,6 +60,13 @@ public partial class McWorld
     // -------------------------------------------------------------------------
     private int[]  radialChunkOrder;
     private int    nextChunkIndexToAssign  = 0;
+    // Resumable cursor + per-cycle budget for the picker's anti-stall fallback scan. Bounds the
+    // far-position scan to O(budget)/cycle instead of O(world): when the look-ahead window is empty,
+    // the old code rescanned all ~8192 remaining positions every cycle (≈20ms/cycle once the near
+    // region fills — which happens fast under GPU residency). The cursor amortises the full scan
+    // across cycles, so any pickable far position is still found within a few frames.
+    private int    _fallbackScanCursor      = 0;
+    private const int DATAGEN_FALLBACK_SCAN_BUDGET = 256;
     // totalWorldChunks: already declared in McWorld.cs (line 281) — reused, not redeclared.
     private int    chunksCompletedCount    = 0;
     private bool[] _positionAssigned;
@@ -164,18 +174,34 @@ public partial class McWorld
         // FALLBACK (anti-stall): the windowed scan can come up empty when the next
         // dataGenLookaheadWindow positions are all already-assigned or map to the few
         // busy generator slots, while the pickable (unassigned + FREE-slot) positions
-        // sit further ahead. Scan the whole remaining order for an unassigned position
-        // whose generator slot is FREE.
-        for (int p = scanEnd; p < totalWorldChunks; p++)
+        // sit further ahead. Scan the remaining order for an unassigned position whose
+        // generator slot is FREE — but BOUNDED to DATAGEN_FALLBACK_SCAN_BUDGET positions
+        // per cycle via a resumable cursor, so this is O(budget) not O(world) each cycle.
+        // The cursor wraps within [scanEnd, totalWorldChunks), so over a few cycles the
+        // whole remaining order is still covered (anti-stall preserved). A new column can
+        // only start when canStartNewColumn, so skip the scan entirely otherwise.
+        int remaining = totalWorldChunks - scanEnd;
+        if (canStartNewColumn && remaining > 0)
         {
-            if (_positionAssigned[p]) continue;
-            int ci = radialChunkOrder[p];
-            if (!ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin)
-            if (!genSlotBusy[_GenSlotForChunk(ci)] && canStartNewColumn)
+            int budget = remaining < DATAGEN_FALLBACK_SCAN_BUDGET ? remaining : DATAGEN_FALLBACK_SCAN_BUDGET;
+            int p = _fallbackScanCursor;
+            if (p < scanEnd || p >= totalWorldChunks) p = scanEnd;
+            for (int s = 0; s < budget; s++)
             {
-                _lastPickedDataGenPos = p;
-                return true;
+                if (p >= totalWorldChunks) p = scanEnd;
+                if (!_positionAssigned[p])
+                {
+                    int ci = radialChunkOrder[p];
+                    if (ShouldGenerateChunkData(ci) && !genSlotBusy[_GenSlotForChunk(ci)])
+                    {
+                        _lastPickedDataGenPos = p;
+                        _fallbackScanCursor = (p + 1 >= totalWorldChunks) ? scanEnd : p + 1;
+                        return true;
+                    }
+                }
+                p++;
             }
+            _fallbackScanCursor = (p >= totalWorldChunks) ? scanEnd : p;
         }
         return false;
     }

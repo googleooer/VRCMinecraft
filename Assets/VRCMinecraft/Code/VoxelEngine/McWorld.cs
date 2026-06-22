@@ -62,10 +62,10 @@ public partial class McWorld : UdonSharpBehaviour
     [Header("Performance Tuning")]
     [Tooltip("Approximate time budget per mesh step in milliseconds. Raised to 12ms on the CPU-only path to do more meshing per step before yielding (fewer, larger steps = less Udon loop overhead).")]
     public float meshStepTimeBudgetMs = 12.0f;
-    [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops.")]
-    public float updateTimeBudgetMs = 22.0f;
+    [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops. ~6ms targets the Quest 3 90fps frame (the scheduler + ProcessActiveChunks each take a slice, so newly-streamed chunks fill in over a few frames instead of spiking the frame).")]
+    public float updateTimeBudgetMs = 6.0f;
     [Tooltip("During the ONE-TIME initial world generation, updateTimeBudgetMs is temporarily raised to this value so the (profiled ~92% idle) GPU + async readback pipeline can drain far more work per frame. Frame rate during the load matters much less than total load time. Automatically restored to updateTimeBudgetMs once world gen completes. Set <= updateTimeBudgetMs to disable the boost.")]
-    public float loadPhaseUpdateBudgetMs = 60.0f;
+    public float loadPhaseUpdateBudgetMs = 6.0f;
     // Runtime state for the load-phase budget boost (see Update()).
     private bool _loadPhaseBudgetRestored = false;
     private float _runtimeUpdateBudgetMs = 0f;
@@ -90,13 +90,13 @@ public partial class McWorld : UdonSharpBehaviour
     [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame. Higher = each chunk's readback decodes into a mesh in fewer frames (frees the worker sooner -> more readback concurrency). The adaptive budget below still caps aggregate work.")]
     public int gpuMeshDecodeStepsPerFrame = 8;
     [Tooltip("Total GPU mesh decode budget per frame in milliseconds (aggregate across all chunks). The proven path is mesh-bound on the readback->CPU-decode while data-gen sits at ~0% during load, leaving this budget's frame-share unused — so it is set generously to spend the idle CPU on draining mesh decodes. The adaptive system shrinks it if frames get heavy.")]
-    public float gpuMeshDecodeFrameBudgetMs = 12.0f;
+    public float gpuMeshDecodeFrameBudgetMs = 3.0f;
     [Tooltip("Minecraft-style NEAR meshing guarantee: per-frame GPU mesh-decode time reserved EXCLUSIVELY for chunks near the player, drained BEFORE and independently of the shared aggregate budget above. MC rebuilds near chunks unconditionally each frame (under a time budget) so a far-chunk backlog can never starve the chunk you're standing on. Bounded so it can't spike frames; lower it if the headset overshoots.")]
-    public float gpuNearMeshDecodeFrameBudgetMs = 6.0f;
-    [Tooltip("Budget per GPU worldgen step in milliseconds. Lower values reduce frame spikes during terrain generation.")]
-    public float gpuWorldgenStepBudgetMs = 3.0f;
-    [Tooltip("Maximum GPU worldgen steps per chunk each frame.")]
-    public int gpuWorldgenStepsPerFrame = 4;
+    public float gpuNearMeshDecodeFrameBudgetMs = 2.5f;
+    [Tooltip("Budget per GPU worldgen step in milliseconds. THIS IS THE MAIN LOAD-LAG LEVER: StepChunkDataGeneration runs GPU-worldgen blit phases in a loop bounded by this, so a high value (the scene was 25ms) lets a single stepping call run many blits and blow the frame. Keep it small for smooth load.")]
+    public float gpuWorldgenStepBudgetMs = 2.0f;
+    [Tooltip("Maximum GPU worldgen steps per chunk each frame. Caps how many blit phases one stepping call runs. Small = smooth load (the scene was 24).")]
+    public int gpuWorldgenStepsPerFrame = 2;
     [Tooltip("Prioritize meshing the exposed shell and chunks near the player before fully enclosed interiors.")]
     public bool prioritizeVisibleShellMeshing = true;
     [Tooltip("Chunks within this XZ radius of the player are always eligible for meshing.")]
@@ -125,10 +125,10 @@ public partial class McWorld : UdonSharpBehaviour
     private bool _streamPlayerKnown = false;
     [Tooltip("Require all 6 in-world neighbour chunks to be data-ready before meshing a chunk, so chunk-boundary faces are always culled correctly (eliminates the transient un-culled boundary 'walls' that a chunk draws toward a not-yet-generated neighbour and waits for a heal re-mesh to fix). Costs a little meshing latency at the frontier. The coordinator falls back to air-boundary meshing if ALL workers are waiting, to avoid deadlock. Turn OFF to restore the old draw-now-heal-later behaviour.")]
     public bool requireAllNeighborsForMesh = true;
-    [Tooltip("How many deferred interior chunks to reconsider per frame when headroom is available.")]
-    public int deferredInteriorMeshRequestsPerFrame = 1;
-    [Tooltip("How many chunk slots to scan per frame when looking for deferred interior meshes to wake up.")]
-    public int deferredInteriorMeshScanCountPerFrame = 64;
+    [Tooltip("How many deferred interior chunks to re-queue per frame. Matched to the scheduler's per-cycle deferred-mesh drain rate so the re-wake never lags meshing (never-skip guarantee).")]
+    public int deferredInteriorMeshRequestsPerFrame = 8;
+    [Tooltip("How many chunk slots to scan per frame when looking for deferred interior meshes to wake up. Higher = the whole world is swept for stranded deferred chunks in fewer frames (never-skip guarantee).")]
+    public int deferredInteriorMeshScanCountPerFrame = 256;
     [Tooltip("Defer collider application, lighting finalize, and neighbor mesh rebuilds for far chunks until there is frame headroom.")]
     public bool deferFarChunkSecondaryWork = true;
     [Tooltip("Only keep chunk colliders enabled near the player. Far chunks keep render meshes but disable collision until the player approaches.")]
@@ -259,6 +259,10 @@ public partial class McWorld : UdonSharpBehaviour
     public bool enableInstancedVoxelRender = false;
     [Tooltip("(c) Material using Unlit/MCVoxelInstanced for the instanced voxel render path.")]
     public Material gpuVoxelInstancedMaterial;
+    [Tooltip("(c) Material using Unlit/MCVoxelInstanced_Cutout for the chunk cutout (leaves) pass.")]
+    public Material gpuVoxelCutoutMaterial;
+    [Tooltip("(c) Material using Unlit/MCVoxelInstanced_Transparent for the chunk transparent (water/ice) pass.")]
+    public Material gpuVoxelTransparentMaterial;
     [Tooltip("(c) Chunk XZ radius around the player to issue instanced draws for. Keep modest to bound draw-call count.")]
     public int gpuInstancedRenderRadius = 4;
     [Tooltip("(c) Chunk Y radius around the player to draw. The deep underground is never visible from the surface; this skips it (follows the player vertically). Raise if you fly/descend a lot.")]
@@ -888,9 +892,8 @@ public partial class McWorld : UdonSharpBehaviour
         _InitializeGpuDebugHud();
         _InitializeMeshPool();
         _InitVoxelColliderGrid();
-        // Runtime override: keep the update budget above the irreducible baseline
-        // so the adaptive system has room to scale decode budgets.
-        if (updateTimeBudgetMs < 16f) updateTimeBudgetMs = 16f;
+        // Runtime override: a tiny floor only (the 90fps steady-state budget is intentionally ~6ms).
+        if (updateTimeBudgetMs < 2f) updateTimeBudgetMs = 2f;
         // Load-phase budget boost: remember the normal runtime budget, then run the
         // one-time initial world generation at a larger budget so the idle GPU + readback
         // pipeline drains faster. Restored in Update() once gen completes.
@@ -983,22 +986,17 @@ public partial class McWorld : UdonSharpBehaviour
         // bandwidth for meshing, while mesh decode is boosted so the near world fills in during gen.
         if (!_loadPhaseBudgetRestored)
         {
-            adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(gpuWorldgenStepsPerFrame, 8);
-            adaptiveGpuWorldgenStepBudgetMs = Mathf.Max(gpuWorldgenStepBudgetMs, 16f);
-            // Boost mesh decode during load too (Minecraft never starves near meshing). Floored to the
-            // intended throughput-fix values (8 steps / 12ms) so a stale low serialized config can't pin
-            // meshing at the floor while worldgen floods — that imbalance left the visible world unmeshed
-            // for minutes. With data-gen now streamed to the render distance, worldgen has far less to do.
-            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(gpuMeshDecodeStepsPerFrame, 16);
+            // SMOOTH-LOAD tuning: the user chose decent FPS during the one-time load over fastest total
+            // load, so keep the load phase close to steady-state per-frame cost instead of the old
+            // high floors (which monopolised the frame for fast load). Use the serialized step counts
+            // as-is; cap the load mesh-decode share at the load budget minus a small reserve for
+            // finalize/lighting/worldgen. Everything still drains — just spread over more frames.
+            adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(1, gpuWorldgenStepsPerFrame);
+            adaptiveGpuWorldgenStepBudgetMs = gpuWorldgenStepBudgetMs;
+            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(1, gpuMeshDecodeStepsPerFrame);
             adaptiveGpuMeshDecodeStepBudgetMs = gpuMeshDecodeStepBudgetMs;
-            // Mesh decode was floored at 12ms while the LOAD frame budget (loadPhaseUpdateBudgetMs) is
-            // far larger — so meshing used a fraction of the budget already allotted for load and the
-            // world sat unmeshed for minutes ("fragmented" load). Floor the decode budget near the load
-            // budget (leaving ~18ms for finalize/lighting/worldgen) so meshing uses the headroom that
-            // already exists. No NEW FPS tradeoff: load FPS is governed by loadPhaseUpdateBudgetMs, which
-            // the user already set — lower THAT to trade load speed for load FPS.
-            float loadMeshBudget = Mathf.Max(12f, loadPhaseUpdateBudgetMs - 18f);
-            adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Max(gpuMeshDecodeFrameBudgetMs, loadMeshBudget);
+            float loadMeshBudget = Mathf.Max(gpuMeshDecodeFrameBudgetMs, loadPhaseUpdateBudgetMs - 3f);
+            adaptiveGpuMeshDecodeFrameBudgetMs = loadMeshBudget;
             return;
         }
 
@@ -1285,7 +1283,7 @@ public partial class McWorld : UdonSharpBehaviour
         if (enableInstancedVoxelRender)
         {
             _GpuBuildBlockFaceSliceTexture();
-            _GpuBuildVoxelCubeMesh();
+            _GpuBuildVoxelChunkMesh();
         }
         _GpuPublishStaticGlobals(); // publish the never-changing globals ONCE
         _GpuPublishGlobals();
@@ -2404,10 +2402,22 @@ public partial class McWorld : UdonSharpBehaviour
             byte top = (byte)Mathf.Clamp(blockTypeManager.GetFinalBlockTextureSlice((byte)id, FACE_INDEX_TOP), 0, 255);
             byte bottom = (byte)Mathf.Clamp(blockTypeManager.GetFinalBlockTextureSlice((byte)id, FACE_INDEX_BOTTOM), 0, 255);
             byte side = (byte)Mathf.Clamp(blockTypeManager.GetFinalBlockTextureSlice((byte)id, FACE_INDEX_SIDE), 0, 255);
-            bool opaque = id != 0
-                && blockTypeManager.GetBlockVisibilityType((byte)id) == BlockVisibilityType.Opaque
-                && blockTypeManager.GetBlockShapeType((byte)id) == McBlockShapeType.Cube;
-            pixels[id] = new Color32(top, bottom, side, opaque ? (byte)255 : (byte)0);
+            // A channel encodes the render CLASS for the GPU chunk-mesh passes (see MCVoxelInstanced.cginc):
+            //   255 = opaque cube, 128 = cutout cube (leaves), 64 = transparent cube (water/ice/glass),
+            //   0 = skip (air / cross-shaped / non-cube). Each pass renders only its class.
+            // Fluids (water 8/9, lava 10/11) are NOT drawn by the GPU shared-mesh passes — they are
+            // rendered 1:1 by the CPU fluid mesh (_AddWaterBlocks) on the chunk's transparent
+            // MeshRenderer with the real water material. cls=0 makes them degenerate in every GPU pass.
+            byte cls = 0;
+            if (id != 0 && blockTypeManager.GetBlockShapeType((byte)id) == McBlockShapeType.Cube
+                && !_IsFluidBlock((byte)id))
+            {
+                BlockVisibilityType vis = blockTypeManager.GetBlockVisibilityType((byte)id);
+                if (vis == BlockVisibilityType.Opaque) cls = 255;
+                else if (vis == BlockVisibilityType.Cutout) cls = 128;
+                else if (vis == BlockVisibilityType.Transparent) cls = 64;
+            }
+            pixels[id] = new Color32(top, bottom, side, cls);
         }
         gpuBlockFaceSliceTexture.SetPixels32(pixels);
         gpuBlockFaceSliceTexture.Apply(false, false);
@@ -2478,32 +2488,136 @@ public partial class McWorld : UdonSharpBehaviour
         gpuVoxelCubeMesh.SetNormals(norms, 0, vCount);
         gpuVoxelCubeMesh.SetUVs(0, uvs, 0, vCount);
         gpuVoxelCubeMesh.SetTriangles(tris, 0, tCount, 0, false);
-        // The vertex shader positions geometry in ABSOLUTE world space (instance matrices are
-        // identity), so Unity's per-instance frustum cull (mesh.bounds x matrix) would wrongly cull
-        // everything to the origin. Give the mesh huge bounds so it's never CPU-culled; per-chunk
-        // visibility is decided by the render driver before it calls GpuRenderInstancedVoxelChunk.
-        gpuVoxelCubeMesh.bounds = new Bounds(Vector3.zero, Vector3.one * 100000f);
+        // Per-instance frustum cull bounds: the draw passes a real per-chunk transform (TRS at the
+        // chunk origin), so set the mesh's local bounds to cover a whole CHUNK (16x16x16 from the
+        // chunk origin corner). DrawMeshInstanced culls each instance by mesh.bounds x matrix; with a
+        // chunk-origin matrix this yields the chunk's real world AABB, so visible chunks render and
+        // off-screen ones cull. (The previous identity-matrix + huge-bounds hack rendered 0 batches —
+        // Unity placed every instance at the world origin, far below the player's view, and culled all.)
+        gpuVoxelCubeMesh.bounds = new Bounds(
+            new Vector3(chunkSizeXZ * 0.5f, chunkSizeY * 0.5f, chunkSizeXZ * 0.5f),
+            new Vector3(chunkSizeXZ, chunkSizeY, chunkSizeXZ));
+    }
+
+    // (c) FULL-CHUNK voxel mesh for the MeshRenderer GPU-render path. One SHARED mesh holds every
+    // voxel of a chunk (chunkSizeXZ^2 * chunkSizeY cubes, 6 faces, 24 verts each), in CHUNK-LOCAL
+    // space. It is assigned to each GPU-rendered chunk's opaque MeshFilter; the chunk GameObject
+    // transform places it in the world, and the vertex shader (Unlit/MCVoxelInstanced) reads the
+    // block atlas per voxel to degenerate hidden/air faces — so the GPU still does all the meshing
+    // work, but rendering rides the normal MeshRenderer path (which works; DrawMeshInstanced did not).
+    // Per-vertex: position = chunk-local cube corner, uv.xy = face corner, uv.z = ly, uv2 = (lx,lz).
+    private Mesh gpuVoxelChunkMesh;
+    private void _GpuBuildVoxelChunkMesh()
+    {
+        if (gpuVoxelChunkMesh != null) return;
+        Vector3[] normals6 = new Vector3[6] {
+            new Vector3(0,1,0), new Vector3(0,-1,0),
+            new Vector3(0,0,1), new Vector3(0,0,-1),
+            new Vector3(1,0,0), new Vector3(-1,0,0)
+        };
+        Vector3[] tanU6 = new Vector3[6] {
+            new Vector3(1,0,0), new Vector3(1,0,0),
+            new Vector3(1,0,0), new Vector3(1,0,0),
+            new Vector3(0,0,1), new Vector3(0,0,1)
+        };
+        Vector3[] tanV6 = new Vector3[6] {
+            new Vector3(0,0,1), new Vector3(0,0,1),
+            new Vector3(0,1,0), new Vector3(0,1,0),
+            new Vector3(0,1,0), new Vector3(0,1,0)
+        };
+        int sx = chunkSizeXZ, sy = chunkSizeY;
+        int voxels = sx * sx * sy;
+        int vCount = 24 * voxels;
+        int tCount = 36 * voxels;
+        Vector3[] verts = new Vector3[vCount];
+        Vector3[] norms = new Vector3[vCount];
+        Vector3[] uvs = new Vector3[vCount];   // .xy = corner, .z = ly
+        Vector3[] uv2s = new Vector3[vCount];  // .xy = (lx, lz)
+        int[] tris = new int[tCount];
+        int voxelIndex = 0;
+        for (int lx = 0; lx < sx; lx++)
+        {
+            for (int lz = 0; lz < sx; lz++)
+            {
+                Vector3 col = new Vector3(lx, lz, 0);
+                for (int ly = 0; ly < sy; ly++)
+                {
+                    for (int f = 0; f < 6; f++)
+                    {
+                        Vector3 n = normals6[f];
+                        Vector3 u = tanU6[f];
+                        Vector3 vv = tanV6[f];
+                        Vector3 baseCorner = new Vector3(
+                            lx + (n.x > 0 ? 1 : 0),
+                            ly + (n.y > 0 ? 1 : 0),
+                            lz + (n.z > 0 ? 1 : 0));
+                        int faceIndex = voxelIndex * 6 + f;
+                        int vbase = faceIndex * 4;
+                        verts[vbase + 0] = baseCorner;            uvs[vbase + 0] = new Vector3(0, 0, ly);
+                        verts[vbase + 1] = baseCorner + u;        uvs[vbase + 1] = new Vector3(1, 0, ly);
+                        verts[vbase + 2] = baseCorner + u + vv;   uvs[vbase + 2] = new Vector3(1, 1, ly);
+                        verts[vbase + 3] = baseCorner + vv;       uvs[vbase + 3] = new Vector3(0, 1, ly);
+                        norms[vbase + 0] = n; norms[vbase + 1] = n; norms[vbase + 2] = n; norms[vbase + 3] = n;
+                        uv2s[vbase + 0] = col; uv2s[vbase + 1] = col; uv2s[vbase + 2] = col; uv2s[vbase + 3] = col;
+                        int tbase = faceIndex * 6;
+                        // Wind each quad CCW as seen from its OUTWARD (+normal) side so Cull Back keeps
+                        // the visible face and culls the inside — no more double-sided backface draw.
+                        bool flipWind = Vector3.Dot(Vector3.Cross(u, vv), n) < 0f;
+                        if (flipWind)
+                        {
+                            tris[tbase + 0] = vbase + 0; tris[tbase + 1] = vbase + 2; tris[tbase + 2] = vbase + 1;
+                            tris[tbase + 3] = vbase + 0; tris[tbase + 4] = vbase + 3; tris[tbase + 5] = vbase + 2;
+                        }
+                        else
+                        {
+                            tris[tbase + 0] = vbase + 0; tris[tbase + 1] = vbase + 1; tris[tbase + 2] = vbase + 2;
+                            tris[tbase + 3] = vbase + 0; tris[tbase + 4] = vbase + 2; tris[tbase + 5] = vbase + 3;
+                        }
+                    }
+                    voxelIndex++;
+                }
+            }
+        }
+        gpuVoxelChunkMesh = new Mesh();
+        gpuVoxelChunkMesh.name = "GpuVoxelChunk";
+        gpuVoxelChunkMesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+        gpuVoxelChunkMesh.SetVertices(verts, 0, vCount);
+        gpuVoxelChunkMesh.SetNormals(norms, 0, vCount);
+        gpuVoxelChunkMesh.SetUVs(0, uvs, 0, vCount);
+        gpuVoxelChunkMesh.SetUVs(1, uv2s, 0, vCount);
+        gpuVoxelChunkMesh.SetTriangles(tris, 0, tCount, 0, false);
+        // Bounds cover a whole chunk in local space; the chunk transform yields its real world AABB.
+        gpuVoxelChunkMesh.bounds = new Bounds(
+            new Vector3(sx * 0.5f, sy * 0.5f, sx * 0.5f),
+            new Vector3(sx, sy, sx));
     }
 
     // (c) Bind the shared (same-for-all-chunks) textures onto the instanced material once. The
     // 2DArrays are pulled from the shared opaque chunk material so they stay in sync with the
     // CPU mesh path. Returns true when the material is ready to draw.
     private bool _gpuVoxelInstancedBound = false;
-    private bool _GpuBindInstancedMaterial()
+    // Bind the shared (same-for-all-chunks) textures onto one GPU voxel material.
+    private void _GpuBindOneInstMaterial(Material m)
     {
-        if (gpuVoxelInstancedMaterial == null || gpuVoxelCubeMesh == null
-            || gpuBlockFaceSliceTexture == null || gpuShouldDrawTexture == null) return false;
-        if (_gpuVoxelInstancedBound) return true;
-        gpuVoxelInstancedMaterial.SetTexture("_ShouldDrawTex", gpuShouldDrawTexture);
-        gpuVoxelInstancedMaterial.SetTexture("_BlockFaceSliceTex", gpuBlockFaceSliceTexture);
+        if (m == null) return;
+        m.SetTexture("_ShouldDrawTex", gpuShouldDrawTexture);
+        m.SetTexture("_BlockFaceSliceTex", gpuBlockFaceSliceTexture);
         if (sharedOpaqueChunkMaterial != null)
         {
             Texture mainTex = sharedOpaqueChunkMaterial.GetTexture("_MainTex");
             Texture tintMask = sharedOpaqueChunkMaterial.GetTexture("_TintMask");
-            if (mainTex != null) gpuVoxelInstancedMaterial.SetTexture("_MainTex", mainTex);
-            if (tintMask != null) gpuVoxelInstancedMaterial.SetTexture("_TintMask", tintMask);
+            if (mainTex != null) m.SetTexture("_MainTex", mainTex);
+            if (tintMask != null) m.SetTexture("_TintMask", tintMask);
         }
-        gpuVoxelInstancedMaterial.enableInstancing = true;
+    }
+    private bool _GpuBindInstancedMaterial()
+    {
+        if (gpuVoxelInstancedMaterial == null || gpuVoxelChunkMesh == null
+            || gpuBlockFaceSliceTexture == null || gpuShouldDrawTexture == null) return false;
+        if (_gpuVoxelInstancedBound) return true;
+        _GpuBindOneInstMaterial(gpuVoxelInstancedMaterial);
+        _GpuBindOneInstMaterial(gpuVoxelCutoutMaterial);      // leaves pass (may be null until assigned)
+        _GpuBindOneInstMaterial(gpuVoxelTransparentMaterial); // water/ice pass (may be null until assigned)
         _gpuVoxelInstancedBound = true;
         return true;
     }
@@ -2513,6 +2627,7 @@ public partial class McWorld : UdonSharpBehaviour
     // per frame from the render path. The shader resolves the chunk's atlas slot from world pos via
     // the global slot lookup, so a chunk only renders correctly while its blocks are in the atlas.
     private MaterialPropertyBlock _gpuVoxelMPB;
+    private MaterialPropertyBlock _gpuChunkMpb; // per-chunk biome tint for the chunk-mesh render path
     public void GpuRenderInstancedVoxelChunk(ChunkData chunk)
     {
         if (chunk == null || !enableInstancedVoxelRender) return;
@@ -2533,10 +2648,14 @@ public partial class McWorld : UdonSharpBehaviour
         const int BATCH = 1023;
         int batches = (columnsPerChunk + BATCH - 1) / BATCH;
         if (_gpuVoxelInstanceXforms == null || _gpuVoxelInstanceXforms.Length != BATCH)
-        {
             _gpuVoxelInstanceXforms = new Matrix4x4[BATCH];
-            for (int i = 0; i < BATCH; i++) _gpuVoxelInstanceXforms[i] = Matrix4x4.identity;
-        }
+        // Real per-chunk transform so DrawMeshInstanced's per-instance frustum cull (mesh.bounds x
+        // matrix) yields the chunk's true world AABB. All columns share the chunk origin; the shader
+        // ignores the matrix and positions each voxel absolutely from _ChunkOrigin + instanceID.
+        Matrix4x4 chunkXform = Matrix4x4.TRS(
+            new Vector3(chunk.chunkX_world * chunkSizeXZ, chunk.chunkY_world * chunkSizeY, chunk.chunkZ_world * chunkSizeXZ),
+            Quaternion.identity, Vector3.one);
+        for (int i = 0; i < BATCH; i++) _gpuVoxelInstanceXforms[i] = chunkXform;
         for (int b = 0; b < batches; b++)
         {
             int batchSize = (b == batches - 1) ? (columnsPerChunk - b * BATCH) : BATCH;
@@ -2562,60 +2681,85 @@ public partial class McWorld : UdonSharpBehaviour
         }
     }
 
-    // (c) Per-frame driver: issue one instanced draw per visible instanced chunk. Called from
-    // Update after ProcessActiveChunks. Distance-culled to gpuInstancedRenderRadius (XZ) around the
-    // resident center (player) to bound draw-call count. DrawMeshInstanced is immediate-mode, so
-    // this must run every frame the chunk should be visible.
+    // (c) Per-frame upkeep for the chunk-mesh GPU render path. The chunks render through their own
+    // MeshRenderers (the normal render loop), so there's no per-chunk draw call to issue here — we
+    // only keep the shared material's vertex-readable atlas + slot-lookup textures current, because
+    // the block atlas ping-pongs current<->scratch each time it's updated. Called from Update.
     public void GpuRenderInstancedVoxels()
     {
-        if (!enableInstancedVoxelRender || _instancedChunkCount == 0 || chunks_1D == null) return;
-        if (!_GpuBindInstancedMaterial()) return;
-        int cx = gpuResidentCenterChunkX;
-        int cy = gpuResidentCenterChunkY;
-        int cz = gpuResidentCenterChunkZ;
-        int r = Mathf.Max(1, gpuInstancedRenderRadius);
-        int ry = Mathf.Max(0, gpuInstancedRenderRadiusY);
+        if (!enableInstancedVoxelRender || gpuVoxelInstancedMaterial == null || !gpuBackendReady) return;
+        gpuVoxelInstancedMaterial.SetTexture("_InstBlockAtlas", gpuBlockAtlas);
+        gpuVoxelInstancedMaterial.SetTexture("_InstSlotLookup", gpuSlotLookupTexture);
+        if (gpuVoxelCutoutMaterial != null) { gpuVoxelCutoutMaterial.SetTexture("_InstBlockAtlas", gpuBlockAtlas); gpuVoxelCutoutMaterial.SetTexture("_InstSlotLookup", gpuSlotLookupTexture); }
+        if (gpuVoxelTransparentMaterial != null) { gpuVoxelTransparentMaterial.SetTexture("_InstBlockAtlas", gpuBlockAtlas); gpuVoxelTransparentMaterial.SetTexture("_InstSlotLookup", gpuSlotLookupTexture); }
+    }
 
-        // View-direction cull: skip chunks well behind the player's head — DrawMeshInstanced has
-        // real per-call overhead and per-voxel instancing is heavy, so not issuing the back
-        // hemisphere roughly halves the draw count. Adjacent chunks (close) are never direction-
-        // culled so peripheral/just-behind blocks don't pop while turning.
-        VRCPlayerApi lp = Networking.LocalPlayer;
-        bool haveView = false;
-        Vector3 camPos = Vector3.zero;
-        Vector3 camFwd = Vector3.forward;
-        if (lp != null && lp.IsValid())
+    // (c) Build the chunk's fluid (water/lava) mesh on the CPU and show it on the chunk's transparent
+    // MeshRenderer with the real water material. The GPU shared-mesh passes skip fluids (cls=0 in the
+    // face-slice LUT), so this is the 1:1 fluid path — it calls the SAME _AddWaterBlocks the normal CPU
+    // mesh build uses (lowered corner-height surface, flow-angle UVs, still/flow textures, lava). Cheap:
+    // only fluid surface faces are emitted, and only for chunks that actually contain fluids.
+    private void _GpuBuildAndApplyFluidMesh(ChunkData chunk)
+    {
+        if (chunk == null) return;
+        MeshFilter tmf = chunk.transparentMeshFilter;
+        MeshRenderer trr = chunk.transparentRenderer;
+        // The transparent filter may still hold the SHARED static voxel mesh (parked by an earlier GPU
+        // transparent pass / a pooled tenant). Never Clear()/overwrite the shared mesh — detach it so we
+        // build a private per-chunk fluid mesh instead.
+        if (tmf != null && tmf.sharedMesh == gpuVoxelChunkMesh) tmf.sharedMesh = null;
+
+        // Materialise the derived caches the water builder reads (_hasWaterBlocks, _columnMinY/MaxY).
+        _EnsureChunkDerivedData(chunk);
+
+        // No fluids → hide any stale water mesh and bail (no pool work).
+        if (!chunk._hasWaterBlocks)
         {
-            VRCPlayerApi.TrackingData hd = lp.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
-            camPos = hd.position;
-            camFwd = hd.rotation * Vector3.forward;
-            haveView = true;
-        }
-        float halfChunk = chunkSizeXZ * 0.5f;
-
-        for (int i = 0; i < _instancedChunkCount; i++)
-        {
-            int ci = _instancedChunks[i];
-            if (ci < 0 || ci >= chunks_1D.Length) continue;
-            ChunkData chunk = chunks_1D[ci];
-            if (chunk == null || !chunk._isInstancedRendered) continue;
-            if (Mathf.Abs(chunk.chunkX_world - cx) > r || Mathf.Abs(chunk.chunkZ_world - cz) > r) continue;
-            if (Mathf.Abs(chunk.chunkY_world - cy) > ry) continue;
-
-            if (haveView)
+            if (tmf != null)
             {
-                Vector3 center = new Vector3(
-                    chunk.chunkX_world * chunkSizeXZ + halfChunk,
-                    chunk.chunkY_world * chunkSizeY + chunkSizeY * 0.5f,
-                    chunk.chunkZ_world * chunkSizeXZ + halfChunk);
-                Vector3 toChunk = center - camPos;
-                float dist = toChunk.magnitude;
-                // keep chunks within ~1.5 chunks regardless (peripheral); cull the rest if behind.
-                if (dist > chunkSizeXZ * 1.5f && Vector3.Dot(toChunk / dist, camFwd) < -0.25f) continue;
+                if (tmf.sharedMesh != null) tmf.sharedMesh.Clear();
+                tmf.gameObject.SetActive(false);
             }
-
-            GpuRenderInstancedVoxelChunk(chunk);
+            return;
         }
+
+        byte[] data = _GetDecompressedData(chunk);
+        if (data == null) return; // data not ready (resident rehydrate) — retried on a later gate pass
+
+        // Borrow a mesh-pool slot transiently: build water faces, copy them into the chunk's own mesh,
+        // release the slot. The GPU opaque/cutout path uses the shared static mesh (no pool), so the pool
+        // is free here except while the main CPU mesher runs — defer (retry next pass) if exhausted.
+        if (!_AcquireMeshPool(chunk)) return;
+
+        chunk._transparentVertexCount = 0;
+        chunk._transparentTriangleCount = 0;
+
+        // Neighbour refs + decompressed neighbours: cross-chunk corner heights & face culling sample them.
+        ChunkData[] neighbors = _GetCachedNeighbors(chunk);
+        chunk.neighborPX = neighbors[0]; chunk.neighborNX = neighbors[1];
+        chunk.neighborPY = neighbors[2]; chunk.neighborNY = neighbors[3];
+        chunk.neighborPZ = neighbors[4]; chunk.neighborNZ = neighbors[5];
+        _DecompressNeighborsOnce(chunk);
+
+        _AddWaterBlocks(chunk);
+
+        // Copy the water faces into the transparent MeshFilter (activates/deactivates by vert count) and
+        // make sure the transparent renderer uses the real water material.
+        _ApplyDataToMesh(tmf, chunk._transparentVertices, chunk._transparentTriangles,
+            chunk._transparentUVs, chunk._transparentNormals, chunk._transparentColors,
+            chunk._transparentVertexCount, chunk._transparentTriangleCount);
+        if (trr != null && sharedTransparentChunkMaterial != null)
+            trr.sharedMaterial = sharedTransparentChunkMaterial;
+
+        // Release neighbour refs + decompressed caches + the pool slot.
+        chunk.neighborPX = null; chunk.neighborNX = null;
+        chunk.neighborPY = null; chunk.neighborNY = null;
+        chunk.neighborPZ = null; chunk.neighborNZ = null;
+        chunk._decompSelf = null;
+        chunk._decompNX = null; chunk._decompPX = null;
+        chunk._decompNY = null; chunk._decompPY = null;
+        chunk._decompNZ = null; chunk._decompPZ = null;
+        _ReleaseMeshPool(chunk);
     }
 
     private bool _GpuFaceExtractionReady()
@@ -4324,8 +4468,13 @@ public partial class McWorld : UdonSharpBehaviour
 
         chunk.gameObject = go;
         chunk.opaqueMeshFilter = opaqueTransform != null ? opaqueTransform.GetComponent<MeshFilter>() : null;
+        chunk.opaqueRenderer = opaqueTransform != null ? opaqueTransform.GetComponent<MeshRenderer>() : null;
+        chunk.opaqueOriginalMaterial = chunk.opaqueRenderer != null ? chunk.opaqueRenderer.sharedMaterial : null;
+        chunk._isGpuMeshRendered = false;
         chunk.transparentMeshFilter = transparentTransform != null ? transparentTransform.GetComponent<MeshFilter>() : null;
+        chunk.transparentRenderer = transparentTransform != null ? transparentTransform.GetComponent<MeshRenderer>() : null;
         chunk.cutoutMeshFilter = cutoutTransform != null ? cutoutTransform.GetComponent<MeshFilter>() : null;
+        chunk.cutoutRenderer = cutoutTransform != null ? cutoutTransform.GetComponent<MeshRenderer>() : null;
         chunk.meshCollider = go.GetComponent<MeshCollider>();
         if (chunk.meshCollider != null) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; }
         go.SetActive(true);
@@ -4334,13 +4483,24 @@ public partial class McWorld : UdonSharpBehaviour
     // Return a chunk's render GameObject to the pool (parked, inactive) and null its shell fields.
     // The chunk's block/light/biome DATA stays intact; it re-acquires a GameObject and re-meshes
     // (isMeshDeferred) if the player returns and it re-enters the render distance.
+    // Detach the shared static voxel mesh, or Clear() a private per-chunk mesh, on a recycled filter.
+    private void _RecycleFilterMesh(MeshFilter mf)
+    {
+        if (mf == null || mf.sharedMesh == null) return;
+        if (mf.sharedMesh == gpuVoxelChunkMesh) mf.sharedMesh = null; // shared — never Clear()
+        else mf.sharedMesh.Clear();                                   // private — free its data
+    }
+
     private void _RecycleChunkGo(ChunkData chunk)
     {
         GameObject go = chunk != null ? chunk.gameObject : null;
         if (go == null) return;
-        if (chunk.opaqueMeshFilter != null && chunk.opaqueMeshFilter.sharedMesh != null) chunk.opaqueMeshFilter.sharedMesh.Clear();
-        if (chunk.transparentMeshFilter != null && chunk.transparentMeshFilter.sharedMesh != null) chunk.transparentMeshFilter.sharedMesh.Clear();
-        if (chunk.cutoutMeshFilter != null && chunk.cutoutMeshFilter.sharedMesh != null) chunk.cutoutMeshFilter.sharedMesh.Clear();
+        // GPU-rendered chunks reference the SHARED static voxel mesh on their opaque/cutout filters —
+        // detach it (never Clear() it, that would blank every GPU chunk). Private per-chunk meshes
+        // (CPU mesh / fluid mesh) are Clear()ed to free their data.
+        _RecycleFilterMesh(chunk.opaqueMeshFilter);
+        _RecycleFilterMesh(chunk.transparentMeshFilter);
+        _RecycleFilterMesh(chunk.cutoutMeshFilter);
         if (chunk.meshCollider != null) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; }
         go.SetActive(false);
         if (_chunkGoPool != null && _chunkGoPoolCount < _chunkGoPool.Length) { _chunkGoPool[_chunkGoPoolCount] = go; _chunkGoPoolCount++; }
@@ -4791,7 +4951,10 @@ public partial class McWorld : UdonSharpBehaviour
     private void _ScheduleDeferredInteriorMeshUpdates(float frameStart, float frameBudget)
     {
         if (!prioritizeVisibleShellMeshing || chunks_1D == null || chunks_1D.Length == 0) return;
-        if (Time.realtimeSinceStartup - frameStart > frameBudget * 0.75f) return;
+        // Re-wake guarantee: this scan only flag-checks + enqueues (the actual meshing stays
+        // budget-bounded by the scheduler), so let it run unless the frame already blew well past
+        // budget. Skipping it on every busy frame is what strands deferred chunks ("never skip").
+        if (Time.realtimeSinceStartup - frameStart > frameBudget * 1.5f) return;
 
         bool hasHeadroom = !enableAdaptiveBudgets || lastUpdateDurationMs < Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
         int requestLimit = Mathf.Max(1, deferredInteriorMeshRequestsPerFrame);
@@ -6855,19 +7018,68 @@ public partial class McWorld : UdonSharpBehaviour
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null || chunk.isBuildingMesh) return;
 
-        // (c) GPU instanced voxel render: a resident chunk (blocks live only in the atlas) renders
-        // straight from the atlas via per-voxel instancing — no CPU mesh, no face readback, no build
-        // wedge. Mark it + complete immediately (isBuildingMesh stays false) so the worker frees and
-        // the chunk counts done; the per-frame driver issues its DrawMeshInstanced. Player edits
-        // (interactionMeshPriority) still take the normal path so the edit re-meshes accurately.
-        if (enableInstancedVoxelRender && gpuVoxelInstancedMaterial != null
-            && chunk._isGpuResident && chunk._chunkData == null && !chunk.interactionMeshPriority)
+        // (c) GPU instanced voxel render: render this chunk's opaque voxels straight from the GPU
+        // block atlas via per-column instancing — no CPU mesh build (the multi-second greedy-emit
+        // wall) and no per-chunk face readback. CRITICAL: this reads the SAME atlas + slot-lookup
+        // that the GPU lighting/AO path already populates correctly via _GpuSyncChunkBlocks, so the
+        // instanced shader reads provably-correct data — NO dependence on the GPU->GPU column repack
+        // (which is correct on paper but failed in practice). We KEEP the CPU block mirror
+        // (collision/edits need it); we only skip emitting a render mesh. Bounded to the mesh render
+        // distance so the slot-limited atlas isn't flooded — far chunks defer and instance once in
+        // range. Player edits (interactionMeshPriority) take the normal CPU mesh path (which clears
+        // _isInstancedRendered below) so the edit re-meshes exactly and isn't double-drawn.
+        if (enableInstancedVoxelRender && gpuVoxelInstancedMaterial != null && gpuBackendReady
+            && gpuVoxelChunkMesh != null && chunk._chunkData != null && !chunk._isAllAir && !chunk.interactionMeshPriority
+            && (chunk.pendingChunkMeshRebuild || _IsChunkWithinMeshRenderDistance(chunk)))
         {
-            bool wasInstanced = chunk._isInstancedRendered;
+            // Ensure this chunk's blocks are in the atlas (proven path), then show the SHARED full-chunk
+            // GPU voxel mesh on the chunk's opaque MeshRenderer. The mesh is chunk-local; the chunk
+            // GameObject transform places it; the vertex shader reads the atlas to cull hidden/air
+            // faces. Rendering rides the normal MeshRenderer path (works) — no DrawMeshInstanced.
+            int instSlot = (gpuChunkIndexToSlot != null && chunkIndex < gpuChunkIndexToSlot.Length)
+                ? gpuChunkIndexToSlot[chunkIndex] : -1;
+            bool instSynced = instSlot >= 0 && gpuChunkSyncedDataVersion != null
+                && chunkIndex < gpuChunkSyncedDataVersion.Length
+                && gpuChunkSyncedDataVersion[chunkIndex] == chunk._cachedDataVersion;
+            if (!instSynced) _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
+            _GpuBindInstancedMaterial();          // bind _MainTex/_TintMask/_ShouldDrawTex/_BlockFaceSliceTex once
+            _EnsureChunkGo(chunk);                 // active GameObject at the chunk's world position
+            if (chunk.opaqueMeshFilter != null) chunk.opaqueMeshFilter.sharedMesh = gpuVoxelChunkMesh;
+            // EXACT CPU biome colours: a linear texture of this chunk's _cachedBiomeColors (the same
+            // values MCTerrain uses as vertex colours), bound per-chunk so the shader tints identically.
+            // Ensure climate (temp/rainfall) is populated first — otherwise _PreComputeBiomeColors fills
+            // WHITE (untinted), which is why some chunks' grass rendered washed/tan instead of biome-green.
+            _StoreBiomeData(chunk);
+            Texture2D biomeTex = _GpuGetCpuBiomeTex(chunk);
+            // Per-chunk biome MPB, shared across all three GPU passes.
+            if (biomeTex != null)
+            {
+                if (_gpuChunkMpb == null) _gpuChunkMpb = new MaterialPropertyBlock();
+                _gpuChunkMpb.Clear();
+                _gpuChunkMpb.SetTexture("_BiomeColorRT", biomeTex);
+            }
+            if (chunk.opaqueRenderer != null)
+            {
+                chunk.opaqueRenderer.sharedMaterial = gpuVoxelInstancedMaterial;
+                if (biomeTex != null) chunk.opaqueRenderer.SetPropertyBlock(_gpuChunkMpb);
+                chunk.opaqueRenderer.enabled = true;
+            }
+            // Cutout pass (leaves etc.): same shared chunk mesh, cutout material/renderer.
+            if (gpuVoxelCutoutMaterial != null && chunk.cutoutMeshFilter != null && chunk.cutoutRenderer != null)
+            {
+                chunk.cutoutMeshFilter.sharedMesh = gpuVoxelChunkMesh;
+                chunk.cutoutRenderer.sharedMaterial = gpuVoxelCutoutMaterial;
+                if (biomeTex != null) chunk.cutoutRenderer.SetPropertyBlock(_gpuChunkMpb);
+                chunk.cutoutRenderer.enabled = true;
+            }
+            // Fluids (water/lava): rendered 1:1 by the CPU fluid mesh (_AddWaterBlocks) on the transparent
+            // MeshRenderer with the real water material — the GPU shared-mesh passes skip fluids (cls=0 in
+            // the face-slice LUT). Builds only fluid surface faces; hides the renderer if the chunk has none.
+            _GpuBuildAndApplyFluidMesh(chunk);
+            chunk._isGpuMeshRendered = true;
             chunk._isInstancedRendered = true;
             chunk.isMeshDeferred = false;
             chunk.isBuildingMesh = false;
-            if (!wasInstanced) _GpuRegisterInstancedChunk(chunkIndex);
             return;
         }
         // (b) GPU mesh-from-atlas: a resident chunk has no CPU mirror — it builds its mesh from
@@ -6914,6 +7126,25 @@ public partial class McWorld : UdonSharpBehaviour
             chunk.profile_firstMeshWasDeferred = false;
         }
 #endif
+        // This chunk is building a real CPU mesh (e.g. a player edit) — stop GPU-mesh rendering it so
+        // the GPU voxel mesh and the CPU mesh don't double up. Restore the original opaque material so
+        // the CPU mesh shades normally (the GPU path swapped it to the voxel-cull material).
+        chunk._isInstancedRendered = false;
+        if (chunk._isGpuMeshRendered)
+        {
+            if (chunk.opaqueRenderer != null && chunk.opaqueOriginalMaterial != null)
+                chunk.opaqueRenderer.sharedMaterial = chunk.opaqueOriginalMaterial;
+            // Detach the SHARED static voxel mesh from this chunk's filters — the upcoming CPU
+            // _ApplyDataToMesh would otherwise Clear() the shared mesh and blank every GPU chunk.
+            // The fluid filter already builds a private mesh, but guard it too for pooled-reuse safety.
+            if (chunk.opaqueMeshFilter != null && chunk.opaqueMeshFilter.sharedMesh == gpuVoxelChunkMesh)
+                chunk.opaqueMeshFilter.sharedMesh = null;
+            if (chunk.cutoutMeshFilter != null && chunk.cutoutMeshFilter.sharedMesh == gpuVoxelChunkMesh)
+                chunk.cutoutMeshFilter.sharedMesh = null;
+            if (chunk.transparentMeshFilter != null && chunk.transparentMeshFilter.sharedMesh == gpuVoxelChunkMesh)
+                chunk.transparentMeshFilter.sharedMesh = null;
+            chunk._isGpuMeshRendered = false;
+        }
         // Keep interactionMeshPriority alive — the step loop reads it to uncap steps.
         // Cleared when the mesh build finishes.
         chunk.isBuildingMesh = true;
@@ -14278,6 +14509,26 @@ public partial class McWorld : UdonSharpBehaviour
         return true;
     }
 
+    // (c) GPU chunk-mesh render: build (once) a LINEAR 16x16 texture holding this chunk's EXACT CPU
+    // per-column biome colours, so the instanced shader samples the SAME raw values MCTerrain feeds
+    // through vertex colours — exact CPU-side colour match, no GPU-bake/color-space drift. Pixel (x,z)
+    // == _cachedBiomeColors[z*chunkSizeXZ + x], matching the shader's (lx,lz) sample.
+    private Texture2D _GpuGetCpuBiomeTex(ChunkData chunk)
+    {
+        _PreComputeBiomeColors(chunk); // fills chunk._cachedBiomeColors with the exact CPU colours
+        if (chunk._cachedBiomeColors == null) return null;
+        if (chunk._gpuBiomeCpuTex == null)
+        {
+            // linear=true: sampled values are returned raw (no sRGB->linear), matching vertex-colour use.
+            chunk._gpuBiomeCpuTex = new Texture2D(chunkSizeXZ, chunkSizeXZ, TextureFormat.RGBA32, false, true);
+            chunk._gpuBiomeCpuTex.filterMode = FilterMode.Point;
+            chunk._gpuBiomeCpuTex.wrapMode = TextureWrapMode.Clamp;
+        }
+        chunk._gpuBiomeCpuTex.SetPixels(chunk._cachedBiomeColors);
+        chunk._gpuBiomeCpuTex.Apply(false, false);
+        return chunk._gpuBiomeCpuTex;
+    }
+
     private void _PreComputeBiomeColors(ChunkData chunk)
     {
         // Allocate biome color cache if needed (256 colors for 16x16 XZ grid)
@@ -14968,8 +15219,68 @@ public partial class McWorld : UdonSharpBehaviour
         Debug.Log(logBuilder.ToString());
     }
 
+    public bool gpuDebugLogInstancedState = true;
+    // DIAGNOSTIC: logs WHY instanced chunks do/don't render. A summary line (how many chunks are
+    // resident / instanced / slotted vs slot capacity) + a per-chunk dump of the 0,0 column and a far
+    // column, each showing resident/instanced state, its atlas slot, and whether the slot-lookup
+    // texture (the thing the shader reads) actually has a valid entry for it. Rides with the
+    // Performance Summary so it shows up in the same console output.
+    private void _GpuDebugLogInstancedState()
+    {
+        if (!gpuDebugLogInstancedState) return;
+        if (chunks_1D == null || gpuChunkIndexToSlot == null) { Debug.Log("[GPU-DEBUG] not ready"); return; }
+        int dataReady = 0, resident = 0, instanced = 0, slotted = 0, total = 0;
+        for (int i = 0; i < chunks_1D.Length; i++)
+        {
+            ChunkData c = chunks_1D[i];
+            if (c == null) continue;
+            total++;
+            if (c.isDataReady) dataReady++;
+            if (c._isGpuResident) resident++;
+            if (c._isInstancedRendered) instanced++;
+            if (i < gpuChunkIndexToSlot.Length && gpuChunkIndexToSlot[i] >= 0) slotted++;
+        }
+        Debug.Log("[GPU-DEBUG] SUMMARY non-null=" + total + " dataReady=" + dataReady + " resident=" + resident
+            + " instanced=" + instanced + " slotted=" + slotted + " (cap " + gpuChunkSlotCapacity + ")"
+            + " instCount=" + _instancedChunkCount
+            + " center=(" + gpuResidentCenterChunkX + "," + gpuResidentCenterChunkY + "," + gpuResidentCenterChunkZ + ")"
+            + " instR=" + gpuInstancedRenderRadius + "/" + gpuInstancedRenderRadiusY
+            + " mirrorR=" + cpuMirrorRadiusXZ + "/" + cpuMirrorRadiusY);
+        _GpuDebugLogColumn(0, 0);
+        _GpuDebugLogColumn(gpuInstancedRenderRadius, 0);
+    }
+
+    private void _GpuDebugLogColumn(int cxCentered, int czCentered)
+    {
+        if (chunks_1D == null || gpuChunkIndexToSlot == null) return;
+        for (int cy = 0; cy < worldDimensionY; cy++)
+        {
+            int idx = ChunkCenteredCoordsTo1D(cxCentered, cy, czCentered);
+            if (idx < 0 || idx >= chunks_1D.Length) continue;
+            ChunkData c = chunks_1D[idx];
+            if (c == null || !c.isDataReady) continue;
+            int slot = (idx < gpuChunkIndexToSlot.Length) ? gpuChunkIndexToSlot[idx] : -2;
+            int lookupSlot = -1; bool valid = false;
+            if (gpuSlotLookupPixels != null)
+            {
+                int li = _GpuGetLookupPixelIndex(c.chunkX_world + chunkOffsetX, c.chunkY_world + chunkOffsetY, c.chunkZ_world + chunkOffsetZ);
+                if (li >= 0 && li < gpuSlotLookupPixels.Length)
+                {
+                    Color32 px = gpuSlotLookupPixels[li];
+                    valid = px.a >= 128;
+                    lookupSlot = px.r + (px.g << 8);
+                }
+            }
+            Debug.Log("[GPU-DEBUG] chunk (" + c.chunkX_world + "," + c.chunkY_world + "," + c.chunkZ_world + "): "
+                + "dataNull=" + (c._chunkData == null) + " allAir=" + c._isAllAir + " resident=" + c._isGpuResident
+                + " instanced=" + c._isInstancedRendered + " slot=" + slot
+                + " lookupValid=" + valid + " lookupSlot=" + lookupSlot);
+        }
+    }
+
     private void LogAggregateStats()
     {
+        _GpuDebugLogInstancedState();
         float windowDuration = Time.realtimeSinceStartup - stats_aggregateWindowStart;
 
         logBuilder.Clear();
