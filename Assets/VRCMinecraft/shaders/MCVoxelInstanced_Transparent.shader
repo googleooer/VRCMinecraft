@@ -1,10 +1,7 @@
-// (c) GPU chunk-mesh voxel render — OPAQUE pass. Shared logic in MCVoxelInstanced.cginc.
-// Renders a chunk's opaque cubes straight from the GPU block atlas (vertex-stage per-voxel culling),
-// through the chunk's opaque MeshRenderer. Cutout (leaves) + transparent (water/ice) are the sibling
-// shaders MCVoxelInstanced_Cutout / MCVoxelInstanced_Transparent on the chunk's cutout/transparent
-// MeshRenderers. Bindings (set by McWorld): _MainTex, _TintMask, _ShouldDrawTex, _BlockFaceSliceTex,
-// _BiomeColorRT (per-chunk MPB), _InstBlockAtlas, _InstSlotLookup, + the _UdonVRCM_Gpu* globals.
-Shader "Unlit/MCVoxelInstanced"
+// (c) GPU chunk-mesh voxel render — TRANSPARENT pass (water/ice/glass). Shared in MCVoxelInstanced.cginc.
+// Renders a chunk's transparent cubes (block-class 0.25 in _BlockFaceSliceTex.a) alpha-blended, on the
+// chunk's TRANSPARENT MeshRenderer. Cull Off, ZWrite On (matches MCTerrain_Transparent).
+Shader "Unlit/MCVoxelInstanced_Transparent"
 {
     Properties
     {
@@ -21,10 +18,11 @@ Shader "Unlit/MCVoxelInstanced"
     }
     SubShader
     {
-        Tags { "RenderType"="Opaque" "Queue"="Geometry" }
+        Tags { "RenderType"="Transparent" "Queue"="Transparent" }
         LOD 100
-        Cull Back
+        Cull Off
         ZWrite On
+        Blend SrcAlpha OneMinusSrcAlpha
 
         Pass
         {
@@ -32,7 +30,7 @@ Shader "Unlit/MCVoxelInstanced"
             #pragma vertex vert
             #pragma fragment frag
             #pragma target 4.5
-            #define PASS_CLASS 0
+            #define PASS_CLASS 2
             #include "MCVoxelInstanced.cginc"
             ENDCG
         }
