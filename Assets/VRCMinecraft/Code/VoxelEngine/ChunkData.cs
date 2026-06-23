@@ -103,6 +103,22 @@ public class ChunkData
     public byte[] _gpuFaceSliceMinV;
     public byte[] _gpuFaceSliceMaxV;
 
+    // --- GPU render-prep time-slicing (shared-mesh render path) ---
+    // The GPU render gate spreads a chunk's render-prep (atlas sync, derived-data scan, mesh+fluid
+    // assign) across frames instead of doing ~28ms atomically. _gpuPrepActive marks a chunk in the
+    // stepped prep; _gpuPrepStage is the stage; _derivedScanCursor is the Y cursor for the sliced
+    // derived-data scan; _gpuPrepData holds the decompressed blocks the prep operates on.
+    public bool _gpuPrepActive = false;
+    public int _gpuPrepStage = 0;
+    public int _derivedScanCursor = 0;
+    public byte[] _gpuPrepData;
+
+    // NO-HOLES guarantee: set true the moment a render mesh is APPLIED to this chunk (GPU prep finish,
+    // CPU mesh apply, or an intentional empty/occluded apply). Cleared on recycle. The deferred-mesh
+    // sweep re-arms any in-render, data-ready, non-air chunk that lacks this — so a chunk can never be
+    // a permanent hole even if its build fell out of the pipeline.
+    public bool _renderMeshApplied = false;
+
     // --- Time-slicing State (for meshing) ---
     public int _greedyAxis;
     public int _greedyU, _greedyV;

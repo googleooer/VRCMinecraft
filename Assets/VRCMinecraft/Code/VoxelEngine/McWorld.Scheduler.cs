@@ -26,10 +26,10 @@ public partial class McWorld
     // -------------------------------------------------------------------------
     [Header("Scheduler: Performance")]
     public int maxConcurrentWorkers = 16;
-    // Concurrent GPU worldgen columns (each = one in-flight base readback + a burst of blits). Lower
-    // reduces GPU saturation, which shrinks the per-step blit-submit stalls that were spiking the frame
-    // to 100-300ms during load. 2 trades load throughput for smooth load FPS.
-    public int maxConcurrentWorldgenColumns = 2;
+    // Concurrent GPU worldgen columns (each = one in-flight base readback, ~150ms latency). Workers
+    // parked on a readback cost no CPU, so more columns = more throughput without more per-frame work.
+    // (2 was too restrictive — it left workers idle and made the data-gen picker spin-scan ~12ms/cycle.)
+    public int maxConcurrentWorldgenColumns = 4;
     public bool reserveWorkersForDataGenDuringLoad = false;
     public int loadPhaseMeshWorkerCap = 8;
     public int debugGenSlotHoldFrames = 0;
@@ -72,6 +72,10 @@ public partial class McWorld
     private bool[] _positionAssigned;
     private int    _lastPickedDataGenPos   = -1;
     private int[]  _genSlotCache;
+    // Anti-spin: once the picker finds nothing pickable in a cycle, scanning again for every other
+    // idle worker that cycle is pure waste (state can't improve mid-assign) — it cost ~12ms/cycle with
+    // a restrictive column cap + many idle workers. Latched per assign cycle, reset at its start.
+    private bool   _pickerExhaustedThisCycle = false;
 
     // -------------------------------------------------------------------------
     // Initial-load plateau detection
@@ -148,6 +152,8 @@ public partial class McWorld
     private bool _TryPickDataGenPositionImpl()
     {
         if (radialChunkOrder == null || _positionAssigned == null) return false;
+        // Already scanned this cycle and found nothing — don't rescan for every other idle worker.
+        if (_pickerExhaustedThisCycle) return false;
         // THROTTLE: how many NEW worldgen columns may be in flight concurrently. Each
         // new column holds a generator + an in-flight GPU base-readback; capping below
         // the generator count leaves GPU readback bandwidth for mesh face-readbacks
@@ -203,6 +209,8 @@ public partial class McWorld
             }
             _fallbackScanCursor = (p >= totalWorldChunks) ? scanEnd : p;
         }
+        // Nothing pickable this cycle — latch so the remaining idle workers skip the rescan.
+        _pickerExhaustedThisCycle = true;
         return false;
     }
 
@@ -301,6 +309,7 @@ public partial class McWorld
         int rebuildAssignmentsThisCycle = 0;
         int deferredWakeAssignmentsThisCycle = 0;
         int chunkInstantiationsThisFrame = 0;
+        _pickerExhaustedThisCycle = false; // reset the per-cycle picker anti-spin latch
         for (int i = 0; i < maxConcurrentWorkers; i++)
         {
             if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break; // Don't exceed budget

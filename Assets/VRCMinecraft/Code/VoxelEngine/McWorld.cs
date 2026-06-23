@@ -2762,6 +2762,94 @@ public partial class McWorld : UdonSharpBehaviour
         _ReleaseMeshPool(chunk);
     }
 
+    // Advance a chunk's TIME-SLICED GPU render-prep by one bounded step. The GPU render gate kicks
+    // this off (sets _gpuPrepActive + isBuildingMesh) instead of doing the whole ~28ms render-prep
+    // synchronously; _BuildChunkMeshStep calls this from the budget-bounded activeMeshing loop, so the
+    // prep spreads across frames (the meshDeadline check between steps enforces the slicing). Stages:
+    //   0 = atlas block sync (upload + overlay + occupancy) + attach the shared opaque mesh,
+    //   1 = derived-data scan, Y-sliced across calls until complete,
+    //   2 = biome tex + opaque/cutout render assign + CPU fluid mesh -> done (isBuildingMesh=false).
+    private const int GPU_PREP_DERIVED_SLICE_Y = 16; // chunkSizeY(64)/16 = 4 derived slices per chunk
+    private void _StepGpuChunkPrep(ChunkData chunk)
+    {
+        if (chunk == null) return;
+        byte[] data = chunk._gpuPrepData;
+        if (data == null)
+        {
+            // Block data vanished (eviction mid-prep) — abort and re-defer so it re-meshes when ready.
+            chunk._gpuPrepActive = false;
+            chunk.isBuildingMesh = false;
+            int ci = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            if (ci != -1) MarkChunkMeshDeferred(ci);
+            return;
+        }
+
+        if (chunk._gpuPrepStage == 0)
+        {
+            int chunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            int instSlot = (gpuChunkIndexToSlot != null && chunkIndex >= 0 && chunkIndex < gpuChunkIndexToSlot.Length)
+                ? gpuChunkIndexToSlot[chunkIndex] : -1;
+            bool instSynced = instSlot >= 0 && gpuChunkSyncedDataVersion != null
+                && chunkIndex >= 0 && chunkIndex < gpuChunkSyncedDataVersion.Length
+                && gpuChunkSyncedDataVersion[chunkIndex] == chunk._cachedDataVersion;
+            if (!instSynced) _GpuSyncChunkBlocks(chunk, data);
+            if (chunk.opaqueMeshFilter != null) chunk.opaqueMeshFilter.sharedMesh = gpuVoxelChunkMesh;
+            chunk._derivedScanCursor = 0;
+            chunk._gpuPrepStage = 1;
+            return;
+        }
+
+        if (chunk._gpuPrepStage == 1)
+        {
+            bool done = _RefreshChunkDerivedDataSliced(chunk, data, chunk._derivedScanCursor, GPU_PREP_DERIVED_SLICE_Y);
+            chunk._derivedScanCursor = chunk._derivedScanCursor + GPU_PREP_DERIVED_SLICE_Y;
+            if (done) chunk._gpuPrepStage = 2;
+            return;
+        }
+
+        // stage 2: finish — biome colours + opaque/cutout render assign + CPU fluid mesh
+        // NO-HOLES guard: if the GameObject/renderer is gone (recycled mid-prep or a pool failure),
+        // do NOT complete unrendered — re-defer so it re-acquires a GameObject and actually renders.
+        if (chunk.gameObject == null || chunk.opaqueRenderer == null)
+        {
+            chunk._gpuPrepActive = false;
+            chunk._gpuPrepData = null;
+            chunk.isBuildingMesh = false;
+            int ciMissing = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            if (ciMissing != -1) MarkChunkMeshDeferred(ciMissing);
+            return;
+        }
+        _StoreBiomeData(chunk);
+        Texture2D biomeTex = _GpuGetCpuBiomeTex(chunk);
+        if (biomeTex != null)
+        {
+            if (_gpuChunkMpb == null) _gpuChunkMpb = new MaterialPropertyBlock();
+            _gpuChunkMpb.Clear();
+            _gpuChunkMpb.SetTexture("_BiomeColorRT", biomeTex);
+        }
+        if (chunk.opaqueRenderer != null)
+        {
+            chunk.opaqueRenderer.sharedMaterial = gpuVoxelInstancedMaterial;
+            if (biomeTex != null) chunk.opaqueRenderer.SetPropertyBlock(_gpuChunkMpb);
+            chunk.opaqueRenderer.enabled = true;
+        }
+        if (gpuVoxelCutoutMaterial != null && chunk.cutoutMeshFilter != null && chunk.cutoutRenderer != null)
+        {
+            chunk.cutoutMeshFilter.sharedMesh = gpuVoxelChunkMesh;
+            chunk.cutoutRenderer.sharedMaterial = gpuVoxelCutoutMaterial;
+            if (biomeTex != null) chunk.cutoutRenderer.SetPropertyBlock(_gpuChunkMpb);
+            chunk.cutoutRenderer.enabled = true;
+        }
+        _GpuBuildAndApplyFluidMesh(chunk);
+        chunk._isGpuMeshRendered = true;
+        chunk._isInstancedRendered = true;
+        chunk._renderMeshApplied = true; // NO-HOLES: a render mesh is now applied
+        chunk.isMeshDeferred = false;
+        chunk._gpuPrepActive = false;
+        chunk._gpuPrepData = null;
+        chunk.isBuildingMesh = false;
+    }
+
     private bool _GpuFaceExtractionReady()
     {
         return gpuBackendReady && gpuFaceExtractMaterial != null && gpuShouldDrawTexture != null && gpuFaceReadbackTextures != null;
@@ -4511,6 +4599,11 @@ public partial class McWorld : UdonSharpBehaviour
         chunk.cutoutMeshFilter = null;
         chunk.meshCollider = null;
         chunk.selectionCollider = null;
+        // Abort any in-flight time-sliced GPU render-prep — its GameObject/filters are gone now.
+        chunk._gpuPrepActive = false;
+        chunk._gpuPrepData = null;
+        chunk.isBuildingMesh = false;
+        chunk._renderMeshApplied = false; // its render mesh is gone — must re-apply on return
         chunk.isMeshDeferred = true; // re-mesh (re-acquires a GO) when it comes back into render distance
     }
 
@@ -4992,6 +5085,18 @@ public partial class McWorld : UdonSharpBehaviour
                     RequestChunkMeshUpdate(chunkIndex);
                 }
                 continue;
+            }
+
+            // NO-HOLES SAFETY NET: a chunk that is data-ready, in render distance, has real geometry
+            // (not all-air), isn't already building/prepping/queued, yet has NO render mesh applied —
+            // re-arm it so the re-queue below picks it up. Catches anything that fell out of the meshing
+            // pipeline (e.g. a prep that completed without a GameObject) so it can never be a permanent
+            // hole. Cheap checks short-circuit, so the worker/queue scan only runs for real suspects.
+            // (_gpuPrepActive implies isBuildingMesh, already excluded above.)
+            if (!chunk.isMeshDeferred && !chunk._renderMeshApplied && !chunk._isAllAir
+                && _IsChunkWithinMeshRenderDistance(chunk) && !IsChunkScheduledForMeshUpdate(chunkIndex))
+            {
+                chunk.isMeshDeferred = true;
             }
 
             if (!chunk.isMeshDeferred) continue;
@@ -5613,7 +5718,11 @@ public partial class McWorld : UdonSharpBehaviour
             //   - the atlas slot is synced on demand by _GpuMaintainResidentChunks / the mesh dispatch.
             // Gated on GPU lighting being active: the CPU lighting path (InitializeChunkLighting, run
             // below at finalize) reads _hasEmissiveBlocks, which only _RefreshChunkDerivedData produces.
-            bool deferRenderPrep = gpuBackendReady && _UsesGpuTerrainLightSampling() && !_IsChunkWithinMeshRenderDistance(chunk);
+            // CHEAP FINALIZE: defer the heavy render-prep (derived scan + atlas sync) for ALL chunks on
+            // the GPU-lighting path, not just out-of-render ones. The per-chunk ~28ms render-prep was the
+            // data-gen lag floor; the GPU render gate now does it TIME-SLICED at mesh time (_StepGpuChunkPrep),
+            // and out-of-range chunks still sync on demand via _GpuMaintainResidentChunks / the mesh dispatch.
+            bool deferRenderPrep = gpuBackendReady && _UsesGpuTerrainLightSampling();
 
             if (!deferRenderPrep)
             {
@@ -7032,55 +7141,29 @@ public partial class McWorld : UdonSharpBehaviour
             && gpuVoxelChunkMesh != null && chunk._chunkData != null && !chunk._isAllAir && !chunk.interactionMeshPriority
             && (chunk.pendingChunkMeshRebuild || _IsChunkWithinMeshRenderDistance(chunk)))
         {
-            // Ensure this chunk's blocks are in the atlas (proven path), then show the SHARED full-chunk
-            // GPU voxel mesh on the chunk's opaque MeshRenderer. The mesh is chunk-local; the chunk
-            // GameObject transform places it; the vertex shader reads the atlas to cull hidden/air
-            // faces. Rendering rides the normal MeshRenderer path (works) — no DrawMeshInstanced.
-            int instSlot = (gpuChunkIndexToSlot != null && chunkIndex < gpuChunkIndexToSlot.Length)
-                ? gpuChunkIndexToSlot[chunkIndex] : -1;
-            bool instSynced = instSlot >= 0 && gpuChunkSyncedDataVersion != null
-                && chunkIndex < gpuChunkSyncedDataVersion.Length
-                && gpuChunkSyncedDataVersion[chunkIndex] == chunk._cachedDataVersion;
-            if (!instSynced) _GpuSyncChunkBlocks(chunk, _GetDecompressedData(chunk));
-            _GpuBindInstancedMaterial();          // bind _MainTex/_TintMask/_ShouldDrawTex/_BlockFaceSliceTex once
-            _EnsureChunkGo(chunk);                 // active GameObject at the chunk's world position
-            if (chunk.opaqueMeshFilter != null) chunk.opaqueMeshFilter.sharedMesh = gpuVoxelChunkMesh;
-            // EXACT CPU biome colours: a linear texture of this chunk's _cachedBiomeColors (the same
-            // values MCTerrain uses as vertex colours), bound per-chunk so the shader tints identically.
-            // Ensure climate (temp/rainfall) is populated first — otherwise _PreComputeBiomeColors fills
-            // WHITE (untinted), which is why some chunks' grass rendered washed/tan instead of biome-green.
-            _StoreBiomeData(chunk);
-            Texture2D biomeTex = _GpuGetCpuBiomeTex(chunk);
-            // Per-chunk biome MPB, shared across all three GPU passes.
-            if (biomeTex != null)
+            // GPU shared-mesh render via a TIME-SLICED prep: instead of doing the whole ~28ms render-prep
+            // (atlas sync + 16K-voxel derived scan + mesh/fluid assign) synchronously here — which spiked
+            // the frame and starved meshing — kick off a stepped prep (_StepGpuChunkPrep) advanced by the
+            // budget-bounded activeMeshing loop, so the cost spreads across frames. Player edits
+            // (interactionMeshPriority) are excluded above and stay on the synchronous CPU path.
+            byte[] prepData = _GetDecompressedData(chunk);
+            if (prepData != null)
             {
-                if (_gpuChunkMpb == null) _gpuChunkMpb = new MaterialPropertyBlock();
-                _gpuChunkMpb.Clear();
-                _gpuChunkMpb.SetTexture("_BiomeColorRT", biomeTex);
+                _GpuBindInstancedMaterial();   // bind _MainTex/_TintMask/_ShouldDrawTex/_BlockFaceSliceTex once
+                _EnsureChunkGo(chunk);         // active GameObject at the chunk's world position
+                chunk._gpuPrepData = prepData;
+                chunk._gpuPrepStage = 0;
+                chunk._derivedScanCursor = 0;
+                chunk._gpuPrepActive = true;
+                chunk.isBuildingMesh = true;   // worker stays SCH_STATE_MESHING until the prep completes
+                chunk.isMeshDeferred = false;
+                chunk._gpuMeshPending = false;
+                chunk._meshBuildVersion = chunk._meshBuildVersion + 1;
+                if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
+                    activeMeshingChunks[activeMeshingCount++] = chunk;
+                return;
             }
-            if (chunk.opaqueRenderer != null)
-            {
-                chunk.opaqueRenderer.sharedMaterial = gpuVoxelInstancedMaterial;
-                if (biomeTex != null) chunk.opaqueRenderer.SetPropertyBlock(_gpuChunkMpb);
-                chunk.opaqueRenderer.enabled = true;
-            }
-            // Cutout pass (leaves etc.): same shared chunk mesh, cutout material/renderer.
-            if (gpuVoxelCutoutMaterial != null && chunk.cutoutMeshFilter != null && chunk.cutoutRenderer != null)
-            {
-                chunk.cutoutMeshFilter.sharedMesh = gpuVoxelChunkMesh;
-                chunk.cutoutRenderer.sharedMaterial = gpuVoxelCutoutMaterial;
-                if (biomeTex != null) chunk.cutoutRenderer.SetPropertyBlock(_gpuChunkMpb);
-                chunk.cutoutRenderer.enabled = true;
-            }
-            // Fluids (water/lava): rendered 1:1 by the CPU fluid mesh (_AddWaterBlocks) on the transparent
-            // MeshRenderer with the real water material — the GPU shared-mesh passes skip fluids (cls=0 in
-            // the face-slice LUT). Builds only fluid surface faces; hides the renderer if the chunk has none.
-            _GpuBuildAndApplyFluidMesh(chunk);
-            chunk._isGpuMeshRendered = true;
-            chunk._isInstancedRendered = true;
-            chunk.isMeshDeferred = false;
-            chunk.isBuildingMesh = false;
-            return;
+            // prepData unavailable — fall through to the normal mesh paths (defer/rebuild handle it).
         }
         // (b) GPU mesh-from-atlas: a resident chunk has no CPU mirror — it builds its mesh from
         // the atlas (GPU face extract, cross-slot neighbours). Otherwise _chunkData is required.
@@ -7455,6 +7538,14 @@ public partial class McWorld : UdonSharpBehaviour
     private void _BuildChunkMeshStep(ChunkData chunk)
     {
         if (!chunk.isBuildingMesh) return;
+
+        // TIME-SLICED GPU render-prep (shared-mesh path): advance one bounded stage. The activeMeshing
+        // loop calls this under the mesh budget, so a chunk's render-prep spreads across frames.
+        if (chunk._gpuPrepActive)
+        {
+            _StepGpuChunkPrep(chunk);
+            return;
+        }
 
         if (chunk._gpuFaceBuildActive)
         {
@@ -10836,6 +10927,7 @@ public partial class McWorld : UdonSharpBehaviour
         _ApplyDataToMesh(chunk.transparentMeshFilter, chunk._transparentVertices, chunk._transparentTriangles, chunk._transparentUVs, chunk._transparentNormals, chunk._transparentColors, 0, 0);
         _ApplyDataToMesh(chunk.cutoutMeshFilter, chunk._cutoutVertices, chunk._cutoutTriangles, chunk._cutoutUVs, chunk._cutoutNormals, chunk._cutoutColors, 0, 0);
         _DisableChunkCollider(chunk, false);
+        chunk._renderMeshApplied = true; // NO-HOLES: an (intentionally empty) render mesh was applied
     }
 
     private byte[] _GetDecompressedData(ChunkData chunk)
@@ -11006,6 +11098,7 @@ public partial class McWorld : UdonSharpBehaviour
 
     private void _ApplyAllMeshData(ChunkData chunk)
     {
+        chunk._renderMeshApplied = true; // NO-HOLES: the CPU render mesh is being applied this call
         // Lazily acquire a pooled render GameObject — only for chunks that actually have geometry to
         // show (skips the data-gen margin ring and fully-enclosed chunks). Recycled on leave-range.
         if (chunk.gameObject == null
@@ -13658,6 +13751,98 @@ public partial class McWorld : UdonSharpBehaviour
             }
         }
         chunk._derivedDirty = false;
+    }
+
+    // Resumable variant of _RefreshChunkDerivedData for the GPU render-prep time-slicer: scans Y in
+    // [yStart, yStart+yCount) accumulating into the SAME derived caches. The homogeneous fast-path
+    // completes in the first call. Returns true once the whole chunk is processed (caller stops
+    // slicing). Mirrors the atomic version exactly (incl. the packed-position post-increment form) so
+    // sliced and atomic derived data are byte-identical — just spread across frames to kill the ~14ms
+    // 16K-voxel spike. yStart==0 does the init; the final slice clears _derivedDirty.
+    private bool _RefreshChunkDerivedDataSliced(ChunkData chunk, byte[] fullData, int yStart, int yCount)
+    {
+        if (chunk == null || fullData == null) return true;
+        int columnCount = chunkSizeXZ * chunkSizeXZ;
+
+        if (yStart == 0)
+        {
+            if (chunk._columnMinY == null || chunk._columnMinY.Length != columnCount)
+            {
+                chunk._columnMinY = new byte[columnCount];
+                chunk._columnMaxY = new byte[columnCount];
+            }
+            // Homogeneous chunks are cheap — do them in one shot (no slicing needed).
+            if (chunk._chunkDataKind == ChunkData.CHUNK_KIND_HOMOGENEOUS)
+            {
+                _RefreshChunkDerivedData(chunk, fullData);
+                return true;
+            }
+            if (chunk._crossBlockPackedPositions == null || chunk._crossBlockPackedPositions.Length != fullData.Length)
+                chunk._crossBlockPackedPositions = new int[fullData.Length];
+            if (chunk._torchBlockPackedPositions == null || chunk._torchBlockPackedPositions.Length != fullData.Length)
+                chunk._torchBlockPackedPositions = new int[fullData.Length];
+            chunk._crossBlockCount = 0;
+            chunk._torchBlockCount = 0;
+            chunk._isAllAir = true;
+            chunk._hasWaterBlocks = false;
+            chunk._hasEmissiveBlocks = false;
+            chunk._hasTorchBlocks = false;
+            chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
+            chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
+            chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
+            for (int i = 0; i < columnCount; i++) { chunk._columnMinY[i] = 255; chunk._columnMaxY[i] = 255; }
+        }
+
+        int stride = chunkSizeXZ * chunkSizeXZ;
+        int yEnd = yStart + yCount;
+        if (yEnd > chunkSizeY) yEnd = chunkSizeY;
+        for (int y = yStart; y < yEnd; y++)
+        {
+            int yBase = y * stride;
+            for (int z = 0; z < chunkSizeXZ; z++)
+            {
+                int zBase = yBase + z * chunkSizeXZ;
+                for (int x = 0; x < chunkSizeXZ; x++)
+                {
+                    int idx = zBase + x;
+                    byte blockID = fullData[idx];
+                    if (blockID == 0) continue;
+
+                    chunk._isAllAir = false;
+                    if (!chunk._hasWaterBlocks && (_IsWaterBlock(blockID) || _IsLavaBlock(blockID)))
+                    {
+                        chunk._hasWaterBlocks = true;
+                    }
+                    int columnIndex = z * chunkSizeXZ + x;
+                    if (chunk._columnMinY[columnIndex] == 255) chunk._columnMinY[columnIndex] = (byte)y;
+                    chunk._columnMaxY[columnIndex] = (byte)y;
+
+                    if (y < chunk._chunkGlobalMinY) chunk._chunkGlobalMinY = (byte)y;
+                    if (y > chunk._chunkGlobalMaxY) chunk._chunkGlobalMaxY = (byte)y;
+                    if (x < chunk._chunkGlobalMinX) chunk._chunkGlobalMinX = (byte)x;
+                    if (x > chunk._chunkGlobalMaxX) chunk._chunkGlobalMaxX = (byte)x;
+                    if (z < chunk._chunkGlobalMinZ) chunk._chunkGlobalMinZ = (byte)z;
+                    if (z > chunk._chunkGlobalMaxZ) chunk._chunkGlobalMaxZ = (byte)z;
+
+                    if (!chunk._hasEmissiveBlocks && blockID < lightEmissionCache.Length && lightEmissionCache[blockID] > 0)
+                    {
+                        chunk._hasEmissiveBlocks = true;
+                    }
+
+                    if (blockID < shapeTypeCache.Length && shapeTypeCache[blockID] == McBlockShapeType.Cross)
+                    {
+                        chunk._crossBlockPackedPositions[chunk._crossBlockCount++] = (x << 16) | (y << 8) | z;
+                    }
+                    else if (_IsTorchBlock(blockID))
+                    {
+                        chunk._hasTorchBlocks = true;
+                        chunk._torchBlockPackedPositions[chunk._torchBlockCount++] = (x << 16) | (y << 8) | z;
+                    }
+                }
+            }
+        }
+        if (yEnd >= chunkSizeY) { chunk._derivedDirty = false; return true; }
+        return false;
     }
 
     // RENDER-PREP DEFERRAL: materialise the per-chunk derived caches for a chunk whose finalize skipped
