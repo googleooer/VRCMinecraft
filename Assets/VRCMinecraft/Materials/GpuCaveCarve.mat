@@ -71,8 +71,8 @@ Material:
     m_Floats:
     - _Amplitude: 10000
     - _ChunkSizeXZ: 16
-    - _ChunkX: -3
-    - _ChunkZ: 1
+    - _ChunkX: 1
+    - _ChunkZ: -6
     - _ClimateOctaveCount0: 4
     - _ClimateOctaveCount1: 4
     - _ClimateOctaveCount2: 2
