@@ -182,20 +182,28 @@ public partial class McWorld
         bool canStartNewColumn = _BusyGeneratorCount() < maxConcurrentWorldgenColumns;
         int scanEnd = nextChunkIndexToAssign + dataGenLookaheadWindow;
         if (scanEnd > totalWorldChunks) scanEnd = totalWorldChunks;
+        // CACHE AFFINITY: a chunk whose column slice is already in its generator's cache copies in
+        // ~1ms with no readback — ALWAYS prefer it over starting a new column, even when a slot is
+        // free. Picking a new column first stomps that cache, forcing the cached siblings into full
+        // column re-generations. This was the end-of-load crawl: two straggler columns hashing to
+        // the same generator alternated picks, so EVERY remaining Y-chunk cost a whole fresh column
+        // (~300-700ms each, mostly idle readback latency).
+        int newColumnPos = -1;
         for (int p = nextChunkIndexToAssign; p < scanEnd; p++)
         {
             if (_positionAssigned[p]) continue;
             int ci = radialChunkOrder[p];
             if (!ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin)
-            if (!genSlotBusy[_GenSlotForChunk(ci)])
+            if (CanStartChunkDataGenerationWithoutExclusiveGenerator(ci))
             {
-                if (canStartNewColumn) { _lastPickedDataGenPos = p; return true; } // new column (concurrency-capped)
+                _lastPickedDataGenPos = p; return true; // sibling from column cache — free; drain before any new column
             }
-            else if (CanStartChunkDataGenerationWithoutExclusiveGenerator(ci))
+            if (newColumnPos < 0 && canStartNewColumn && _GenSlotIsFreeForNewColumn(_GenSlotForChunk(ci)) && _NewColumnPickAllowed(ci))
             {
-                _lastPickedDataGenPos = p; return true; // sibling from column cache — no new readback, bypasses the cap
+                newColumnPos = p; // radially-first new-column candidate; used only if no cache-hit exists
             }
         }
+        if (newColumnPos >= 0) { _lastPickedDataGenPos = newColumnPos; return true; }
 
         // FALLBACK (anti-stall): the windowed scan can come up empty when the next
         // dataGenLookaheadWindow positions are all already-assigned or map to the few
@@ -218,7 +226,7 @@ public partial class McWorld
                 if (!_positionAssigned[p])
                 {
                     int ci = radialChunkOrder[p];
-                    if (ShouldGenerateChunkData(ci) && !genSlotBusy[_GenSlotForChunk(ci)])
+                    if (ShouldGenerateChunkData(ci) && _GenSlotIsFreeForNewColumn(_GenSlotForChunk(ci)) && _NewColumnPickAllowed(ci))
                     {
                         _lastPickedDataGenPos = p;
                         _fallbackScanCursor = (p + 1 >= totalWorldChunks) ? scanEnd : p + 1;
@@ -233,13 +241,58 @@ public partial class McWorld
         _pickerExhaustedThisCycle = true;
         // PICKER PARKING: with nothing pickable and no column in flight, eligibility only changes
         // when the player enters a new chunk (instant wake) or on the periodic retry (~15 cycles).
-        if (_BusyGeneratorCount() == 0)
+        // Never park while a generator still has drainable cached siblings — the drain guard is
+        // refusing new columns right now, and parking 15 cycles would stall the drain itself.
+        if (_BusyGeneratorCount() == 0 && !_AnyGeneratorDrainPending())
         {
             _pickerParkCooldown = 15;
             _pickerParkPlayerX = _streamPlayerKnown ? _streamPlayerChunkX : int.MinValue;
             _pickerParkPlayerZ = _streamPlayerKnown ? _streamPlayerChunkZ : int.MinValue;
         }
         return false;
+    }
+
+    // CACHE-DRAIN GUARD (pick side): a new-column pick must not stomp a generator cache that
+    // still has drainable siblings. Cached-column chunks are exempt inside the guard (they use
+    // the generator's cached start path), so a column's own top chunk stays pickable.
+    private bool _NewColumnPickAllowed(int ci)
+    {
+        // Coords from the INDEX: unassigned candidates have no ChunkData yet (lazy creation),
+        // and a "c == null -> allowed" bail here let every foreign new-column pick through the
+        // drain gate — which is most of them during the tail, when candidates are unassigned.
+        Chunk1DToArrrayCoords(ci, out int ax, out int ay, out int az);
+        int cx = ax - chunkOffsetX;
+        int cz = az - chunkOffsetZ;
+        return !GenBlocksNewColumnForCacheDrain(_GeneratorForColumn(cx, cz), _GenSlotForChunk(ci), cx, cz);
+    }
+
+    // Any generator currently holding a copyable cache with pending siblings? (Used to keep the
+    // picker from parking mid-drain.)
+    private bool _AnyGeneratorDrainPending()
+    {
+        int n = GetGeneratorCount();
+        for (int s = 0; s < n; s++)
+        {
+            McTerrainGenerator g = (s == 0)
+                ? terrainGenerator
+                : ((extraGenerators != null && s - 1 < extraGenerators.Length) ? extraGenerators[s - 1] : null);
+            if (g != null && GenBlocksNewColumnForCacheDrain(g, s, int.MinValue, int.MinValue)) return true;
+        }
+        return false;
+    }
+
+    // A slot is free for a NEW exclusive column only when unreserved AND its generator's state
+    // machine is actually Idle. A column restarted by the multi-gen contract guard in
+    // StepChunkDataGeneration runs WITHOUT a reservation (its worker never held the slot), and
+    // starting a fresh column on top of it would stomp the restart mid-flight and churn both.
+    private bool _GenSlotIsFreeForNewColumn(int slot)
+    {
+        if (slot < 0 || genSlotBusy == null || slot >= genSlotBusy.Length) return false;
+        if (genSlotBusy[slot]) return false;
+        McTerrainGenerator g = (slot == 0)
+            ? terrainGenerator
+            : ((extraGenerators != null && slot - 1 < extraGenerators.Length) ? extraGenerators[slot - 1] : null);
+        return g == null || g.IsIdle();
     }
 
     // Number of generator slots currently mid-column (each = one in-flight GPU
@@ -693,7 +746,7 @@ public partial class McWorld
                         // the lenient air-boundary check to break the deadlock.
                         bool neighborsReadyForMesh = (_CountWaitingWorkers() >= maxConcurrentWorkers)
                             ? AreAllNeighborsReadyLenient(chunkIndex)
-                            : AreAllNeighborsReady(chunkIndex);
+                            : (AreAllNeighborsReady(chunkIndex) || CanMeshWithoutAllNeighbors(chunkIndex));
                         if (neighborsReadyForMesh)
                         {
                             // Only defer mesh builds during initial worldgen, not rebuilds.

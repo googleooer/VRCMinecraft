@@ -3727,6 +3727,23 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return currentChunkX == gx && currentChunkY == chunkY && currentChunkZ == gz;
     }
 
+    // MULTI-GEN CONTRACT: the state machine has no active column (safe to StartChunkGeneration).
+    public bool IsIdle()
+    {
+        return currentState == GenerationState.Idle;
+    }
+
+    // MULTI-GEN CONTRACT: does the chunk the state machine last worked on match these coords?
+    // Unlike IsGeneratingChunk this stays true right AFTER completion (state back at Idle), so
+    // McWorld can verify a step-loop completion actually belongs to the consuming chunk before
+    // writing the data into it. Same coordinate space as IsGeneratingChunk's inputs.
+    public bool IsLastWorkedChunk(int chunkX, int chunkY, int chunkZ)
+    {
+        int gx = chunkX + (chunkOffsetX / world.chunkSizeXZ);
+        int gz = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+        return currentChunkX == gx && currentChunkY == chunkY && currentChunkZ == gz;
+    }
+
     public bool CanCopyCachedGpuChunkSlice(int chunkX, int chunkY, int chunkZ)
     {
         if (!isInitialized || !enableGpuWorldgen || !gpuWorldgenReady || !gpuColumnReadbackReady || !gpuCachedChunkSlicesReady || gpuCachedChunkSlices == null || world == null)
@@ -3744,22 +3761,47 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return gpuCachedChunkSlices[chunkY] != null;
     }
 
+    // MULTI-GEN CONTRACT: true while this generator holds a complete, copyable column slice
+    // cache. McWorld uses this (with CachedColumnChunkX/Z) to keep a FOREIGN column from
+    // grabbing an idle generator while the cached column still has pending sibling chunks —
+    // a new column's base-fill blit sets gpuCachedChunkSlicesReady=false, so starting one
+    // forces every remaining cached sibling into a full ~300ms column re-generation.
+    public bool HasCopyableColumnCache()
+    {
+        return isInitialized && enableGpuWorldgen && gpuWorldgenReady && gpuColumnReadbackReady
+            && gpuCachedChunkSlicesReady && gpuCachedChunkSlices != null;
+    }
+
+    // World-space (centered) chunk coords of the cached column. Only meaningful while
+    // HasCopyableColumnCache() is true.
+    public int CachedColumnChunkX() { return gpuCachedColumnX - (chunkOffsetX / world.chunkSizeXZ); }
+    public int CachedColumnChunkZ() { return gpuCachedColumnZ - (chunkOffsetZ / world.chunkSizeXZ); }
+
+    // Dedicated output buffer for sibling slice copies. NEVER workingChunkData: sibling copies
+    // are legal while the state machine is BUSY (the whole point of the cache — e.g. during the
+    // top chunk's multi-frame DecoratingTerrain), and workingChunkData is the machine's live
+    // buffer. Routing copies through workingChunkData let a draining sibling overwrite the top
+    // chunk's in-flight blocks, so the top completed with a duplicate of that sibling's slice
+    // (terrain copies floating at the top of columns). McWorld clones completedData on consume,
+    // so one reusable buffer is safe.
+    private byte[] gpuSliceCopyBuffer;
+
     public bool TryCopyCachedGpuChunkSlice(int chunkX, int chunkY, int chunkZ, out byte[] completedData)
     {
         completedData = null;
         if (!CanCopyCachedGpuChunkSlice(chunkX, chunkY, chunkZ)) return false;
 
         int chunkSize = world.chunkSizeXZ * world.chunkSizeY * world.chunkSizeXZ;
-        if (workingChunkData == null || workingChunkData.Length != chunkSize)
+        if (gpuSliceCopyBuffer == null || gpuSliceCopyBuffer.Length != chunkSize)
         {
-            workingChunkData = new byte[chunkSize];
+            gpuSliceCopyBuffer = new byte[chunkSize];
         }
 
 #if LOGGING
         float copyStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
-        System.Array.Copy(gpuCachedChunkSlices[chunkY], workingChunkData, chunkSize);
-        completedData = workingChunkData;
+        System.Array.Copy(gpuCachedChunkSlices[chunkY], gpuSliceCopyBuffer, chunkSize);
+        completedData = gpuSliceCopyBuffer;
 
 #if LOGGING
         if (enableVerboseLogging && !dbg_loggedFirstGpuChunkCopy)

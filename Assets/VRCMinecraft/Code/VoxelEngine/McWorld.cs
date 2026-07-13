@@ -98,9 +98,12 @@ public partial class McWorld : UdonSharpBehaviour
     // NEAR meshing guarantee: per-frame decode time reserved for chunks near the player.
     [System.NonSerialized] public float gpuNearMeshDecodeFrameBudgetMs = 5.0f;
     // Budget per GPU worldgen step (ms) — main load-lag lever.
-    [System.NonSerialized] public float gpuWorldgenStepBudgetMs = 2.0f;
+    // 3.0x3 (was 2.0x2): during streaming the mesh pipeline (~25 chunks/s) runs AHEAD of column
+    // generation (~13-18 chunks/s), so generation gets a bigger share of the frame budget — the
+    // adaptive governor still shrinks it under frame pressure.
+    [System.NonSerialized] public float gpuWorldgenStepBudgetMs = 3.0f;
     // Max GPU worldgen steps per chunk per frame.
-    [System.NonSerialized] public int gpuWorldgenStepsPerFrame = 2;
+    [System.NonSerialized] public int gpuWorldgenStepsPerFrame = 3;
     [Tooltip("Prioritize meshing the exposed shell and chunks near the player before fully enclosed interiors.")]
     public bool prioritizeVisibleShellMeshing = true;
     [Tooltip("Chunks within this XZ radius of the player are always eligible for meshing.")]
@@ -2955,7 +2958,39 @@ public partial class McWorld : UdonSharpBehaviour
     private const int GPU_PREP_FLUID_SLICE_Z = 2;
     // Rotating cursor for the meshing starvation-rescue lane (see ProcessActiveChunks).
     private int _meshRescueCursor = 0;
+
+    // ROUND-ROBIN cursor for the budgeted mesh stepping pass in ProcessActiveChunks — resumes
+    // where the previous frame's budget cutoff stopped so no list position starves.
+    private int _meshLoopCursor = 0;
+#if LOGGING
+    // PREP STAGE PROFILE: where the ~15-18ms per-chunk render-prep actually goes (stage totals
+    // across all preps in the window). Guides the streaming-throughput optimization work.
+    private float stats_prepStage0Ms = 0f; // atlas sync + shared-mesh attach
+    private float stats_prepStage1Ms = 0f; // sliced derived scan
+    private float stats_prepStage2Ms = 0f; // biome + render gates
+    private float stats_prepStage3Ms = 0f; // sliced fluid mesh build
+#endif
+
     private void _StepGpuChunkPrep(ChunkData chunk)
+    {
+#if LOGGING
+        float _prepStepT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+        int _prepStageAtEntry = chunk != null ? chunk._gpuPrepStage : -1;
+#endif
+        _StepGpuChunkPrepImpl(chunk);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            float _prepStepEl = (Time.realtimeSinceStartup - _prepStepT0) * 1000f;
+            if (_prepStageAtEntry == 0) stats_prepStage0Ms += _prepStepEl;
+            else if (_prepStageAtEntry == 1) stats_prepStage1Ms += _prepStepEl;
+            else if (_prepStageAtEntry == 3) stats_prepStage3Ms += _prepStepEl;
+            else stats_prepStage2Ms += _prepStepEl;
+        }
+#endif
+    }
+
+    private void _StepGpuChunkPrepImpl(ChunkData chunk)
     {
         if (chunk == null) return;
         byte[] data = chunk._gpuPrepData;
@@ -3097,9 +3132,13 @@ public partial class McWorld : UdonSharpBehaviour
             if (biomeTex != null) chunk.cutoutRenderer.SetPropertyBlock(_gpuChunkMpb);
             chunk.cutoutRenderer.enabled = true;
         }
-        else if (chunk.cutoutMeshFilter != null && chunk.cutoutMeshFilter.sharedMesh == gpuVoxelChunkMesh)
+        else if (chunk.cutoutMeshFilter != null)
         {
-            chunk.cutoutMeshFilter.sharedMesh = null;
+            // Detach the shared mesh, or CLEAR a stale private CPU cutout mesh left by an earlier
+            // interaction build (e.g. the player broke the chunk's last leaves and the edit then
+            // routed back through this prep). Never Clear() the shared voxel mesh.
+            if (chunk.cutoutMeshFilter.sharedMesh == gpuVoxelChunkMesh) chunk.cutoutMeshFilter.sharedMesh = null;
+            else if (chunk.cutoutMeshFilter.sharedMesh != null) chunk.cutoutMeshFilter.sharedMesh.Clear();
             if (chunk.cutoutRenderer != null) chunk.cutoutRenderer.enabled = false;
         }
         if (chunk._hasWaterBlocks)
@@ -3139,6 +3178,30 @@ public partial class McWorld : UdonSharpBehaviour
         chunk._gpuPrepData = null;
         chunk._gpuFluidZCursor = -1;
         chunk.isBuildingMesh = false;
+        // Defensive: an edit landing mid-prep re-sets this alongside pendingChunkMeshRebuild;
+        // the follow-up rebuild re-raises it (mesh-loop removal path). Matches the CPU
+        // completion paths, which also clear it.
+        chunk.interactionMeshPriority = false;
+    }
+
+    // RE-PREP CUT companion: re-evaluate ONLY the renderer enable toggles of an already-prepped
+    // instanced chunk (the enclosed-gate) without a full re-prep. Called when adjacent data arrives
+    // (TriggerNeighborMeshRebuilds) — arriving solid neighbors can complete this chunk's burial.
+    // Everything else the prep computes (atlas sync, derived, cutout attach, fluid) is unaffected
+    // by neighbor-data arrival on a dry chunk.
+    private void _ReGateInstancedRenderers(ChunkData c)
+    {
+        if (c == null || !c._isInstancedRendered) return;
+        bool enclosed = c._isAllOpaqueSolid && !c._derivedDirty
+            && c._derivedForDataVersion == c._cachedDataVersion && _AllNeighborsAllOpaqueSolid(c);
+        if (c.opaqueRenderer != null) c.opaqueRenderer.enabled = !enclosed;
+        // Only toggle the cutout renderer when the shared voxel mesh is attached (i.e. the prep
+        // enabled it for this chunk's non-opaque content) — never re-enable a detached one.
+        if (c.cutoutRenderer != null && c.cutoutMeshFilter != null
+            && c.cutoutMeshFilter.sharedMesh == gpuVoxelChunkMesh)
+        {
+            c.cutoutRenderer.enabled = !enclosed && c._hasNonOpaqueContent;
+        }
     }
 
     // True when all 6 neighbors exist, are data-ready with fresh derived data, and are entirely
@@ -3150,7 +3213,12 @@ public partial class McWorld : UdonSharpBehaviour
         for (int i = 0; i < 6; i++)
         {
             ChunkData nb = neighbors[i];
-            if (nb == null || !nb.isDataReady || nb._derivedDirty || !nb._isAllOpaqueSolid) return false;
+            // Version check: a neighbor whose derived flags predate its latest edit must count as
+            // "not solid" (conservative -> render). Without it, digging into a buried chunk could
+            // re-gate the neighbor against the PRE-edit _isAllOpaqueSolid and leave an invisible
+            // chunk exposed (a hole). Stale-but-actually-solid neighbors merely over-render.
+            if (nb == null || !nb.isDataReady || nb._derivedDirty
+                || nb._derivedForDataVersion != nb._cachedDataVersion || !nb._isAllOpaqueSolid) return false;
         }
         return true;
     }
@@ -4999,11 +5067,23 @@ public partial class McWorld : UdonSharpBehaviour
         int count = gridXZ * gridXZ * gridY;
         _voxelColliders = new GameObject[count];
         _voxelColliderActive = new bool[count];
+        _voxelColliderKeyX = new int[count];
+        _voxelColliderKeyY = new int[count];
+        _voxelColliderKeyZ = new int[count];
+        _collisionSlotCollider = new int[count];
+        _voxelColliderFreeList = new int[count];
         for (int i = 0; i < count; i++)
         {
             GameObject go = Instantiate(voxelColliderPrefab);
             if (go == null) continue;
             go.transform.SetParent(this.transform, false);
+            // SEAM OVERLAP: flush 1x1x1 boxes leave internal seam edges that the player capsule
+            // catches when crossing block boundaries or sliding off an edge (PhysX ghost
+            // collisions — the residual walk/fall jitter after the pinned-collider rework). A 2%
+            // uniform overlap buries every seam edge inside the neighboring box so contacts stay
+            // face-aligned. Floors sit 1cm high and walls protrude 1cm — imperceptible.
+            Vector3 cs = go.transform.localScale;
+            go.transform.localScale = new Vector3(cs.x * 1.02f, cs.y * 1.02f, cs.z * 1.02f);
             go.SetActive(false);
             _voxelColliders[i] = go;
             _voxelColliderActive[i] = false;
@@ -5030,6 +5110,19 @@ public partial class McWorld : UdonSharpBehaviour
     private bool _collisionGridDirty = true;
     private int _collisionSafetyCountdown = 0;
     public int collisionGridSafetyRescanFrames = 30;
+
+    // WORLD-STATIONARY COLLIDERS: an ACTIVE collider is pinned to a world voxel (key arrays) and is
+    // NEVER repositioned while active. The old grid slot-mapped colliders to player-relative
+    // offsets, so crossing a voxel boundary teleported every active collider — including the one
+    // underfoot. VRChat treats a collider moving under the player as a MOVING PLATFORM (drags the
+    // player with it), and colliders teleporting into the capsule cause depenetration shoves —
+    // together: the fast, erratic sliding. Now colliders only deactivate when their voxel leaves
+    // the window / turns to air, and fresh ones activate at newly-covered voxels.
+    private int[] _voxelColliderKeyX;
+    private int[] _voxelColliderKeyY;
+    private int[] _voxelColliderKeyZ;
+    private int[] _collisionSlotCollider;  // window-slot -> pool index holding that voxel (-1 none)
+    private int[] _voxelColliderFreeList;  // scratch: inactive pool indices
 
     private void _UpdateVoxelColliderGrid()
     {
@@ -5060,6 +5153,41 @@ public partial class McWorld : UdonSharpBehaviour
         int lastCX = int.MinValue, lastCY = int.MinValue, lastCZ = int.MinValue;
         ChunkData colChunk = null;
         byte[] colData = null;
+
+        // PASS 1 (world-stationary colliders): map each ACTIVE collider's pinned voxel to its slot
+        // in the CURRENT window; deactivate any whose voxel left the window. Colliders that stay
+        // in-window keep their exact world position — never touched again below unless their voxel
+        // turned to air. Inactive colliders go on the free list for pass 2 activations.
+        int gridXZ = 2 * R + 1;
+        int gridY = down + up + 1;
+        int baseX = pvx - R, baseY = pvy - down, baseZ = pvz - R;
+        int windowCount = _collisionSlotCollider != null ? _collisionSlotCollider.Length : 0;
+        for (int s = 0; s < windowCount; s++) _collisionSlotCollider[s] = -1;
+        int freeCount = 0;
+        int poolCount = _voxelColliders.Length;
+        for (int i = 0; i < poolCount; i++)
+        {
+            if (!_voxelColliderActive[i])
+            {
+                _voxelColliderFreeList[freeCount] = i;
+                freeCount = freeCount + 1;
+                continue;
+            }
+            int sx = _voxelColliderKeyX[i] - baseX;
+            int sy = _voxelColliderKeyY[i] - baseY;
+            int sz = _voxelColliderKeyZ[i] - baseZ;
+            if (sx < 0 || sx >= gridXZ || sy < 0 || sy >= gridY || sz < 0 || sz >= gridXZ)
+            {
+                GameObject ogo = _voxelColliders[i];
+                if (ogo != null) ogo.SetActive(false);
+                _voxelColliderActive[i] = false;
+                _voxelColliderFreeList[freeCount] = i;
+                freeCount = freeCount + 1;
+                continue;
+            }
+            _collisionSlotCollider[(sy * gridXZ + sz) * gridXZ + sx] = i;
+        }
+
         int idx = 0;
         for (int dy = -down; dy <= up; dy++)
         {
@@ -5104,27 +5232,37 @@ public partial class McWorld : UdonSharpBehaviour
                         }
                         solid = bid != 0 && bid < collisionLen && _blockHasCollisionCache[bid];
                     }
-                    GameObject go = idx < _voxelColliders.Length ? _voxelColliders[idx] : null;
-                    if (go != null)
+                    // PASS 2 (world-stationary colliders): a voxel already holding a collider is
+                    // left completely untouched — repositioning an active collider under the
+                    // player made VRChat treat it as a moving platform (the sliding bug). Only
+                    // newly-solid voxels activate a FREE collider; newly-air voxels release theirs.
+                    int holder = idx < windowCount ? _collisionSlotCollider[idx] : -1;
+                    if (solid)
                     {
-                        if (solid)
+                        if (holder < 0 && freeCount > 0)
                         {
-                            if (!_voxelColliderActive[idx])
+                            freeCount = freeCount - 1;
+                            int ni = _voxelColliderFreeList[freeCount];
+                            GameObject ngo = _voxelColliders[ni];
+                            if (ngo != null)
                             {
-                                go.transform.position = new Vector3(wx + 0.5f, wy + 0.5f, wz + 0.5f);
-                                go.SetActive(true);
-                                _voxelColliderActive[idx] = true;
-                            }
-                            else if (moved)
-                            {
-                                go.transform.position = new Vector3(wx + 0.5f, wy + 0.5f, wz + 0.5f);
+                                ngo.transform.position = new Vector3(wx + 0.5f, wy + 0.5f, wz + 0.5f);
+                                ngo.SetActive(true);
+                                _voxelColliderActive[ni] = true;
+                                _voxelColliderKeyX[ni] = wx;
+                                _voxelColliderKeyY[ni] = wy;
+                                _voxelColliderKeyZ[ni] = wz;
                             }
                         }
-                        else if (_voxelColliderActive[idx])
-                        {
-                            go.SetActive(false);
-                            _voxelColliderActive[idx] = false;
-                        }
+                    }
+                    else if (holder >= 0)
+                    {
+                        GameObject hgo = _voxelColliders[holder];
+                        if (hgo != null) hgo.SetActive(false);
+                        _voxelColliderActive[holder] = false;
+                        _voxelColliderFreeList[freeCount] = holder;
+                        freeCount = freeCount + 1;
+                        _collisionSlotCollider[idx] = -1;
                     }
                     idx++;
                 }
@@ -5139,6 +5277,13 @@ public partial class McWorld : UdonSharpBehaviour
     private int _goRecycleDryStreak = 0;
     private int _goRecycleSkipPhase = 0;
 
+    // UNLOAD BURST: when the player crosses a chunk boundary, sweep the whole array within a few
+    // frames (1024 cheap distance checks/frame) instead of waiting for the 32/frame rolling cursor
+    // to come around (~8+ seconds) — out-of-range chunks now disappear in ~a quarter second.
+    private int _goRecycleBurstRemaining = 0;
+    private int _goRecyclePrevPlayerX = int.MinValue;
+    private int _goRecyclePrevPlayerZ = int.MinValue;
+
     private void _ProcessChunkGoRecycle(float frameStart, float frameBudget)
     {
         if (chunks_1D == null || !_streamPlayerKnown) return;
@@ -5151,6 +5296,12 @@ public partial class McWorld : UdonSharpBehaviour
         int keepR = _activeRenderDistanceChunks + 2; // GOs exist only for rendered chunks (render distance); +2 hysteresis
         int keepRR = keepR * keepR;
         int scan = Mathf.Max(1, chunkGoRecycleScanPerFrame);
+        if (_goRecycleBurstRemaining > 0)
+        {
+            scan = 1024;
+            if (scan > _goRecycleBurstRemaining) scan = _goRecycleBurstRemaining;
+            _goRecycleBurstRemaining -= scan;
+        }
         bool recycledAny = false;
         while (scan-- > 0)
         {
@@ -5301,6 +5452,15 @@ public partial class McWorld : UdonSharpBehaviour
         bool _spKnown = _TryGetPlayerChunkCoords(out int _spX, out int _spY, out int _spZ);
         _streamPlayerKnown = _spKnown;
         if (_spKnown) { _streamPlayerChunkX = _spX; _streamPlayerChunkZ = _spZ; }
+        // UNLOAD BURST trigger: the player entered a new chunk — fast-sweep the GO recycle scan
+        // so chunks that just left the keep ring deactivate promptly (see _ProcessChunkGoRecycle).
+        if (_spKnown && (_spX != _goRecyclePrevPlayerX || _spZ != _goRecyclePrevPlayerZ))
+        {
+            _goRecyclePrevPlayerX = _spX;
+            _goRecyclePrevPlayerZ = _spZ;
+            _goRecycleBurstRemaining = chunks_1D != null ? chunks_1D.Length : 0;
+            _goRecycleDryStreak = 0; // unpark the recycle sweep
+        }
 
         // --- Process Data Generation ---
         for (int i = 0; i < activeDataGenCount; i++)
@@ -5382,37 +5542,57 @@ public partial class McWorld : UdonSharpBehaviour
         // watchdog and get force-released — losing chunks. Mirrors the readback guarantee above:
         // the slice is only consumed when there is actually mesh work queued (activeMeshingCount>0).
         float meshDeadline = Mathf.Max(frameStart + frameBudget, Time.realtimeSinceStartup + gpuMeshDecodeFrameBudgetSec);
+
+        // COMPACTION PASS (unbudgeted, O(n) flag checks): remove completed entries over the WHOLE
+        // list every frame. The old combined scan removed only entries the budget cutoff reached —
+        // once frontier meshing let the list legitimately grow past what one frame's budget covers,
+        // completed builds accumulated in the unvisited tail, the list crept to MAX_ACTIVE_CHUNKS,
+        // new builds bounced to deferred, and live tail entries (stage-3 fluid preps holding mesh
+        // pool slots) starved until the 300-frame watchdog force-released them (observed: meshing
+        // avg 55-62/64 with repeated prepStage=3 watchdog kills -> unrendered chunks).
         for (int i = 0; i < activeMeshingCount; i++)
+        {
+            ChunkData doneChunk = activeMeshingChunks[i];
+            if (doneChunk != null && doneChunk.isBuildingMesh) continue;
+
+            bool needsFollowupMeshBuild = false;
+            int followupChunkIndex = -1;
+            if (doneChunk != null && doneChunk.pendingChunkMeshRebuild)
+            {
+                doneChunk.pendingChunkMeshRebuild = false;
+                doneChunk.interactionMeshPriority = true;
+                followupChunkIndex = ChunkCenteredCoordsTo1D(doneChunk.chunkX_world, doneChunk.chunkY_world, doneChunk.chunkZ_world);
+                needsFollowupMeshBuild = followupChunkIndex != -1;
+            }
+
+            // Remove from active list
+            activeMeshingChunks[i] = activeMeshingChunks[activeMeshingCount - 1];
+            activeMeshingCount--;
+            i--; // Re-check this index
+
+            if (needsFollowupMeshBuild)
+            {
+                RequestChunkMeshUpdate(followupChunkIndex);
+#if LOGGING
+                stats_rqFollowup++;
+#endif
+            }
+        }
+
+        // STEPPING PASS (budgeted): ROUND-ROBIN from where the previous frame stopped, so the
+        // budget cutoff rotates over the list instead of always starving the same tail entries.
+        int meshLoopLive = activeMeshingCount;
+        if (_meshLoopCursor >= meshLoopLive) _meshLoopCursor = 0;
+        for (int n = 0; n < meshLoopLive; n++)
         {
             if (Time.realtimeSinceStartup > meshDeadline) break; // Don't exceed budget
 
+            int i = _meshLoopCursor;
+            _meshLoopCursor = _meshLoopCursor + 1;
+            if (_meshLoopCursor >= meshLoopLive) _meshLoopCursor = 0;
+
             ChunkData chunk = activeMeshingChunks[i];
-            if (chunk == null || !chunk.isBuildingMesh)
-            {
-                bool needsFollowupMeshBuild = false;
-                int followupChunkIndex = -1;
-                if (chunk != null && chunk.pendingChunkMeshRebuild)
-                {
-                    chunk.pendingChunkMeshRebuild = false;
-                    chunk.interactionMeshPriority = true;
-                    followupChunkIndex = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
-                    needsFollowupMeshBuild = followupChunkIndex != -1;
-                }
-
-                // Remove from active list
-                activeMeshingChunks[i] = activeMeshingChunks[activeMeshingCount - 1];
-                activeMeshingCount--;
-                i--; // Re-check this index
-
-                if (needsFollowupMeshBuild)
-                {
-                    RequestChunkMeshUpdate(followupChunkIndex);
-#if LOGGING
-                    stats_rqFollowup++;
-#endif
-                }
-                continue;
-            }
+            if (chunk == null || !chunk.isBuildingMesh) continue; // completed mid-pass; compacted next frame
 
             if (chunk._gpuFaceBuildActive && gpuMeshDecodeSpentSec >= gpuMeshDecodeFrameBudgetSec)
             {
@@ -5584,7 +5764,9 @@ public partial class McWorld : UdonSharpBehaviour
             // just bounce off the cap in BuildChunkMesh). They wake when the player comes in range.
             if (!_IsChunkWithinMeshRenderDistance(chunk)) continue;
             if (chunk._borderMissingMask != 0 && !_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask)) continue;
-            if (!AreAllNeighborsReady(chunkIndex)) continue;
+            // FRONTIER MESHING: instanced-path chunks don't wait for ungenerated outward
+            // neighbors — the shader culls from the atlas at draw time (see CanMeshWithoutAllNeighbors).
+            if (!AreAllNeighborsReady(chunkIndex) && !CanMeshWithoutAllNeighbors(chunkIndex)) continue;
 
             bool shouldWake = _ShouldPrioritizeChunkMesh(chunk);
             if (!shouldWake)
@@ -5976,9 +6158,110 @@ public partial class McWorld : UdonSharpBehaviour
     public bool CanStartChunkDataGenerationWithoutExclusiveGenerator(int chunkIndex)
     {
         if (chunkIndex == -1 || chunks_1D == null || chunkIndex >= chunks_1D.Length || terrainGenerator == null) return false;
+        // Coords from the INDEX, not the ChunkData: chunks_1D entries are null until first
+        // assignment (lazy creation in InstantiateAndConfigureChunk), and a never-assigned
+        // sibling is exactly the chunk this check must say yes to. The old null bail made
+        // cache-hit picks impossible for unassigned siblings — column caches were never
+        // drained through this path, only stomped.
         ChunkData chunk = chunks_1D[chunkIndex];
-        if (chunk == null) return false;
-        return _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world).CanCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        if (chunk != null && (chunk.isDataReady || chunk.isGeneratingData)) return false;
+        Chunk1DToArrrayCoords(chunkIndex, out int ax, out int ay, out int az);
+        int cx = ax - chunkOffsetX;
+        int cy = ay - chunkOffsetY;
+        int cz = az - chunkOffsetZ;
+        return _GeneratorForColumn(cx, cz).CanCopyCachedGpuChunkSlice(cx, cy, cz);
+    }
+
+    // CACHE-DRAIN GUARD: after a column completes, its generator's slice cache can finish the
+    // column's remaining Y-chunks as ~1ms copies — but ANY new column started on that generator
+    // destroys the cache at its base-fill blit. Returns true while `gen` still has cached
+    // siblings that are pending and reachable (parked on a worker, or unassigned but inside
+    // streaming range), so callers about to start a DIFFERENT column on it yield instead of
+    // stomping the cache (which was the end-of-load crawl AND the slow scattered frontier:
+    // interleaved same-slot columns turned EVERY sibling into a full ~300ms column re-gen).
+    // A per-slot deadline guarantees liveness if a pending sibling somehow never drains.
+    private int[] _drainGuardColX;
+    private int[] _drainGuardColZ;
+    private float[] _drainGuardUntil;
+    private int[] _drainGuardMemoFrame;   // per slot: frame the verdict below was computed
+    private bool[] _drainGuardMemoBlock;  // per slot: cache has pending drainable siblings this frame
+    private int[] _drainGuardMemoCcx;     // per slot: cached column coords behind a true verdict
+    private int[] _drainGuardMemoCcz;
+
+    private bool GenBlocksNewColumnForCacheDrain(McTerrainGenerator gen, int slot, int candidateCx, int candidateCz)
+    {
+        if (gen == null || chunks_1D == null) return false;
+        int genCount = GetGeneratorCount();
+        if (slot < 0 || slot >= genCount) return false;
+        if (_drainGuardMemoFrame == null || _drainGuardMemoFrame.Length < genCount)
+        {
+            _drainGuardColX = new int[genCount];
+            _drainGuardColZ = new int[genCount];
+            _drainGuardUntil = new float[genCount];
+            _drainGuardMemoFrame = new int[genCount];
+            _drainGuardMemoBlock = new bool[genCount];
+            _drainGuardMemoCcx = new int[genCount];
+            _drainGuardMemoCcz = new int[genCount];
+            for (int i = 0; i < genCount; i++)
+            {
+                _drainGuardColX[i] = int.MinValue; _drainGuardColZ[i] = int.MinValue;
+                _drainGuardMemoFrame[i] = -1;
+            }
+        }
+        // The verdict only needs the generator's cache state + the column's pending set, both of
+        // which the picker can probe many times per scan — compute once per slot per frame so the
+        // cross-VM generator calls stay bounded.
+        int fc = Time.frameCount;
+        if (_drainGuardMemoFrame[slot] != fc)
+        {
+            _drainGuardMemoFrame[slot] = fc;
+            _drainGuardMemoBlock[slot] = false;
+            if (gen.HasCopyableColumnCache())
+            {
+                int ccx = gen.CachedColumnChunkX();
+                int ccz = gen.CachedColumnChunkZ();
+                _drainGuardMemoCcx[slot] = ccx;
+                _drainGuardMemoCcz[slot] = ccz;
+                if (_drainGuardColX[slot] != ccx || _drainGuardColZ[slot] != ccz)
+                {
+                    _drainGuardColX[slot] = ccx;
+                    _drainGuardColZ[slot] = ccz;
+                    _drainGuardUntil[slot] = Time.realtimeSinceStartup + 3f;
+                }
+                // Deadline = liveness cap: if a pending sibling somehow never drains, stop
+                // blocking after 3s and let new columns proceed (old behavior).
+                if (Time.realtimeSinceStartup <= _drainGuardUntil[slot])
+                {
+                    // Any pending, reachable sibling in the cached column? (Top chunk can't copy.)
+                    for (int y = 0; y < worldDimensionY - 1; y++)
+                    {
+                        int ci = ChunkCenteredCoordsTo1D(ccx, y, ccz);
+                        if (ci < 0) continue;
+                        ChunkData c = chunks_1D[ci];
+                        // Null = never assigned (chunks_1D is populated lazily at assignment).
+                        // A null, in-range sibling is precisely a drainable one — the picker
+                        // creates it via a cache-hit pick. Skipping nulls left the guard blind
+                        // to every unassigned sibling, so it never actually blocked anything.
+                        if (c == null)
+                        {
+                            if (ShouldGenerateChunkData(ci)) { _drainGuardMemoBlock[slot] = true; break; }
+                            continue;
+                        }
+                        if (c.isDataReady) continue;
+                        if (c.isGeneratingData          // parked on a worker; copies on its next step
+                            || ShouldGenerateChunkData(ci)) // in range; picker takes it as a cache-hit
+                        {
+                            _drainGuardMemoBlock[slot] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!_drainGuardMemoBlock[slot]) return false;
+        // Blocked — unless the candidate IS the cached column: StartChunkGeneration routes those
+        // through the cached-column fast path (Copy_GpuChunkSlice / cached prep), no cache stomp.
+        return candidateCx != _drainGuardMemoCcx[slot] || candidateCz != _drainGuardMemoCcz[slot];
     }
 
     // Called by Coordinator
@@ -6138,16 +6421,42 @@ public partial class McWorld : UdonSharpBehaviour
 #if LOGGING
         float _finSliceT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
+        bool completedViaStepLoop = false;
         if (useGpuWorldgen && gen.TryCopyCachedGpuChunkSlice(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world, out generatedData))
         {
             isComplete = true;
         }
         else
         {
+            // MULTI-GEN CONTRACT GUARD: only the chunk the generator is actually working on may
+            // step the state machine. With extraGenerators, a parked sibling whose column cache
+            // was superseded (this generator started ANOTHER column before the sibling copied its
+            // slice) would otherwise drive someone else's pipeline: it can consume the foreign
+            // column's Complete step as its own data (silent wrong terrain), and the foreign
+            // holder then steps the now-Idle machine — which returns isComplete=true with NULL
+            // data (the switch default) and crashed on generatedData[0].
+            if (useGpuWorldgen && !gen.IsGeneratingChunk(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world))
+            {
+                if (gen.IsIdle() && !GenBlocksNewColumnForCacheDrain(gen, _GeneratorSlotForColumn(chunk.chunkX_world, chunk.chunkZ_world), chunk.chunkX_world, chunk.chunkZ_world))
+                {
+                    // Generator free — (re)start this chunk's own column. Cheap when its caches
+                    // survived; a full re-gen otherwise, which is correct, just slower.
+                    gen.gpuSkipReadbackForColumn = _ColumnShouldSkipReadback(chunk);
+                    gen.StartChunkGeneration(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+                }
+                // else: busy with another column, or its cached column still has pending siblings
+                // to drain (starting THIS chunk's column would kill the cache and force them into
+                // full re-gens) — wait; the worker retries next frame once the generator frees or
+                // the slice cache becomes copyable for this chunk again.
+#if LOGGING
+                if (enableDetailedTimings) stats_finalizeSliceTime += (Time.realtimeSinceStartup - _finSliceT0) * 1000f;
+#endif
+                return;
+            }
             for (int step = 0; step < maxStepsPerFrame; step++)
             {
                 isComplete = gen.StepChunkGeneration(out generatedData);
-                if (isComplete) break;
+                if (isComplete) { completedViaStepLoop = true; break; }
 
                 // EVENT-DRIVEN GEN: the generator is parked on an async GPU readback (base-column or
                 // climate) that only its OnAsyncGpuReadbackComplete callback can finish. Re-stepping it
@@ -6173,6 +6482,35 @@ public partial class McWorld : UdonSharpBehaviour
             {
                 _GpuResidentCompleteChunk(chunk, gen);
                 return;
+            }
+            // MULTI-GEN CONTRACT GUARD (consume side): never write a completion that doesn't
+            // belong to this chunk. generatedData is null when an Idle machine was stepped (the
+            // generator's switch default), and a coordinate mismatch means the step loop finished
+            // a FOREIGN column. Both are contract breaches — restart this chunk's own generation
+            // instead of crashing on generatedData[0] / corrupting the chunk with foreign terrain.
+            if (completedViaStepLoop
+                && (generatedData == null || !gen.IsLastWorkedChunk(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world)))
+            {
+                Debug.LogWarning("[McWorld] Discarded foreign/null column completion at ("
+                    + chunk.chunkX_world + "," + chunk.chunkY_world + "," + chunk.chunkZ_world
+                    + ") — restarting its generation");
+                if (gen.IsIdle() && !GenBlocksNewColumnForCacheDrain(gen, _GeneratorSlotForColumn(chunk.chunkX_world, chunk.chunkZ_world), chunk.chunkX_world, chunk.chunkZ_world))
+                {
+                    gen.gpuSkipReadbackForColumn = _ColumnShouldSkipReadback(chunk);
+                    gen.StartChunkGeneration(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+                }
+                return;
+            }
+            if (generatedData == null) return; // TryCopy never yields null on true; never index null
+            // CACHE-DRAIN GUARD: this completion may have just made the generator's slice cache
+            // copyable (trigger chunk of a fresh column). Drop the slot's per-frame guard memo so
+            // foreign chunks stepping LATER THIS FRAME re-evaluate against the new cache instead
+            // of a stale pre-completion "unblocked" verdict — that stale window was enough for a
+            // parked foreign chunk to grab the generator and kill the cache before any sibling ran.
+            if (_drainGuardMemoFrame != null)
+            {
+                int _dgSlot = _GeneratorSlotForColumn(chunk.chunkX_world, chunk.chunkZ_world);
+                if (_dgSlot >= 0 && _dgSlot < _drainGuardMemoFrame.Length) _drainGuardMemoFrame[_dgSlot] = -1;
             }
 #if LOGGING
             float _finTailT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
@@ -7280,6 +7618,21 @@ public partial class McWorld : UdonSharpBehaviour
                 neighborChunk.pendingChunkMeshRebuild = true;
                 continue;
             }
+            // RE-PREP CUT: a DRY instanced-rendered neighbor needs NO rebuild when adjacent data
+            // arrives — the shader culls its faces from the GPU atlas at draw time, so new border
+            // data takes effect the moment the new chunk's slot syncs. The only self-state that can
+            // change is the enclosed-gate (arriving solid data can complete its burial) — re-run
+            // just the renderer toggles inline. Watery neighbors still rebuild: their CPU fluid
+            // mesh bakes border faces/corner heights from neighbor data at build time.
+            // This was ~half the streaming meshLoop (neighborTriggers ~200-340/window, each a full
+            // re-prep of an unchanged chunk).
+            if (!interactionPriority && neighborChunk._isInstancedRendered
+                && neighborChunk._renderMeshApplied && !neighborChunk._hasWaterBlocks
+                && neighborChunk._borderMissingMask == 0)
+            {
+                _ReGateInstancedRenderers(neighborChunk);
+                continue;
+            }
             if (interactionPriority) neighborChunk.interactionMeshPriority = true;
 
             RequestChunkMeshUpdate(neighborIndex);
@@ -7290,28 +7643,28 @@ public partial class McWorld : UdonSharpBehaviour
         int diagonalChunkY = chunk.chunkY_world;
 
         ChunkData diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world - 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world + 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world - 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world + 1);
-        if (diagonalChunk != null && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
@@ -7457,6 +7810,23 @@ public partial class McWorld : UdonSharpBehaviour
     public bool AreAllNeighborsReady(int chunkIndex)
     {
         return _NeighborsReady(chunkIndex, requireAllNeighborsForMesh);
+    }
+
+    // FRONTIER MESHING: a chunk headed for the instanced render path can mesh BEFORE its in-world
+    // neighbors have generated — the shader culls faces by sampling the GPU atlas at DRAW time, so
+    // a missing/ungenerated neighbor just renders as a temporary frontier wall that heals the
+    // moment the neighbor's data syncs, with no rebuild and no _borderMissingMask churn. All-air
+    // chunks complete via the neighbor-independent empty-mesh path. Only the CPU-mesh path (which
+    // bakes border faces at build time) keeps the strict wait. This is what let frontier chunks
+    // sit data-ready-but-unrendered for many seconds while the outward column trickled in.
+    public bool CanMeshWithoutAllNeighbors(int chunkIndex)
+    {
+        if (!enableInstancedVoxelRender || !gpuBackendReady || gpuVoxelInstancedMaterial == null
+            || gpuVoxelChunkMesh == null) return false;
+        if (chunkIndex < 0 || chunks_1D == null || chunkIndex >= chunks_1D.Length) return false;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk == null) return false;
+        return chunk._chunkData != null || chunk._isAllAir;
     }
 
     private bool _NeighborsReady(int chunkIndex, bool strict)
@@ -7707,19 +8077,28 @@ public partial class McWorld : UdonSharpBehaviour
         // (which is correct on paper but failed in practice). We KEEP the CPU block mirror
         // (collision/edits need it); we only skip emitting a render mesh. Bounded to the mesh render
         // distance so the slot-limited atlas isn't flooded — far chunks defer and instance once in
-        // range. Player edits (interactionMeshPriority) take the normal CPU mesh path (which clears
-        // _isInstancedRendered below) so the edit re-meshes exactly and isn't double-drawn.
+        // range.
         if (enableInstancedVoxelRender && gpuVoxelInstancedMaterial != null && gpuBackendReady
-            && gpuVoxelChunkMesh != null && chunk._chunkData != null && !chunk._isAllAir && !chunk.interactionMeshPriority
-            && (chunk.pendingChunkMeshRebuild || _IsChunkWithinMeshRenderDistance(chunk)))
+            && gpuVoxelChunkMesh != null && chunk._chunkData != null
+            && (chunk.pendingChunkMeshRebuild || chunk.interactionMeshPriority || _IsChunkWithinMeshRenderDistance(chunk)))
         {
             // GPU shared-mesh render via a TIME-SLICED prep: instead of doing the whole ~28ms render-prep
-            // (atlas sync + 16K-voxel derived scan + mesh/fluid assign) synchronously here — which spiked
+            // (atlas sync + derived scan + mesh/fluid assign) synchronously here — which spiked
             // the frame and starved meshing — kick off a stepped prep (_StepGpuChunkPrep) advanced by the
-            // budget-bounded activeMeshing loop, so the cost spreads across frames. Player edits
-            // (interactionMeshPriority) are excluded above and stay on the synchronous CPU path.
+            // budget-bounded activeMeshing loop, so the cost spreads across frames.
+            // NOTE: _GetDecompressedData re-derives on its cache-miss path, so after an edit the
+            // flags/counts read below are post-edit fresh (the edit invalidated the decomp cache).
             byte[] prepData = _GetDecompressedData(chunk);
-            if (prepData != null)
+            // EDIT ROUTE: player edits (interactionMeshPriority) also take the instanced prep when
+            // the chunk needs no exact CPU geometry — crosses (flowers/tallgrass/saplings) and
+            // torches only render via the CPU cutout mesh, so chunks containing them keep the
+            // synchronous CPU path. For everything else the atlas poke in _SetBlockLocal already
+            // made the edit visible this frame; the prep just re-gates cutout/enclosed state and
+            // rebuilds the fluid mesh, time-sliced — instead of the 130-200ms atomic greedy remesh
+            // the interaction path used to run per edited chunk.
+            bool needsExactCpuGeometry = chunk.interactionMeshPriority
+                && (chunk._crossBlockCount > 0 || chunk._torchBlockCount > 0);
+            if (prepData != null && !chunk._isAllAir && !needsExactCpuGeometry)
             {
                 _GpuBindInstancedMaterial();   // bind _MainTex/_TintMask/_ShouldDrawTex/_BlockFaceSliceTex once
                 _EnsureChunkGo(chunk);         // active GameObject at the chunk's world position
@@ -7743,6 +8122,10 @@ public partial class McWorld : UdonSharpBehaviour
                     MarkChunkMeshDeferred(chunkIndex);
                     return;
                 }
+                // Edit handled: the atlas already shows the change, so the prep can proceed at
+                // normal pace. Cleared only once the prep is committed (kept through the aborts
+                // above so a deferred edit keeps its priority when re-queued).
+                chunk.interactionMeshPriority = false;
                 int prepSlot = activeMeshingCount;
                 activeMeshingChunks[prepSlot] = chunk;
                 activeMeshingCount = prepSlot + 1;
@@ -11505,26 +11888,43 @@ public partial class McWorld : UdonSharpBehaviour
 
     // Ranged variant so the GPU prep's stage-3 fluid build can step z-rows across frames instead
     // of paying the whole 10-30ms ocean-chunk build in one atomic step.
+    // HOT LOOP (was 3-6 SECONDS per 300-frame streaming window): the fluid test is now ONE table
+    // read (was two method calls per voxel), and columns with no fluid at all — known from the
+    // derived scan's _columnFluidMask — are skipped outright. A mountain chunk with a single lava
+    // pocket scans a handful of columns instead of all 256 full-height. Emits _AddWaterBlock for
+    // exactly the same cells in the same order as before.
     private void _AddWaterBlocksSliced(ChunkData chunk, int zStart, int zCount)
     {
         if (chunk == null || !chunk._hasWaterBlocks || chunk._decompSelf == null) return;
+
+        _EnsureDerivedBlockClassTable();
+        byte[] clsTable = _derivedBlockClass;
+        byte[] data = chunk._decompSelf;
+        byte[] colMinArr = chunk._columnMinY;
+        byte[] colMaxArr = chunk._columnMaxY;
+        // Trust the fluid mask only when it was computed for the CURRENT data version (the atomic
+        // derive path after edits doesn't fill it — fall back to the full scan there).
+        byte[] colFluid = (chunk._columnFluidMask != null
+            && chunk._columnFluidMaskVersion == chunk._cachedDataVersion) ? chunk._columnFluidMask : null;
 
         int stride = chunkSizeXZ * chunkSizeXZ;
         int zEnd = zStart + zCount;
         if (zEnd > chunkSizeXZ) zEnd = chunkSizeXZ;
         for (int z = zStart; z < zEnd; z++)
         {
+            int colBase = z * chunkSizeXZ;
             for (int x = 0; x < chunkSizeXZ; x++)
             {
-                int columnIndex = z * chunkSizeXZ + x;
-                byte minY = chunk._columnMinY != null ? chunk._columnMinY[columnIndex] : (byte)255;
-                byte maxY = chunk._columnMaxY != null ? chunk._columnMaxY[columnIndex] : (byte)255;
+                int columnIndex = colBase + x;
+                if (colFluid != null && colFluid[columnIndex] == 0) continue;
+                byte minY = colMinArr != null ? colMinArr[columnIndex] : (byte)255;
+                byte maxY = colMaxArr != null ? colMaxArr[columnIndex] : (byte)255;
                 if (minY == 255 || maxY == 255) continue;
 
                 for (int y = minY; y <= maxY; y++)
                 {
-                    byte blockID = chunk._decompSelf[y * stride + columnIndex];
-                    if (!_IsWaterBlock(blockID) && !_IsLavaBlock(blockID)) continue;
+                    byte blockID = data[y * stride + columnIndex];
+                    if ((clsTable[blockID] & DBC_FLUID) == 0) continue;
                     _AddWaterBlock(chunk, x, y, z, blockID);
                 }
             }
@@ -11945,6 +12345,7 @@ public partial class McWorld : UdonSharpBehaviour
 
         // OPTIMIZATION: Invalidate chunk-owned caches since data is changing
         chunk._decompCacheValid = false;
+        int preEditDataVersion = chunk._cachedDataVersion;
         chunk._cachedDataVersion++;
 
         // OPTIMIZATION: Invalidate neighbor cache since chunk data changed
@@ -12031,7 +12432,15 @@ public partial class McWorld : UdonSharpBehaviour
         byte oldB = _GetBlockLocal(chunk, x, y, z); // captured before write above; recompute safely
         if (_GpuSetBlockChain(chunk, x, y, z, oldB, blockType))
         {
-            // chain handled the atlas write; just mark the chunk's CPU cache invalidated.
+            // chain handled the atlas write. If the slot held the pre-edit version, it now matches
+            // the CPU data EXACTLY — advance the synced version so the instanced prep's stage-0
+            // skips a redundant full 16KB re-upload. A stale slot stays stale and re-syncs as before.
+            int pokeCi = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+            if (pokeCi >= 0 && gpuChunkSyncedDataVersion != null && pokeCi < gpuChunkSyncedDataVersion.Length
+                && gpuChunkSyncedDataVersion[pokeCi] == preEditDataVersion)
+            {
+                gpuChunkSyncedDataVersion[pokeCi] = chunk._cachedDataVersion;
+            }
         }
         else if (_gpuSyncDeferred)
         {
@@ -14266,6 +14675,41 @@ public partial class McWorld : UdonSharpBehaviour
         if (chunk._biomeTemperatures != null && chunk._biomeRainfall != null) chunk._biomeDataValid = true;
     }
 
+    // DERIVED BLOCK CLASS TABLE: one array read replaces the 2-3 per-voxel method calls
+    // (_IsWaterBlock/_IsLavaBlock/_IsTorchBlock, ~5-20us of VM re-entry each) plus the multi-step
+    // cache lookups the derived/fluid scans did per non-air voxel. Bits are EXACTLY the predicates
+    // the scans used inline — pure functions of block id and the immutable block caches.
+    private const byte DBC_OPAQUE = 1;         // visibilityCache[id] == Opaque
+    private const byte DBC_FLUID = 2;          // _IsWaterBlock || _IsLavaBlock
+    private const byte DBC_TORCH = 4;          // _IsTorchBlock
+    private const byte DBC_CROSS = 8;          // shapeTypeCache[id] == Cross
+    private const byte DBC_EMISSIVE = 16;      // lightEmissionCache[id] > 0
+    private const byte DBC_STATIC_EMITTER = 32; // fire / lit furnace / portal
+    private const byte DBC_LAVA = 64;          // id 10 or 11 (lava air-above emitter check)
+    private const byte DBC_TORCH_AMBIENT = 128; // torch that emits ambient particles (not redstone-off)
+    private byte[] _derivedBlockClass;
+
+    private void _EnsureDerivedBlockClassTable()
+    {
+        if (_derivedBlockClass != null) return;
+        byte[] t = new byte[256];
+        for (int id = 1; id < 256; id++)
+        {
+            byte b = (byte)id;
+            int cls = 0;
+            if (visibilityCache != null && id < visibilityCache.Length && visibilityCache[id] == BlockVisibilityType.Opaque) cls |= DBC_OPAQUE;
+            if (_IsWaterBlock(b) || _IsLavaBlock(b)) cls |= DBC_FLUID;
+            if (_IsTorchBlock(b)) cls |= DBC_TORCH;
+            if (shapeTypeCache != null && id < shapeTypeCache.Length && shapeTypeCache[id] == McBlockShapeType.Cross) cls |= DBC_CROSS;
+            if (lightEmissionCache != null && id < lightEmissionCache.Length && lightEmissionCache[id] > 0) cls |= DBC_EMISSIVE;
+            if (b == BLOCK_FIRE || b == BLOCK_FURNACE_LIT || b == BLOCK_PORTAL) cls |= DBC_STATIC_EMITTER;
+            if (id == 10 || id == 11) cls |= DBC_LAVA;
+            if ((cls & DBC_TORCH) != 0 && b != BLOCK_REDSTONE_TORCH_OFF) cls |= DBC_TORCH_AMBIENT;
+            t[id] = (byte)cls;
+        }
+        _derivedBlockClass = t;
+    }
+
     private void _RefreshChunkDerivedData(ChunkData chunk, byte[] fullData)
     {
         if (chunk == null || fullData == null) return;
@@ -14465,6 +14909,7 @@ public partial class McWorld : UdonSharpBehaviour
         if (chunk == null || fullData == null) return true;
         int columnCount = chunkSizeXZ * chunkSizeXZ;
 
+        _EnsureDerivedBlockClassTable();
         if (yStart == 0)
         {
             if (chunk._columnMinY == null || chunk._columnMinY.Length != columnCount)
@@ -14472,10 +14917,16 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk._columnMinY = new byte[columnCount];
                 chunk._columnMaxY = new byte[columnCount];
             }
+            if (chunk._columnFluidMask == null || chunk._columnFluidMask.Length != columnCount)
+                chunk._columnFluidMask = new byte[columnCount];
             // Homogeneous chunks are cheap — do them in one shot (no slicing needed).
             if (chunk._chunkDataKind == ChunkData.CHUNK_KIND_HOMOGENEOUS)
             {
                 _RefreshChunkDerivedData(chunk, fullData);
+                // Uniform content -> uniform fluid mask, straight from the single block id.
+                byte homogFluid = (_derivedBlockClass[fullData[0]] & DBC_FLUID) != 0 ? (byte)1 : (byte)0;
+                for (int i = 0; i < columnCount; i++) chunk._columnFluidMask[i] = homogFluid;
+                chunk._columnFluidMaskVersion = chunk._cachedDataVersion;
                 return true;
             }
             if (chunk._crossBlockPackedPositions == null || chunk._crossBlockPackedPositions.Length != fullData.Length)
@@ -14497,10 +14948,43 @@ public partial class McWorld : UdonSharpBehaviour
             chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
             chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
             chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
-            for (int i = 0; i < columnCount; i++) { chunk._columnMinY[i] = 255; chunk._columnMaxY[i] = 255; }
+            for (int i = 0; i < columnCount; i++)
+            {
+                chunk._columnMinY[i] = 255;
+                chunk._columnMaxY[i] = 255;
+                chunk._columnFluidMask[i] = 0;
+            }
         }
 
+        // HOT LOOP (this was 1.8-3.8 SECONDS per 300-frame streaming window — worst on mountain
+        // chunks, whose near-4096 solid voxels all take the full per-voxel path):
+        //   - block classification via ONE table read (was 2-3 method calls + 3 cache lookups),
+        //   - flags/counters/bounds in LOCALS, flushed to chunk fields once per slice,
+        //   - packed-position appends via read-then-increment locals (also fixes the Udon
+        //     post-increment-on-field quirk the old `array[chunk._count++]` form risked).
+        // Iteration order and every append/flag condition are IDENTICAL to the old loop.
+        byte[] clsTable = _derivedBlockClass;
+        byte[] colMinArrD = chunk._columnMinY;
+        byte[] colMaxArrD = chunk._columnMaxY;
+        byte[] colFluidArrD = chunk._columnFluidMask;
+        int[] crossPosArr = chunk._crossBlockPackedPositions;
+        int[] torchPosArr = chunk._torchBlockPackedPositions;
+        int[] aePackedArr = chunk._ambientEmitterPacked;
+        bool locAllAir = chunk._isAllAir;
+        bool locNonOpaque = chunk._hasNonOpaqueContent;
+        bool locHasWater = chunk._hasWaterBlocks;
+        bool locHasEmissive = chunk._hasEmissiveBlocks;
+        bool locHasTorch = chunk._hasTorchBlocks;
+        int locSolidOpaque = chunk._derivedSolidOpaqueCount;
+        int locCrossCount = chunk._crossBlockCount;
+        int locTorchCount = chunk._torchBlockCount;
+        int locAec = chunk._ambientEmitterCount;
+        int gMinY = chunk._chunkGlobalMinY, gMaxY = chunk._chunkGlobalMaxY;
+        int gMinX = chunk._chunkGlobalMinX, gMaxX = chunk._chunkGlobalMaxX;
+        int gMinZ = chunk._chunkGlobalMinZ, gMaxZ = chunk._chunkGlobalMaxZ;
+
         int stride = chunkSizeXZ * chunkSizeXZ;
+        int topYIdx = chunkSizeY - 1;
         int yEnd = yStart + yCount;
         if (yEnd > chunkSizeY) yEnd = chunkSizeY;
         for (int y = yStart; y < yEnd; y++)
@@ -14509,78 +14993,89 @@ public partial class McWorld : UdonSharpBehaviour
             for (int z = 0; z < chunkSizeXZ; z++)
             {
                 int zBase = yBase + z * chunkSizeXZ;
+                int colBase = z * chunkSizeXZ;
                 for (int x = 0; x < chunkSizeXZ; x++)
                 {
                     int idx = zBase + x;
                     byte blockID = fullData[idx];
                     if (blockID == 0) continue;
+                    int cls = clsTable[blockID];
 
-                    chunk._isAllAir = false;
-                    if (visibilityCache != null && blockID < visibilityCache.Length && visibilityCache[blockID] == BlockVisibilityType.Opaque)
-                        chunk._derivedSolidOpaqueCount = chunk._derivedSolidOpaqueCount + 1;
-                    else
-                        chunk._hasNonOpaqueContent = true;
-                    if (!chunk._hasWaterBlocks && (_IsWaterBlock(blockID) || _IsLavaBlock(blockID)))
+                    locAllAir = false;
+                    if ((cls & DBC_OPAQUE) != 0) locSolidOpaque = locSolidOpaque + 1;
+                    else locNonOpaque = true;
+                    int columnIndex = colBase + x;
+                    if ((cls & DBC_FLUID) != 0)
                     {
-                        chunk._hasWaterBlocks = true;
+                        locHasWater = true;
+                        colFluidArrD[columnIndex] = 1;
                     }
-                    int columnIndex = z * chunkSizeXZ + x;
-                    if (chunk._columnMinY[columnIndex] == 255) chunk._columnMinY[columnIndex] = (byte)y;
-                    chunk._columnMaxY[columnIndex] = (byte)y;
+                    if (colMinArrD[columnIndex] == 255) colMinArrD[columnIndex] = (byte)y;
+                    colMaxArrD[columnIndex] = (byte)y;
 
-                    if (y < chunk._chunkGlobalMinY) chunk._chunkGlobalMinY = (byte)y;
-                    if (y > chunk._chunkGlobalMaxY) chunk._chunkGlobalMaxY = (byte)y;
-                    if (x < chunk._chunkGlobalMinX) chunk._chunkGlobalMinX = (byte)x;
-                    if (x > chunk._chunkGlobalMaxX) chunk._chunkGlobalMaxX = (byte)x;
-                    if (z < chunk._chunkGlobalMinZ) chunk._chunkGlobalMinZ = (byte)z;
-                    if (z > chunk._chunkGlobalMaxZ) chunk._chunkGlobalMaxZ = (byte)z;
+                    if (y < gMinY) gMinY = y;
+                    if (y > gMaxY) gMaxY = y;
+                    if (x < gMinX) gMinX = x;
+                    if (x > gMaxX) gMaxX = x;
+                    if (z < gMinZ) gMinZ = z;
+                    if (z > gMaxZ) gMaxZ = z;
 
-                    if (!chunk._hasEmissiveBlocks && blockID < lightEmissionCache.Length && lightEmissionCache[blockID] > 0)
+                    if ((cls & DBC_EMISSIVE) != 0) locHasEmissive = true;
+
+                    if ((cls & DBC_CROSS) != 0)
                     {
-                        chunk._hasEmissiveBlocks = true;
+                        crossPosArr[locCrossCount] = (x << 16) | (y << 8) | z;
+                        locCrossCount = locCrossCount + 1;
                     }
-
-                    if (blockID < shapeTypeCache.Length && shapeTypeCache[blockID] == McBlockShapeType.Cross)
+                    else if ((cls & DBC_TORCH) != 0)
                     {
-                        chunk._crossBlockPackedPositions[chunk._crossBlockCount++] = (x << 16) | (y << 8) | z;
-                    }
-                    else if (_IsTorchBlock(blockID))
-                    {
-                        chunk._hasTorchBlocks = true;
-                        chunk._torchBlockPackedPositions[chunk._torchBlockCount++] = (x << 16) | (y << 8) | z;
+                        locHasTorch = true;
+                        torchPosArr[locTorchCount] = (x << 16) | (y << 8) | z;
+                        locTorchCount = locTorchCount + 1;
                         // Torches (and lit redstone torches) emit ambient flame/smoke particles.
-                        if (blockID != BLOCK_REDSTONE_TORCH_OFF)
+                        if ((cls & DBC_TORCH_AMBIENT) != 0 && locAec < AMBIENT_EMITTER_CAP && aePackedArr != null)
                         {
-                            int aec = chunk._ambientEmitterCount;
-                            if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
-                            {
-                                chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
-                                chunk._ambientEmitterCount = aec + 1;
-                            }
+                            aePackedArr[locAec] = (blockID << 24) | (x << 16) | (y << 8) | z;
+                            locAec = locAec + 1;
                         }
                     }
-                    else if (blockID == BLOCK_FIRE || blockID == BLOCK_FURNACE_LIT || blockID == BLOCK_PORTAL
-                             || ((blockID == 10 || blockID == 11) && (y == chunkSizeY - 1 || fullData[idx + stride] == 0)))
+                    else if ((cls & DBC_STATIC_EMITTER) != 0
+                             || ((cls & DBC_LAVA) != 0 && (y == topYIdx || fullData[idx + stride] == 0)))
                     {
                         // Ambient particle emitters: fire, lit furnace, portal, and lava cells with air
                         // above (chunk-top lava re-checks air at emission time). Registry consumed by
                         // McParticleManager instead of 1000 random GetBlock samples per frame.
-                        int aec = chunk._ambientEmitterCount;
-                        if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
+                        if (locAec < AMBIENT_EMITTER_CAP && aePackedArr != null)
                         {
-                            chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
-                            chunk._ambientEmitterCount = aec + 1;
+                            aePackedArr[locAec] = (blockID << 24) | (x << 16) | (y << 8) | z;
+                            locAec = locAec + 1;
                         }
                     }
                 }
             }
         }
+
+        // Flush locals back to the chunk (once per slice instead of per voxel).
+        chunk._isAllAir = locAllAir;
+        chunk._hasNonOpaqueContent = locNonOpaque;
+        chunk._hasWaterBlocks = locHasWater;
+        chunk._hasEmissiveBlocks = locHasEmissive;
+        chunk._hasTorchBlocks = locHasTorch;
+        chunk._derivedSolidOpaqueCount = locSolidOpaque;
+        chunk._crossBlockCount = locCrossCount;
+        chunk._torchBlockCount = locTorchCount;
+        chunk._ambientEmitterCount = locAec;
+        chunk._chunkGlobalMinY = (byte)gMinY; chunk._chunkGlobalMaxY = (byte)gMaxY;
+        chunk._chunkGlobalMinX = (byte)gMinX; chunk._chunkGlobalMaxX = (byte)gMaxX;
+        chunk._chunkGlobalMinZ = (byte)gMinZ; chunk._chunkGlobalMaxZ = (byte)gMaxZ;
+
         if (yEnd >= chunkSizeY)
         {
             chunk._isAllOpaqueSolid = !chunk._isAllAir
                 && chunk._derivedSolidOpaqueCount == chunkSizeY * chunkSizeXZ * chunkSizeXZ;
             chunk._derivedForDataVersion = chunk._cachedDataVersion;
             chunk._derivedDirty = false;
+            chunk._columnFluidMaskVersion = chunk._cachedDataVersion;
             return true;
         }
         return false;
@@ -16238,6 +16733,7 @@ public partial class McWorld : UdonSharpBehaviour
                 if (stats_finalizeCount > 0)
                     logBuilder.AppendLine($"  Chunk finalize (per chunk, {stats_finalizeCount} done): slice {stats_finalizeSliceTime / stats_finalizeCount:F2}ms, derived {stats_finalizeDerivedTime / stats_finalizeCount:F2}ms, gpuSync {stats_finalizeGpuSyncTime / stats_finalizeCount:F2}ms");
                 logBuilder.AppendLine($"  StepGen breakdown (totals): genChecks {stats_stepGenChecksTime:F2}ms, residentComplete {stats_stepResidentCompleteTime:F2}ms ({stats_stepFastPathCount} fast), finalizeTail {stats_stepFinalizeTailTime:F2}ms ({stats_stepFullCompleteCount} full)");
+                logBuilder.AppendLine($"  Prep stages (totals): sync {stats_prepStage0Ms:F1}ms, derived {stats_prepStage1Ms:F1}ms, gates {stats_prepStage2Ms:F1}ms, fluid {stats_prepStage3Ms:F1}ms");
             }
             if (enableAdaptiveBudgets)
             {
@@ -16560,6 +17056,10 @@ public partial class McWorld : UdonSharpBehaviour
         stats_finalizeDerivedTime = 0f;
         stats_finalizeGpuSyncTime = 0f;
         stats_finalizeCount = 0;
+        stats_prepStage0Ms = 0f;
+        stats_prepStage1Ms = 0f;
+        stats_prepStage2Ms = 0f;
+        stats_prepStage3Ms = 0f;
         stats_stepGenChecksTime = 0f;
         stats_stepResidentCompleteTime = 0f;
         stats_stepFastPathCount = 0;
