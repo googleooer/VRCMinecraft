@@ -169,6 +169,11 @@ public class ModifyTerrain : UdonSharpBehaviour
     public Material gpuRaycastMaterial;
     public RenderTexture gpuRaycastHitInfoRT;
     public RenderTexture gpuRaycastHitPosRT;
+    // The GPU raycast result has no readback consumer yet — the CPU DDA is the source of truth.
+    // Until the consumer exists, dispatching the two Blits every frame is pure waste (two extra
+    // render passes per frame on Quest's tiler). Off by default; flip on when wiring the readback.
+    [Tooltip("Dispatch the experimental GPU raycast blits each frame (result is not consumed yet).")]
+    public bool enableGpuRaycastExperiment = false;
     private bool dbg_loggedRaycastPath = false;
     private bool gpuRaycastInflight = false;
 
@@ -185,7 +190,7 @@ public class ModifyTerrain : UdonSharpBehaviour
         // async readback) and fall through to the CPU path this frame using the most recent
         // completed result (cached). On the first ~2 frames the CPU fallback handles us;
         // after that the GPU result becomes available.
-        if (gpuRaycastMaterial != null && gpuRaycastHitInfoRT != null)
+        if (enableGpuRaycastExperiment && gpuRaycastMaterial != null && gpuRaycastHitInfoRT != null)
         {
             gpuRaycastMaterial.SetVector("_RayOrigin", new Vector4(rayOrigin.x, rayOrigin.y, rayOrigin.z, 0f));
             gpuRaycastMaterial.SetVector("_RayDirection", new Vector4(rayDirection.x, rayDirection.y, rayDirection.z, 0f));
@@ -214,10 +219,12 @@ public class ModifyTerrain : UdonSharpBehaviour
         if (world != null && world.useBoxColliderCollision)
         {
             // Box-collider mode: terrain has no full chunk mesh colliders to hit, so target blocks with
-            // a voxel DDA raycast (steps the block grid, stops at the first block BlockHasCollision marks
-            // — the same set the colliders use). Produces the same hit point/normal/distance contract.
+            // ONE voxel DDA raycast that tests torch AABBs and solid blocks in the same walk (this used
+            // to be two separate walks — 2-3 cross-behaviour GetBlock chains per voxel step per frame).
+            // Voxels are visited in t-order and torch/solid ids are mutually exclusive per voxel, so the
+            // first hit is identical to the old solid-walk-then-clipped-torch-walk result.
             float vDist; Vector3 vPoint; Vector3 vNormal;
-            currentFrameHitValid = _TryGetVoxelBlockHit(rayOrigin, rayDirection, blockInteractionRange, out vDist, out vPoint, out vNormal);
+            currentFrameHitValid = _TryGetVoxelOrTorchHit(rayOrigin, rayDirection, blockInteractionRange, out vDist, out vPoint, out vNormal);
             currentFrameHitPoint = currentFrameHitValid ? vPoint : Vector3.zero;
             currentFrameHitNormal = currentFrameHitValid ? vNormal : Vector3.zero;
             currentFrameHitDistance = currentFrameHitValid ? vDist : blockInteractionRange;
@@ -236,19 +243,91 @@ public class ModifyTerrain : UdonSharpBehaviour
             currentFrameHitPoint = currentFrameHitValid ? physicsHit.point : Vector3.zero;
             currentFrameHitNormal = currentFrameHitValid ? physicsHit.normal : Vector3.zero;
             currentFrameHitDistance = currentFrameHitValid ? physicsHit.distance : blockInteractionRange;
-        }
 
-        float maxTorchDistance = currentFrameHitValid ? currentFrameHitDistance : blockInteractionRange;
-        float torchHitDistance;
-        Vector3 torchHitPoint;
-        Vector3 torchHitNormal;
-        if (_TryGetTorchHit(rayOrigin, rayDirection, maxTorchDistance, out torchHitDistance, out torchHitPoint, out torchHitNormal))
-        {
-            currentFrameHitValid = true;
-            currentFrameHitPoint = torchHitPoint;
-            currentFrameHitNormal = torchHitNormal;
-            currentFrameHitDistance = torchHitDistance;
+            // Torches have no mesh collider — overlay a torch AABB walk clipped to the physics hit.
+            float maxTorchDistance = currentFrameHitValid ? currentFrameHitDistance : blockInteractionRange;
+            float torchHitDistance;
+            Vector3 torchHitPoint;
+            Vector3 torchHitNormal;
+            if (_TryGetTorchHit(rayOrigin, rayDirection, maxTorchDistance, out torchHitDistance, out torchHitPoint, out torchHitNormal))
+            {
+                currentFrameHitValid = true;
+                currentFrameHitPoint = torchHitPoint;
+                currentFrameHitNormal = torchHitNormal;
+                currentFrameHitDistance = torchHitDistance;
+            }
         }
+    }
+
+    // Merged solid+torch DDA for box-collider mode: one GetBlock per voxel step, air short-circuits
+    // before any further cross-behaviour calls. Same hit contract as the old pair of walks.
+    private bool _TryGetVoxelOrTorchHit(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out float hitDistance, out Vector3 hitPoint, out Vector3 hitNormal)
+    {
+        hitDistance = 0f;
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.zero;
+        if (world == null || maxDistance <= 0f) return false;
+
+        Vector3 dir = rayDirection.normalized;
+        int vx = Mathf.FloorToInt(rayOrigin.x);
+        int vy = Mathf.FloorToInt(rayOrigin.y);
+        int vz = Mathf.FloorToInt(rayOrigin.z);
+
+        int stepX = dir.x > 0f ? 1 : (dir.x < 0f ? -1 : 0);
+        int stepY = dir.y > 0f ? 1 : (dir.y < 0f ? -1 : 0);
+        int stepZ = dir.z > 0f ? 1 : (dir.z < 0f ? -1 : 0);
+
+        float nbX = stepX > 0 ? vx + 1f : vx;
+        float nbY = stepY > 0 ? vy + 1f : vy;
+        float nbZ = stepZ > 0 ? vz + 1f : vz;
+
+        float tMaxX = stepX != 0 ? (nbX - rayOrigin.x) / dir.x : float.PositiveInfinity;
+        float tMaxY = stepY != 0 ? (nbY - rayOrigin.y) / dir.y : float.PositiveInfinity;
+        float tMaxZ = stepZ != 0 ? (nbZ - rayOrigin.z) / dir.z : float.PositiveInfinity;
+        float tDeltaX = stepX != 0 ? 1f / Mathf.Abs(dir.x) : float.PositiveInfinity;
+        float tDeltaY = stepY != 0 ? 1f / Mathf.Abs(dir.y) : float.PositiveInfinity;
+        float tDeltaZ = stepZ != 0 ? 1f / Mathf.Abs(dir.z) : float.PositiveInfinity;
+
+        float t = 0f;
+        int lastAxis = -1; // 0=x,1=y,2=z; -1 = still in the origin voxel
+        int budget = 0;
+        while (t <= maxDistance && budget < 256)
+        {
+            byte bid = (byte)(world.GetBlock(vx, vy, vz) & 0xFF);
+            if (bid != 0)
+            {
+                if (bid == BLOCK_TORCH || bid == BLOCK_REDSTONE_TORCH_OFF || bid == BLOCK_REDSTONE_TORCH_ON)
+                {
+                    Vector3 boundsMin;
+                    Vector3 boundsMax;
+                    _GetTorchBounds(vx, vy, vz, world.GetTorchMount(vx, vy, vz), out boundsMin, out boundsMax);
+                    float torchDist;
+                    Vector3 torchNormal;
+                    if (_TryRayBoundsHit(rayOrigin, dir, boundsMin, boundsMax, out torchDist, out torchNormal) && torchDist <= maxDistance)
+                    {
+                        hitDistance = torchDist;
+                        hitPoint = rayOrigin + dir * torchDist;
+                        hitNormal = torchNormal;
+                        return true;
+                    }
+                }
+                else if (world.BlockHasCollision(bid))
+                {
+                    hitDistance = t;
+                    hitPoint = rayOrigin + dir * t;
+                    if (lastAxis == 0) hitNormal = new Vector3(-stepX, 0f, 0f);
+                    else if (lastAxis == 1) hitNormal = new Vector3(0f, -stepY, 0f);
+                    else if (lastAxis == 2) hitNormal = new Vector3(0f, 0f, -stepZ);
+                    else hitNormal = -dir; // ray started inside a solid block
+                    return true;
+                }
+            }
+            if (tMaxX <= tMaxY && tMaxX <= tMaxZ) { vx += stepX; t = tMaxX; tMaxX += tDeltaX; lastAxis = 0; }
+            else if (tMaxY <= tMaxZ) { vy += stepY; t = tMaxY; tMaxY += tDeltaY; lastAxis = 1; }
+            else { vz += stepZ; t = tMaxZ; tMaxZ += tDeltaZ; lastAxis = 2; }
+            budget++;
+        }
+        return false;
     }
 
     /// <summary>

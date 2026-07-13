@@ -33,8 +33,12 @@ public partial class McWorld : UdonSharpBehaviour
     private GameObject[] _chunkGoPool;
     private int _chunkGoPoolCount = 0;
     private int _chunkGoRecycleCursor = 0;
-    [Tooltip("CHUNK GO POOL: render GameObjects Instantiated per frame during the startup pool pre-warm. The pool is filled to the render-distance set up front (time-sliced) so chunks pop a ready GameObject during load instead of Instantiating one each as they generate.")]
-    public int chunkGoPrewarmPerFrame = 24;
+    // CODE-OWNED TUNING: all perf budget/timing knobs below carry [System.NonSerialized] so the
+    // CODE initializer is the single source of truth — scene/inspector values are IGNORED for
+    // these. (They were previously scene-serialized, which silently overrode every code-side
+    // tuning change; see the adaptive-budget THROUGHPUT FIX that the scene had reverted.)
+    // CHUNK GO POOL: render GameObjects Instantiated per frame during the startup pool pre-warm.
+    [System.NonSerialized] public int chunkGoPrewarmPerFrame = 24;
     private int _chunkGoPrewarmTarget = 0;  // render-distance set size to pre-instantiate at startup
     private int _chunkGoTotalCreated = 0;   // total chunk GOs ever Instantiated (pre-warm + lazy fallback)
     private bool _chunkGoPrewarmDone = false;
@@ -55,17 +59,17 @@ public partial class McWorld : UdonSharpBehaviour
     private bool _collisionGridInitialized = false;
     private int _collisionPlayerVoxelX = -2147483648, _collisionPlayerVoxelY = -2147483648, _collisionPlayerVoxelZ = -2147483648;
     private bool[] _blockHasCollisionCache; // per blockID: full-cube, opaque/cutout, non-fluid => has box collision
-    [Tooltip("CHUNK GO POOL: chunk slots scanned per frame for render GameObjects to recycle once their chunk has moved beyond the render distance (returns them to the pool for reuse). Higher reclaims memory faster as the player moves; lower spreads the cost.")]
-    public int chunkGoRecycleScanPerFrame = 64;
+    // CHUNK GO POOL: chunk slots scanned per frame for render GameObjects to recycle.
+    [System.NonSerialized] public int chunkGoRecycleScanPerFrame = 32;
     public ChunkData[] chunks_1D; // OPTIMIZED: Public for direct coordinator access
 
     [Header("Performance Tuning")]
-    [Tooltip("Approximate time budget per mesh step in milliseconds. Raised to 12ms on the CPU-only path to do more meshing per step before yielding (fewer, larger steps = less Udon loop overhead).")]
-    public float meshStepTimeBudgetMs = 12.0f;
-    [Tooltip("Time budget per Update() call in milliseconds to prevent frame drops. ~6ms targets the Quest 3 90fps frame (the scheduler + ProcessActiveChunks each take a slice, so newly-streamed chunks fill in over a few frames instead of spiking the frame).")]
-    public float updateTimeBudgetMs = 6.0f;
-    [Tooltip("During the ONE-TIME initial world generation, updateTimeBudgetMs is temporarily raised to this value so the (profiled ~92% idle) GPU + async readback pipeline can drain far more work per frame. Frame rate during the load matters much less than total load time. Automatically restored to updateTimeBudgetMs once world gen completes. Set <= updateTimeBudgetMs to disable the boost.")]
-    public float loadPhaseUpdateBudgetMs = 6.0f;
+    // Approximate time budget per mesh step (CPU-only mesh path).
+    [System.NonSerialized] public float meshStepTimeBudgetMs = 15.0f;
+    // Time budget per Update() call in ms. Was scene-serialized at 22.
+    [System.NonSerialized] public float updateTimeBudgetMs = 22.0f;
+    // Load-phase boost for updateTimeBudgetMs (<= updateTimeBudgetMs disables the boost).
+    [System.NonSerialized] public float loadPhaseUpdateBudgetMs = 6.0f;
     // Runtime state for the load-phase budget boost (see Update()).
     private bool _loadPhaseBudgetRestored = false;
     private float _runtimeUpdateBudgetMs = 0f;
@@ -85,18 +89,18 @@ public partial class McWorld : UdonSharpBehaviour
     private float _nearGenStartTime = -1f;
     private int _nearChunksReady = 0;
     private bool _nearGenLogged = false;
-    [Tooltip("Budget per incremental GPU mesh decode step in milliseconds. Lower values reduce hitches from GPU mesh completion.")]
-    public float gpuMeshDecodeStepBudgetMs = 1.5f;
-    [Tooltip("Maximum incremental GPU mesh decode steps per chunk each frame. Higher = each chunk's readback decodes into a mesh in fewer frames (frees the worker sooner -> more readback concurrency). The adaptive budget below still caps aggregate work.")]
-    public int gpuMeshDecodeStepsPerFrame = 8;
-    [Tooltip("Total GPU mesh decode budget per frame in milliseconds (aggregate across all chunks). The proven path is mesh-bound on the readback->CPU-decode while data-gen sits at ~0% during load, leaving this budget's frame-share unused — so it is set generously to spend the idle CPU on draining mesh decodes. The adaptive system shrinks it if frames get heavy.")]
-    public float gpuMeshDecodeFrameBudgetMs = 3.0f;
-    [Tooltip("Minecraft-style NEAR meshing guarantee: per-frame GPU mesh-decode time reserved EXCLUSIVELY for chunks near the player, drained BEFORE and independently of the shared aggregate budget above. MC rebuilds near chunks unconditionally each frame (under a time budget) so a far-chunk backlog can never starve the chunk you're standing on. Bounded so it can't spike frames; lower it if the headset overshoots.")]
-    public float gpuNearMeshDecodeFrameBudgetMs = 2.5f;
-    [Tooltip("Budget per GPU worldgen step in milliseconds. THIS IS THE MAIN LOAD-LAG LEVER: StepChunkDataGeneration runs GPU-worldgen blit phases in a loop bounded by this, so a high value (the scene was 25ms) lets a single stepping call run many blits and blow the frame. Keep it small for smooth load.")]
-    public float gpuWorldgenStepBudgetMs = 2.0f;
-    [Tooltip("Maximum GPU worldgen steps per chunk each frame. Caps how many blit phases one stepping call runs. Small = smooth load (the scene was 24).")]
-    public int gpuWorldgenStepsPerFrame = 2;
+    // Budget per incremental GPU mesh decode step (ms).
+    [System.NonSerialized] public float gpuMeshDecodeStepBudgetMs = 5.0f;
+    // Max incremental GPU mesh decode steps per chunk per frame.
+    [System.NonSerialized] public int gpuMeshDecodeStepsPerFrame = 2;
+    // Total GPU mesh decode budget per frame (ms, aggregate across chunks).
+    [System.NonSerialized] public float gpuMeshDecodeFrameBudgetMs = 5.0f;
+    // NEAR meshing guarantee: per-frame decode time reserved for chunks near the player.
+    [System.NonSerialized] public float gpuNearMeshDecodeFrameBudgetMs = 5.0f;
+    // Budget per GPU worldgen step (ms) — main load-lag lever.
+    [System.NonSerialized] public float gpuWorldgenStepBudgetMs = 2.0f;
+    // Max GPU worldgen steps per chunk per frame.
+    [System.NonSerialized] public int gpuWorldgenStepsPerFrame = 2;
     [Tooltip("Prioritize meshing the exposed shell and chunks near the player before fully enclosed interiors.")]
     public bool prioritizeVisibleShellMeshing = true;
     [Tooltip("Chunks within this XZ radius of the player are always eligible for meshing.")]
@@ -125,10 +129,10 @@ public partial class McWorld : UdonSharpBehaviour
     private bool _streamPlayerKnown = false;
     [Tooltip("Require all 6 in-world neighbour chunks to be data-ready before meshing a chunk, so chunk-boundary faces are always culled correctly (eliminates the transient un-culled boundary 'walls' that a chunk draws toward a not-yet-generated neighbour and waits for a heal re-mesh to fix). Costs a little meshing latency at the frontier. The coordinator falls back to air-boundary meshing if ALL workers are waiting, to avoid deadlock. Turn OFF to restore the old draw-now-heal-later behaviour.")]
     public bool requireAllNeighborsForMesh = true;
-    [Tooltip("How many deferred interior chunks to re-queue per frame. Matched to the scheduler's per-cycle deferred-mesh drain rate so the re-wake never lags meshing (never-skip guarantee).")]
-    public int deferredInteriorMeshRequestsPerFrame = 8;
-    [Tooltip("How many chunk slots to scan per frame when looking for deferred interior meshes to wake up. Higher = the whole world is swept for stranded deferred chunks in fewer frames (never-skip guarantee).")]
-    public int deferredInteriorMeshScanCountPerFrame = 256;
+    // Deferred interior chunks re-queued per frame (never-skip guarantee).
+    [System.NonSerialized] public int deferredInteriorMeshRequestsPerFrame = 8;
+    // Chunk slots scanned per frame for deferred interior meshes to wake.
+    [System.NonSerialized] public int deferredInteriorMeshScanCountPerFrame = 256;
     [Tooltip("Defer collider application, lighting finalize, and neighbor mesh rebuilds for far chunks until there is frame headroom.")]
     public bool deferFarChunkSecondaryWork = true;
     [Tooltip("Only keep chunk colliders enabled near the player. Far chunks keep render meshes but disable collision until the player approaches.")]
@@ -139,30 +143,22 @@ public partial class McWorld : UdonSharpBehaviour
     public int colliderPriorityRadiusY = 1;
     [Tooltip("Chunks within this many chunk layers below the player keep their colliders active so the ground does not disappear underfoot.")]
     public int colliderPriorityBelowRadiusY = 3;
-    [Tooltip("Maximum nearby chunk colliders to enable per frame before the general deferred-work scan runs.")]
-    public int nearColliderUpdatesPerFrame = 8;
-    [Tooltip("How many deferred secondary tasks to finish per frame when there is headroom.")]
-    public int deferredSecondaryWorkTasksPerFrame = 2;
-    [Tooltip("How many chunk slots to scan per frame for deferred secondary work.")]
-    public int deferredSecondaryWorkScanCountPerFrame = 64;
-    [Tooltip("Adapt GPU worldgen and mesh decode budgets based on recent frame time.")]
-    public bool enableAdaptiveBudgets = true;
-    [Tooltip("Target headroom below the frame budget before adaptive budgets ramp up.")]
-    // THROUGHPUT FIX: was 1.5f. The adaptive throttle was collapsing the frame budget to
-    // 5ms when worldgen briefly exceeded budget. Setting headroom to a negative value
-    // effectively disables shrinking (target = budget + |headroom|, always met by smoothedMs).
-    public float adaptiveFrameHeadroomMs = -100f;
-    [Tooltip("Rate used to grow adaptive budgets on frames with spare headroom.")]
-    public float adaptiveBudgetRecoverRate = 0.08f;
-    [Tooltip("Rate used to shrink adaptive budgets on over-budget frames.")]
-    // THROUGHPUT FIX: was 0.20f (shrink by 20% per over-budget frame).
-    // Set to 0 to disable shrinking entirely — the system can still grow back up to the
-    // configured budget but never below it.
-    public float adaptiveBudgetBackoffRate = 0.0f;
-    [Tooltip("Minimum fraction of the configured GPU budgets that adaptive throttling will allow.")]
-    // THROUGHPUT FIX: was 0.80 (budget can shrink to 80% of configured). Setting to 1.0
-    // means the budget never drops below the configured value.
-    public float adaptiveBudgetMinScale = 1.0f;
+    // Max nearby chunk colliders enabled per frame before the general deferred-work scan runs.
+    [System.NonSerialized] public int nearColliderUpdatesPerFrame = 8;
+    // Deferred secondary tasks finished per frame when there is headroom.
+    [System.NonSerialized] public int deferredSecondaryWorkTasksPerFrame = 2;
+    // Chunk slots scanned per frame for deferred secondary work.
+    [System.NonSerialized] public int deferredSecondaryWorkScanCountPerFrame = 64;
+    // Adapt GPU worldgen and mesh decode budgets based on recent frame time.
+    [System.NonSerialized] public bool enableAdaptiveBudgets = true;
+    // THROUGHPUT FIX (now authoritative — the scene had silently reverted these to
+    // 1.5/0.2/0.65, re-enabling the frame-budget collapse to 5ms visible in the perf logs):
+    // negative headroom + zero backoff + minScale 1.0 disable adaptive SHRINKING entirely;
+    // budgets can grow but never drop below the configured values.
+    [System.NonSerialized] public float adaptiveFrameHeadroomMs = -100f;
+    [System.NonSerialized] public float adaptiveBudgetRecoverRate = 0.08f;
+    [System.NonSerialized] public float adaptiveBudgetBackoffRate = 0.0f;
+    [System.NonSerialized] public float adaptiveBudgetMinScale = 1.0f;
 
     [Header("System References")]
     [SerializeField, FindObjectOfType(true)]
@@ -199,10 +195,10 @@ public partial class McWorld : UdonSharpBehaviour
     // per-sync full-atlas overlay blit (_GpuOverlayTextureIntoAtlas) does ~2x the fill — absorbed
     // by the idle gen-phase GPU here, but DIAL BACK toward 1023 if Quest VRAM/load regresses.
     // Clamped to [1,4095] in _InitializeGpuVoxelBackend.
-    public int gpuChunkSlotCapacity = 2047;
-    public int gpuLightingIterationsPerUpdate = 64;
-    public int gpuLightingTotalIterations = 128;
-    public int gpuResidentSyncsPerFrame = 32;
+    [System.NonSerialized] public int gpuChunkSlotCapacity = 1023;
+    [System.NonSerialized] public int gpuLightingIterationsPerUpdate = 15;
+    [System.NonSerialized] public int gpuLightingTotalIterations = 15;
+    [System.NonSerialized] public int gpuResidentSyncsPerFrame = 32;
     [Tooltip("Experimental: export per-slice face bounds instead of dense face pixels for GPU meshing. Disabled by default until validated.")]
     public bool useCompactGpuFaceExport = false;
     [Tooltip("Experimental (default OFF): extract many chunks' faces in ONE blit over a tiled RT + ONE region readback, then demux on the CPU. Cuts the per-chunk readback request/callback count by the batch tile count. Falls back to the per-chunk path for interaction/resident chunks. Off = unchanged per-chunk path.")]
@@ -379,6 +375,12 @@ public partial class McWorld : UdonSharpBehaviour
     private const byte BLOCK_TORCH = 50;
     private const byte BLOCK_REDSTONE_TORCH_OFF = 75;
     private const byte BLOCK_REDSTONE_TORCH_ON = 76;
+    private const byte BLOCK_FIRE = 51;
+    private const byte BLOCK_FURNACE_LIT = 62;
+    private const byte BLOCK_PORTAL = 90;
+    // Max ambient-particle emitters tracked per chunk (torch/fire/lava-surface/furnace/portal).
+    // 512 ints = 2KB per scanned chunk; overflow just thins ambient particles on extreme chunks.
+    public const int AMBIENT_EMITTER_CAP = 512;
     private const byte BLOCK_FENCE = 85;
     private const byte BLOCK_ICE = 79;
     private const byte TORCH_MOUNT_WEST = 1;
@@ -793,6 +795,22 @@ public partial class McWorld : UdonSharpBehaviour
     private float stats_gpuChunkUploadTime = 0f;
     private int stats_gpuChunkUploadBytes = 0;
     // TEMP: split the ~27ms per-chunk finalize (StepChunkDataGeneration completion) into its phases.
+    // PAC PHASE BREAKDOWN: per-frame time inside each ProcessActiveChunks phase, so 100% of
+    // "Active processing" is attributed (the load-phase logs had ~30ms/frame unaccounted).
+    private float stats_pacMaintainMs = 0f;   // prewarm + lookup flushes + _GpuMaintainResidentChunks
+    private float stats_pacLightingMs = 0f;   // _ProcessGpuLighting (both calls)
+    private float stats_pacReadbackMs = 0f;   // _ProcessGpuFaceReadback
+    private float stats_pacDataGenMs = 0f;    // StepChunkDataGeneration loop
+    private float stats_pacNearMeshMs = 0f;   // near-mesh guarantee lane
+    private float stats_pacMeshLoopMs = 0f;   // shared meshing loop
+    private float stats_pacSweepsMs = 0f;     // deferred-interior sweep + GO recycle + border heal/cleanup
+    private float stats_pacSecondaryMs = 0f;  // _ProcessDeferredChunkSecondaryWork
+    // REBUILD-SOURCE ATTRIBUTION: who is feeding the mesh rebuild queue (storm diagnosis).
+    private int stats_rqHealSweep = 0;      // _HealStaleBorderChunks
+    private int stats_rqHealImmediate = 0;  // _TryImmediateBorderHeal
+    private int stats_rqHealInterior = 0;   // border-heal inside _ScheduleDeferredInteriorMeshUpdates
+    private int stats_rqFollowup = 0;       // pendingChunkMeshRebuild followups (meshing-loop cleanup)
+    private int stats_rqNeighborTrigger = 0; // TriggerNeighborMeshRebuilds invocations (up to 6 requests each)
     private float stats_finalizeSliceTime = 0f;   // data acquisition (TryCopyCachedGpuChunkSlice / StepChunkGeneration)
     private float stats_finalizeDerivedTime = 0f; // _RefreshChunkDerivedData (4096-voxel scan)
     private float stats_finalizeGpuSyncTime = 0f; // _GpuSyncChunkBlocks (pack + atlas upload)
@@ -2137,6 +2155,31 @@ public partial class McWorld : UdonSharpBehaviour
         gpuResidentCenterChunkZ = Mathf.Clamp(gpuResidentCenterChunkZ, minChunkZ, maxChunkZ);
     }
 
+    // EVENT-DRIVEN RESIDENT MAINTAIN: the full radial ring scan below visits ~R^2*pi*worldDimY
+    // chunk positions (hundreds) every frame just to find the ~1 chunk that needs an atlas sync —
+    // measured 8-11ms/frame of pure Udon scanning in the PAC phase logs. Chunks that finish
+    // data-gen now enqueue themselves; the queue is drained cheaply every frame, and the full
+    // safety scan only runs when the player's chunk changes or a periodic cooldown expires
+    // (covers slot eviction recovery and anything the queue missed).
+    private int[] _gpuSyncRequestQueue;
+    private int _gpuSyncRequestCount = 0;
+    private int _gpuResidentScanCooldown = 0;
+    private int _gpuResidentLastCenterX = int.MinValue;
+    private int _gpuResidentLastCenterZ = int.MinValue;
+    private const int GPU_SYNC_QUEUE_CAP = 256;
+    private const int GPU_RESIDENT_SCAN_COOLDOWN_FRAMES = 30;
+
+    private void _GpuQueueResidentSync(ChunkData chunk)
+    {
+        if (chunk == null) return;
+        int ci = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
+        if (ci < 0) return;
+        if (_gpuSyncRequestQueue == null) _gpuSyncRequestQueue = new int[GPU_SYNC_QUEUE_CAP];
+        if (_gpuSyncRequestCount >= GPU_SYNC_QUEUE_CAP) return; // overflow: the periodic safety scan catches it
+        _gpuSyncRequestQueue[_gpuSyncRequestCount] = ci;
+        _gpuSyncRequestCount = _gpuSyncRequestCount + 1;
+    }
+
     private void _GpuMaintainResidentChunks(float frameStart, float frameBudget)
     {
         if (!gpuBackendReady) return;
@@ -2147,6 +2190,48 @@ public partial class McWorld : UdonSharpBehaviour
         int touched = 0;
         int R = _activeRenderDistanceChunks;
         int rr = R * R;
+
+        // Drain the pending-sync queue first (newly generated chunks). Cheap: O(pending).
+        // Entries are consumed front-to-back; on budget exhaustion the tail shifts down and
+        // waits for next frame. Skipped/invalid entries are simply dropped — the periodic
+        // safety scan below is the correctness backstop for anything missed.
+        if (_gpuSyncRequestCount > 0 && chunks_1D != null)
+        {
+            int consumed = 0;
+            while (consumed < _gpuSyncRequestCount)
+            {
+                if (touched >= syncBudget) break;
+                if (Time.realtimeSinceStartup - frameStart > frameBudget) break;
+                int ci = _gpuSyncRequestQueue[consumed];
+                consumed++;
+                if (ci < 0 || ci >= chunks_1D.Length) continue;
+                ChunkData qc = chunks_1D[ci];
+                if (qc == null || !qc.isDataReady) continue;
+                int qSlot = gpuChunkIndexToSlot[ci];
+                if (qSlot >= 0 && qSlot < gpuChunkSlotCapacity) continue; // already lit
+                int qdx = qc.chunkX_world - gpuResidentCenterChunkX;
+                int qdz = qc.chunkZ_world - gpuResidentCenterChunkZ;
+                if (qdx * qdx + qdz * qdz > rr) continue; // outside lit radius — scan handles later
+                byte[] qData = _GetDecompressedData(qc);
+                if (qData == null) continue;
+                _GpuSyncChunkBlocks(qc, qData);
+                touched++;
+            }
+            int remaining = _gpuSyncRequestCount - consumed;
+            for (int mi = 0; mi < remaining; mi++) _gpuSyncRequestQueue[mi] = _gpuSyncRequestQueue[consumed + mi];
+            _gpuSyncRequestCount = remaining;
+        }
+
+        // Full radial safety scan: only when the player's chunk changed (immediate re-light of
+        // newly-in-range columns) or the periodic cooldown expires (eviction recovery, missed
+        // entries). Skipping it on ordinary frames is the entire win.
+        bool centerMoved = gpuResidentCenterChunkX != _gpuResidentLastCenterX
+            || gpuResidentCenterChunkZ != _gpuResidentLastCenterZ;
+        _gpuResidentScanCooldown = _gpuResidentScanCooldown - 1;
+        if (!centerMoved && _gpuResidentScanCooldown > 0) return;
+        _gpuResidentLastCenterX = gpuResidentCenterChunkX;
+        _gpuResidentLastCenterZ = gpuResidentCenterChunkZ;
+        _gpuResidentScanCooldown = GPU_RESIDENT_SCAN_COOLDOWN_FRAMES;
         // Keep the WHOLE render-distance set GPU-lit: radial XZ disc, full Y column. Any visible
         // chunk lacking a light slot (e.g. just walked into view, or evicted while far and now
         // back in range) gets re-synced here so it lights up. Closest-first by XZ ring so the
@@ -2769,7 +2854,16 @@ public partial class McWorld : UdonSharpBehaviour
     //   0 = atlas block sync (upload + overlay + occupancy) + attach the shared opaque mesh,
     //   1 = derived-data scan, Y-sliced across calls until complete,
     //   2 = biome tex + opaque/cutout render assign + CPU fluid mesh -> done (isBuildingMesh=false).
-    private const int GPU_PREP_DERIVED_SLICE_Y = 16; // chunkSizeY(64)/16 = 4 derived slices per chunk
+    // Derived-scan Y-rows per prep step. Chunks are 16 tall (NOT 64 — old comment was stale), so
+    // the previous value of 16 degenerated the "time-sliced" scan into ONE atomic 4096-voxel Udon
+    // pass (~8-15ms) per prep step — the un-attributed frame spikes in the load-phase perf logs.
+    // 4 rows = 1024 voxels ≈ 2-4ms per step; the meshing loop's deadline checks between steps can
+    // now actually bound the frame.
+    private const int GPU_PREP_DERIVED_SLICE_Y = 4;
+    // One watery-chunk stage-2 (atomic CPU fluid mesh build) allowed per frame; reset each Update.
+    private bool _gpuPrepFluidBudgetUsed = false;
+    // Rotating cursor for the meshing starvation-rescue lane (see ProcessActiveChunks).
+    private int _meshRescueCursor = 0;
     private void _StepGpuChunkPrep(ChunkData chunk)
     {
         if (chunk == null) return;
@@ -2801,13 +2895,26 @@ public partial class McWorld : UdonSharpBehaviour
 
         if (chunk._gpuPrepStage == 1)
         {
+            // Derived caches already fresh for this exact data version — typical for the
+            // neighbor-rebuild re-preps that flood the meshing loop during load. Skip the
+            // whole 4096-voxel rescan; the flags/emitters/columns can't have changed.
+            if (chunk._derivedScanCursor == 0 && !chunk._derivedDirty
+                && chunk._derivedForDataVersion == chunk._cachedDataVersion)
+            {
+                chunk._gpuPrepStage = 2;
+                return;
+            }
             bool done = _RefreshChunkDerivedDataSliced(chunk, data, chunk._derivedScanCursor, GPU_PREP_DERIVED_SLICE_Y);
             chunk._derivedScanCursor = chunk._derivedScanCursor + GPU_PREP_DERIVED_SLICE_Y;
             if (done) chunk._gpuPrepStage = 2;
             return;
         }
 
-        // stage 2: finish — biome colours + opaque/cutout render assign + CPU fluid mesh
+        // stage 2: finish — biome colours + opaque/cutout render assign + CPU fluid mesh.
+        // FLUID FRAME CAP: the CPU fluid mesh build inside this stage is atomic and can cost
+        // 10-30ms for watery chunks — several landing in one frame caused the 100-200ms load
+        // spikes. Allow at most ONE watery-chunk stage-2 per frame; others retry next frame.
+        if (chunk._hasWaterBlocks && _gpuPrepFluidBudgetUsed) return;
         // NO-HOLES guard: if the GameObject/renderer is gone (recycled mid-prep or a pool failure),
         // do NOT complete unrendered — re-defer so it re-acquires a GameObject and actually renders.
         if (chunk.gameObject == null || chunk.opaqueRenderer == null)
@@ -2819,6 +2926,7 @@ public partial class McWorld : UdonSharpBehaviour
             if (ciMissing != -1) MarkChunkMeshDeferred(ciMissing);
             return;
         }
+        if (chunk._hasWaterBlocks) _gpuPrepFluidBudgetUsed = true;
         _StoreBiomeData(chunk);
         Texture2D biomeTex = _GpuGetCpuBiomeTex(chunk);
         if (biomeTex != null)
@@ -2827,27 +2935,64 @@ public partial class McWorld : UdonSharpBehaviour
             _gpuChunkMpb.Clear();
             _gpuChunkMpb.SetTexture("_BiomeColorRT", biomeTex);
         }
+        // RENDER GATES: a fully-buried chunk (all voxels opaque-solid AND all 6 neighbors also
+        // all-opaque-solid) has zero visible faces — skip its renderers entirely. The shared voxel
+        // mesh costs ~98k vertex-shader invocations (x ~5 texture taps each) per renderer per
+        // frame, so every skipped renderer matters. Conservative: a missing/unscanned/edited
+        // neighbor counts as "not solid" and the chunk renders. Boundary edits trigger neighbor
+        // remeshes, which re-run this gate, so exposure by digging re-enables rendering.
+        bool chunkEnclosed = chunk._isAllOpaqueSolid && _AllNeighborsAllOpaqueSolid(chunk);
         if (chunk.opaqueRenderer != null)
         {
             chunk.opaqueRenderer.sharedMaterial = gpuVoxelInstancedMaterial;
             if (biomeTex != null) chunk.opaqueRenderer.SetPropertyBlock(_gpuChunkMpb);
-            chunk.opaqueRenderer.enabled = true;
+            chunk.opaqueRenderer.enabled = !chunkEnclosed;
         }
-        if (gpuVoxelCutoutMaterial != null && chunk.cutoutMeshFilter != null && chunk.cutoutRenderer != null)
+        // Cutout pass: only chunks that actually contain non-opaque content (leaves/glass/cross/
+        // torch/...) need the second shared-mesh renderer. Plain terrain chunks skip it — that
+        // halves their per-frame vertex load. Explicitly detach on the skip path: pooled
+        // GameObjects can carry a stale cutout attach from a previous tenant.
+        if (gpuVoxelCutoutMaterial != null && chunk.cutoutMeshFilter != null && chunk.cutoutRenderer != null
+            && chunk._hasNonOpaqueContent && !chunkEnclosed)
         {
             chunk.cutoutMeshFilter.sharedMesh = gpuVoxelChunkMesh;
             chunk.cutoutRenderer.sharedMaterial = gpuVoxelCutoutMaterial;
             if (biomeTex != null) chunk.cutoutRenderer.SetPropertyBlock(_gpuChunkMpb);
             chunk.cutoutRenderer.enabled = true;
         }
+        else if (chunk.cutoutMeshFilter != null && chunk.cutoutMeshFilter.sharedMesh == gpuVoxelChunkMesh)
+        {
+            chunk.cutoutMeshFilter.sharedMesh = null;
+            if (chunk.cutoutRenderer != null) chunk.cutoutRenderer.enabled = false;
+        }
         _GpuBuildAndApplyFluidMesh(chunk);
         chunk._isGpuMeshRendered = true;
         chunk._isInstancedRendered = true;
         chunk._renderMeshApplied = true; // NO-HOLES: a render mesh is now applied
+        // REBUILD-STORM FIX: the instanced render samples neighbors from the GPU atlas at draw
+        // time, so it has NO air-assumed-border defect — a stale _borderMissingMask from an old
+        // CPU/face build must be cleared here. Leaving it set made the border-heal sweep
+        // re-request this chunk forever (mask never cleared by this path), which snowballed into
+        // the rebuild storm (652 rebuilds/window) that starved datagen and froze world loading.
+        chunk._borderMissingMask = 0;
         chunk.isMeshDeferred = false;
         chunk._gpuPrepActive = false;
         chunk._gpuPrepData = null;
         chunk.isBuildingMesh = false;
+    }
+
+    // True when all 6 neighbors exist, are data-ready with fresh derived data, and are entirely
+    // opaque-solid — i.e. this chunk's border faces are all covered. Conservative on any doubt.
+    private bool _AllNeighborsAllOpaqueSolid(ChunkData chunk)
+    {
+        ChunkData[] neighbors = _GetCachedNeighbors(chunk);
+        if (neighbors == null) return false;
+        for (int i = 0; i < 6; i++)
+        {
+            ChunkData nb = neighbors[i];
+            if (nb == null || !nb.isDataReady || nb._derivedDirty || !nb._isAllOpaqueSolid) return false;
+        }
+        return true;
     }
 
     private bool _GpuFaceExtractionReady()
@@ -4383,39 +4528,63 @@ public partial class McWorld : UdonSharpBehaviour
 
 
 
+    // 20Hz gate + cached shader property ids for the water texture animation. MC's procedural
+    // water/lava textures advance once per game tick (20/sec); running the 4-blit chain per frame
+    // did 4.5x the GPU passes AND scrolled flowing water 4.5x too fast at 90fps. Ticking at 20Hz
+    // is both cheaper and Beta-accurate.
+    private float _betaWaterAnimNextTime = 0f;
+    private bool _betaWaterAnimPropsInit = false;
+    private int _waterPropTime2Id, _waterPropSplashChanceId, _waterPropSplashDecayId,
+                _waterPropDivisorInvId, _waterPropIsFlowModeId, _waterPropFlowScrollId;
+
     private void _UpdateBetaWaterAnimation()
     {
         if (betaWaterStillStateA == null || gpuWaterAnimMaterial == null) return;
 
-        float t = Time.time * 73.1f;
+        float now = Time.time;
+        if (now < _betaWaterAnimNextTime) return;
+        _betaWaterAnimNextTime = now + 0.05f; // 20 ticks/sec, MC parity
+
+        if (!_betaWaterAnimPropsInit)
+        {
+            _betaWaterAnimPropsInit = true;
+            _waterPropTime2Id = VRCShader.PropertyToID("_Time2");
+            _waterPropSplashChanceId = VRCShader.PropertyToID("_SplashChance");
+            _waterPropSplashDecayId = VRCShader.PropertyToID("_SplashDecay");
+            _waterPropDivisorInvId = VRCShader.PropertyToID("_DivisorInv");
+            _waterPropIsFlowModeId = VRCShader.PropertyToID("_IsFlowMode");
+            _waterPropFlowScrollId = VRCShader.PropertyToID("_FlowScroll");
+        }
+
+        float t = now * 73.1f;
 
         // Still water: evolve state then convert to color
-        gpuWaterAnimMaterial.SetFloat("_Time2", t);
-        gpuWaterAnimMaterial.SetFloat("_SplashChance", 0.05f);
-        gpuWaterAnimMaterial.SetFloat("_SplashDecay", 0.1f);
-        gpuWaterAnimMaterial.SetFloat("_DivisorInv", 1.0f / 3.3f);
-        gpuWaterAnimMaterial.SetFloat("_IsFlowMode", 0f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropTime2Id, t);
+        gpuWaterAnimMaterial.SetFloat(_waterPropSplashChanceId, 0.05f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropSplashDecayId, 0.1f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropDivisorInvId, 1.0f / 3.3f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropIsFlowModeId, 0f);
         VRCGraphics.Blit(betaWaterStillStateA, betaWaterStillStateB, gpuWaterAnimMaterial, 0);
         RenderTexture tempStill = betaWaterStillStateA;
         betaWaterStillStateA = betaWaterStillStateB;
         betaWaterStillStateB = tempStill;
 
-        gpuWaterAnimMaterial.SetFloat("_FlowScroll", 0f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropFlowScrollId, 0f);
         VRCGraphics.Blit(betaWaterStillStateA, betaWaterStillColor, gpuWaterAnimMaterial, 1);
 
         // Flow water: evolve state then convert to color with scroll
         betaWaterFlowFrame++;
-        gpuWaterAnimMaterial.SetFloat("_SplashChance", 0.2f);
-        gpuWaterAnimMaterial.SetFloat("_SplashDecay", 0.3f);
-        gpuWaterAnimMaterial.SetFloat("_DivisorInv", 1.0f / 3.2f);
-        gpuWaterAnimMaterial.SetFloat("_IsFlowMode", 1f);
-        gpuWaterAnimMaterial.SetFloat("_Time2", t + 17.3f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropSplashChanceId, 0.2f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropSplashDecayId, 0.3f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropDivisorInvId, 1.0f / 3.2f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropIsFlowModeId, 1f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropTime2Id, t + 17.3f);
         VRCGraphics.Blit(betaWaterFlowStateA, betaWaterFlowStateB, gpuWaterAnimMaterial, 0);
         RenderTexture tempFlow = betaWaterFlowStateA;
         betaWaterFlowStateA = betaWaterFlowStateB;
         betaWaterFlowStateB = tempFlow;
 
-        gpuWaterAnimMaterial.SetFloat("_FlowScroll", (float)betaWaterFlowFrame / 16.0f);
+        gpuWaterAnimMaterial.SetFloat(_waterPropFlowScrollId, (float)betaWaterFlowFrame / 16.0f);
         VRCGraphics.Blit(betaWaterFlowStateA, betaWaterFlowColor, gpuWaterAnimMaterial, 1);
     }
 
@@ -4685,6 +4854,17 @@ public partial class McWorld : UdonSharpBehaviour
     // moved a voxel, keeping the per-frame extern count near zero while standing still. Placing a
     // collider on EVERY solid voxel in the grid (not just exposed faces) gives a deep solid stack that
     // can't be tunneled through in one physics step during a fast fall.
+    // EVENT-DRIVEN COLLISION GRID: the 250-cell rescan below used to run unconditionally every
+    // frame (~250 full GetBlock chains — the single largest steady-state Udon cost). It now runs
+    // only when the player crossed a voxel boundary, a SetBlock landed in/next to the grid
+    // (_collisionGridDirty, set by _SetBlockLocal), or the periodic safety net expires (covers
+    // chunk data streaming in under the player without a SetBlock — initial gen, rehydrate).
+    // A falling/walking player crosses voxel boundaries continuously, so anything that could
+    // make them fall through the world already forces per-frame rescans.
+    private bool _collisionGridDirty = true;
+    private int _collisionSafetyCountdown = 0;
+    public int collisionGridSafetyRescanFrames = 30;
+
     private void _UpdateVoxelColliderGrid()
     {
         if (!useBoxColliderCollision || !_collisionGridInitialized || _voxelColliders == null) return;
@@ -4697,10 +4877,23 @@ public partial class McWorld : UdonSharpBehaviour
         bool moved = pvx != _collisionPlayerVoxelX || pvy != _collisionPlayerVoxelY || pvz != _collisionPlayerVoxelZ;
         _collisionPlayerVoxelX = pvx; _collisionPlayerVoxelY = pvy; _collisionPlayerVoxelZ = pvz;
 
+        _collisionSafetyCountdown = _collisionSafetyCountdown - 1;
+        if (!moved && !_collisionGridDirty && _collisionSafetyCountdown > 0) return;
+        _collisionGridDirty = false;
+        _collisionSafetyCountdown = collisionGridSafetyRescanFrames < 1 ? 1 : collisionGridSafetyRescanFrames;
+
         int R = collisionGridRadiusXZ < 0 ? 0 : collisionGridRadiusXZ;
         int down = collisionGridDown < 0 ? 0 : collisionGridDown;
         int up = collisionGridUp < 0 ? 0 : collisionGridUp;
         int collisionLen = _blockHasCollisionCache != null ? _blockHasCollisionCache.Length : 0;
+        // Cached-chunk fast path: the scan is spatially coherent, so resolve the chunk only when
+        // the (cx,cy,cz) key changes and read ids straight from the decompressed cache when valid
+        // (the exact array GetBlock's fast path returns). Cold chunks fall back to _GetBlockLocal,
+        // which preserves GetBlock semantics (decompress, GPU-resident rehydrate request).
+        int colDimX = worldDimensionX, colDimY = worldDimensionY, colDimZ = worldDimensionZ;
+        int lastCX = int.MinValue, lastCY = int.MinValue, lastCZ = int.MinValue;
+        ChunkData colChunk = null;
+        byte[] colData = null;
         int idx = 0;
         for (int dy = -down; dy <= up; dy++)
         {
@@ -4714,7 +4907,35 @@ public partial class McWorld : UdonSharpBehaviour
                     bool solid = false;
                     if (wy >= 0)
                     {
-                        int bid = GetBlock(wx, wy, wz) & 0xFF;
+                        int ccx = wx >> 4, ccy = wy >> 4, ccz = wz >> 4;
+                        if (ccx != lastCX || ccy != lastCY || ccz != lastCZ)
+                        {
+                            lastCX = ccx; lastCY = ccy; lastCZ = ccz;
+                            colChunk = null; colData = null;
+                            int ax = ccx + chunkOffsetX, ay = ccy + chunkOffsetY, az = ccz + chunkOffsetZ;
+                            if (ax >= 0 && ax < colDimX && ay >= 0 && ay < colDimY && az >= 0 && az < colDimZ)
+                            {
+                                ChunkData cc = chunks_1D[(az * colDimX * colDimY) + (ay * colDimX) + ax];
+                                if (cc != null && cc.isDataReady)
+                                {
+                                    colChunk = cc;
+                                    if (cc._decompCacheValid) colData = cc._cachedDecompressedData;
+                                }
+                            }
+                        }
+                        int bid;
+                        if (colData != null)
+                        {
+                            bid = colData[((wy & 15) << 8) | ((wz & 15) << 4) | (wx & 15)];
+                        }
+                        else if (colChunk != null)
+                        {
+                            bid = _GetBlockLocal(colChunk, wx & 15, wy & 15, wz & 15) & 0xFF;
+                        }
+                        else
+                        {
+                            bid = 0;
+                        }
                         solid = bid != 0 && bid < collisionLen && _blockHasCollisionCache[bid];
                     }
                     GameObject go = idx < _voxelColliders.Length ? _voxelColliders[idx] : null;
@@ -4850,6 +5071,10 @@ public partial class McWorld : UdonSharpBehaviour
         float processStartTime = frameStart;
 #endif
 
+        _gpuPrepFluidBudgetUsed = false; // fluid frame cap: see _StepGpuChunkPrep stage 2
+#if LOGGING
+        float _pacT1 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         // CHUNK GO POOL: pre-warm the pool to the render-distance set at startup (time-sliced), before
         // the heavy GPU maintain/lighting work, so chunks pop a ready GameObject during the initial
         // load rather than Instantiate one each as they generate. No-op once the target is reached.
@@ -4874,15 +5099,24 @@ public partial class McWorld : UdonSharpBehaviour
             gpuSlotLookupDirty = false;
         }
 
+#if LOGGING
+        if (enableDetailedTimings) { float _n1 = Time.realtimeSinceStartup; stats_pacMaintainMs += (_n1 - _pacT1) * 1000f; _pacT1 = _n1; }
+#endif
         // Run GPU lighting first so atlas propagation still gets time while worldgen and
         // meshing are busy. Otherwise repeated chunk uploads can keep reseeding lighting
         // without enough passes to converge.
         _ProcessGpuLighting(frameStart, frameBudget);
+#if LOGGING
+        if (enableDetailedTimings) { float _n2 = Time.realtimeSinceStartup; stats_pacLightingMs += (_n2 - _pacT1) * 1000f; _pacT1 = _n2; }
+#endif
 
         // Process completed GPU face readbacks. Guarantee at least 1ms of budget so
         // readbacks aren't completely starved on over-budget frames.
         float readbackBudget = Mathf.Max(frameBudget, Time.realtimeSinceStartup - frameStart + 0.001f);
         _ProcessGpuFaceReadback(frameStart, readbackBudget);
+#if LOGGING
+        if (enableDetailedTimings) { float _n3 = Time.realtimeSinceStartup; stats_pacReadbackMs += (_n3 - _pacT1) * 1000f; _pacT1 = _n3; }
+#endif
 
         // DATA-GEN STREAMING: refresh the cached player chunk once per frame so the coordinator's
         // data-gen picker (which calls ShouldGenerateChunkData per scanned position) never does a
@@ -4908,6 +5142,9 @@ public partial class McWorld : UdonSharpBehaviour
             StepChunkDataGeneration(chunk);
         }
 
+#if LOGGING
+        if (enableDetailedTimings) { float _n4 = Time.realtimeSinceStartup; stats_pacDataGenMs += (_n4 - _pacT1) * 1000f; _pacT1 = _n4; }
+#endif
         // --- NEAR meshing guarantee (Minecraft: near chunks rebuild unconditionally each frame) ---
         // Runs BEFORE the shared budget loop, with its OWN time budget that the shared aggregate cap
         // does not deduct from, so a far-chunk backlog (the deferred mesh queue can sit at 256/256)
@@ -4933,6 +5170,32 @@ public partial class McWorld : UdonSharpBehaviour
             }
         }
 
+        // --- STARVATION RESCUE lane ---
+        // The shared meshing loop below always starts at index 0 and breaks at its deadline, and
+        // swap-remove refills freed head slots from the TAIL — so entries in the middle of the
+        // list can starve indefinitely on over-budget frames (observed: player-adjacent chunks
+        // stuck at prepStage=0 for 300 frames until the watchdog killed them). Guarantee progress:
+        // one rotating entry gets stepped every frame under a small dedicated budget, so every
+        // listed build is touched at least once every activeMeshingCount frames.
+        if (activeMeshingCount > 0)
+        {
+            _meshRescueCursor = _meshRescueCursor + 1;
+            if (_meshRescueCursor >= activeMeshingCount) _meshRescueCursor = 0;
+            ChunkData rescue = activeMeshingChunks[_meshRescueCursor];
+            if (rescue != null && rescue.isBuildingMesh)
+            {
+                float rescueDeadline = Time.realtimeSinceStartup + 0.002f; // 2ms cap (one atomic step may overshoot)
+                for (int rs = 0; rs < 8; rs++)
+                {
+                    if (!rescue.isBuildingMesh) break;
+                    if (Time.realtimeSinceStartup > rescueDeadline) break;
+                    _BuildChunkMeshStep(rescue);
+                }
+            }
+        }
+#if LOGGING
+        if (enableDetailedTimings) { float _n5 = Time.realtimeSinceStartup; stats_pacNearMeshMs += (_n5 - _pacT1) * 1000f; _pacT1 = _n5; }
+#endif
         // --- Process Meshing ---
         float gpuMeshDecodeFrameBudgetSec = Mathf.Max(0.25f, adaptiveGpuMeshDecodeFrameBudgetMs) * 0.001f;
         float gpuMeshDecodeSpentSec = 0f;
@@ -4967,6 +5230,9 @@ public partial class McWorld : UdonSharpBehaviour
                 if (needsFollowupMeshBuild)
                 {
                     RequestChunkMeshUpdate(followupChunkIndex);
+#if LOGGING
+                    stats_rqFollowup++;
+#endif
                 }
                 continue;
             }
@@ -4999,10 +5265,16 @@ public partial class McWorld : UdonSharpBehaviour
             }
         }
 
+#if LOGGING
+        if (enableDetailedTimings) { float _n6 = Time.realtimeSinceStartup; stats_pacMeshLoopMs += (_n6 - _pacT1) * 1000f; _pacT1 = _n6; }
+#endif
         _ScheduleDeferredInteriorMeshUpdates(frameStart, frameBudget);
         _ProcessChunkGoRecycle(frameStart, frameBudget);
         _HealStaleBorderChunks();
         _PostWorldGenBorderCleanup();
+#if LOGGING
+        if (enableDetailedTimings) { float _n7 = Time.realtimeSinceStartup; stats_pacSweepsMs += (_n7 - _pacT1) * 1000f; _pacT1 = _n7; }
+#endif
 
         // --- FIXED: Process Incremental Lighting (managed by coordinator) ---
         // Note: Lighting is now handled by coordinator's STATE_LIGHTING, not here
@@ -5026,10 +5298,22 @@ public partial class McWorld : UdonSharpBehaviour
         // can wait until the next frame.
         if (gpuLightingSeedPending)
         {
+#if LOGGING
+            float _pacL2 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
             _ProcessGpuLighting(frameStart, frameBudget);
+#if LOGGING
+            if (enableDetailedTimings) stats_pacLightingMs += (Time.realtimeSinceStartup - _pacL2) * 1000f;
+#endif
         }
 
+#if LOGGING
+        float _pacT8 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         _ProcessDeferredChunkSecondaryWork(frameStart, frameBudget);
+#if LOGGING
+        if (enableDetailedTimings) stats_pacSecondaryMs += (Time.realtimeSinceStartup - _pacT8) * 1000f;
+#endif
 
 #if LOGGING
         if (enableDetailedTimings)
@@ -5080,9 +5364,17 @@ public partial class McWorld : UdonSharpBehaviour
             // deferred-interior wakes still get their budget.
             if (!chunk.isMeshDeferred && chunk._borderMissingMask != 0)
             {
-                if (_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask))
+                // Instanced chunks read neighbors from the GPU atlas at draw time — nothing to heal.
+                if (chunk._isInstancedRendered)
+                {
+                    chunk._borderMissingMask = 0;
+                }
+                else if (_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask))
                 {
                     RequestChunkMeshUpdate(chunkIndex);
+#if LOGGING
+                    stats_rqHealInterior++;
+#endif
                 }
                 continue;
             }
@@ -5177,10 +5469,18 @@ public partial class McWorld : UdonSharpBehaviour
     private void _TryImmediateBorderHeal(ChunkData chunk)
     {
         if (chunk == null || chunk._borderMissingMask == 0 || chunk.isBuildingMesh) return;
+        // Instanced chunks read neighbors from the GPU atlas at draw time — nothing to heal.
+        if (chunk._isInstancedRendered) { chunk._borderMissingMask = 0; return; }
         if (_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask))
         {
             int idx = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
-            if (idx >= 0) RequestChunkMeshUpdate(idx);
+            if (idx >= 0)
+            {
+                RequestChunkMeshUpdate(idx);
+#if LOGGING
+                stats_rqHealImmediate++;
+#endif
+            }
         }
     }
 
@@ -5199,10 +5499,15 @@ public partial class McWorld : UdonSharpBehaviour
             ChunkData chunk = chunks_1D[idx];
             if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh || chunk.isMeshDeferred) continue;
             if (chunk._borderMissingMask == 0) continue;
+            // Instanced chunks read neighbors from the GPU atlas at draw time — nothing to heal.
+            if (chunk._isInstancedRendered) { chunk._borderMissingMask = 0; continue; }
 
             if (_AreMaskedNeighborsReady(chunk, chunk._borderMissingMask))
             {
                 RequestChunkMeshUpdate(idx);
+#if LOGGING
+                stats_rqHealSweep++;
+#endif
                 healed++;
                 if (healed >= 16) return;
             }
@@ -5278,6 +5583,9 @@ public partial class McWorld : UdonSharpBehaviour
 
     private int _ProcessNearbyChunkColliderUpdates()
     {
+        // Box-collider mode: chunk mesh colliders are never built, so this 125-cell per-frame
+        // poll can only ever discover no-op work — skip it entirely.
+        if (useBoxColliderCollision) return 0;
         if (!nearOnlyChunkColliders || chunks_1D == null || chunks_1D.Length == 0) return 0;
         if (!_TryGetPlayerChunkCoords(out int playerChunkX, out int playerChunkY, out int playerChunkZ)) return 0;
 
@@ -5343,7 +5651,7 @@ public partial class McWorld : UdonSharpBehaviour
             ChunkData chunk = chunks_1D[chunkIndex];
             if (chunk == null || !chunk.isDataReady) continue;
 
-            if (chunk.pendingColliderMeshRebuild && !chunk.isBuildingMesh)
+            if (!useBoxColliderCollision && chunk.pendingColliderMeshRebuild && !chunk.isBuildingMesh)
             {
                 if (!_ShouldEnableChunkCollider(chunk)) continue;
                 chunk.pendingColliderMeshRebuild = false;
@@ -5353,7 +5661,7 @@ public partial class McWorld : UdonSharpBehaviour
                 continue;
             }
 
-            if (nearOnlyChunkColliders && !chunk.isBuildingMesh && chunk.meshCollider != null && chunk.meshCollider.enabled && !_ShouldEnableChunkCollider(chunk))
+            if (!useBoxColliderCollision && nearOnlyChunkColliders && !chunk.isBuildingMesh && chunk.meshCollider != null && chunk.meshCollider.enabled && !_ShouldEnableChunkCollider(chunk))
             {
                 _DisableChunkCollider(chunk, true);
                 completedTasks++;
@@ -5393,7 +5701,7 @@ public partial class McWorld : UdonSharpBehaviour
             bool shouldRunNow = _ShouldPrioritizeChunkSecondaryWork(chunk) || hasHeadroom;
             if (!shouldRunNow) continue;
 
-            if (chunk.pendingColliderApply && !chunk.isBuildingMesh)
+            if (!useBoxColliderCollision && chunk.pendingColliderApply && !chunk.isBuildingMesh)
             {
                 if (!_ShouldEnableChunkCollider(chunk)) continue;
                 chunk.pendingColliderApply = false;
@@ -5699,6 +6007,10 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk._decompCacheValid = true;
             }
             chunk._cachedDataVersion++;
+
+            // EVENT-DRIVEN RESIDENT MAINTAIN: announce this freshly generated chunk to the atlas
+            // sync queue so _GpuMaintainResidentChunks doesn't have to ring-scan to discover it.
+            _GpuQueueResidentSync(chunk);
 #if LOGGING
             if (enableDetailedTimings) { stats_stepFinalizeTailTime += (Time.realtimeSinceStartup - _finTailT0) * 1000f; stats_stepFullCompleteCount++; }
             // Count EVERY finalize (eager + deferred) so the slice/derived/gpuSync per-chunk averages
@@ -6315,6 +6627,10 @@ public partial class McWorld : UdonSharpBehaviour
     // Returns block type; caller reads lastMetaResult for the metadata.
     [System.NonSerialized] public byte lastMetaResult;
 
+    // Incremented on every real block change (see _SetBlockLocal). Consumers compare snapshots to
+    // skip re-sampling the world when nothing can have changed.
+    [System.NonSerialized] public int worldEditCounter;
+
     public byte GetBlockAndMeta(int globalX, int globalY, int globalZ)
     {
         int cx = globalX >> CHUNK_SIZE_SHIFT;
@@ -6721,6 +7037,9 @@ public partial class McWorld : UdonSharpBehaviour
     public void TriggerNeighborMeshRebuilds(ChunkData chunk, bool interactionPriority)
     {
         if (chunk == null) return;
+#if LOGGING
+        stats_rqNeighborTrigger++;
+#endif
 
         for (int i = 0; i < 6; i++) {
             int neighborX = chunk.chunkX_world + neighbor_dx_offsets[i];
@@ -7109,14 +7428,47 @@ public partial class McWorld : UdonSharpBehaviour
         if (chunks_1D == null || chunkIndex < 0 || chunkIndex >= chunks_1D.Length) return;
         ChunkData chunk = chunks_1D[chunkIndex];
         if (chunk == null) return;
+
+        // DIAGNOSIS + ORPHAN RESCUE: determine whether this "stuck" build is actually in
+        // activeMeshingChunks. A valid in-progress build that is NOT listed can never be stepped
+        // (that is a lost/orphaned entry, not a wedge) — re-list it and let it finish normally
+        // instead of killing it. A listed one that still hit the watchdog was starved or wedged;
+        // fall through to the release below (the rotating rescue lane should make this rare).
+        int listIndex = -1;
+        for (int mi = 0; mi < activeMeshingCount; mi++)
+        {
+            if (activeMeshingChunks[mi] == chunk) { listIndex = mi; break; }
+        }
+        if (listIndex < 0 && chunk.isBuildingMesh && (chunk._gpuPrepActive || chunk._gpuFaceBuildActive)
+            && activeMeshingCount < MAX_ACTIVE_CHUNKS)
+        {
+            int slot = activeMeshingCount;
+            activeMeshingChunks[slot] = chunk;
+            activeMeshingCount = slot + 1;
+            Debug.LogWarning("[McWorld] Mesh watchdog RE-LISTED an orphaned in-progress build at chunk ("
+                + chunk.chunkX_world + "," + chunk.chunkY_world + "," + chunk.chunkZ_world
+                + ") prepActive=" + chunk._gpuPrepActive + " prepStage=" + chunk._gpuPrepStage
+                + " faceBuildActive=" + chunk._gpuFaceBuildActive
+                + " — it was building but missing from activeMeshingChunks (count=" + slot + ")");
+            return;
+        }
+
         Debug.LogWarning("[McWorld] Mesh watchdog force-released a stuck build at chunk ("
             + chunk.chunkX_world + "," + chunk.chunkY_world + "," + chunk.chunkZ_world
             + ") resident=" + chunk._isGpuResident + " faceBuildActive=" + chunk._gpuFaceBuildActive
-            + " stage=" + chunk._gpuFaceBuildStage + " poolSlot=" + chunk._meshPoolSlot);
+            + " stage=" + chunk._gpuFaceBuildStage + " poolSlot=" + chunk._meshPoolSlot
+            + " prepActive=" + chunk._gpuPrepActive + " prepStage=" + chunk._gpuPrepStage
+            + " meshPending=" + chunk._gpuMeshPending + " dataReady=" + chunk.isDataReady
+            + " allAir=" + chunk._isAllAir + " borderMask=" + chunk._borderMissingMask
+            + " hasWater=" + chunk._hasWaterBlocks
+            + " listIndex=" + listIndex + "/" + activeMeshingCount
+            + " prepActive2=" + chunk._gpuPrepActive + " prepStage2=" + chunk._gpuPrepStage);
         if (chunk._gpuFaceBuildActive) _ReleaseGpuFaceBuildBuffer(chunk);
         _ReleaseMeshPool(chunk);
         chunk._gpuFaceBuildActive = false;
         chunk._gpuMeshPending = false;
+        chunk._gpuPrepActive = false;   // hygiene: a half-done prep must not leak into the next build
+        chunk._gpuPrepData = null;
         chunk.isBuildingMesh = false;
         chunk.interactionMeshPriority = false;
     }
@@ -7159,8 +7511,21 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk.isMeshDeferred = false;
                 chunk._gpuMeshPending = false;
                 chunk._meshBuildVersion = chunk._meshBuildVersion + 1;
-                if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
-                    activeMeshingChunks[activeMeshingCount++] = chunk;
+                // ORPHAN FIX: never start a phantom build. If the active list is full (observed
+                // intra-frame during rebuild storms: sampled max 63), a dropped add left the chunk
+                // isBuildingMesh=true but unsteppable until the watchdog. Abort cleanly instead —
+                // the deferred sweep re-queues it once the list drains.
+                if (activeMeshingCount >= MAX_ACTIVE_CHUNKS)
+                {
+                    chunk._gpuPrepActive = false;
+                    chunk._gpuPrepData = null;
+                    chunk.isBuildingMesh = false;
+                    MarkChunkMeshDeferred(chunkIndex);
+                    return;
+                }
+                int prepSlot = activeMeshingCount;
+                activeMeshingChunks[prepSlot] = chunk;
+                activeMeshingCount = prepSlot + 1;
                 return;
             }
             // prepData unavailable — fall through to the normal mesh paths (defer/rebuild handle it).
@@ -7235,7 +7600,10 @@ public partial class McWorld : UdonSharpBehaviour
         chunk._meshBuildVersion = chunk._meshBuildVersion + 1;
         chunk._gpuMeshPending = false;
         chunk.pendingColliderApply = false;
-        chunk.pendingColliderMeshRebuild = !_ShouldEnableChunkCollider(chunk);
+        // Box-collider mode never emits chunk collision geometry (see the useBoxColliderCollision
+        // gates in the face emitters) — flagging a collider rebuild would only schedule a full
+        // remesh that produces nothing. Only the mesh-collider mode needs the deferred rebuild.
+        chunk.pendingColliderMeshRebuild = !useBoxColliderCollision && !_ShouldEnableChunkCollider(chunk);
         if (interactionPriority)
         {
             if (chunk._gpuFaceBuildActive)
@@ -7300,6 +7668,12 @@ public partial class McWorld : UdonSharpBehaviour
         if (chunk._isAllAir)
         {
             _ApplyEmptyMesh(chunk);
+            // REBUILD-STORM FIX: an air chunk's mesh is empty REGARDLESS of neighbor state, so a
+            // border-missing mask on it is meaningless — but this early-out used to complete
+            // WITHOUT clearing it, so the border-heal sweeps re-requested the same air chunks
+            // forever (hundreds of [empty] rebuilds per window) once their neighbors generated.
+            chunk._borderMissingMask = 0;
+            chunk._renderMeshApplied = true;
 #if LOGGING
             _RecordMeshBuildCompletion(chunk, false, true);
 #endif
@@ -7532,6 +7906,13 @@ public partial class McWorld : UdonSharpBehaviour
         if (activeMeshingCount < MAX_ACTIVE_CHUNKS)
         {
             activeMeshingChunks[activeMeshingCount++] = chunk;
+        }
+        else
+        {
+            // ORPHAN FIX: full list — abort instead of leaving an unsteppable phantom build.
+            chunk.isBuildingMesh = false;
+            chunk.interactionMeshPriority = false;
+            MarkChunkMeshDeferred(chunkIndex);
         }
     }
 
@@ -11293,6 +11674,25 @@ public partial class McWorld : UdonSharpBehaviour
         // Optimization: check if the block is actually changing before doing any work.
         if (blockType == _GetBlockLocal(chunk, x, y, z)) return;
 
+        // Monotonic edit counter — cheap "did ANY block change since frame X" signal for
+        // per-frame consumers that cache world samples (McMovement env sensing, etc.).
+        worldEditCounter = worldEditCounter + 1;
+
+        // COLLISION DIRTY: an edit inside (or adjacent to) the player's box-collider grid wakes
+        // the event-driven grid rescan (see _UpdateVoxelColliderGrid).
+        if (useBoxColliderCollision)
+        {
+            int cgdx = ((chunk.chunkX_world << 4) + x) - _collisionPlayerVoxelX;
+            int cgdy = ((chunk.chunkY_world << 4) + y) - _collisionPlayerVoxelY;
+            int cgdz = ((chunk.chunkZ_world << 4) + z) - _collisionPlayerVoxelZ;
+            int cgr = collisionGridRadiusXZ + 1;
+            if (cgdx <= cgr && cgdx >= -cgr && cgdz <= cgr && cgdz >= -cgr
+                && cgdy <= collisionGridUp + 1 && cgdy >= -(collisionGridDown + 1))
+            {
+                _collisionGridDirty = true;
+            }
+        }
+
         // PARITY: Beta Chunk.setBlockID (Chunk.java:289) explicitly does
         //   this.data.setNibble(var1, var2, var3, 0);
         // immediately after changing the block ID. Without this, replacing a flowing-water
@@ -13652,11 +14052,32 @@ public partial class McWorld : UdonSharpBehaviour
             chunk._crossBlockCount = 0;
             chunk._torchBlockCount = 0;
             chunk._hasTorchBlocks = false;
+            chunk._ambientEmitterCount = 0;
+            // Homogeneous lava: only the top layer can ever emit embers (needs air above, checked
+            // again at emission time against the chunk above). Register those 256 cells.
+            if (_IsLavaBlock(hb))
+            {
+                if (chunk._ambientEmitterPacked == null || chunk._ambientEmitterPacked.Length < AMBIENT_EMITTER_CAP)
+                    chunk._ambientEmitterPacked = new int[AMBIENT_EMITTER_CAP];
+                int topY = chunkSizeY - 1;
+                int emitIdx = 0;
+                for (int hz = 0; hz < chunkSizeXZ; hz++)
+                {
+                    for (int hx = 0; hx < chunkSizeXZ; hx++)
+                    {
+                        chunk._ambientEmitterPacked[emitIdx] = (hb << 24) | (hx << 16) | (topY << 8) | hz;
+                        emitIdx++;
+                    }
+                }
+                chunk._ambientEmitterCount = emitIdx;
+            }
             if (hb == 0)
             {
                 chunk._isAllAir = true;
                 chunk._hasWaterBlocks = false;
                 chunk._hasEmissiveBlocks = false;
+                chunk._hasNonOpaqueContent = false;
+                chunk._isAllOpaqueSolid = false;
                 for (int i = 0; i < columnCount; i++) { chunk._columnMinY[i] = 255; chunk._columnMaxY[i] = 255; }
                 chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
                 chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
@@ -13667,6 +14088,10 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk._isAllAir = false;
                 chunk._hasWaterBlocks = _IsWaterBlock(hb) || _IsLavaBlock(hb);
                 chunk._hasEmissiveBlocks = (hb < lightEmissionCache.Length && lightEmissionCache[hb] > 0);
+                bool hbOpaque = visibilityCache != null && hb < visibilityCache.Length
+                    && visibilityCache[hb] == BlockVisibilityType.Opaque;
+                chunk._hasNonOpaqueContent = !hbOpaque;
+                chunk._isAllOpaqueSolid = hbOpaque;
                 byte maxYb = (byte)(chunkSizeY - 1);
                 byte maxXZb = (byte)(chunkSizeXZ - 1);
                 for (int i = 0; i < columnCount; i++) { chunk._columnMinY[i] = 0; chunk._columnMaxY[i] = maxYb; }
@@ -13674,6 +14099,7 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk._chunkGlobalMinX = 0; chunk._chunkGlobalMaxX = maxXZb;
                 chunk._chunkGlobalMinZ = 0; chunk._chunkGlobalMaxZ = maxXZb;
             }
+            chunk._derivedForDataVersion = chunk._cachedDataVersion;
             chunk._derivedDirty = false;
             return;
         }
@@ -13686,13 +14112,21 @@ public partial class McWorld : UdonSharpBehaviour
         {
             chunk._torchBlockPackedPositions = new int[fullData.Length];
         }
+        if (chunk._ambientEmitterPacked == null || chunk._ambientEmitterPacked.Length < AMBIENT_EMITTER_CAP)
+        {
+            chunk._ambientEmitterPacked = new int[AMBIENT_EMITTER_CAP];
+        }
 
         chunk._crossBlockCount = 0;
         chunk._torchBlockCount = 0;
+        chunk._ambientEmitterCount = 0;
         chunk._isAllAir = true;
         chunk._hasWaterBlocks = false;
         chunk._hasEmissiveBlocks = false;
         chunk._hasTorchBlocks = false;
+        chunk._hasNonOpaqueContent = false;
+        chunk._isAllOpaqueSolid = false;
+        chunk._derivedSolidOpaqueCount = 0;
         chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
         chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
         chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
@@ -13717,6 +14151,10 @@ public partial class McWorld : UdonSharpBehaviour
                     if (blockID == 0) continue;
 
                     chunk._isAllAir = false;
+                    if (visibilityCache != null && blockID < visibilityCache.Length && visibilityCache[blockID] == BlockVisibilityType.Opaque)
+                        chunk._derivedSolidOpaqueCount = chunk._derivedSolidOpaqueCount + 1;
+                    else
+                        chunk._hasNonOpaqueContent = true;
                     if (!chunk._hasWaterBlocks && (_IsWaterBlock(blockID) || _IsLavaBlock(blockID)))
                     {
                         chunk._hasWaterBlocks = true;
@@ -13746,10 +14184,36 @@ public partial class McWorld : UdonSharpBehaviour
                     {
                         chunk._hasTorchBlocks = true;
                         chunk._torchBlockPackedPositions[chunk._torchBlockCount++] = (x << 16) | (y << 8) | z;
+                        // Torches (and lit redstone torches) emit ambient flame/smoke particles.
+                        if (blockID != BLOCK_REDSTONE_TORCH_OFF)
+                        {
+                            int aec = chunk._ambientEmitterCount;
+                            if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
+                            {
+                                chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
+                                chunk._ambientEmitterCount = aec + 1;
+                            }
+                        }
+                    }
+                    else if (blockID == BLOCK_FIRE || blockID == BLOCK_FURNACE_LIT || blockID == BLOCK_PORTAL
+                             || ((blockID == 10 || blockID == 11) && (y == chunkSizeY - 1 || fullData[idx + stride] == 0)))
+                    {
+                        // Ambient particle emitters: fire, lit furnace, portal, and lava cells with air
+                        // above (chunk-top lava re-checks air at emission time). Registry consumed by
+                        // McParticleManager instead of 1000 random GetBlock samples per frame.
+                        int aec = chunk._ambientEmitterCount;
+                        if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
+                        {
+                            chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
+                            chunk._ambientEmitterCount = aec + 1;
+                        }
                     }
                 }
             }
         }
+        chunk._isAllOpaqueSolid = !chunk._isAllAir
+            && chunk._derivedSolidOpaqueCount == chunkSizeY * chunkSizeXZ * chunkSizeXZ;
+        chunk._derivedForDataVersion = chunk._cachedDataVersion;
         chunk._derivedDirty = false;
     }
 
@@ -13781,12 +14245,18 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk._crossBlockPackedPositions = new int[fullData.Length];
             if (chunk._torchBlockPackedPositions == null || chunk._torchBlockPackedPositions.Length != fullData.Length)
                 chunk._torchBlockPackedPositions = new int[fullData.Length];
+            if (chunk._ambientEmitterPacked == null || chunk._ambientEmitterPacked.Length < AMBIENT_EMITTER_CAP)
+                chunk._ambientEmitterPacked = new int[AMBIENT_EMITTER_CAP];
             chunk._crossBlockCount = 0;
             chunk._torchBlockCount = 0;
+            chunk._ambientEmitterCount = 0;
             chunk._isAllAir = true;
             chunk._hasWaterBlocks = false;
             chunk._hasEmissiveBlocks = false;
             chunk._hasTorchBlocks = false;
+            chunk._hasNonOpaqueContent = false;
+            chunk._isAllOpaqueSolid = false;
+            chunk._derivedSolidOpaqueCount = 0;
             chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
             chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
             chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
@@ -13809,6 +14279,10 @@ public partial class McWorld : UdonSharpBehaviour
                     if (blockID == 0) continue;
 
                     chunk._isAllAir = false;
+                    if (visibilityCache != null && blockID < visibilityCache.Length && visibilityCache[blockID] == BlockVisibilityType.Opaque)
+                        chunk._derivedSolidOpaqueCount = chunk._derivedSolidOpaqueCount + 1;
+                    else
+                        chunk._hasNonOpaqueContent = true;
                     if (!chunk._hasWaterBlocks && (_IsWaterBlock(blockID) || _IsLavaBlock(blockID)))
                     {
                         chunk._hasWaterBlocks = true;
@@ -13837,11 +14311,41 @@ public partial class McWorld : UdonSharpBehaviour
                     {
                         chunk._hasTorchBlocks = true;
                         chunk._torchBlockPackedPositions[chunk._torchBlockCount++] = (x << 16) | (y << 8) | z;
+                        // Torches (and lit redstone torches) emit ambient flame/smoke particles.
+                        if (blockID != BLOCK_REDSTONE_TORCH_OFF)
+                        {
+                            int aec = chunk._ambientEmitterCount;
+                            if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
+                            {
+                                chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
+                                chunk._ambientEmitterCount = aec + 1;
+                            }
+                        }
+                    }
+                    else if (blockID == BLOCK_FIRE || blockID == BLOCK_FURNACE_LIT || blockID == BLOCK_PORTAL
+                             || ((blockID == 10 || blockID == 11) && (y == chunkSizeY - 1 || fullData[idx + stride] == 0)))
+                    {
+                        // Ambient particle emitters: fire, lit furnace, portal, and lava cells with air
+                        // above (chunk-top lava re-checks air at emission time). Registry consumed by
+                        // McParticleManager instead of 1000 random GetBlock samples per frame.
+                        int aec = chunk._ambientEmitterCount;
+                        if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
+                        {
+                            chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
+                            chunk._ambientEmitterCount = aec + 1;
+                        }
                     }
                 }
             }
         }
-        if (yEnd >= chunkSizeY) { chunk._derivedDirty = false; return true; }
+        if (yEnd >= chunkSizeY)
+        {
+            chunk._isAllOpaqueSolid = !chunk._isAllAir
+                && chunk._derivedSolidOpaqueCount == chunkSizeY * chunkSizeXZ * chunkSizeXZ;
+            chunk._derivedForDataVersion = chunk._cachedDataVersion;
+            chunk._derivedDirty = false;
+            return true;
+        }
         return false;
     }
 
@@ -15484,6 +15988,8 @@ public partial class McWorld : UdonSharpBehaviour
             if (enableDetailedTimings)
             {
                 logBuilder.AppendLine($"  Active processing: {stats_processActiveChunksTime:F2}ms total, reconciliation {stats_reconciliationTime:F2}ms total");
+                logBuilder.AppendLine($"  PAC phases (totals): maintain {stats_pacMaintainMs:F1}ms, lighting {stats_pacLightingMs:F1}ms, readback {stats_pacReadbackMs:F1}ms, datagen {stats_pacDataGenMs:F1}ms, nearMesh {stats_pacNearMeshMs:F1}ms, meshLoop {stats_pacMeshLoopMs:F1}ms, sweeps {stats_pacSweepsMs:F1}ms, secondary {stats_pacSecondaryMs:F1}ms");
+                logBuilder.AppendLine($"  Rebuild sources: healSweep {stats_rqHealSweep}, healImmediate {stats_rqHealImmediate}, healInterior {stats_rqHealInterior}, followup {stats_rqFollowup}, neighborTriggers {stats_rqNeighborTrigger}");
                 if (stats_finalizeCount > 0)
                     logBuilder.AppendLine($"  Chunk finalize (per chunk, {stats_finalizeCount} done): slice {stats_finalizeSliceTime / stats_finalizeCount:F2}ms, derived {stats_finalizeDerivedTime / stats_finalizeCount:F2}ms, gpuSync {stats_finalizeGpuSyncTime / stats_finalizeCount:F2}ms");
                 logBuilder.AppendLine($"  StepGen breakdown (totals): genChecks {stats_stepGenChecksTime:F2}ms, residentComplete {stats_stepResidentCompleteTime:F2}ms ({stats_stepFastPathCount} fast), finalizeTail {stats_stepFinalizeTailTime:F2}ms ({stats_stepFullCompleteCount} full)");
@@ -15677,6 +16183,19 @@ public partial class McWorld : UdonSharpBehaviour
         stats_updateTimeMax = 0f;
         stats_budgetExceededCount = 0;
         stats_processActiveChunksTime = 0f;
+        stats_pacMaintainMs = 0f;
+        stats_pacLightingMs = 0f;
+        stats_pacReadbackMs = 0f;
+        stats_pacDataGenMs = 0f;
+        stats_pacNearMeshMs = 0f;
+        stats_pacMeshLoopMs = 0f;
+        stats_pacSweepsMs = 0f;
+        stats_pacSecondaryMs = 0f;
+        stats_rqHealSweep = 0;
+        stats_rqHealImmediate = 0;
+        stats_rqHealInterior = 0;
+        stats_rqFollowup = 0;
+        stats_rqNeighborTrigger = 0;
         stats_reconciliationTime = 0f;
         stats_dataGenActiveSamplesTotal = 0;
         stats_meshingActiveSamplesTotal = 0;

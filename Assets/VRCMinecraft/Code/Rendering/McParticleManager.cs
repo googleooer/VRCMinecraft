@@ -253,31 +253,95 @@ public class McParticleManager : UdonSharpBehaviour
     // MC randomDisplayTick — ambient block particles
     // ════════════════════════════════════════════════════════════════
 
-    // MC World.randomDisplayUpdates runs 1000 samples per FRAME (called from
-    // the render loop, not the tick loop) using a triangular distribution that
-    // concentrates sampling near the player.
+    // MC World.randomDisplayUpdates runs 1000 samples per FRAME (called from the render loop, not
+    // the tick loop) using a triangular distribution that concentrates sampling near the player.
+    //
+    // PERF REWRITE: the literal port (1000 iterations x cross-behaviour world.GetBlock) cost
+    // 25-80ms/frame in the Udon VM. Instead we walk the per-chunk ambient-emitter registry that
+    // McWorld's derived-data scan collects (torch/fire/lava-surface/lit-furnace/redstone-torch-on/
+    // portal) and fire each emitter with EXACTLY the probability MC's sampling would have hit it:
+    //   P(hit emitter at offset dx,dy,dz) = 1000 * w(|dx|) * w(|dy|) * w(|dz|)
+    //   where w(d) = (16-d)/256 = P[rand16 - rand16 == d]  (per-axis triangular weight)
+    // Statistically identical particle output; cost scales with actual emitters in range (usually
+    // a few dozen) instead of 1000 blind samples. deltaTime-scaled so the per-second rate matches
+    // MC running at ambientParticleReferenceFps regardless of our frame rate.
+    [Header("Ambient Particles")]
+    public float ambientParticleReferenceFps = 60f;
+    private const float AMBIENT_P_SCALE = 1000f / 16777216f; // 1000 * (1/256)^3 shared factor
+    private const int AMBIENT_MAX_ITER_PER_CHUNK = 96;       // Poisson-thinning cap for dense chunks
+
     void _RandomDisplayTick()
     {
         if (world == null) return;
+        ChunkData[] chunks = world.chunks_1D;
+        if (chunks == null) return;
 
         Vector3 ppos = localPlayer.GetPosition();
         int px = Mathf.FloorToInt(ppos.x);
         int py = Mathf.FloorToInt(ppos.y);
         int pz = Mathf.FloorToInt(ppos.z);
 
-        for (int i = 0; i < 1000; i++)
+        // Chunk-index math mirrors McWorld.GetChunkAt (fields read once per frame; element access
+        // on the cached array reference is local, no cross-behaviour calls in the loop).
+        int offX = world.chunkOffsetX, offY = world.chunkOffsetY, offZ = world.chunkOffsetZ;
+        int dimX = world.worldDimensionX, dimY = world.worldDimensionY, dimZ = world.worldDimensionZ;
+
+        float frameScale = Time.deltaTime * ambientParticleReferenceFps;
+        if (frameScale > 4f) frameScale = 4f; // hitch guard: never burst more than ~4 frames worth
+        float pShared = AMBIENT_P_SCALE * frameScale;
+
+        // The +/-15 sample box spans at most the 3x3x3 chunk neighborhood around the player.
+        int pcx = px >> 4, pcy = py >> 4, pcz = pz >> 4;
+        for (int dcy = -1; dcy <= 1; dcy++)
         {
-            // Triangular distribution matching MC's rand.nextInt(16) - rand.nextInt(16)
-            int rx = px + Random.Range(0, 16) - Random.Range(0, 16);
-            int ry = py + Random.Range(0, 16) - Random.Range(0, 16);
-            int rz = pz + Random.Range(0, 16) - Random.Range(0, 16);
+            int ay = pcy + dcy + offY;
+            if (ay < 0 || ay >= dimY) continue;
+            for (int dcz = -1; dcz <= 1; dcz++)
+            {
+                int az = pcz + dcz + offZ;
+                if (az < 0 || az >= dimZ) continue;
+                for (int dcx = -1; dcx <= 1; dcx++)
+                {
+                    int ax = pcx + dcx + offX;
+                    if (ax < 0 || ax >= dimX) continue;
+                    ChunkData chunk = chunks[(az * dimX * dimY) + (ay * dimX) + ax];
+                    if (chunk == null || !chunk.isDataReady) continue;
+                    int ec = chunk._ambientEmitterCount;
+                    if (ec <= 0) continue;
+                    int[] packed = chunk._ambientEmitterPacked;
+                    if (packed == null) continue;
 
-            if (ry < 0 || ry >= 128) continue;
+                    int baseX = (pcx + dcx) << 4;
+                    int baseY = (pcy + dcy) << 4;
+                    int baseZ = (pcz + dcz) << 4;
 
-            byte blockId = (byte)(world.GetBlock(rx, ry, rz) & 0xFF);
-            if (blockId == 0) continue;
-
-            _BlockRandomDisplayTick(blockId, rx, ry, rz);
+                    // Dense chunks (lava-lake surfaces): Poisson-thin — visit a random subset and
+                    // boost each visit's probability by the skipped fraction. Same expected rate.
+                    int iter = ec;
+                    float boost = 1f;
+                    bool subsample = false;
+                    if (ec > AMBIENT_MAX_ITER_PER_CHUNK)
+                    {
+                        iter = AMBIENT_MAX_ITER_PER_CHUNK;
+                        boost = ec / (float)AMBIENT_MAX_ITER_PER_CHUNK;
+                        subsample = true;
+                    }
+                    for (int i = 0; i < iter; i++)
+                    {
+                        int p = subsample ? packed[Random.Range(0, ec)] : packed[i];
+                        int wx = baseX + ((p >> 16) & 0xFF);
+                        int wy = baseY + ((p >> 8) & 0xFF);
+                        int wz = baseZ + (p & 0xFF);
+                        int adx = wx - px; if (adx < 0) adx = -adx;
+                        int ady = wy - py; if (ady < 0) ady = -ady;
+                        int adz = wz - pz; if (adz < 0) adz = -adz;
+                        if (adx > 15 || ady > 15 || adz > 15) continue;
+                        float prob = pShared * boost * ((16 - adx) * (16 - ady) * (16 - adz));
+                        if (Random.value >= prob) continue;
+                        _BlockRandomDisplayTick((byte)((p >> 24) & 0xFF), wx, wy, wz);
+                    }
+                }
+            }
         }
     }
 

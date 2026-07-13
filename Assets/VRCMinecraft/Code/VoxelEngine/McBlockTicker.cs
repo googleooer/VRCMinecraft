@@ -22,16 +22,18 @@ public class McBlockTicker : UdonSharpBehaviour
     private McBlockTypeManager blockTypeManager;
 
     [Header("Performance Tuning")]
-    [Tooltip("Max scheduled ticks to process per frame")]
-    public int scheduledTickBudget = 200;
-    [Tooltip("Max time in ms for scheduled tick processing per frame")]
-    public float scheduledTickTimeBudgetMs = 2.0f;
-    [Tooltip("Chunks to scan for random ticks per frame")]
-    public int randomTickChunksPerFrame = 4;
-    [Tooltip("Random voxel picks per chunk (MC uses 80 per section)")]
-    public int randomTicksPerChunk = 20;
-    [Tooltip("Max time in ms for random tick processing per frame")]
-    public float randomTickTimeBudgetMs = 1.0f;
+    // CODE-OWNED TUNING: [System.NonSerialized] so the code initializers are authoritative and
+    // scene/inspector values can't silently override tuning changes (see McWorld counterparts).
+    // Max scheduled ticks to process per frame
+    [System.NonSerialized] public int scheduledTickBudget = 200;
+    // Max time in ms for scheduled tick processing per frame
+    [System.NonSerialized] public float scheduledTickTimeBudgetMs = 2.0f;
+    // Chunks to scan for random ticks per frame
+    [System.NonSerialized] public int randomTickChunksPerFrame = 4;
+    // Random voxel picks per chunk (MC uses 80 per section)
+    [System.NonSerialized] public int randomTicksPerChunk = 20;
+    // Max time in ms for random tick processing per frame
+    [System.NonSerialized] public float randomTickTimeBudgetMs = 1.0f;
     [Tooltip("Enable block tick processing")]
     public bool enableBlockTicks = true;
 

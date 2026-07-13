@@ -333,21 +333,45 @@ public class McMovement : NUMovement
         }
     }
 
+    // Env-sensing cache: the ~18 cross-behaviour world samples below are pure functions of the
+    // player position and nearby block state. Standing still with no block edits, last frame's
+    // inWater/inLava/onLadder/inWeb/blockBelowId/groundSlipperiness are still exact — skip the
+    // resample. A periodic forced refresh covers chunk data streaming in without a SetBlock.
+    private Vector3 _lastEnvBasePos = new Vector3(float.MinValue, 0f, 0f);
+    private int _lastEnvEditCounter = -1;
+    private int _envRefreshCountdown = 0;
+
     private void UpdateEnvironmentState()
     {
+        if (world == null)
+        {
+            inWater = false;
+            inLava = false;
+            onLadder = false;
+            inWeb = false;
+            blockBelowId = 0;
+            groundSlipperiness = DEFAULT_SLIPPERINESS;
+            return;
+        }
+
+        Vector3 basePos = transform.position + Controller.center;
+
+        int editCounter = world.worldEditCounter;
+        _envRefreshCountdown = _envRefreshCountdown - 1;
+        if (basePos == _lastEnvBasePos && editCounter == _lastEnvEditCounter && _envRefreshCountdown > 0)
+        {
+            return; // stationary, no edits: every env value from last frame is still exact
+        }
+        _lastEnvBasePos = basePos;
+        _lastEnvEditCounter = editCounter;
+        _envRefreshCountdown = 10;
+
         inWater = false;
         inLava = false;
         onLadder = false;
         inWeb = false;
         blockBelowId = 0;
         groundSlipperiness = DEFAULT_SLIPPERINESS;
-
-        if (world == null)
-        {
-            return;
-        }
-
-        Vector3 basePos = transform.position + Controller.center;
         float radius = Controller.radius;
         float halfHeight = Controller.height * 0.5f;
         float feetY = basePos.y - halfHeight - 0.01f;
@@ -627,7 +651,9 @@ public class McMovement : NUMovement
 
     private int GetEffectiveFlowDecay(int x, int y, int z, bool water)
     {
-        byte b = world.GetBlock(x, y, z);
+        // One combined chunk resolve instead of two (GetBlock + GetBlockMetadata each re-resolved
+        // the same chunk — 2 cross-behaviour chains per probed voxel while swimming).
+        byte b = world.GetBlockAndMeta(x, y, z);
         if (water)
         {
             if (b != (byte)BlockMaterial.WATER && b != (byte)BlockMaterial.STATIONARY_WATER) return -1;
@@ -636,7 +662,7 @@ public class McMovement : NUMovement
         {
             if (b != (byte)BlockMaterial.LAVA && b != (byte)BlockMaterial.STATIONARY_LAVA) return -1;
         }
-        int meta = world.GetBlockMetadata(x, y, z);
+        int meta = world.lastMetaResult;
         if (meta >= 8) meta = 0;
         return meta;
     }

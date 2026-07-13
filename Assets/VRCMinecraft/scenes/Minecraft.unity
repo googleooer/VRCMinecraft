@@ -1144,6 +1144,7 @@ MonoBehaviour:
   gpuRaycastMaterial: {fileID: 2100000, guid: e7f6dac650581b542bad78665f32650c, type: 2}
   gpuRaycastHitInfoRT: {fileID: 8400000, guid: 374f4e5b8c683f94f9d0bc4ed16e208d, type: 2}
   gpuRaycastHitPosRT: {fileID: 8400000, guid: b896477108abb2c40a39fdcc8148143f, type: 2}
+  enableGpuRaycastExperiment: 0
 --- !u!4 &185524277
 Transform:
   m_ObjectHideFlags: 0
@@ -14809,11 +14810,6 @@ MonoBehaviour:
   _udonSharpBackingUdonBehaviour: {fileID: 663259473}
   world: {fileID: 1596987940}
   blockTypeManager: {fileID: 1410233257}
-  scheduledTickBudget: 200
-  scheduledTickTimeBudgetMs: 2
-  randomTickChunksPerFrame: 4
-  randomTicksPerChunk: 20
-  randomTickTimeBudgetMs: 1
   enableBlockTicks: 1
   fallingBlockPool:
   - {fileID: 1607031009}
@@ -58074,25 +58070,14 @@ MonoBehaviour:
   chunkSizeXZ: 16
   chunkSizeY: 16
   chunkPrefab: {fileID: 1697751968}
-  chunkGoPrewarmPerFrame: 24
   useBoxColliderCollision: 1
   voxelColliderPrefab: {fileID: 3210786987275447709, guid: 5a29cf2fc7726fc4797e0966f89485e7,
     type: 3}
   collisionGridRadiusXZ: 2
   collisionGridDown: 6
   collisionGridUp: 3
-  chunkGoRecycleScanPerFrame: 32
-  meshStepTimeBudgetMs: 15
-  updateTimeBudgetMs: 22
-  loadPhaseUpdateBudgetMs: 6
   debugTerrainChecksum: 0
   nearRegionRadius: 8
-  gpuMeshDecodeStepBudgetMs: 5
-  gpuMeshDecodeStepsPerFrame: 2
-  gpuMeshDecodeFrameBudgetMs: 5
-  gpuNearMeshDecodeFrameBudgetMs: 5
-  gpuWorldgenStepBudgetMs: 2
-  gpuWorldgenStepsPerFrame: 2
   prioritizeVisibleShellMeshing: 1
   shellMeshPriorityRadiusXZ: 2
   shellMeshPriorityRadiusY: 1
@@ -58101,21 +58086,11 @@ MonoBehaviour:
   renderDistanceChunksMobile: 4
   dataGenRenderDistanceMarginChunks: 2
   requireAllNeighborsForMesh: 1
-  deferredInteriorMeshRequestsPerFrame: 8
-  deferredInteriorMeshScanCountPerFrame: 256
   deferFarChunkSecondaryWork: 1
   nearOnlyChunkColliders: 1
   colliderPriorityRadiusXZ: 2
   colliderPriorityRadiusY: 1
   colliderPriorityBelowRadiusY: 3
-  nearColliderUpdatesPerFrame: 8
-  deferredSecondaryWorkTasksPerFrame: 2
-  deferredSecondaryWorkScanCountPerFrame: 64
-  enableAdaptiveBudgets: 1
-  adaptiveFrameHeadroomMs: 1.5
-  adaptiveBudgetRecoverRate: 0.08
-  adaptiveBudgetBackoffRate: 0.2
-  adaptiveBudgetMinScale: 0.65
   terrainGenerator: {fileID: 660800870}
   extraGenerators: []
   blockTypeManager: {fileID: 1410233257}
@@ -58128,10 +58103,6 @@ MonoBehaviour:
   ambientOcclusion: 1
   enableVerboseLogging: 0
   enableGpuVoxelBackend: 1
-  gpuChunkSlotCapacity: 1023
-  gpuLightingIterationsPerUpdate: 15
-  gpuLightingTotalIterations: 15
-  gpuResidentSyncsPerFrame: 32
   useCompactGpuFaceExport: 1
   enableBatchedFaceReadback: 0
   useBakedVertexAo: 0
@@ -58174,7 +58145,7 @@ MonoBehaviour:
   gpuInstancedRenderRadius: 8
   gpuInstancedRenderRadiusY: 8
   enableGpuDebugHud: 1
-  showGpuDebugHudOnStart: 1
+  showGpuDebugHudOnStart: 0
   gpuDebugHudDistance: 0.85
   gpuDebugHudLocalOffset: {x: 0, y: -0.08, z: 0}
   gpuDebugHudEulerOffset: {x: 0, y: 0, z: 0}
@@ -58194,6 +58165,7 @@ MonoBehaviour:
   enableCounters: 0
   enableCacheTracking: 0
   aggregateLogInterval: 300
+  collisionGridSafetyRescanFrames: 30
   cpuMirrorRadiusXZ: 5
   cpuMirrorRadiusY: 3
   gpuSetBlockChainMaterial: {fileID: 2100000, guid: b1073cb9b08d4854fad69e8bdd675c87,
@@ -58548,6 +58520,7 @@ MonoBehaviour:
   blockParticleAtlas: {fileID: 2800000, guid: 6485a766d7fd4fb49acc3e26e98e1205, type: 3}
   blockTypeManager: {fileID: 1410233257}
   world: {fileID: 1596987940}
+  ambientParticleReferenceFps: 60
 --- !u!82 &1615954563
 AudioSource:
   m_ObjectHideFlags: 0
