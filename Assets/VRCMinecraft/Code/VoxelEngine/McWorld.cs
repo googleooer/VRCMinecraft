@@ -1172,6 +1172,11 @@ public partial class McWorld : UdonSharpBehaviour
         for (int i = 0; i < totalWorldChunks; i++) gpuChunkIndexToSlot[i] = -1;
         for (int i = 0; i < totalWorldChunks; i++) gpuChunkSyncedDataVersion[i] = -1;
         for (int i = 0; i < gpuChunkSlotCapacity; i++) gpuSlotToChunkIndex[i] = -1;
+        // SLOT FREE-STACK: O(1) allocation. Descending fill so the first pop is slot 0 (matches
+        // the old first-free-lowest scan order).
+        gpuSlotFreeStack = new int[gpuChunkSlotCapacity];
+        gpuSlotFreeCount = gpuChunkSlotCapacity;
+        for (int i = 0; i < gpuChunkSlotCapacity; i++) gpuSlotFreeStack[i] = gpuChunkSlotCapacity - 1 - i;
 
         gpuSlotLookupPixels = new Color32[worldDimensionX * worldDimensionY * worldDimensionZ];
         gpuSlotMetaPixels = new Color32[gpuChunkSlotCapacity];
@@ -1633,17 +1638,67 @@ public partial class McWorld : UdonSharpBehaviour
         }
 
         int targetSlot = -1;
-        for (int i = 0; i < gpuChunkSlotCapacity; i++)
+        // SLOT FREE-STACK: O(1) pop replaces the old O(capacity) linear free scan (which grew with
+        // occupancy during load and cost ~0.5-3ms per assignment mid-load).
+        while (gpuSlotFreeCount > 0)
         {
-            if (gpuSlotToChunkIndex[i] == -1)
+            int cand = gpuSlotFreeStack[gpuSlotFreeCount - 1];
+            gpuSlotFreeCount = gpuSlotFreeCount - 1;
+            if (cand >= 0 && cand < gpuChunkSlotCapacity && gpuSlotToChunkIndex[cand] == -1)
             {
-                targetSlot = i;
+                targetSlot = cand;
                 break;
             }
         }
 
         if (targetSlot == -1)
         {
+            // BATCH EVICTION: once the atlas is full, the old code ran a full capacity scan (with a
+            // user-method protection call per occupied slot, ~10-30ms) on EVERY assignment. Instead,
+            // ONE scan (protection check inlined) harvests up to GPU_SLOT_EVICT_BATCH clearly-far
+            // victims into the free stack, amortizing the scan over the next ~32 assignments.
+            int rrProt = _activeRenderDistanceChunks * _activeRenderDistanceChunks;
+            int farR = _activeRenderDistanceChunks + 2;
+            int farRR = farR * farR;
+            int harvested = 0;
+            for (int i = 0; i < gpuChunkSlotCapacity; i++)
+            {
+                if (harvested >= GPU_SLOT_EVICT_BATCH) break;
+                int residentChunkIndex = gpuSlotToChunkIndex[i];
+                ChunkData residentChunk = (residentChunkIndex >= 0 && residentChunkIndex < totalWorldChunks)
+                    ? chunks_1D[residentChunkIndex] : null;
+                if (residentChunk != null)
+                {
+                    int ddx = residentChunk.chunkX_world - gpuResidentCenterChunkX;
+                    int ddz = residentChunk.chunkZ_world - gpuResidentCenterChunkZ;
+                    int dist = ddx * ddx + ddz * ddz;
+                    if (dist <= rrProt) continue;  // protected: within render distance, never evict
+                    if (dist <= farRR) continue;   // unprotected but near — prefer clearly-far victims
+                    _GpuSetSlotLookupPixel(residentChunk.chunkX_world + chunkOffsetX,
+                        residentChunk.chunkY_world + chunkOffsetY,
+                        residentChunk.chunkZ_world + chunkOffsetZ, 0, false);
+                }
+                if (residentChunkIndex >= 0 && residentChunkIndex < totalWorldChunks)
+                {
+                    gpuChunkIndexToSlot[residentChunkIndex] = -1;
+                    gpuChunkSyncedDataVersion[residentChunkIndex] = -1;
+                }
+                gpuSlotToChunkIndex[i] = -1;
+                gpuSlotFreeStack[gpuSlotFreeCount] = i;
+                gpuSlotFreeCount = gpuSlotFreeCount + 1;
+                harvested++;
+            }
+            if (harvested > 0)
+            {
+                gpuSlotLookupDirty = true;
+                gpuSlotFreeCount = gpuSlotFreeCount - 1;
+                targetSlot = gpuSlotFreeStack[gpuSlotFreeCount];
+            }
+        }
+
+        if (targetSlot == -1)
+        {
+            // No clearly-far victim found — fall back to the original farthest-unprotected scan.
             // No free slot: evict the chunk FARTHEST from the player (greatest XZ distance from the
             // resident center) that is NOT protected — i.e. outside the render-distance disc. This
             // keeps every on-screen chunk lit; only far/off-screen chunks ever lose a slot. With
@@ -2106,29 +2161,65 @@ public partial class McWorld : UdonSharpBehaviour
         _GpuOverlayTextureIntoAtlas(gpuUploadBlockTexture, ref gpuBlockAtlas, ref gpuBlockAtlasScratch);
         gpuAtlasOverlayMaterial.SetFloat(gpuPropOverlayPackedWidthId, 0f);
 
-        if (useCompactGpuFaceExport && gpuFaceOccupancyUploadTexture != null && gpuFaceOccupancyAtlas != null && gpuFaceOccupancyAtlasScratch != null)
+        // OCCUPANCY ON-DEMAND: the occupancy bitmask build was a 6,144-iteration Udon loop + 384
+        // Color32 allocations + SetPixels32/Apply per sync (~3-6ms), yet its ONLY consumer is the
+        // GpuVoxelFaceExtract shader — which never dispatches in the instanced-render config
+        // ('face extract 0' in every perf log). Just mark the slot stale here; the build runs
+        // lazily in _GpuEnsureOccupancyForSlot right before an extraction actually dispatches.
+        if (gpuSlotOccupancyVersion != null && slotIndex >= 0 && slotIndex < gpuSlotOccupancyVersion.Length)
         {
-            _GpuBuildFaceOccupancyUpload(blockData);
-#if LOGGING
-            uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
-#endif
-            gpuFaceOccupancyUploadTexture.SetPixels32(gpuFaceOccupancyUploadPixels);
-            gpuFaceOccupancyUploadTexture.Apply(false, false);
-#if LOGGING
-            if (enableDetailedTimings)
-            {
-                stats_gpuFaceOccupancyUploads++;
-                stats_gpuFaceOccupancyUploadTime += (Time.realtimeSinceStartup - uploadStart) * 1000f;
-                stats_gpuFaceOccupancyUploadBytes += gpuFaceOccupancyUploadPixels.Length * 4;
-            }
-#endif
-            gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetFaceOccupancySlotRect(slotIndex));
-            _GpuOverlayTextureIntoAtlas(gpuFaceOccupancyUploadTexture, ref gpuFaceOccupancyAtlas, ref gpuFaceOccupancyAtlasScratch);
+            gpuSlotOccupancyVersion[slotIndex] = -1;
         }
 
         gpuChunkSyncedDataVersion[chunkIndex] = chunk._cachedDataVersion;
         _GpuRequestLightingRebuild();
         _GpuPublishGlobals();
+    }
+
+    // OCCUPANCY ON-DEMAND: per-slot data version the occupancy atlas currently holds (-1 = stale).
+    private int[] gpuSlotOccupancyVersion;
+
+    // SLOT FREE-STACK: free slot indices for O(1) allocation; refilled by batch eviction.
+    private int[] gpuSlotFreeStack;
+    private int gpuSlotFreeCount = 0;
+    private const int GPU_SLOT_EVICT_BATCH = 32;
+
+    // Build + upload + blit the occupancy slot for slotIndex if it is stale. Called only from the
+    // face-extraction dispatch paths (cold in the instanced-render config), so the 6,144-iteration
+    // Udon pack loop no longer taxes every chunk sync.
+    private void _GpuEnsureOccupancyForSlot(int slotIndex)
+    {
+        if (!useCompactGpuFaceExport || gpuFaceOccupancyUploadTexture == null
+            || gpuFaceOccupancyAtlas == null || gpuFaceOccupancyAtlasScratch == null) return;
+        if (slotIndex < 0 || slotIndex >= gpuChunkSlotCapacity) return;
+        if (gpuSlotOccupancyVersion == null) gpuSlotOccupancyVersion = new int[gpuChunkSlotCapacity];
+
+        int chunkIndex = gpuSlotToChunkIndex[slotIndex];
+        if (chunkIndex < 0 || chunks_1D == null || chunkIndex >= chunks_1D.Length) return;
+        ChunkData chunk = chunks_1D[chunkIndex];
+        if (chunk == null || !chunk.isDataReady) return;
+        if (gpuSlotOccupancyVersion[slotIndex] == chunk._cachedDataVersion && chunk._cachedDataVersion != 0) return;
+
+        byte[] blockData = _GetDecompressedData(chunk);
+        if (blockData == null) return;
+
+        _GpuBuildFaceOccupancyUpload(blockData);
+#if LOGGING
+        float occUploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
+        gpuFaceOccupancyUploadTexture.SetPixels32(gpuFaceOccupancyUploadPixels);
+        gpuFaceOccupancyUploadTexture.Apply(false, false);
+#if LOGGING
+        if (enableDetailedTimings)
+        {
+            stats_gpuFaceOccupancyUploads++;
+            stats_gpuFaceOccupancyUploadTime += (Time.realtimeSinceStartup - occUploadStart) * 1000f;
+            stats_gpuFaceOccupancyUploadBytes += gpuFaceOccupancyUploadPixels.Length * 4;
+        }
+#endif
+        gpuAtlasOverlayMaterial.SetVector(gpuPropOverlayRectId, _GpuGetFaceOccupancySlotRect(slotIndex));
+        _GpuOverlayTextureIntoAtlas(gpuFaceOccupancyUploadTexture, ref gpuFaceOccupancyAtlas, ref gpuFaceOccupancyAtlasScratch);
+        gpuSlotOccupancyVersion[slotIndex] = chunk._cachedDataVersion;
     }
 
     private void _GpuUpdateResidentCenterFromPlayer()
@@ -2860,8 +2951,8 @@ public partial class McWorld : UdonSharpBehaviour
     // 4 rows = 1024 voxels ≈ 2-4ms per step; the meshing loop's deadline checks between steps can
     // now actually bound the frame.
     private const int GPU_PREP_DERIVED_SLICE_Y = 4;
-    // One watery-chunk stage-2 (atomic CPU fluid mesh build) allowed per frame; reset each Update.
-    private bool _gpuPrepFluidBudgetUsed = false;
+    // Stage-3 fluid build: z-rows of _AddWaterBlocks per step (2 rows = 32 columns ≈ 1-4ms).
+    private const int GPU_PREP_FLUID_SLICE_Z = 2;
     // Rotating cursor for the meshing starvation-rescue lane (see ProcessActiveChunks).
     private int _meshRescueCursor = 0;
     private void _StepGpuChunkPrep(ChunkData chunk)
@@ -2910,11 +3001,58 @@ public partial class McWorld : UdonSharpBehaviour
             return;
         }
 
-        // stage 2: finish — biome colours + opaque/cutout render assign + CPU fluid mesh.
-        // FLUID FRAME CAP: the CPU fluid mesh build inside this stage is atomic and can cost
-        // 10-30ms for watery chunks — several landing in one frame caused the 100-200ms load
-        // spikes. Allow at most ONE watery-chunk stage-2 per frame; others retry next frame.
-        if (chunk._hasWaterBlocks && _gpuPrepFluidBudgetUsed) return;
+        if (chunk._gpuPrepStage == 3)
+        {
+            // Stage 3: TIME-SLICED fluid mesh build (was a 10-30ms atomic step for ocean chunks,
+            // rate-limited to one chunk per frame — which serialized ocean streaming).
+            MeshFilter fluidMf = chunk.transparentMeshFilter;
+            if (chunk._gpuFluidZCursor < 0)
+            {
+                // Setup: detach the shared voxel mesh, grab pool slot + neighbor decomp caches.
+                if (fluidMf != null && fluidMf.sharedMesh == gpuVoxelChunkMesh) fluidMf.sharedMesh = null;
+                byte[] fluidData = _GetDecompressedData(chunk);
+                if (fluidData == null)
+                {
+                    _GpuFinishChunkPrep(chunk); // data gone (eviction) — finish; sweeps re-arm if needed
+                    return;
+                }
+                if (!_AcquireMeshPool(chunk)) return; // pool busy — retry next step (rescue lane guarantees progress)
+                chunk._transparentVertexCount = 0;
+                chunk._transparentTriangleCount = 0;
+                ChunkData[] fluidNeighbors = _GetCachedNeighbors(chunk);
+                chunk.neighborPX = fluidNeighbors[0]; chunk.neighborNX = fluidNeighbors[1];
+                chunk.neighborPY = fluidNeighbors[2]; chunk.neighborNY = fluidNeighbors[3];
+                chunk.neighborPZ = fluidNeighbors[4]; chunk.neighborNZ = fluidNeighbors[5];
+                _DecompressNeighborsOnce(chunk);
+                chunk._gpuFluidZCursor = 0;
+                return;
+            }
+            if (chunk._gpuFluidZCursor < chunkSizeXZ)
+            {
+                _AddWaterBlocksSliced(chunk, chunk._gpuFluidZCursor, GPU_PREP_FLUID_SLICE_Z);
+                chunk._gpuFluidZCursor = chunk._gpuFluidZCursor + GPU_PREP_FLUID_SLICE_Z;
+                if (chunk._gpuFluidZCursor < chunkSizeXZ) return;
+            }
+            // Final: apply the water mesh, restore the water material, release everything.
+            _ApplyDataToMesh(fluidMf, chunk._transparentVertices, chunk._transparentTriangles,
+                chunk._transparentUVs, chunk._transparentNormals, chunk._transparentColors,
+                chunk._transparentVertexCount, chunk._transparentTriangleCount);
+            if (chunk.transparentRenderer != null && sharedTransparentChunkMaterial != null)
+                chunk.transparentRenderer.sharedMaterial = sharedTransparentChunkMaterial;
+            chunk.neighborPX = null; chunk.neighborNX = null;
+            chunk.neighborPY = null; chunk.neighborNY = null;
+            chunk.neighborPZ = null; chunk.neighborNZ = null;
+            chunk._decompSelf = null;
+            chunk._decompNX = null; chunk._decompPX = null;
+            chunk._decompNY = null; chunk._decompPY = null;
+            chunk._decompNZ = null; chunk._decompPZ = null;
+            _ReleaseMeshPool(chunk);
+            _GpuFinishChunkPrep(chunk);
+            return;
+        }
+
+        // stage 2: biome colours + opaque/cutout render assign; watery chunks continue into the
+        // TIME-SLICED stage-3 fluid build instead of paying it atomically here.
         // NO-HOLES guard: if the GameObject/renderer is gone (recycled mid-prep or a pool failure),
         // do NOT complete unrendered — re-defer so it re-acquires a GameObject and actually renders.
         if (chunk.gameObject == null || chunk.opaqueRenderer == null)
@@ -2926,7 +3064,6 @@ public partial class McWorld : UdonSharpBehaviour
             if (ciMissing != -1) MarkChunkMeshDeferred(ciMissing);
             return;
         }
-        if (chunk._hasWaterBlocks) _gpuPrepFluidBudgetUsed = true;
         _StoreBiomeData(chunk);
         Texture2D biomeTex = _GpuGetCpuBiomeTex(chunk);
         if (biomeTex != null)
@@ -2965,19 +3102,42 @@ public partial class McWorld : UdonSharpBehaviour
             chunk.cutoutMeshFilter.sharedMesh = null;
             if (chunk.cutoutRenderer != null) chunk.cutoutRenderer.enabled = false;
         }
-        _GpuBuildAndApplyFluidMesh(chunk);
+        if (chunk._hasWaterBlocks)
+        {
+            // Watery chunk: fluid mesh builds sliced in stage 3 (setup on the next step).
+            chunk._gpuFluidZCursor = -1;
+            chunk._gpuPrepStage = 3;
+            return;
+        }
+        _GpuHideFluidMesh(chunk);
+        _GpuFinishChunkPrep(chunk);
+    }
+
+    // Hide/clear any stale fluid mesh on a dry chunk's transparent filter (never Clear() the
+    // shared voxel mesh — detach it instead).
+    private void _GpuHideFluidMesh(ChunkData chunk)
+    {
+        MeshFilter tmf = chunk.transparentMeshFilter;
+        if (tmf == null) return;
+        if (tmf.sharedMesh == gpuVoxelChunkMesh) tmf.sharedMesh = null;
+        else if (tmf.sharedMesh != null) tmf.sharedMesh.Clear();
+        tmf.gameObject.SetActive(false);
+    }
+
+    // Shared prep-completion: called by stage 2 (dry chunks) and stage 3 (after the fluid apply).
+    // REBUILD-STORM FIX: the instanced render samples neighbors from the GPU atlas at draw time,
+    // so it has NO air-assumed-border defect — clear any stale _borderMissingMask or the border-
+    // heal sweeps re-request this chunk forever.
+    private void _GpuFinishChunkPrep(ChunkData chunk)
+    {
         chunk._isGpuMeshRendered = true;
         chunk._isInstancedRendered = true;
         chunk._renderMeshApplied = true; // NO-HOLES: a render mesh is now applied
-        // REBUILD-STORM FIX: the instanced render samples neighbors from the GPU atlas at draw
-        // time, so it has NO air-assumed-border defect — a stale _borderMissingMask from an old
-        // CPU/face build must be cleared here. Leaving it set made the border-heal sweep
-        // re-request this chunk forever (mask never cleared by this path), which snowballed into
-        // the rebuild storm (652 rebuilds/window) that starved datagen and froze world loading.
         chunk._borderMissingMask = 0;
         chunk.isMeshDeferred = false;
         chunk._gpuPrepActive = false;
         chunk._gpuPrepData = null;
+        chunk._gpuFluidZCursor = -1;
         chunk.isBuildingMesh = false;
     }
 
@@ -3019,6 +3179,10 @@ public partial class McWorld : UdonSharpBehaviour
     {
         if (!_GpuFaceExtractionReady() || bufferIndex < 0 || bufferIndex >= gpuFaceReadbackTextures.Length) return;
         if (gpuBorderTextures == null || bufferIndex >= gpuBorderTextures.Length || gpuBorderTextures[bufferIndex] == null) return;
+
+        // OCCUPANCY ON-DEMAND: the extract shader reads the occupancy atlas — make sure this
+        // slot's occupancy is current before dispatching (syncs no longer build it eagerly).
+        _GpuEnsureOccupancyForSlot(slotIndex);
 
         gpuFaceExtractMaterial.SetFloat(gpuPropFaceModeId, 1f);
         gpuFaceExtractMaterial.SetFloat(gpuPropFaceReadSlotId, slotIndex);
@@ -3261,6 +3425,8 @@ public partial class McWorld : UdonSharpBehaviour
             }
             if (slotIndex >= 0)
             {
+                // OCCUPANCY ON-DEMAND: batch extraction reads the occupancy atlas too.
+                _GpuEnsureOccupancyForSlot(slotIndex);
                 chunk._gpuFaceSlotIndex = slotIndex;
                 gpuFaceReadbackSlots[buf] = slotIndex;
                 gpuBatchBuffers[rt][j] = buf;
@@ -4969,13 +5135,23 @@ public partial class McWorld : UdonSharpBehaviour
     // CHUNK GO POOL: scan chunks_1D (rolling cursor, time-sliced) and recycle the render GameObject
     // of any chunk that has moved beyond the render distance (+ a hysteresis ring so a chunk at the
     // boundary doesn't thrash). Returns GameObjects to the pool for reuse by chunks entering the view.
+    // IDLE PARKING state for _ProcessChunkGoRecycle: after a full dry lap, 1 frame in 8.
+    private int _goRecycleDryStreak = 0;
+    private int _goRecycleSkipPhase = 0;
+
     private void _ProcessChunkGoRecycle(float frameStart, float frameBudget)
     {
         if (chunks_1D == null || !_streamPlayerKnown) return;
+        int total = chunks_1D.Length;
+        if (_goRecycleDryStreak >= total)
+        {
+            _goRecycleSkipPhase = _goRecycleSkipPhase + 1;
+            if ((_goRecycleSkipPhase & 7) != 0) return;
+        }
         int keepR = _activeRenderDistanceChunks + 2; // GOs exist only for rendered chunks (render distance); +2 hysteresis
         int keepRR = keepR * keepR;
-        int total = chunks_1D.Length;
         int scan = Mathf.Max(1, chunkGoRecycleScanPerFrame);
+        bool recycledAny = false;
         while (scan-- > 0)
         {
             int idx = _chunkGoRecycleCursor;
@@ -4985,8 +5161,10 @@ public partial class McWorld : UdonSharpBehaviour
             if (chunk == null || chunk.gameObject == null) continue;
             int dx = chunk.chunkX_world - _streamPlayerChunkX;
             int dz = chunk.chunkZ_world - _streamPlayerChunkZ;
-            if (dx * dx + dz * dz > keepRR) _RecycleChunkGo(chunk);
+            if (dx * dx + dz * dz > keepRR) { _RecycleChunkGo(chunk); recycledAny = true; }
         }
+        if (recycledAny) _goRecycleDryStreak = 0;
+        else _goRecycleDryStreak = _goRecycleDryStreak + Mathf.Max(1, chunkGoRecycleScanPerFrame);
     }
 
     void Update()
@@ -5071,7 +5249,6 @@ public partial class McWorld : UdonSharpBehaviour
         float processStartTime = frameStart;
 #endif
 
-        _gpuPrepFluidBudgetUsed = false; // fluid frame cap: see _StepGpuChunkPrep stage 2
 #if LOGGING
         float _pacT1 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
@@ -5333,6 +5510,15 @@ public partial class McWorld : UdonSharpBehaviour
         // budget. Skipping it on every busy frame is what strands deferred chunks ("never skip").
         if (Time.realtimeSinceStartup - frameStart > frameBudget * 1.5f) return;
 
+        // IDLE PARKING: after a full dry lap (no deferred/masked/no-holes work anywhere), run only
+        // 1 frame in 8 — worst case +8 frames of wake latency, ~0.6ms/frame saved at idle.
+        if (_deferredSweepFoundWork) { _deferredSweepDryStreak = 0; _deferredSweepFoundWork = false; }
+        if (_deferredSweepDryStreak >= chunks_1D.Length)
+        {
+            _deferredSweepSkipPhase = _deferredSweepSkipPhase + 1;
+            if ((_deferredSweepSkipPhase & 7) != 0) return;
+        }
+
         bool hasHeadroom = !enableAdaptiveBudgets || lastUpdateDurationMs < Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
         int requestLimit = Mathf.Max(1, deferredInteriorMeshRequestsPerFrame);
 
@@ -5364,6 +5550,7 @@ public partial class McWorld : UdonSharpBehaviour
             // deferred-interior wakes still get their budget.
             if (!chunk.isMeshDeferred && chunk._borderMissingMask != 0)
             {
+                _deferredSweepFoundWork = true;
                 // Instanced chunks read neighbors from the GPU atlas at draw time — nothing to heal.
                 if (chunk._isInstancedRendered)
                 {
@@ -5392,6 +5579,7 @@ public partial class McWorld : UdonSharpBehaviour
             }
 
             if (!chunk.isMeshDeferred) continue;
+            _deferredSweepFoundWork = true;
             // MESH RENDER DISTANCE: leave far chunks deferred — don't re-queue them (which would
             // just bounce off the cap in BuildChunkMesh). They wake when the player comes in range.
             if (!_IsChunkWithinMeshRenderDistance(chunk)) continue;
@@ -5410,7 +5598,16 @@ public partial class McWorld : UdonSharpBehaviour
                 if (scheduled >= requestLimit) break;
             }
         }
+        if (!_deferredSweepFoundWork)
+        {
+            _deferredSweepDryStreak = _deferredSweepDryStreak + Mathf.Max(1, deferredInteriorMeshScanCountPerFrame);
+        }
     }
+
+    // IDLE PARKING state for _ScheduleDeferredInteriorMeshUpdates.
+    private int _deferredSweepDryStreak = 0;
+    private int _deferredSweepSkipPhase = 0;
+    private bool _deferredSweepFoundWork = false;
 
     private int _borderHealCursor = 0;
     private bool _postWorldGenBorderCleanupDone = false;
@@ -5438,6 +5635,10 @@ public partial class McWorld : UdonSharpBehaviour
         if (!IsWorldGenComplete()) return;
         if (chunks_1D == null || chunks_1D.Length == 0) return;
 
+        // Cheap O(1) gate first: the 8192-chunk isBuildingMesh scan below used to run EVERY frame
+        // between gen-complete and quiet (~8-25ms/frame of pure Udon iteration).
+        if (activeMeshingCount > 0) return;
+
         // Wait until no chunks are actively building a mesh so we don't race.
         // Don't wait for isMeshDeferred — those haven't been meshed yet and
         // can take many seconds to wake, blocking the cleanup for all other chunks.
@@ -5456,6 +5657,12 @@ public partial class McWorld : UdonSharpBehaviour
             if (chunk == null || !chunk.isDataReady) continue;
             // Deferred chunks haven't been meshed yet — no stale border to fix.
             if (chunk.isMeshDeferred) continue;
+            // Instanced chunks with a clean mask need NO border cleanup — they sample neighbors
+            // from the GPU atlas at draw time. Skipping them turned this one-shot from a 904-chunk
+            // rebuild burst (~10s of churn) into a handful of genuine CPU-mesh heals.
+            if (chunk._isInstancedRendered && chunk._borderMissingMask == 0) continue;
+            // All-air chunks mesh empty regardless of neighbor state — nothing to clean.
+            if (chunk._isAllAir) { chunk._borderMissingMask = 0; continue; }
 
             chunk._borderMissingMask = 0;
             RequestChunkMeshUpdate(i);
@@ -5484,12 +5691,22 @@ public partial class McWorld : UdonSharpBehaviour
         }
     }
 
+    // IDLE PARKING: after a full dry lap (no masked chunk anywhere), run only 1 frame in 8.
+    private int _borderHealDryStreak = 0;
+    private int _borderHealSkipPhase = 0;
+
     private void _HealStaleBorderChunks()
     {
         if (chunks_1D == null || chunks_1D.Length == 0) return;
         int totalChunks = chunks_1D.Length;
+        if (_borderHealDryStreak >= totalChunks)
+        {
+            _borderHealSkipPhase = _borderHealSkipPhase + 1;
+            if ((_borderHealSkipPhase & 7) != 0) return;
+        }
         int scans = 256;
         int healed = 0;
+        bool foundAny = false;
         while (scans-- > 0)
         {
             int idx = _borderHealCursor;
@@ -5499,6 +5716,7 @@ public partial class McWorld : UdonSharpBehaviour
             ChunkData chunk = chunks_1D[idx];
             if (chunk == null || !chunk.isDataReady || chunk.isBuildingMesh || chunk.isMeshDeferred) continue;
             if (chunk._borderMissingMask == 0) continue;
+            foundAny = true;
             // Instanced chunks read neighbors from the GPU atlas at draw time — nothing to heal.
             if (chunk._isInstancedRendered) { chunk._borderMissingMask = 0; continue; }
 
@@ -5509,9 +5727,11 @@ public partial class McWorld : UdonSharpBehaviour
                 stats_rqHealSweep++;
 #endif
                 healed++;
-                if (healed >= 16) return;
+                if (healed >= 16) { _borderHealDryStreak = 0; return; }
             }
         }
+        if (foundAny) _borderHealDryStreak = 0;
+        else _borderHealDryStreak = _borderHealDryStreak + 256;
     }
 
     private bool _ShouldPrioritizeChunkSecondaryWork(ChunkData chunk)
@@ -11280,10 +11500,19 @@ public partial class McWorld : UdonSharpBehaviour
 
     private void _AddWaterBlocks(ChunkData chunk)
     {
+        _AddWaterBlocksSliced(chunk, 0, chunkSizeXZ);
+    }
+
+    // Ranged variant so the GPU prep's stage-3 fluid build can step z-rows across frames instead
+    // of paying the whole 10-30ms ocean-chunk build in one atomic step.
+    private void _AddWaterBlocksSliced(ChunkData chunk, int zStart, int zCount)
+    {
         if (chunk == null || !chunk._hasWaterBlocks || chunk._decompSelf == null) return;
 
         int stride = chunkSizeXZ * chunkSizeXZ;
-        for (int z = 0; z < chunkSizeXZ; z++)
+        int zEnd = zStart + zCount;
+        if (zEnd > chunkSizeXZ) zEnd = chunkSizeXZ;
+        for (int z = zStart; z < zEnd; z++)
         {
             for (int x = 0; x < chunkSizeXZ; x++)
             {
@@ -14023,10 +14252,18 @@ public partial class McWorld : UdonSharpBehaviour
         // This needs to be called right after chunk generation completes
         if (terrainGenerator == null) return;
 
+        // SPIKE FIX: biome data is a pure function of world seed + column position — it can never
+        // change once fetched. Re-fetching on every prep re-ran the generator's biome noise on a
+        // cache miss (~60-300ms in one frame: the residual 140-350ms spikes) and invalidated the
+        // colour/texture caches below, forcing their rebuild too.
+        if (chunk._biomeDataValid && chunk._biomeTemperatures != null && chunk._biomeRainfall != null) return;
+
         // Request the current biome data from terrain generator
         // The terrain generator should have this cached for the current chunk
         _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world).GetBiomeDataForChunk(chunk.chunkX_world, chunk.chunkZ_world, chunk._biomeTemperatures, chunk._biomeRainfall);
         chunk._cachedBiomeColorsValid = false;
+        chunk._gpuBiomeTexValid = false;
+        if (chunk._biomeTemperatures != null && chunk._biomeRainfall != null) chunk._biomeDataValid = true;
     }
 
     private void _RefreshChunkDerivedData(ChunkData chunk, byte[] fullData)
@@ -15204,6 +15441,7 @@ public partial class McWorld : UdonSharpBehaviour
     // == _cachedBiomeColors[z*chunkSizeXZ + x], matching the shader's (lx,lz) sample.
     private Texture2D _GpuGetCpuBiomeTex(ChunkData chunk)
     {
+        bool colorsWereValid = chunk._cachedBiomeColorsValid;
         _PreComputeBiomeColors(chunk); // fills chunk._cachedBiomeColors with the exact CPU colours
         if (chunk._cachedBiomeColors == null) return null;
         if (chunk._gpuBiomeCpuTex == null)
@@ -15212,9 +15450,16 @@ public partial class McWorld : UdonSharpBehaviour
             chunk._gpuBiomeCpuTex = new Texture2D(chunkSizeXZ, chunkSizeXZ, TextureFormat.RGBA32, false, true);
             chunk._gpuBiomeCpuTex.filterMode = FilterMode.Point;
             chunk._gpuBiomeCpuTex.wrapMode = TextureWrapMode.Clamp;
+            colorsWereValid = false; // fresh texture always needs its first upload
         }
-        chunk._gpuBiomeCpuTex.SetPixels(chunk._cachedBiomeColors);
-        chunk._gpuBiomeCpuTex.Apply(false, false);
+        // Re-upload only when the colours were actually recomputed (or the texture is new/stale).
+        // Re-preps with valid cached colours skip the 256-pixel SetPixels+Apply entirely.
+        if (!colorsWereValid || !chunk._gpuBiomeTexValid)
+        {
+            chunk._gpuBiomeCpuTex.SetPixels(chunk._cachedBiomeColors);
+            chunk._gpuBiomeCpuTex.Apply(false, false);
+            chunk._gpuBiomeTexValid = true;
+        }
         return chunk._gpuBiomeCpuTex;
     }
 

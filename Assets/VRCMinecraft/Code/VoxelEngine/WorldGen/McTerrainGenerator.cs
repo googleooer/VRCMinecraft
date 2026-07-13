@@ -1822,11 +1822,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
     /// coord pixel arrays. Does NOT call SetPixels/Apply — call _FlushBatchedNoiseCoords after
     /// all generators have been written.
     /// </summary>
+    // Y-COORD INVARIANCE: the Y coordinate block for a generator is a pure function of the seed
+    // (every call site passes yPos=0, gridY is a per-generator constant, generator.yCoord is fixed
+    // at seed init). It was rebuilt (2,600 double-precision iterations + 5,200 Color writes) and
+    // re-uploaded (~83KB of the ~104KB coord upload) for EVERY column. Write each generator's Y
+    // rows exactly once; the flush uploads the Y texture only while new rows appear.
+    private bool[] gpuCoordYRowDone = new bool[16];
+    private bool gpuCoordYDirty = false;
+
     private void _WriteNoiseCoordBlock(NoiseGeneratorOctaves3D source, int octaveCount,
         int xSize, int ySize, int zSize, int xPos, int yPos, int zPos,
         double gridX, double gridY, double gridZ, bool is2D, int generatorIndex)
     {
         int baseRow = generatorIndex * GPU_MAX_OCTAVES;
+        bool writeY = generatorIndex >= gpuCoordYRowDone.Length || !gpuCoordYRowDone[generatorIndex];
         for (int octave = 0; octave < octaveCount; octave++)
         {
             NoiseGenerator3dPerlin generator = source.GetGenerator(octave);
@@ -1838,7 +1847,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
             double scaledGridZ = gridZ * octaveFrequency;
 
             _PrecomputeNoiseCoords(gpuPrePermX, gpuPreFracX, xSize, (double)xPos, scaledGridX, generator.xCoord);
-            if (!is2D)
+            if (!is2D && writeY)
             {
                 _PrecomputeNoiseCoordsY(gpuPrePermY, gpuPreFracY, gpuPreGradFracY, ySize, (double)yPos, scaledGridY, generator.yCoord);
             }
@@ -1854,16 +1863,19 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 gpuCoordXZPixels[xzRowOffset + i] = new Color(xPerm, xFrac, zPerm, zFrac);
             }
 
-            int yRowOff = (baseRow + octave) * GPU_MAX_YSIZE;
-            for (int i = 0; i < GPU_MAX_YSIZE; i++)
+            if (writeY)
             {
-                if (!is2D && i < ySize)
+                int yRowOff = (baseRow + octave) * GPU_MAX_YSIZE;
+                for (int i = 0; i < GPU_MAX_YSIZE; i++)
                 {
-                    gpuCoordYPixels[yRowOff + i] = new Color(gpuPrePermY[i] / 255.0f, gpuPreFracY[i], gpuPreGradFracY[i], 1f);
-                }
-                else
-                {
-                    gpuCoordYPixels[yRowOff + i] = new Color(0f, 0f, 0f, 1f);
+                    if (!is2D && i < ySize)
+                    {
+                        gpuCoordYPixels[yRowOff + i] = new Color(gpuPrePermY[i] / 255.0f, gpuPreFracY[i], gpuPreGradFracY[i], 1f);
+                    }
+                    else
+                    {
+                        gpuCoordYPixels[yRowOff + i] = new Color(0f, 0f, 0f, 1f);
+                    }
                 }
             }
         }
@@ -1873,9 +1885,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
             int xzRowOffset = (baseRow + octave) * GPU_MAX_XZSIZE;
             for (int i = 0; i < GPU_MAX_XZSIZE; i++)
                 gpuCoordXZPixels[xzRowOffset + i] = new Color(0f, 0f, 0f, 0f);
-            int yRowOff = (baseRow + octave) * GPU_MAX_YSIZE;
-            for (int i = 0; i < GPU_MAX_YSIZE; i++)
-                gpuCoordYPixels[yRowOff + i] = new Color(0f, 0f, 0f, 1f);
+            if (writeY)
+            {
+                int yRowOff = (baseRow + octave) * GPU_MAX_YSIZE;
+                for (int i = 0; i < GPU_MAX_YSIZE; i++)
+                    gpuCoordYPixels[yRowOff + i] = new Color(0f, 0f, 0f, 1f);
+            }
+        }
+        if (writeY && generatorIndex >= 0 && generatorIndex < gpuCoordYRowDone.Length)
+        {
+            gpuCoordYRowDone[generatorIndex] = true;
+            gpuCoordYDirty = true;
         }
     }
 
@@ -1887,15 +1907,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
 #if LOGGING
         float uploadStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+        int bytes = gpuCoordXZPixels.Length * 16;
 #endif
         gpuCoordXZTexture.SetPixels(gpuCoordXZPixels);
         gpuCoordXZTexture.Apply(false, false);
-        gpuCoordYTexture.SetPixels(gpuCoordYPixels);
-        gpuCoordYTexture.Apply(false, false);
+        // Y-COORD INVARIANCE: upload the Y texture only when new generator rows were written
+        // this batch (first column or two); after that it never changes.
+        if (gpuCoordYDirty)
+        {
+            gpuCoordYTexture.SetPixels(gpuCoordYPixels);
+            gpuCoordYTexture.Apply(false, false);
+            gpuCoordYDirty = false;
+#if LOGGING
+            bytes += gpuCoordYPixels.Length * 16;
+#endif
+        }
 #if LOGGING
         if (enableDetailedTimings)
         {
-            int bytes = gpuCoordXZPixels.Length * 16 + gpuCoordYPixels.Length * 16;
             _RecordGpuNoiseInputUpload((Time.realtimeSinceStartup - uploadStart) * 1000f, bytes);
         }
 #endif

@@ -74,9 +74,17 @@ public class JavaRandom
         return (int)((shifted ^ 0x80000000L) - 0x80000000L);
     }
 
+    // PERF NOTE: the public draw methods below flatten the LCG advance inline instead of calling
+    // Next(bits). In the Udon VM every user-method call costs ~5-20us of re-entry overhead, and
+    // worldgen draws these tens of thousands of times per column finalize (surface params,
+    // bedrock mask, decoration scatter). The math is byte-for-byte identical to the nested form —
+    // one LCG advance per draw in the exact same order — so the generated terrain is unchanged.
+
     public int NextInt()
     {
-        return Next(32);
+        seed = (seed * multiplier + addend) & mask;
+        long shifted = seed >> 16; // Next(32)
+        return (int)((shifted ^ 0x80000000L) - 0x80000000L);
     }
 
     /// <summary>
@@ -98,15 +106,18 @@ public class JavaRandom
         // This logic is a direct port of java.util.Random.nextInt(int)
         // It correctly handles non-powers-of-two by rejecting values
         // that would lead to a non-uniform distribution.
+        // Next(31) yields [0, 2^31), which always fits a checked int cast — no sign fixup needed.
         if ((bound & -bound) == bound)  // i.e., bound is a power of 2
         {
-            return (int)((bound * (long)Next(31)) >> 31);
+            seed = (seed * multiplier + addend) & mask;
+            return (int)((bound * (seed >> 17)) >> 31);
         }
 
         int bits, val;
         do
         {
-            bits = Next(31);
+            seed = (seed * multiplier + addend) & mask;
+            bits = (int)(seed >> 17);
             val = bits % bound;
         } while (bits - val + (bound - 1) < 0);
 
@@ -115,17 +126,24 @@ public class JavaRandom
 
     public long NextLong()
     {
-        return ((long)Next(32) << 32) + Next(32);
+        // Two signed Next(32) draws, same as ((long)Next(32) << 32) + Next(32).
+        seed = (seed * multiplier + addend) & mask;
+        int hi = (int)(((seed >> 16) ^ 0x80000000L) - 0x80000000L);
+        seed = (seed * multiplier + addend) & mask;
+        int lo = (int)(((seed >> 16) ^ 0x80000000L) - 0x80000000L);
+        return ((long)hi << 32) + lo;
     }
 
     public bool NextBoolean()
     {
-        return Next(1) != 0;
+        seed = (seed * multiplier + addend) & mask;
+        return (seed >> 47) != 0; // Next(1)
     }
 
     public float NextFloat()
     {
-        return Next(24) / ((float)(1 << 24));
+        seed = (seed * multiplier + addend) & mask;
+        return (int)(seed >> 24) / ((float)(1 << 24)); // Next(24): [0, 2^24), checked-cast safe
     }
 
     /// <summary>
@@ -135,6 +153,11 @@ public class JavaRandom
     /// </summary>
     public double NextDouble()
     {
-        return (((long)Next(26) << 27) + Next(27)) / (double)(1L << 53);
+        // (((long)Next(26) << 27) + Next(27)) / 2^53, flattened. Both draws are non-negative.
+        seed = (seed * multiplier + addend) & mask;
+        long hi = seed >> 22; // Next(26)
+        seed = (seed * multiplier + addend) & mask;
+        long lo = seed >> 21; // Next(27)
+        return ((hi << 27) + lo) / (double)(1L << 53);
     }
 }

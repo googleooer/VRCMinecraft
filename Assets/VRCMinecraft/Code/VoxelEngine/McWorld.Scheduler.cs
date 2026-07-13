@@ -149,11 +149,31 @@ public partial class McWorld
         return s;
     }
 
+    // PICKER PARKING: when a full pick attempt found nothing, no generator is mid-column, and the
+    // player hasn't entered a new chunk, eligibility cannot change — skip the scans for a few
+    // frames instead of burning ~0.65ms/frame re-scanning forever at idle.
+    private int _pickerParkCooldown = 0;
+    private int _pickerParkPlayerX = int.MinValue;
+    private int _pickerParkPlayerZ = int.MinValue;
+
     private bool _TryPickDataGenPositionImpl()
     {
         if (radialChunkOrder == null || _positionAssigned == null) return false;
         // Already scanned this cycle and found nothing — don't rescan for every other idle worker.
         if (_pickerExhaustedThisCycle) return false;
+        if (_pickerParkCooldown > 0)
+        {
+            if (_streamPlayerKnown && (_streamPlayerChunkX != _pickerParkPlayerX || _streamPlayerChunkZ != _pickerParkPlayerZ))
+            {
+                _pickerParkCooldown = 0; // player entered a new chunk — new columns may be eligible
+            }
+            else
+            {
+                _pickerParkCooldown = _pickerParkCooldown - 1;
+                _pickerExhaustedThisCycle = true; // one decrement per cycle, not per idle worker
+                return false;
+            }
+        }
         // THROTTLE: how many NEW worldgen columns may be in flight concurrently. Each
         // new column holds a generator + an in-flight GPU base-readback; capping below
         // the generator count leaves GPU readback bandwidth for mesh face-readbacks
@@ -211,6 +231,14 @@ public partial class McWorld
         }
         // Nothing pickable this cycle — latch so the remaining idle workers skip the rescan.
         _pickerExhaustedThisCycle = true;
+        // PICKER PARKING: with nothing pickable and no column in flight, eligibility only changes
+        // when the player enters a new chunk (instant wake) or on the periodic retry (~15 cycles).
+        if (_BusyGeneratorCount() == 0)
+        {
+            _pickerParkCooldown = 15;
+            _pickerParkPlayerX = _streamPlayerKnown ? _streamPlayerChunkX : int.MinValue;
+            _pickerParkPlayerZ = _streamPlayerKnown ? _streamPlayerChunkZ : int.MinValue;
+        }
         return false;
     }
 

@@ -135,6 +135,8 @@ public class ChunkData
     public int _gpuPrepStage = 0;
     public int _derivedScanCursor = 0;
     public byte[] _gpuPrepData;
+    // Stage-3 fluid build z-row cursor: -1 = setup pending, 0..15 = next z-row, 16 = apply.
+    public int _gpuFluidZCursor = -1;
 
     // NO-HOLES guarantee: set true the moment a render mesh is APPLIED to this chunk (GPU prep finish,
     // CPU mesh apply, or an intentional empty/occluded apply). Cleared on recycle. The deferred-mesh
@@ -215,6 +217,13 @@ public class ChunkData
     public Color[] _cachedBiomeColors;
     public int[] _cachedPackedGrassBiomeColors;
     public bool _cachedBiomeColorsValid = false;
+    // Biome data (_biomeTemperatures/_biomeRainfall) is a pure function of world seed + column
+    // position — once fetched it can never change. Without this flag every mesh prep re-ran the
+    // generator's full 10-octave biome simplex for 256 columns (~60-300ms — the residual one-frame
+    // spikes) and re-invalidated the colour/texture caches below.
+    public bool _biomeDataValid = false;
+    // The 16x16 biome colour texture matches _cachedBiomeColors; skip SetPixels+Apply while valid.
+    public bool _gpuBiomeTexValid = false;
 
     // GPU OFFLOAD #3: Per-chunk biome tint RTs (16x16) baked by GpuBiomeColorBake shader.
     // Sampled directly by mesh shader (no CPU readback). Only allocated when GPU bake is enabled.
