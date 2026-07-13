@@ -277,7 +277,13 @@ public partial class McWorld
             if (deferredChunk == null || !deferredChunk.isDataReady || deferredChunk.isBuildingMesh || !deferredChunk.isMeshDeferred) continue;
 
             deferredChunk.isMeshDeferred = false;
-            deferredChunk.pendingNeighborMeshRebuild = true;
+            // REBUILD-WAVE FIX: waking a deferred chunk must NOT schedule neighbor rebuilds.
+            // A chunk MESHING changes no block data — its neighbors' meshes were already built
+            // against its (long-present) data, so re-meshing them is pure waste. This flag made
+            // every wake fan out 6 redundant re-preps (measured: 46 wakes -> 361 neighbor
+            // triggers -> 663 rebuilds per 300 frames), monopolizing all 16 workers and starving
+            // data-gen. Genuine border healing (a neighbor meshed while this chunk's DATA was
+            // missing) is handled by the _borderMissingMask heal system.
             worker_targetChunkIndex[workerIndex] = deferredChunkIndex;
             worker_state[workerIndex] = SCH_STATE_WAITING_FOR_MESH;
             worker_isDeferredMeshWake[workerIndex] = true;
@@ -350,8 +356,8 @@ public partial class McWorld
                     worker_isDeferredMeshWake[i] = rebuildChunk != null && rebuildChunk.isMeshDeferred;
                     if (rebuildChunk != null && rebuildChunk.isMeshDeferred)
                     {
+                        // REBUILD-WAVE FIX: no neighbor fan-out on wake — see _TryAssignDeferredMeshWake.
                         rebuildChunk.isMeshDeferred = false;
-                        rebuildChunk.pendingNeighborMeshRebuild = true;
                     }
                     assigned = true;
                     assignedThisCycle++;

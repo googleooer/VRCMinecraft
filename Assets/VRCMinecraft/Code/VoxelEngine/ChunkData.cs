@@ -65,10 +65,33 @@ public class ChunkData
     public int _crossBlockCount = 0;
     public int[] _torchBlockPackedPositions;
     public int _torchBlockCount = 0;
+    // AMBIENT PARTICLE EMITTERS: packed (blockId << 24) | (x << 16) | (y << 8) | z for blocks whose
+    // randomDisplayTick emits ambient particles (torch, fire, lava-with-air-above, lit furnace,
+    // redstone torch on, portal). Collected by the derived-data scan; McParticleManager walks these
+    // instead of blind-sampling 1000 random positions through GetBlock every frame. Capacity-capped
+    // (McWorld.AMBIENT_EMITTER_CAP) — overflow entries are dropped, which only thins particles on
+    // pathological all-lava-surface chunks.
+    public int[] _ambientEmitterPacked;
+    public int _ambientEmitterCount = 0;
     public bool _isAllAir = false;
     public bool _hasWaterBlocks = false;
     public bool _hasEmissiveBlocks = false;
     public bool _hasTorchBlocks = false;
+    // GPU shared-mesh render gates (derived scan):
+    // _hasNonOpaqueContent — any voxel whose visibility class isn't Opaque (cutout/transparent/
+    //   cross/torch/fluid). When false, the chunk's cutout renderer never needs the shared voxel
+    //   mesh — skipping it halves that chunk's per-frame vertex-shader load.
+    // _isAllOpaqueSolid — every voxel is an opaque solid. Combined with all 6 neighbors also being
+    //   all-opaque-solid, the chunk has zero visible faces and its renderers can be skipped
+    //   entirely (typical for buried underground chunks — a large share of the lit set).
+    // _derivedSolidOpaqueCount — scan-internal accumulator (persists across sliced scan calls).
+    public bool _hasNonOpaqueContent = false;
+    public bool _isAllOpaqueSolid = false;
+    public int _derivedSolidOpaqueCount = 0;
+    // Data version the derived caches were last computed for. Lets prep stage 1 skip the
+    // 4096-voxel rescan when a re-prep (neighbor-rebuild churn during load) runs on unchanged
+    // data — the single biggest redundant cost in the load-phase meshing loop.
+    public int _derivedForDataVersion = -1;
     public byte _chunkGlobalMinY = 255, _chunkGlobalMaxY = 0;
     public byte _chunkGlobalMinX = 255, _chunkGlobalMaxX = 0;
     public byte _chunkGlobalMinZ = 255, _chunkGlobalMaxZ = 0;
