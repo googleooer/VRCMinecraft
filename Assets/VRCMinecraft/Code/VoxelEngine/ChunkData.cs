@@ -61,6 +61,13 @@ public class ChunkData
     public bool _neighborCacheValid = false;
     public byte[] _columnMinY;
     public byte[] _columnMaxY;
+    // FLUID COLUMN MASK: 1 = this XZ column contains at least one water/lava voxel. Filled by the
+    // SLICED derived scan; _AddWaterBlocksSliced skips dry columns entirely (a mountain chunk with
+    // one lava pocket scans ~6 columns instead of 256). Only trusted when the version stamp
+    // matches _cachedDataVersion — the atomic derive path (edit re-derives) doesn't fill it, so
+    // stale masks safely fall back to the full scan.
+    public byte[] _columnFluidMask;
+    public int _columnFluidMaskVersion = -1;
     public int[] _crossBlockPackedPositions;
     public int _crossBlockCount = 0;
     public int[] _torchBlockPackedPositions;
