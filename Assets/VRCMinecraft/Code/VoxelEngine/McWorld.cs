@@ -3059,6 +3059,27 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk.neighborPY = fluidNeighbors[2]; chunk.neighborNY = fluidNeighbors[3];
                 chunk.neighborPZ = fluidNeighbors[4]; chunk.neighborNZ = fluidNeighbors[5];
                 _DecompressNeighborsOnce(chunk);
+                // FLUID CHURN GATE: record which of the 26 surrounding chunks are missing or not
+                // data-ready RIGHT NOW — the fluid faces/corner heights baked below treat them as
+                // air. Neighbor-completion triggers consult this mask: only a completion from a
+                // direction whose bit is SET can change this mesh, so settled water chunks stop
+                // fully re-building on every nearby column arrival (was 4-10 rebuilds each during
+                // load — the majority of the measured 4.6-6.8s/window stage-3 'fluid' cost).
+                int fnbMask = 0;
+                for (int fdy = -1; fdy <= 1; fdy++)
+                {
+                    for (int fdz = -1; fdz <= 1; fdz++)
+                    {
+                        for (int fdx = -1; fdx <= 1; fdx++)
+                        {
+                            if (fdx == 0 && fdy == 0 && fdz == 0) continue;
+                            ChunkData fnb = GetChunkAt(chunk.chunkX_world + fdx, chunk.chunkY_world + fdy, chunk.chunkZ_world + fdz);
+                            if (fnb == null || !fnb.isDataReady)
+                                fnbMask |= 1 << ((fdx + 1) * 9 + (fdy + 1) * 3 + (fdz + 1));
+                        }
+                    }
+                }
+                chunk._fluidNbMissingMask = fnbMask;
                 chunk._gpuFluidZCursor = 0;
                 return;
             }
@@ -7622,13 +7643,17 @@ public partial class McWorld : UdonSharpBehaviour
             // arrives — the shader culls its faces from the GPU atlas at draw time, so new border
             // data takes effect the moment the new chunk's slot syncs. The only self-state that can
             // change is the enclosed-gate (arriving solid data can complete its burial) — re-run
-            // just the renderer toggles inline. Watery neighbors still rebuild: their CPU fluid
-            // mesh bakes border faces/corner heights from neighbor data at build time.
-            // This was ~half the streaming meshLoop (neighborTriggers ~200-340/window, each a full
-            // re-prep of an unchanged chunk).
+            // just the renderer toggles inline. WATERY neighbors are gated by the fluid churn mask
+            // (_fluidNbMissingMask): their CPU fluid mesh only baked air where a chunk was MISSING
+            // at build time, so a completion trigger from a direction whose bit is CLEAR cannot
+            // change the mesh. This was ~half the streaming meshLoop for dry chunks, and the
+            // watery-rebuild churn was the majority of the 4.6-6.8s/window stage-3 'fluid' cost.
             if (!interactionPriority && neighborChunk._isInstancedRendered
-                && neighborChunk._renderMeshApplied && !neighborChunk._hasWaterBlocks
-                && neighborChunk._borderMissingMask == 0)
+                && neighborChunk._renderMeshApplied
+                && neighborChunk._borderMissingMask == 0
+                && (!neighborChunk._hasWaterBlocks
+                    || (neighborChunk._fluidNbMissingMask
+                        & (1 << ((1 - neighbor_dx_offsets[i]) * 9 + (1 - neighbor_dy_offsets[i]) * 3 + (1 - neighbor_dz_offsets[i])))) == 0))
             {
                 _ReGateInstancedRenderers(neighborChunk);
                 continue;
@@ -7640,31 +7665,38 @@ public partial class McWorld : UdonSharpBehaviour
 
         // Water corner heights sample diagonal XZ columns, so a chunk can need one more
         // rebuild when a diagonal chunk finishes publishing any occupancy change there.
+        // FLUID CHURN GATE: same per-direction rule as the side loop — only rebuild the diagonal
+        // watery chunk if WE (the completing chunk) were missing when its fluid mesh was built.
+        // Bit = direction of the completing chunk relative to the diagonal: (1-dx)*9 + 3 + (1-dz).
         int diagonalChunkY = chunk.chunkY_world;
 
         ChunkData diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world - 1);
-        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady
+            && (interactionPriority || ((diagonalChunk._fluidNbMissingMask & (1 << 23)) != 0 && !diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world - 1, diagonalChunkY, chunk.chunkZ_world + 1);
-        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady
+            && (interactionPriority || ((diagonalChunk._fluidNbMissingMask & (1 << 21)) != 0 && !diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world - 1);
-        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady
+            && (interactionPriority || ((diagonalChunk._fluidNbMissingMask & (1 << 5)) != 0 && !diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
         }
 
         diagonalChunk = GetChunkAt(chunk.chunkX_world + 1, diagonalChunkY, chunk.chunkZ_world + 1);
-        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady && (interactionPriority || (!diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
+        if (diagonalChunk != null && diagonalChunk._hasWaterBlocks && diagonalChunk.isDataReady
+            && (interactionPriority || ((diagonalChunk._fluidNbMissingMask & (1 << 3)) != 0 && !diagonalChunk.isMeshDeferred && !diagonalChunk.isBuildingMesh)))
         {
             if (interactionPriority) diagonalChunk.interactionMeshPriority = true;
             RequestChunkMeshUpdate(ChunkCenteredCoordsTo1D(diagonalChunk.chunkX_world, diagonalChunkY, diagonalChunk.chunkZ_world));
@@ -11910,6 +11942,19 @@ public partial class McWorld : UdonSharpBehaviour
         int stride = chunkSizeXZ * chunkSizeXZ;
         int zEnd = zStart + zCount;
         if (zEnd > chunkSizeXZ) zEnd = chunkSizeXZ;
+
+        // INLINE NEIGHBOR ARRAYS (fluid fast paths): the stage-3 setup decompressed self + all 6
+        // neighbors, so almost every cell's 6-neighborhood is resolvable with plain array reads —
+        // no VM re-entry. An interior ocean cell used to pay ~20 user-method calls through
+        // _AddWaterBlock/_ShouldRenderFluidFace to conclude "all faces culled"; a still surface
+        // cell paid ~130 (4 corner-height sample loops + flow angle) to emit one flat quad at the
+        // constant still-water height. Those two cases are ~90% of ocean-chunk fluid cells.
+        byte[] dPX = chunk._decompPX; byte[] dNX = chunk._decompNX;
+        byte[] dPY = chunk._decompPY; byte[] dNY = chunk._decompNY;
+        byte[] dPZ = chunk._decompPZ; byte[] dNZ = chunk._decompNZ;
+        byte[] metaArr = chunk.blockMetadata;
+        float fastSurfHeight = 1.0f - 1.0f / 9.0f; // still-water render height (meta 0 -> 8/9)
+
         for (int z = zStart; z < zEnd; z++)
         {
             int colBase = z * chunkSizeXZ;
@@ -11923,8 +11968,136 @@ public partial class McWorld : UdonSharpBehaviour
 
                 for (int y = minY; y <= maxY; y++)
                 {
-                    byte blockID = data[y * stride + columnIndex];
-                    if ((clsTable[blockID] & DBC_FLUID) == 0) continue;
+                    int i = y * stride + columnIndex;
+                    byte blockID = data[i];
+                    int cls = clsTable[blockID];
+                    if ((cls & DBC_FLUID) == 0) continue;
+
+                    // Resolve the 6 face neighbors inline. -1 = crosses into a missing/unready
+                    // chunk -> can't conclude anything, fall through to the exact full path
+                    // (which samples via GetChunkAt and treats missing as air, as before).
+                    int nUp = y < 15 ? data[i + 256] : (dPY != null ? dPY[columnIndex] : -1);
+                    int nDn = y > 0 ? data[i - 256] : (dNY != null ? dNY[3840 + columnIndex] : -1);
+                    int nXP = x < 15 ? data[i + 1] : (dPX != null ? dPX[i - 15] : -1);
+                    int nXN = x > 0 ? data[i - 1] : (dNX != null ? dNX[i + 15] : -1);
+                    int nZP = z < 15 ? data[i + 16] : (dPZ != null ? dPZ[i - 240] : -1);
+                    int nZN = z > 0 ? data[i - 16] : (dNZ != null ? dNZ[i + 240] : -1);
+
+                    // Same-fluid-family tests (water: FLUID set + LAVA clear; lava: LAVA set).
+                    // A false result on a -1 neighbor just means "unknown" — only used to ENABLE
+                    // skips, never to suppress the full path's own neighbor sampling.
+                    bool cellIsLava = (cls & DBC_LAVA) != 0;
+                    bool sUp, sDn, sXP, sXN, sZP, sZN;
+                    if (cellIsLava)
+                    {
+                        sUp = nUp >= 0 && (clsTable[nUp] & DBC_LAVA) != 0;
+                        sDn = nDn >= 0 && (clsTable[nDn] & DBC_LAVA) != 0;
+                        sXP = nXP >= 0 && (clsTable[nXP] & DBC_LAVA) != 0;
+                        sXN = nXN >= 0 && (clsTable[nXN] & DBC_LAVA) != 0;
+                        sZP = nZP >= 0 && (clsTable[nZP] & DBC_LAVA) != 0;
+                        sZN = nZN >= 0 && (clsTable[nZN] & DBC_LAVA) != 0;
+                    }
+                    else
+                    {
+                        sUp = nUp >= 0 && (clsTable[nUp] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                        sDn = nDn >= 0 && (clsTable[nDn] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                        sXP = nXP >= 0 && (clsTable[nXP] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                        sXN = nXN >= 0 && (clsTable[nXN] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                        sZP = nZP >= 0 && (clsTable[nZP] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                        sZN = nZN >= 0 && (clsTable[nZN] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                    }
+
+                    // FAST PATH 1: fully enclosed in same fluid — every face culled, zero quads.
+                    if (sUp && sDn && sXP && sXN && sZP && sZN) continue;
+
+                    if (!cellIsLava && sDn && sXP && sXN && sZP && sZN)
+                    {
+                        // FAST PATH 2: ice-capped water — top culled by ice, rest by same-fluid.
+                        if (nUp == BLOCK_ICE) continue;
+
+                        // FAST PATH 3: still-water surface. Exact preconditions for the full
+                        // path's constant result (all 4 corner heights = 8/9, no flow, top quad
+                        // only): the whole 3x3 ring at this Y is water with meta 0, and no cell
+                        // of the 3x3 above is water (corner sampler's early-out). Ring diagonals
+                        // must live in this chunk's array -> x,z in [1,14]; above row may come
+                        // from the +Y neighbor (ocean surface sits at local y=15).
+                        if (nUp >= 0 && !sUp && x >= 1 && x <= 14 && z >= 1 && z <= 14)
+                        {
+                            int rA = data[i + 17];  // x+1, z+1
+                            int rB = data[i + 15];  // x-1, z+1
+                            int rC = data[i - 15];  // x+1, z-1
+                            int rD = data[i - 17];  // x-1, z-1
+                            bool ringWater =
+                                (clsTable[rA] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID &&
+                                (clsTable[rB] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID &&
+                                (clsTable[rC] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID &&
+                                (clsTable[rD] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                            if (ringWater)
+                            {
+                                // 3x3 above must contain no water (any water above forces a 1.0
+                                // corner). Straight-up already known non-water (!sUp).
+                                bool aboveClear;
+                                if (y < 15)
+                                {
+                                    int a = i + 256;
+                                    aboveClear =
+                                        (clsTable[data[a + 1]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a - 1]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a + 16]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a - 16]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a + 17]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a + 15]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a - 15]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a - 17]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID;
+                                }
+                                else
+                                {
+                                    // dPY non-null is implied by nUp >= 0 at y == 15.
+                                    aboveClear =
+                                        (clsTable[dPY[columnIndex + 1]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex - 1]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex + 16]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex - 16]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex + 17]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex + 15]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex - 15]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex - 17]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID;
+                                }
+                                // All 9 metas must be 0 (still sources). Worldgen chunks have no
+                                // metadata array at all — the common case is one null check.
+                                bool metasZero = metaArr == null ||
+                                    (metaArr.Length >= 4096 &&
+                                     metaArr[i] == 0 &&
+                                     metaArr[i + 1] == 0 && metaArr[i - 1] == 0 &&
+                                     metaArr[i + 16] == 0 && metaArr[i - 16] == 0 &&
+                                     metaArr[i + 17] == 0 && metaArr[i + 15] == 0 &&
+                                     metaArr[i - 15] == 0 && metaArr[i - 17] == 0);
+                                if (aboveClear && metasZero)
+                                {
+                                    // Emit exactly what the full path would: one flat top quad at
+                                    // 8/9, still texture, no flow rotation (sin 0 / cos 0.5 ->
+                                    // UVs (0,0)(0,1)(1,1)(1,0)). Brightness sampled as before.
+                                    float stillS = betaWaterStillSlice >= 0 ? betaWaterStillSlice : _GetTextureSlice(blockID, FACE_INDEX_TOP);
+                                    _AddWaterQuad(
+                                        chunk,
+                                        new Vector3(x, y + fastSurfHeight, z),
+                                        new Vector3(x, y + fastSurfHeight, z + 1),
+                                        new Vector3(x + 1, y + fastSurfHeight, z + 1),
+                                        new Vector3(x + 1, y + fastSurfHeight, z),
+                                        Normal_Up,
+                                        new Vector2(0f, 0f),
+                                        new Vector2(0f, 1f),
+                                        new Vector2(1f, 1f),
+                                        new Vector2(1f, 0f),
+                                        stillS,
+                                        _GetWaterBlockBrightness(chunk, x, y, z),
+                                        false, false);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     _AddWaterBlock(chunk, x, y, z, blockID);
                 }
             }
@@ -12617,37 +12790,30 @@ public partial class McWorld : UdonSharpBehaviour
             return fullData;
         }
 
-        // Case 1: Homogeneous chunk (optimized with Array.Fill equivalent)
+        // Case 1: Homogeneous chunk
         if (dataType == typeof(byte)) {
             byte blockValue = (byte)chunk._chunkData;
-            // OPTIMIZED: Use manual loop unrolling for better performance
-            int size = chunk._chunkDataSize;
-            int i = 0;
-            int limit = size - 15;
-
-            // Process 16 at a time
-            for (; i < limit; i += 16) {
-                fullData[i] = blockValue;
-                fullData[i+1] = blockValue;
-                fullData[i+2] = blockValue;
-                fullData[i+3] = blockValue;
-                fullData[i+4] = blockValue;
-                fullData[i+5] = blockValue;
-                fullData[i+6] = blockValue;
-                fullData[i+7] = blockValue;
-                fullData[i+8] = blockValue;
-                fullData[i+9] = blockValue;
-                fullData[i+10] = blockValue;
-                fullData[i+11] = blockValue;
-                fullData[i+12] = blockValue;
-                fullData[i+13] = blockValue;
-                fullData[i+14] = blockValue;
-                fullData[i+15] = blockValue;
+            // All-air is the overwhelming homogeneous case and new byte[] is already zeroed —
+            // the old 4096-store interpreted fill (even 16-wide unrolled, ~1.5-4ms in the Udon
+            // VM) was pure waste for it. Non-air fills use exponential doubling via Array.Copy
+            // (a native extern): 1 store + 12 copies instead of 4096 stores.
+            if (blockValue != 0) {
+                int size = chunk._chunkDataSize;
+                fullData[0] = blockValue;
+                int filled = 1;
+                while (filled < size) {
+                    int copyLen = size - filled;
+                    if (copyLen > filled) copyLen = filled;
+                    System.Array.Copy(fullData, 0, fullData, filled, copyLen);
+                    filled += copyLen;
+                }
             }
-            // Finish remaining
-            for (; i < size; i++) {
-                fullData[i] = blockValue;
+#if LOGGING
+            if (enableDetailedTimings)
+            {
+                stats_rleDecompressionTime += (Time.realtimeSinceStartup - decompressStartTime) * 1000f;
             }
+#endif
             return fullData;
         }
 

@@ -59,8 +59,8 @@ Material:
     m_Floats:
     - _BuiltinOffsetX: -16
     - _BuiltinOffsetZ: 0
-    - _ChunkX: -6
-    - _ChunkZ: -4
+    - _ChunkX: -9
+    - _ChunkZ: 0
     - _FlipXAxis: 1
     - _XSize: 5
     - _YSize: 17

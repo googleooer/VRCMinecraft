@@ -68,6 +68,13 @@ public class ChunkData
     // stale masks safely fall back to the full scan.
     public byte[] _columnFluidMask;
     public int _columnFluidMaskVersion = -1;
+    // FLUID CHURN GATE: which of the 26 surrounding chunks were MISSING/not-data-ready when this
+    // chunk's CPU fluid mesh was last built. Bit index = (dx+1)*9 + (dy+1)*3 + (dz+1). The fluid
+    // build bakes border faces / corner heights against neighbor data (missing = air), so a
+    // neighbor-completion trigger only needs a rebuild when the completing chunk's bit is SET —
+    // it was air-assumed at build time. -1 (all bits) = never built through the instanced fluid
+    // path / unknown -> always rebuild (conservative, matches old behavior).
+    public int _fluidNbMissingMask = -1;
     public int[] _crossBlockPackedPositions;
     public int _crossBlockCount = 0;
     public int[] _torchBlockPackedPositions;
