@@ -37,7 +37,10 @@ public enum GenerationState
     ReplacingBiomeBlocks,
     DecoratingTerrain,
     Complete,
-    GpuResidentComplete
+    GpuResidentComplete,
+    // FINALIZE SLICING: decoration phase split out of Prepare_GpuFinalize (appended at the
+    // end so existing state indices are untouched).
+    Prepare_GpuDecorate
 }
 
 public enum GpuWorldgenReadbackPhase
@@ -177,6 +180,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int agg_totalSteps;
     private float agg_stepTimeMax;
     private float agg_stepTimeMin = float.MaxValue;
+    // Time spent INSIDE VRCAsyncGPUReadback.Request calls (climate + base column): if the
+    // 20-45ms atomic gen steps live here, Request() is forcing a driver flush at submit.
+    private int agg_readbackRequestCalls;
+    private float agg_readbackRequestMs;
     private int agg_noiseGen1Cells;
     private int agg_noiseGen2Cells;
     private int agg_noiseGen3Cells;
@@ -415,6 +422,27 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // Diagnostic: StepChunkGeneration step count per GenerationState (index = (int)state).
     // The state with the most steps = where the gen spends its frames (the stall).
     public int[] dbgStateSteps = new int[20];
+    // Per-state wall-clock accumulation (LOGGING): pinpoints WHICH state the 20-45ms atomic
+    // step blocks live in — every individually-timed piece (blits, uploads, unpacks) reports
+    // sub-ms, so the block is in an untimed section of specific states. Printed in the perf
+    // summary; reset with the aggregate window.
+    private float[] dbgStateTimeMs = new float[20];
+    private float[] dbgStateTimeMaxMs = new float[20];
+    private string[] dbgStateNames = new string[] {
+        "Idle", "GetBiomes", "SandNoise", "GravelNoise", "StoneNoise", "GpuNoise",
+        "GpuFinalize", "GpuReadback", "CopySlice", "AllocCache", "NoiseOctaves",
+        "CombineNoise", "GenTerrain", "ReplaceBiomes", "Decorate", "Complete", "ResidentDone",
+        "GpuDecorate" };
+
+    // FINALIZE SLICING (Prepare_GpuDecorate): decoration work split across budgeted steps —
+    // candidate collect (CPU JavaRandom streams), then ONE tree-anchor chunk render per step
+    // (each anchor is a full mini column pipeline, ~20-50ms; rendering up to 4 in one call
+    // was the 100-237ms GpuFinalize spike), then the decoration blits + readback request.
+    private int gpuDecorStep = 0;
+    private int gpuDecorTreeCount = 0;
+    private int gpuDecorCandidateCount = 0;
+    private int gpuDecorAnchorMask = 0;
+    private RenderTexture gpuDecorCurrentTex;
     private RenderTexture gpuSandNoiseTexture;
     private RenderTexture gpuGravelNoiseTexture;
     private RenderTexture gpuStoneNoiseTexture;
@@ -750,6 +778,20 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 agg_chunksCompleted, agg_cachedColumnsUsed, avgPrep, avgGenerate, avgReplace);
             sb.AppendFormat("  Chunk work: actual {0:F3}ms, wall-clock {1:F3}ms, steps/chunk {2:F1}, avg step {3:F3}ms, max step {4:F3}ms, min step {5:F3}ms\n",
                 avgActual, avgWallClock, avgSteps, avgStep, agg_stepTimeMax, agg_stepTimeMin == float.MaxValue ? 0f : agg_stepTimeMin);
+            // Per-state step attribution: which generator state the wall-clock actually lives in.
+            if (dbgStateTimeMs != null)
+            {
+                sb.Append("  Gen state time:");
+                for (int si = 0; si < dbgStateTimeMs.Length; si++)
+                {
+                    if (dbgStateTimeMs[si] < 0.5f) continue;
+                    string nm = (dbgStateNames != null && si < dbgStateNames.Length) ? dbgStateNames[si] : si.ToString();
+                    sb.Append(' ').Append(nm).Append(' ')
+                      .Append(dbgStateTimeMs[si].ToString("F1")).Append("ms(max ")
+                      .Append(dbgStateTimeMaxMs[si].ToString("F1")).Append(")");
+                }
+                sb.AppendLine();
+            }
             sb.AppendFormat("  Prep breakdown: biomes {0:F3}ms, sand {1:F3}ms, gravel {2:F3}ms, stone {3:F3}ms, alloc noise cache {4:F3}ms\n",
                 agg_time_Prep_GetBiomes / agg_chunksCompleted,
                 agg_time_Prep_SandNoise / agg_chunksCompleted,
@@ -836,6 +878,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     agg_gpuBaseReadbackLatencyMax, agg_gpuBaseReadbackCallbackCopyTime,
                     agg_gpuBaseReadbackBytes / 1024f);
             }
+            if (agg_readbackRequestCalls > 0)
+            {
+                sb.AppendFormat("  Readback Request() submit-block: {0} calls, {1:F1}ms total, {2:F2}ms avg\n",
+                    agg_readbackRequestCalls, agg_readbackRequestMs, agg_readbackRequestMs / agg_readbackRequestCalls);
+            }
 
             if (agg_gpuDiagnosticReadbacksCompleted > 0 || agg_gpuDiagnosticReadbackFailures > 0)
             {
@@ -872,6 +919,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_totalSteps = 0;
         agg_stepTimeMax = 0f;
         agg_stepTimeMin = float.MaxValue;
+        agg_readbackRequestCalls = 0;
+        agg_readbackRequestMs = 0f;
+        if (dbgStateTimeMs != null)
+        {
+            for (int si = 0; si < dbgStateTimeMs.Length; si++)
+            {
+                dbgStateTimeMs[si] = 0f;
+                dbgStateTimeMaxMs[si] = 0f;
+            }
+        }
         agg_noiseGen1Cells = 0;
         agg_noiseGen2Cells = 0;
         agg_noiseGen3Cells = 0;
@@ -1693,7 +1750,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
             gpuReadbackRequestBytes = gpuClimateReadbackPixels != null ? gpuClimateReadbackPixels.Length * 16 : world.chunkSizeXZ * world.chunkSizeXZ * 16;
         }
 #endif
+#if LOGGING
+        float _rbReqT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCAsyncGPUReadback.Request(gpuClimateTexture, 0, TextureFormat.RGBAFloat, (IUdonEventReceiver)this);
+#if LOGGING
+        if (enableDetailedTimings) { agg_readbackRequestCalls++; agg_readbackRequestMs += (Time.realtimeSinceStartup - _rbReqT0) * 1000f; }
+#endif
         return true;
     }
 
@@ -2153,7 +2216,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
             gpuReadbackRequestBytes = useSingleChannelGpuColumnReadback ? pixelCount : pixelCount * 4;
         }
 #endif
+#if LOGGING
+        float _rbReqT1 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
+#endif
         VRCAsyncGPUReadback.Request(source, 0, useSingleChannelGpuColumnReadback ? TextureFormat.R8 : TextureFormat.RGBA32, (IUdonEventReceiver)this);
+#if LOGGING
+        if (enableDetailedTimings) { agg_readbackRequestCalls++; agg_readbackRequestMs += (Time.realtimeSinceStartup - _rbReqT1) * 1000f; }
+#endif
         return true;
     }
 
@@ -2575,21 +2644,33 @@ public class McTerrainGenerator : UdonSharpBehaviour
         if (!gpuWorldgenReady || gpuColumnSurfaceReplaceMaterial == null || currentChunkBiomes == null) return false;
         dbgColumnFinalizeCount++;
 
+        // FINALIZE SLICING guard: the resident-repack contract (CanRepackGpuResidentColumn)
+        // relied on texture-overwrite and resident-marker-advance being ONE atomic call. Now
+        // that decoration/latching moved to Prepare_GpuDecorate, the surface-replace blit
+        // below stomps gpuColumnFinalTexture one or more FRAMES before step 2 advances the
+        // markers — a stale resident sibling stepping in that window would repack this NEW
+        // column's half-finished terrain into the OLD column's atlas slot (silent wrong
+        // terrain). Invalidate the previous column's latch before the first overwrite; its
+        // stale siblings fall back to a normal re-generation (correct, just slower).
+        if (gpuResidentColumnX != gpuPendingColumnX || gpuResidentColumnZ != gpuPendingColumnZ)
+        {
+            gpuLastReadbackSource = null;
+            gpuResidentColumnX = int.MaxValue;
+            gpuResidentColumnZ = int.MaxValue;
+        }
+
         int sizeXZ = world.chunkSizeXZ;
-        int noiseX = _GetTerrainBlockStartX(currentChunkX);
-        int noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
 
         // Sand/gravel/stone noise: computed on CPU because the GPU noise shader produces
         // incorrect values for these 16x16 surface noise textures (confirmed against vanilla MC).
-        // Cost is negligible — three 256-element arrays per chunk.
-        double[] cpuSandN = noiseGen4.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.03125D, 0.03125D, 1.0D);
-        _UploadCpuSurfaceNoise(cpuSandN, sizeXZ, gpuSandNoiseTexture);
-
-        double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0134D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
-        _UploadCpuSurfaceNoise(cpuGravelN, sizeXZ, gpuGravelNoiseTexture);
-
-        double[] cpuStoneN = noiseGen5.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.0625D, 0.0625D, 0.0625D);
-        _UploadCpuSurfaceNoise(cpuStoneN, sizeXZ, gpuStoneNoiseTexture);
+        // FINALIZE SLICING: the values come from the Prepare_Sand/Gravel/StoneNoise states
+        // (identical generator + arguments — see those cases), each its own budgeted step.
+        // Computing all three inline here was most of the GpuFinalize atomic block. Null
+        // buffers (never possible on the normal path) fall back to the CPU pipeline.
+        if (this.sandNoise == null || this.gravelNoise == null || this.stoneNoise == null) return false;
+        _UploadCpuSurfaceNoise(this.sandNoise, sizeXZ, gpuSandNoiseTexture);
+        _UploadCpuSurfaceNoise(this.gravelNoise, sizeXZ, gpuGravelNoiseTexture);
+        _UploadCpuSurfaceNoise(this.stoneNoise, sizeXZ, gpuStoneNoiseTexture);
 
         _BuildGpuSurfaceParamsFromSurfaceInfo();
 
@@ -2677,35 +2758,24 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
 #endif
 
-        // GPU decoration pass — stamp grass/flowers directly on the column texture
-        RenderTexture readbackSource = gpuColumnFinalTexture;
-        if (!match1to1TerrainBaseline && gpuColumnDecorationMaterial != null && currentChunkBiomes != null)
-        {
-            readbackSource = _BlitGpuDecoration(gpuColumnFinalTexture, sizeXZ);
-        }
-
-        gpuCachedColumnX = gpuPendingColumnX;
-        gpuCachedColumnZ = gpuPendingColumnZ;
-        gpuCachedChunkSlicesReady = false;
-        gpuFinalColumnSliceCachePending = false;
-
-        if (gpuSkipReadbackForColumn)
-        {
-            // GPU-RESIDENT (#2): the column final texture is GPU-ready right now — skip the
-            // GPU->CPU readback entirely. McWorld repacks each Y-slice from this texture into
-            // the chunk's atlas slot; CPU access rehydrates on demand. The X/Z markers let
-            // sibling chunks repack without re-running the column gen.
-            gpuLastReadbackSource = readbackSource;
-            gpuResidentColumnX = gpuPendingColumnX;
-            gpuResidentColumnZ = gpuPendingColumnZ;
-            return true;
-        }
-
-        return _BeginGpuBaseColumnReadback(readbackSource, true);
+        // FINALIZE SLICING: decoration + readback moved to the Prepare_GpuDecorate state —
+        // this method now ends after the surface-info blit, so the finalize step is just
+        // params + a handful of blits.
+        return true;
     }
 
-    private RenderTexture _BlitGpuDecoration(RenderTexture columnTex, int sizeXZ)
+    // FINALIZE SLICING step 1 of Prepare_GpuDecorate: run the CPU candidate collection
+    // (JavaRandom decoration streams of the 4 contributing chunks) and, when trees are
+    // present, snapshot this column's final content into anchor slot 4 BEFORE any anchor
+    // render — anchor renders reuse/overwrite gpuColumnBase/SurfaceInfo/FinalTexture.
+    private void _GpuDecorationCollect(int sizeXZ)
     {
+        gpuDecorTreeCount = 0;
+        gpuDecorCandidateCount = 0;
+        gpuDecorAnchorMask = 0;
+        gpuDecorCurrentTex = gpuColumnFinalTexture;
+        if (match1to1TerrainBaseline || gpuColumnDecorationMaterial == null || currentChunkBiomes == null) return;
+
         int worldHeight = gpuWorldHeightBlocks;
         int colOriginX = currentChunkX * sizeXZ;
         int colOriginZ = currentChunkZ * sizeXZ;
@@ -2736,15 +2806,62 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 ref requiredTreeAnchorMask);
         }
 
-        RenderTexture currentTex = columnTex;
+        gpuDecorTreeCount = treeCount;
+        gpuDecorCandidateCount = candidateCount;
+        if (treeCount > 0 && gpuColumnTreeDecorationMaterial != null && gpuTreeAnchorChunkTextures != null)
+        {
+            VRCGraphics.Blit(gpuColumnFinalTexture, gpuTreeAnchorChunkTextures[4]);
+            gpuDecorCurrentTex = gpuTreeAnchorChunkTextures[4];
+            gpuDecorAnchorMask = requiredTreeAnchorMask & ~(1 << 4);
+        }
+    }
+
+    // FINALIZE SLICING step 2 of Prepare_GpuDecorate: render ONE pending tree-anchor chunk
+    // per call (each is a full mini column pipeline). Returns true while more remain.
+    private bool _GpuDecorationRenderNextAnchor(int sizeXZ)
+    {
+        if (gpuDecorAnchorMask == 0) return false;
+        if (gpuTreeAnchorChunkTextures == null || gpuTreeAnchorBiomeBuffer == null)
+        {
+            gpuDecorAnchorMask = 0;
+            return false;
+        }
+        for (int treeChunkSlot = 0; treeChunkSlot < 9; treeChunkSlot++)
+        {
+            if (treeChunkSlot == 4) continue;
+            if ((gpuDecorAnchorMask & (1 << treeChunkSlot)) == 0) continue;
+            gpuDecorAnchorMask &= ~(1 << treeChunkSlot);
+
+            int chunkOffsetX = (treeChunkSlot % 3) - 1;
+            int chunkOffsetZ = (treeChunkSlot / 3) - 1;
+            int chunkX = currentChunkX + chunkOffsetX;
+            int chunkZ = currentChunkZ + chunkOffsetZ;
+
+            if (!_FillGpuTreeAnchorBiomes(chunkX, chunkZ))
+            {
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
+            }
+            else if (!_RenderGpuTreeAnchorChunk(chunkX, chunkZ, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorChunkTextures[treeChunkSlot], sizeXZ))
+            {
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
+            }
+            break; // one anchor per step
+        }
+        return gpuDecorAnchorMask != 0;
+    }
+
+    // FINALIZE SLICING step 3 of Prepare_GpuDecorate: the tree/flower decoration blits.
+    // Returns the texture the base-column readback should read. Mirrors the tail of the old
+    // _BlitGpuDecoration exactly (same guards, same blit order).
+    private RenderTexture _GpuDecorationFinishBlits(int sizeXZ)
+    {
+        int worldHeight = gpuWorldHeightBlocks;
+        RenderTexture currentTex = gpuDecorCurrentTex != null ? gpuDecorCurrentTex : gpuColumnFinalTexture;
 
         // Pass 1: Tree decoration
-        if (treeCount > 0 && gpuColumnTreeDecorationMaterial != null)
+        if (gpuDecorTreeCount > 0 && gpuColumnTreeDecorationMaterial != null)
         {
-            VRCGraphics.Blit(columnTex, gpuTreeAnchorChunkTextures[4]);
-            currentTex = gpuTreeAnchorChunkTextures[4];
-            _PrepareGpuTreeAnchorChunks(requiredTreeAnchorMask, sizeXZ);
-
+            int treeCount = gpuDecorTreeCount;
             gpuTreeInfoTexture.SetPixels(gpuTreeInfoPixels);
             gpuTreeInfoTexture.Apply(false, false);
 
@@ -2768,14 +2885,14 @@ public class McTerrainGenerator : UdonSharpBehaviour
         }
 
         // Pass 2: Flower/grass decoration
-        if (candidateCount > 0)
+        if (gpuDecorCandidateCount > 0)
         {
             gpuDecorationCandidateTexture.SetPixels(gpuDecorationCandidatePixels);
             gpuDecorationCandidateTexture.Apply(false, false);
 
             gpuColumnDecorationMaterial.SetTexture(gpuPropBaseColumnTexId, currentTex);
             gpuColumnDecorationMaterial.SetTexture(gpuPropCandidateTexId, gpuDecorationCandidateTexture);
-            gpuColumnDecorationMaterial.SetInt(gpuPropCandidateCountId, candidateCount);
+            gpuColumnDecorationMaterial.SetInt(gpuPropCandidateCountId, gpuDecorCandidateCount);
             gpuColumnDecorationMaterial.SetInt(gpuPropCandidateTexWidthId, GPU_DECORATION_TEX_WIDTH);
             gpuColumnDecorationMaterial.SetInt(gpuPropCandidateTexHeightId, GPU_DECORATION_TEX_HEIGHT);
             gpuColumnDecorationMaterial.SetInt(gpuPropWorldHeightId, worldHeight);
@@ -2799,31 +2916,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return (chunkOffsetZ + 1) * 3 + (chunkOffsetX + 1);
     }
 
-    private void _PrepareGpuTreeAnchorChunks(int requiredTreeAnchorMask, int sizeXZ)
-    {
-        if (gpuTreeAnchorChunkTextures == null || gpuTreeAnchorBiomeBuffer == null) return;
-
-        for (int treeChunkSlot = 0; treeChunkSlot < 9; treeChunkSlot++)
-        {
-            if (treeChunkSlot == 4) continue;
-            if ((requiredTreeAnchorMask & (1 << treeChunkSlot)) == 0) continue;
-
-            int chunkOffsetX = (treeChunkSlot % 3) - 1;
-            int chunkOffsetZ = (treeChunkSlot / 3) - 1;
-            int chunkX = currentChunkX + chunkOffsetX;
-            int chunkZ = currentChunkZ + chunkOffsetZ;
-
-            if (!_FillGpuTreeAnchorBiomes(chunkX, chunkZ))
-            {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
-                continue;
-            }
-            if (!_RenderGpuTreeAnchorChunk(chunkX, chunkZ, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorChunkTextures[treeChunkSlot], sizeXZ))
-            {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
-            }
-        }
-    }
+    // (The old _PrepareGpuTreeAnchorChunks — all pending anchors in one atomic call — was
+    // replaced by the per-step _GpuDecorationRenderNextAnchor above.)
 
     private bool _FillGpuTreeAnchorBiomes(int chunkX, int chunkZ)
     {
@@ -3897,7 +3991,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int noiseZ = 0;
         int noiseChunkX = 0;
 
-        if (dbgStateSteps != null && (int)currentState < dbgStateSteps.Length) dbgStateSteps[(int)currentState]++;
+        int dbgEntryState = (int)currentState;
+        if (dbgStateSteps != null && dbgEntryState < dbgStateSteps.Length) dbgStateSteps[dbgEntryState]++;
 
         switch (currentState)
         {
@@ -4010,7 +4105,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
                     if (enableDetailedTimings) { time_Prep_GetBiomes = (float)(DateTime.UtcNow - t0).TotalMilliseconds; }
 #endif
-                    currentState = gpuWorldgenReady ? GenerationState.Prepare_GpuNoise : GenerationState.Prepare_SandNoise;
+                    // FINALIZE SLICING: the GPU path now ALSO runs the Sand/Gravel/Stone noise
+                    // states (each its own budgeted step) — _StartGpuColumnFinalize consumes
+                    // their buffers instead of computing all three inline in one atomic step
+                    // (they were the bulk of the 33-77ms GpuFinalize block on non-tree columns).
+                    // The Prepare_StoneNoise exit already routes back to Prepare_GpuNoise when
+                    // gpuWorldgenReady.
+                    currentState = GenerationState.Prepare_SandNoise;
                 }
                 break;
                 
@@ -4090,7 +4191,57 @@ public class McTerrainGenerator : UdonSharpBehaviour
                         break;
                     }
 
-                    currentState = gpuSkipReadbackForColumn ? GenerationState.GpuResidentComplete : GenerationState.Prepare_GpuReadback;
+                    // FINALIZE SLICING: decoration + readback moved to their own state.
+                    gpuDecorStep = 0;
+                    currentState = GenerationState.Prepare_GpuDecorate;
+                }
+                break;
+
+            case GenerationState.Prepare_GpuDecorate:
+                {
+                    // FINALIZE SLICING: 0 = CPU candidate collect (+ column snapshot into
+                    // anchor slot 4), 1 = ONE tree-anchor chunk render per step, 2 = the
+                    // decoration blits + resident latch / base-column readback request.
+                    if (gpuDecorStep == 0)
+                    {
+                        _GpuDecorationCollect(world.chunkSizeXZ);
+                        gpuDecorStep = 1;
+                        break;
+                    }
+                    if (gpuDecorStep == 1 && _GpuDecorationRenderNextAnchor(world.chunkSizeXZ))
+                    {
+                        break; // more anchors pending — one per step
+                    }
+                    gpuDecorStep = 2;
+
+                    RenderTexture readbackSource = _GpuDecorationFinishBlits(world.chunkSizeXZ);
+                    gpuCachedColumnX = gpuPendingColumnX;
+                    gpuCachedColumnZ = gpuPendingColumnZ;
+                    gpuCachedChunkSlicesReady = false;
+                    gpuFinalColumnSliceCachePending = false;
+
+                    if (gpuSkipReadbackForColumn)
+                    {
+                        // GPU-RESIDENT (#2): the decorated column texture is GPU-ready now —
+                        // skip the GPU->CPU readback entirely. McWorld repacks each Y-slice
+                        // from this texture into the chunk's atlas slot; the X/Z markers let
+                        // sibling chunks repack without re-running the column gen.
+                        gpuLastReadbackSource = readbackSource;
+                        gpuResidentColumnX = gpuPendingColumnX;
+                        gpuResidentColumnZ = gpuPendingColumnZ;
+                        currentState = GenerationState.GpuResidentComplete;
+                    }
+                    else if (_BeginGpuBaseColumnReadback(readbackSource, true))
+                    {
+                        currentState = GenerationState.Prepare_GpuReadback;
+                    }
+                    else
+                    {
+#if LOGGING
+                        if (enableDetailedTimings) { agg_gpuFallbacks++; agg_gpuFallbackFinalize++; }
+#endif
+                        currentState = GenerationState.Prepare_AllocCache;
+                    }
                 }
                 break;
 
@@ -5168,6 +5319,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
             if (lastStepTime > maxStepTime) maxStepTime = lastStepTime;
             if (lastStepTime < minStepTime) minStepTime = lastStepTime;
             totalSteps++;
+            // Attribute the step's wall-clock to the state it ENTERED with (state may have
+            // transitioned inside the switch) — see dbgStateTimeMs declaration.
+            if (dbgStateTimeMs != null && dbgEntryState < dbgStateTimeMs.Length)
+            {
+                dbgStateTimeMs[dbgEntryState] += lastStepTime;
+                if (lastStepTime > dbgStateTimeMaxMs[dbgEntryState]) dbgStateTimeMaxMs[dbgEntryState] = lastStepTime;
+            }
         }
 #endif
         
