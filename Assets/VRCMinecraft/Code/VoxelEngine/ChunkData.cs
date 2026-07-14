@@ -66,7 +66,11 @@ public class ChunkData
     // one lava pocket scans ~6 columns instead of 256). Only trusted when the version stamp
     // matches _cachedDataVersion — the atomic derive path (edit re-derives) doesn't fill it, so
     // stale masks safely fall back to the full scan.
+    // Semantics (V2): _columnFluidMask[col] = LOWEST fluid Y in the column (255 = no fluid),
+    // _columnFluidMaxY[col] = highest fluid Y. The fluid mesh scan iterates ONLY that span —
+    // a coastal column with 2 water rows walks 2 cells instead of bedrock..surface.
     public byte[] _columnFluidMask;
+    public byte[] _columnFluidMaxY;
     public int _columnFluidMaskVersion = -1;
     // FLUID CHURN GATE: which of the 26 surrounding chunks were MISSING/not-data-ready when this
     // chunk's CPU fluid mesh was last built. Bit index = (dx+1)*9 + (dy+1)*3 + (dz+1). The fluid
@@ -75,6 +79,17 @@ public class ChunkData
     // it was air-assumed at build time. -1 (all bits) = never built through the instanced fluid
     // path / unknown -> always rebuild (conservative, matches old behavior).
     public int _fluidNbMissingMask = -1;
+    // Subset of _fluidNbMissingMask the build is WAITING on (missing + will-generate + has a
+    // trigger path back to this chunk). Completions clear their bit; only the completion that
+    // empties this mask (or arrives after it is already empty — range expansion) pays the
+    // single final heal rebuild. Water itself builds IMMEDIATELY with missing chunks read as
+    // still water (faces culled, not walled), so the transient mesh is already presentable.
+    public int _fluidNbExpectedMask = 0;
+    // True once a REAL fluid build applied a mesh to THIS chunk's current GameObject. A re-defer
+    // (heal trigger while other neighbors are still missing) must keep the existing water visible
+    // instead of publishing the empty placeholder over it (that was a visible flicker); the empty
+    // publish is only for fresh pairings, to clear a pooled GO's previous tenant's water mesh.
+    public bool _fluidMeshBuilt = false;
     public int[] _crossBlockPackedPositions;
     public int _crossBlockCount = 0;
     public int[] _torchBlockPackedPositions;
