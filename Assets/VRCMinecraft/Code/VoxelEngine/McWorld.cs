@@ -2901,6 +2901,10 @@ public partial class McWorld : UdonSharpBehaviour
         chunk._decompNX = null; chunk._decompPX = null;
         chunk._decompNY = null; chunk._decompPY = null;
         chunk._decompNZ = null; chunk._decompPZ = null;
+        chunk._decompPYNX = null; chunk._decompPYPX = null;
+        chunk._decompPYNZ = null; chunk._decompPYPZ = null;
+        chunk._udChunkNX = null; chunk._udChunkPX = null;
+        chunk._udChunkNZ = null; chunk._udChunkPZ = null;
         _ReleaseMeshPool(chunk);
     }
 
@@ -3095,6 +3099,10 @@ public partial class McWorld : UdonSharpBehaviour
             chunk._decompNX = null; chunk._decompPX = null;
             chunk._decompNY = null; chunk._decompPY = null;
             chunk._decompNZ = null; chunk._decompPZ = null;
+            chunk._decompPYNX = null; chunk._decompPYPX = null;
+            chunk._decompPYNZ = null; chunk._decompPYPZ = null;
+            chunk._udChunkNX = null; chunk._udChunkPX = null;
+            chunk._udChunkNZ = null; chunk._udChunkPZ = null;
             _ReleaseMeshPool(chunk);
             _GpuFinishChunkPrep(chunk);
             return;
@@ -3997,6 +4005,10 @@ public partial class McWorld : UdonSharpBehaviour
             chunk._decompPY = null;
             chunk._decompNZ = null;
             chunk._decompPZ = null;
+            chunk._decompPYNX = null; chunk._decompPYPX = null;
+            chunk._decompPYNZ = null; chunk._decompPYPZ = null;
+            chunk._udChunkNX = null; chunk._udChunkPX = null;
+            chunk._udChunkNZ = null; chunk._udChunkPZ = null;
             chunk._cachedBrightness = null;
         }
 
@@ -4578,6 +4590,10 @@ public partial class McWorld : UdonSharpBehaviour
                     chunk._decompNX = null; chunk._decompPX = null;
                     chunk._decompNY = null; chunk._decompPY = null;
                     chunk._decompNZ = null; chunk._decompPZ = null;
+                    chunk._decompPYNX = null; chunk._decompPYPX = null;
+                    chunk._decompPYNZ = null; chunk._decompPYPZ = null;
+                    chunk._udChunkNX = null; chunk._udChunkPX = null;
+                    chunk._udChunkNZ = null; chunk._udChunkPZ = null;
                 }
 #if LOGGING
                 if (enableDetailedTimings)
@@ -8910,6 +8926,10 @@ public partial class McWorld : UdonSharpBehaviour
             chunk._decompNX = null; chunk._decompPX = null;
             chunk._decompNY = null; chunk._decompPY = null;
             chunk._decompNZ = null; chunk._decompPZ = null;
+            chunk._decompPYNX = null; chunk._decompPYPX = null;
+            chunk._decompPYNZ = null; chunk._decompPYPZ = null;
+            chunk._udChunkNX = null; chunk._udChunkPX = null;
+            chunk._udChunkNZ = null; chunk._udChunkPZ = null;
 
             if (chunk._collisionVertexCount == 0) _DisableChunkCollider(chunk, false);
             else if (interactionPriority) _ApplyDataToCollider(chunk);
@@ -12025,13 +12045,26 @@ public partial class McWorld : UdonSharpBehaviour
     // exactly the same cells in the same order as before.
     private bool _dbgLoggedFluidFastPath;
 
+    // FLUID V3: resolve an up-diagonal chunk (the +Y neighbor of a lateral face neighbor) for
+    // the border-column surface fast path. Null when the chunk is out of world, unassigned or
+    // not data-ready — the caller then falls back to the exact full path for those cells
+    // (byte-identical output either way).
+    private ChunkData _GetUpDiagonalChunk(int cx, int cy, int cz)
+    {
+        int ci = ChunkCenteredCoordsTo1D(cx, cy, cz);
+        if (ci == -1 || chunks_1D == null) return null;
+        ChunkData nb = chunks_1D[ci];
+        if (nb == null || !nb.isDataReady) return null;
+        return nb;
+    }
+
     private void _AddWaterBlocksSliced(ChunkData chunk, int zStart, int zCount)
     {
         if (chunk == null || !chunk._hasWaterBlocks || chunk._decompSelf == null) return;
         if (!_dbgLoggedFluidFastPath)
         {
             _dbgLoggedFluidFastPath = true;
-            Debug.Log("[McWorld] FLUID-V2 active: inline enclosure/surface fast paths + churn gate");
+            Debug.Log("[McWorld] FLUID-V3 active: V2 + layer-enclosed mask + border surface fast path");
         }
 
         _EnsureDerivedBlockClassTable();
@@ -12062,12 +12095,100 @@ public partial class McWorld : UdonSharpBehaviour
         byte[] metaArr = chunk.blockMetadata;
         float fastSurfHeight = 1.0f - 1.0f / 9.0f; // still-water render height (meta 0 -> 8/9)
 
+        // FLUID V3 per-build precompute (first z-slice only):
+        // (a) LAYER-ENCLOSED MASK — bit y set when layer y is uniform water, layer y-1 is
+        //     uniform water/opaque (bottom+side cull) and layer y+1 is uniform water/ice (top
+        //     cull). For interior columns (x,z in [1,14]) every cell of such a layer is
+        //     provably FAST PATH 1 (all faces culled, zero quads) with NO reads at all —
+        //     this is the bulk of an ocean chunk's water body. Uniformity via the same
+        //     4-sample + base64-equality check as the derived scan.
+        // (b) UP-DIAGONAL ARRAYS — decompressed data of the +Y chunk of each lateral face
+        //     neighbor, needed by the border-column surface fast path when the water surface
+        //     sits at local y==15 (sea level): its above-ring crosses into those chunks.
+        if (zStart == 0)
+        {
+            int enclMask = 0;
+            if (stride == 256 && chunkSizeY == 16)
+            {
+                int lAllWater = 0, lCull = 0, lTopCull = 0;
+                for (int ly = 0; ly < 16; ly++)
+                {
+                    int lbase = ly << 8;
+                    byte lb0 = data[lbase];
+                    if (data[lbase + 85] == lb0 && data[lbase + 170] == lb0
+                        && data[lbase + 255] == lb0 && _IsUniformLayer256(data, lbase, lb0))
+                    {
+                        int lcls = clsTable[lb0];
+                        bool lw = (lcls & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                        if (lw) lAllWater |= 1 << ly;
+                        if (lw || (lcls & DBC_OPAQUE) != 0) lCull |= 1 << ly;
+                        if (lw || lb0 == BLOCK_ICE) lTopCull |= 1 << ly;
+                    }
+                }
+                for (int ly = 1; ly <= 14; ly++)
+                {
+                    if (((lAllWater >> ly) & 1) != 0
+                        && ((lCull >> (ly - 1)) & 1) != 0
+                        && ((lTopCull >> (ly + 1)) & 1) != 0)
+                    {
+                        enclMask |= 1 << ly;
+                    }
+                }
+            }
+            chunk._fluidLayerEnclosedMask = enclMask;
+
+            chunk._decompPYNX = null; chunk._decompPYPX = null;
+            chunk._decompPYNZ = null; chunk._decompPYPZ = null;
+            chunk._udChunkNX = null; chunk._udChunkPX = null;
+            chunk._udChunkNZ = null; chunk._udChunkPZ = null;
+            if (dPY != null)
+            {
+                int wcx = chunk.chunkX_world, wcy = chunk.chunkY_world, wcz = chunk.chunkZ_world;
+                ChunkData ud;
+                ud = _GetUpDiagonalChunk(wcx - 1, wcy + 1, wcz);
+                if (ud != null) { chunk._decompPYNX = _GetDecompressedDataRaw(ud); chunk._udChunkNX = ud; chunk._udVerNX = ud._cachedDataVersion; }
+                ud = _GetUpDiagonalChunk(wcx + 1, wcy + 1, wcz);
+                if (ud != null) { chunk._decompPYPX = _GetDecompressedDataRaw(ud); chunk._udChunkPX = ud; chunk._udVerPX = ud._cachedDataVersion; }
+                ud = _GetUpDiagonalChunk(wcx, wcy + 1, wcz - 1);
+                if (ud != null) { chunk._decompPYNZ = _GetDecompressedDataRaw(ud); chunk._udChunkNZ = ud; chunk._udVerNZ = ud._cachedDataVersion; }
+                ud = _GetUpDiagonalChunk(wcx, wcy + 1, wcz + 1);
+                if (ud != null) { chunk._decompPYPZ = _GetDecompressedDataRaw(ud); chunk._udChunkPZ = ud; chunk._udVerPZ = ud._cachedDataVersion; }
+            }
+        }
+        else
+        {
+            // FLUID V3 HEAL (slice boundary re-validation): edits in an up-diagonal chunk have
+            // NO trigger path back to this chunk (edits only rebuild face neighbors + same-Y
+            // diagonals), so a change landing mid-build would bake a stale border surface with
+            // no recovery. A version change drops the snapshot — the remaining border cells
+            // take the live exact path — and requests the same pendingChunkMeshRebuild
+            // follow-up the face-neighbor mid-build triggers use. The final slice validates
+            // and completes in the same frame, so no edit can slip in after the last check.
+            if (chunk._decompPYNX != null && (chunk._udChunkNX == null || chunk._udChunkNX._cachedDataVersion != chunk._udVerNX))
+            { chunk._decompPYNX = null; chunk.pendingChunkMeshRebuild = true; }
+            if (chunk._decompPYPX != null && (chunk._udChunkPX == null || chunk._udChunkPX._cachedDataVersion != chunk._udVerPX))
+            { chunk._decompPYPX = null; chunk.pendingChunkMeshRebuild = true; }
+            if (chunk._decompPYNZ != null && (chunk._udChunkNZ == null || chunk._udChunkNZ._cachedDataVersion != chunk._udVerNZ))
+            { chunk._decompPYNZ = null; chunk.pendingChunkMeshRebuild = true; }
+            if (chunk._decompPYPZ != null && (chunk._udChunkPZ == null || chunk._udChunkPZ._cachedDataVersion != chunk._udVerPZ))
+            { chunk._decompPYPZ = null; chunk.pendingChunkMeshRebuild = true; }
+        }
+        int layerEnclMask = chunk._fluidLayerEnclosedMask;
+        byte[] udNX = chunk._decompPYNX; byte[] udPX = chunk._decompPYPX;
+        byte[] udNZ = chunk._decompPYNZ; byte[] udPZ = chunk._decompPYPZ;
+        byte[] metaNXArr = chunk.neighborNX != null ? chunk.neighborNX.blockMetadata : null;
+        byte[] metaPXArr = chunk.neighborPX != null ? chunk.neighborPX.blockMetadata : null;
+        byte[] metaNZArr = chunk.neighborNZ != null ? chunk.neighborNZ.blockMetadata : null;
+        byte[] metaPZArr = chunk.neighborPZ != null ? chunk.neighborPZ.blockMetadata : null;
+
         for (int z = zStart; z < zEnd; z++)
         {
             int colBase = z * chunkSizeXZ;
+            bool zInterior = z >= 1 && z <= 14;
             for (int x = 0; x < chunkSizeXZ; x++)
             {
                 int columnIndex = colBase + x;
+                bool colInterior = zInterior && x >= 1 && x <= 14;
                 // FLUID Y-SPAN: iterate only the column's actual fluid rows. The old loop walked
                 // the full occupied bounds (bedrock..surface) for every wet column — ~11 stone
                 // reads per water row on ocean floors, pure interpreter overhead.
@@ -12090,6 +12211,16 @@ public partial class McWorld : UdonSharpBehaviour
 
                 for (int y = yFrom; y <= yTo; y++)
                 {
+                    // LAYER-ENCLOSED skip (V3): masked layers are uniform water sealed above
+                    // and below — for interior columns the cell is provably enclosed water
+                    // (exactly FAST PATH 1's conclusion) without reading anything.
+                    if (colInterior && ((layerEnclMask >> y) & 1) != 0)
+                    {
+#if LOGGING
+                        stats_fluidCellsEnclosed++;
+#endif
+                        continue;
+                    }
                     int i = y * stride + columnIndex;
                     byte blockID = data[i];
                     int cls = clsTable[blockID];
@@ -12163,8 +12294,8 @@ public partial class McWorld : UdonSharpBehaviour
                         // corner). Ring diagonals must live in this chunk's array -> x,z in
                         // [1,14]; the above row may come from the +Y neighbor (ocean surface
                         // sits at local y=15).
-                        if (nUp >= 0 && !sUp && nUp != BLOCK_ICE && ringTbl != null
-                            && x >= 1 && x <= 14 && z >= 1 && z <= 14)
+                        bool surfHead = nUp >= 0 && !sUp && nUp != BLOCK_ICE && ringTbl != null;
+                        if (surfHead && colInterior)
                         {
                             bool ringOk =
                                 (nXP < 0 || ringTbl[nXP] != 0) &&
@@ -12239,6 +12370,109 @@ public partial class McWorld : UdonSharpBehaviour
                                         _GetWaterBlockBrightness(chunk, x, y, z),
                                         false, false);
                                     continue;
+                                }
+                            }
+                        }
+                        else if (surfHead)
+                        {
+                            // FLUID V3 BORDER SURFACE: the same still-surface test for EDGE
+                            // columns (non-corner), with ring/above/meta cells resolved from
+                            // the decompressed face-neighbor arrays (and, at y==15, the
+                            // up-diagonal arrays fetched at zStart==0). V2's counters showed
+                            // the 60 edge columns of every ocean chunk each paying the
+                            // ~130-call exact path per build — the single largest remaining
+                            // fluid cost. Any missing source array -> exact full path below,
+                            // so emitted geometry is byte-identical to the full path in every
+                            // case. Corner columns (x AND z on an edge) always take the full
+                            // path: their ring needs a lateral-diagonal chunk we never
+                            // decompress.
+                            byte[] eArr = null; byte[] eMeta = null; byte[] udArr = null;
+                            int eStep = 0; int inOff = 0; int eBase = 0; int udBase = 0;
+                            bool edgeOk = false;
+                            if (x == 0 && zInterior)
+                            { eArr = dNX; eMeta = metaNXArr; udArr = udNX; eStep = 16; inOff = 1; eBase = i + 15; udBase = columnIndex + 15; edgeOk = eArr != null; }
+                            else if (x == 15 && zInterior)
+                            { eArr = dPX; eMeta = metaPXArr; udArr = udPX; eStep = 16; inOff = -1; eBase = i - 15; udBase = columnIndex - 15; edgeOk = eArr != null; }
+                            else if (z == 0 && x >= 1 && x <= 14)
+                            { eArr = dNZ; eMeta = metaNZArr; udArr = udNZ; eStep = 1; inOff = 16; eBase = i + 240; udBase = columnIndex + 240; edgeOk = eArr != null; }
+                            else if (z == 15 && x >= 1 && x <= 14)
+                            { eArr = dPZ; eMeta = metaPZArr; udArr = udPZ; eStep = 1; inOff = -16; eBase = i - 240; udBase = columnIndex - 240; edgeOk = eArr != null; }
+
+                            if (edgeOk
+                                && ringTbl[eArr[eBase]] != 0
+                                && ringTbl[eArr[eBase + eStep]] != 0
+                                && ringTbl[eArr[eBase - eStep]] != 0
+                                && ringTbl[data[i + eStep]] != 0
+                                && ringTbl[data[i - eStep]] != 0
+                                && ringTbl[data[i + inOff]] != 0
+                                && ringTbl[data[i + inOff + eStep]] != 0
+                                && ringTbl[data[i + inOff - eStep]] != 0)
+                            {
+                                bool aboveClearB;
+                                if (y < 15)
+                                {
+                                    int a = i + 256;
+                                    int eA = eBase + 256;
+                                    aboveClearB =
+                                        (clsTable[eArr[eA]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[eArr[eA + eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[eArr[eA - eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a + eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a - eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a + inOff]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a + inOff + eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[data[a + inOff - eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID;
+                                }
+                                else
+                                {
+                                    // y == 15: own-side above cells from dPY (non-null implied
+                                    // by nUp >= 0 at y == 15), edge-side from the bottom layer
+                                    // of the up-diagonal chunk; missing -> exact full path.
+                                    aboveClearB = udArr != null &&
+                                        (clsTable[udArr[udBase]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[udArr[udBase + eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[udArr[udBase - eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex + eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex - eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex + inOff]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex + inOff + eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID &&
+                                        (clsTable[dPY[columnIndex + inOff - eStep]] & (DBC_FLUID | DBC_LAVA)) != DBC_FLUID;
+                                }
+                                if (aboveClearB)
+                                {
+                                    bool metasZeroB =
+                                        (metaArr == null ||
+                                         (metaArr.Length >= 4096 &&
+                                          metaArr[i] == 0 &&
+                                          metaArr[i + eStep] == 0 && metaArr[i - eStep] == 0 &&
+                                          metaArr[i + inOff] == 0 &&
+                                          metaArr[i + inOff + eStep] == 0 && metaArr[i + inOff - eStep] == 0))
+                                        && (eMeta == null ||
+                                            (eMeta.Length >= 4096 &&
+                                             eMeta[eBase] == 0 &&
+                                             eMeta[eBase + eStep] == 0 && eMeta[eBase - eStep] == 0));
+                                    if (metasZeroB)
+                                    {
+#if LOGGING
+                                        stats_fluidCellsSurf++;
+#endif
+                                        float stillS2 = betaWaterStillSlice >= 0 ? betaWaterStillSlice : _GetTextureSlice(blockID, FACE_INDEX_TOP);
+                                        _AddWaterQuad(
+                                            chunk,
+                                            new Vector3(x, y + fastSurfHeight, z),
+                                            new Vector3(x, y + fastSurfHeight, z + 1),
+                                            new Vector3(x + 1, y + fastSurfHeight, z + 1),
+                                            new Vector3(x + 1, y + fastSurfHeight, z),
+                                            Normal_Up,
+                                            new Vector2(0f, 0f),
+                                            new Vector2(0f, 1f),
+                                            new Vector2(1f, 1f),
+                                            new Vector2(1f, 0f),
+                                            stillS2,
+                                            _GetWaterBlockBrightness(chunk, x, y, z),
+                                            false, false);
+                                        continue;
+                                    }
                                 }
                             }
                         }
