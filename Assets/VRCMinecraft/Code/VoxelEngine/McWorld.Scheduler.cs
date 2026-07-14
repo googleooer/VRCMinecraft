@@ -81,6 +81,8 @@ public partial class McWorld
     // Initial-load plateau detection
     // -------------------------------------------------------------------------
     private bool  _initialBulkLoadDone          = false;
+    // Wall-clock of the previous scheduler cycle — feeds the plateau pause/hitch guard.
+    private float _lastSchedulerCycleTime       = -1f;
     private int   _lastProgressCompletedCount   = -1;
     private float _lastGenProgressTime          = -1f;
 
@@ -995,7 +997,10 @@ public partial class McWorld
     {
         if (!_schedulerReady) return;
 
-        float cycleStartTime = Time.realtimeSinceStartup;
+        // FRAME GOVERNOR: consume from the shared per-Update envelope (anchored in Update())
+        // instead of anchoring a fresh full budget here — the old fresh anchor stacked a
+        // second updateTimeBudgetMs on top of ProcessActiveChunks' envelope on busy frames.
+        float cycleStartTime = _frameStartSec;
 
         // DATA-GEN STREAMING: detect end of the one-time initial load by completion PLATEAU.
         // With streaming, chunksCompletedCount never reaches totalWorldChunks. Once completion
@@ -1003,6 +1008,18 @@ public partial class McWorld
         // one-way so the load-phase budget boost drops to steady-state.
         if (!_initialBulkLoadDone)
         {
+            // PAUSE/HITCH GUARD: a big gap between scheduler cycles means the app was paused
+            // or hard-stalled (Quest headset doff, OS pause, GPU device reset) — wall-clock
+            // kept running while no work COULD complete. Re-arm the plateau window instead of
+            // falsely latching end-of-load, which would permanently drop the load-phase
+            // budget boost (24ms -> 8ms) for the rest of the initial load. A genuine
+            // end-of-load plateau has cycles running every frame, so it is unaffected.
+            if (_lastSchedulerCycleTime >= 0f && cycleStartTime - _lastSchedulerCycleTime > 2f)
+            {
+                _lastGenProgressTime = cycleStartTime;
+            }
+            _lastSchedulerCycleTime = cycleStartTime;
+
             if (chunksCompletedCount != _lastProgressCompletedCount)
             {
                 _lastProgressCompletedCount = chunksCompletedCount;
@@ -1015,11 +1032,14 @@ public partial class McWorld
             }
         }
 
-        // Load-phase budget boost: drain terrain faster at the larger budget during the one-time
-        // initial generation; revert to the normal budget once complete.
-        float effectiveBudgetMs = (!_initialBulkLoadDone && loadPhaseUpdateBudgetMs > updateTimeBudgetMs)
-            ? loadPhaseUpdateBudgetMs : updateTimeBudgetMs;
-        float cycleBudget = effectiveBudgetMs * 0.001f;
+        // FRAME GOVERNOR: the scheduler gets schedulerBudgetShare of the shared envelope
+        // (updateTimeBudgetMs already carries the load-phase boost via the init/restore
+        // machinery in McWorld). The PAC lanes get the remainder of the same envelope.
+        // Floor: guarantee ~1ms of scheduler work from NOW even if pre-envelope mandatory
+        // work (collision/rehydration) already blew the share — data-gen liveness needs the
+        // per-worker poll step every frame (readback un-parking).
+        float shareBudget = updateTimeBudgetMs * Mathf.Clamp01(schedulerBudgetShare) * 0.001f;
+        float cycleBudget = Mathf.Max(shareBudget, (Time.realtimeSinceStartup - cycleStartTime) + 0.001f);
 
         // DEBUG (debugGenSlotHoldFrames): release generator slots whose simulated
         // readback-occupancy hold has elapsed. No-op when the knob is 0.

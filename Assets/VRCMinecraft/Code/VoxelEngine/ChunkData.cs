@@ -40,6 +40,10 @@ public class ChunkData
     public bool isDataReady = false;
     public bool isSingleOpaqueSolid = false;
     public bool isGeneratingData = false;
+    // FRAME GOVERNOR: Time.frameCount of the last StepChunkDataGeneration on this chunk.
+    // The scheduler worker loop and the ProcessActiveChunks data-gen lane both step data-gen;
+    // this stamp lets the second caller skip a chunk already stepped this frame.
+    public int _dataGenStepFrame = -1;
     public bool isBuildingMesh = false;
     public bool isMeshDeferred = false;
     public bool pendingColliderApply = false;
