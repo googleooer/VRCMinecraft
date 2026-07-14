@@ -3733,6 +3733,18 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return currentState == GenerationState.Idle;
     }
 
+    // DYNAMIC GENERATOR ASSIGNMENT: is the state machine mid-generation on this COLUMN (any
+    // Y)? Pre-readback a column has no copyable cache, so without this check a mid-gen
+    // column's sibling Y-chunks are indistinguishable from fresh new-column candidates.
+    // Same coordinate adjustment as IsGeneratingChunk.
+    public bool IsGeneratingColumn(int chunkX, int chunkZ)
+    {
+        if (currentState == GenerationState.Idle) return false;
+        int gx = chunkX + (chunkOffsetX / world.chunkSizeXZ);
+        int gz = chunkZ + (chunkOffsetZ / world.chunkSizeXZ);
+        return currentChunkX == gx && currentChunkZ == gz;
+    }
+
     // MULTI-GEN CONTRACT: does the chunk the state machine last worked on match these coords?
     // Unlike IsGeneratingChunk this stays true right AFTER completion (state back at Idle), so
     // McWorld can verify a step-loop completion actually belongs to the consuming chunk before
