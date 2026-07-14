@@ -66,10 +66,31 @@ public partial class McWorld : UdonSharpBehaviour
     [Header("Performance Tuning")]
     // Approximate time budget per mesh step (CPU-only mesh path).
     [System.NonSerialized] public float meshStepTimeBudgetMs = 15.0f;
-    // Time budget per Update() call in ms. Was scene-serialized at 22.
-    [System.NonSerialized] public float updateTimeBudgetMs = 22.0f;
+    // FRAME GOVERNOR: ONE envelope per Update(), anchored at Update() entry and shared by the
+    // scheduler AND every ProcessActiveChunks lane. They used to each anchor their own full
+    // updateTimeBudgetMs (scheduler 22 + PAC 22 + per-lane floors), stacking busy frames to
+    // ~30-34ms. Lanes keep small work-gated FLOORS (below) so nothing starves on a blown
+    // frame; those floors are the only permitted overshoot past the envelope.
+    // STEADY-STATE budget per Update() in ms: sized for 90fps streaming (11.1ms frame minus
+    // ~3ms render/VRC overhead). Only binds while there is queued chunk work.
+    [System.NonSerialized] public float updateTimeBudgetMs = 8.0f;
     // Load-phase boost for updateTimeBudgetMs (<= updateTimeBudgetMs disables the boost).
-    [System.NonSerialized] public float loadPhaseUpdateBudgetMs = 6.0f;
+    // Active during the one-time initial load only; ends on the scheduler's completion
+    // plateau (_initialBulkLoadDone). ~24ms preserves the pre-governor load pacing.
+    [System.NonSerialized] public float loadPhaseUpdateBudgetMs = 24.0f;
+    // Scheduler (data-gen side) share of the envelope; the PAC lanes get the remainder.
+    // Datagen is readback-latency-bound (steps park on gpuStepBlockedOnReadback almost
+    // immediately), so capping its share costs little gen throughput while guaranteeing the
+    // mesh lane — the actual pipeline bottleneck — the rest of every frame.
+    [System.NonSerialized] public float schedulerBudgetShare = 0.5f;
+    // Work-gated per-lane floors (ms) applied only when the shared envelope is already spent:
+    // each guarantees minimum forward progress for its lane on blown frames.
+    [System.NonSerialized] public float laneFloorLightingMs = 1.5f;
+    [System.NonSerialized] public float laneFloorNearMeshMs = 1.5f;
+    [System.NonSerialized] public float laneFloorMeshDecodeMs = 2.0f;
+    // Governor anchor state, set once at the top of Update().
+    private float _frameStartSec = 0f;
+    private float _frameDeadlineSec = 0f;
     // Runtime state for the load-phase budget boost (see Update()).
     private bool _loadPhaseBudgetRestored = false;
     private float _runtimeUpdateBudgetMs = 0f;
@@ -152,16 +173,13 @@ public partial class McWorld : UdonSharpBehaviour
     [System.NonSerialized] public int deferredSecondaryWorkTasksPerFrame = 2;
     // Chunk slots scanned per frame for deferred secondary work.
     [System.NonSerialized] public int deferredSecondaryWorkScanCountPerFrame = 64;
-    // Adapt GPU worldgen and mesh decode budgets based on recent frame time.
+    // RETIRED CONTROLLER: the adaptive budget controller is gone (see _UpdateAdaptiveBudgets)
+    // — the FRAME GOVERNOR's shared envelope replaced it. These two fields survive only for
+    // the EMA-based hasHeadroom gates on deferred secondary work / lighting pressure:
+    // headroom -100 keeps those gates permanently open (deferred work always flows; the
+    // governor's envelope is what actually protects the frame).
     [System.NonSerialized] public bool enableAdaptiveBudgets = true;
-    // THROUGHPUT FIX (now authoritative — the scene had silently reverted these to
-    // 1.5/0.2/0.65, re-enabling the frame-budget collapse to 5ms visible in the perf logs):
-    // negative headroom + zero backoff + minScale 1.0 disable adaptive SHRINKING entirely;
-    // budgets can grow but never drop below the configured values.
     [System.NonSerialized] public float adaptiveFrameHeadroomMs = -100f;
-    [System.NonSerialized] public float adaptiveBudgetRecoverRate = 0.08f;
-    [System.NonSerialized] public float adaptiveBudgetBackoffRate = 0.0f;
-    [System.NonSerialized] public float adaptiveBudgetMinScale = 1.0f;
 
     [Header("System References")]
     [SerializeField, FindObjectOfType(true)]
@@ -913,7 +931,7 @@ public partial class McWorld : UdonSharpBehaviour
         _InitializeGpuDebugHud();
         _InitializeMeshPool();
         _InitVoxelColliderGrid();
-        // Runtime override: a tiny floor only (the 90fps steady-state budget is intentionally ~6ms).
+        // Runtime override: a tiny floor only (the 90fps steady-state budget is intentionally ~8ms).
         if (updateTimeBudgetMs < 2f) updateTimeBudgetMs = 2f;
         // Load-phase budget boost: remember the normal runtime budget, then run the
         // one-time initial world generation at a larger budget so the idle GPU + readback
@@ -986,81 +1004,25 @@ public partial class McWorld : UdonSharpBehaviour
     private void _UpdateAdaptiveBudgets(float updateTimeMs)
     {
         // Clamp input before EMA — a single 300ms+ GC/VRC spike would poison
-        // the smoothed value for 40+ frames, collapsing budgets to the floor.
-        // Capping at 1.5× budget limits the damage to ~5 frames of recovery.
+        // the smoothed value for 40+ frames. Capping at 1.5× budget limits the
+        // damage to ~5 frames of recovery. The EMA still feeds hasHeadroom checks
+        // and the perf logs.
         float clampedMs = updateTimeMs < updateTimeBudgetMs * 1.5f ? updateTimeMs : updateTimeBudgetMs * 1.5f;
         const float alpha = 0.15f;
         lastUpdateDurationMs = lastUpdateDurationMs + alpha * (clampedMs - lastUpdateDurationMs);
 
-        if (!enableAdaptiveBudgets)
-        {
-            _ResetAdaptiveBudgets();
-            lastUpdateDurationMs = updateTimeMs;
-            return;
-        }
-
-        // LOAD PHASE: during the one-time initial world generation, raise budgets vs steady-state —
-        // total load time matters more than load FPS — but DON'T let worldgen monopolize the GPU:
-        // worldgen base-readbacks were saturating the GPU and starving mesh face-readbacks, so the
-        // visible world only meshed AFTER data-gen finished. Worldgen is now moderated (and the
-        // coordinator caps concurrent columns via maxConcurrentWorldgenColumns) to leave GPU readback
-        // bandwidth for meshing, while mesh decode is boosted so the near world fills in during gen.
-        if (!_loadPhaseBudgetRestored)
-        {
-            // SMOOTH-LOAD tuning: the user chose decent FPS during the one-time load over fastest total
-            // load, so keep the load phase close to steady-state per-frame cost instead of the old
-            // high floors (which monopolised the frame for fast load). Use the serialized step counts
-            // as-is; cap the load mesh-decode share at the load budget minus a small reserve for
-            // finalize/lighting/worldgen. Everything still drains — just spread over more frames.
-            adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(1, gpuWorldgenStepsPerFrame);
-            adaptiveGpuWorldgenStepBudgetMs = gpuWorldgenStepBudgetMs;
-            adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(1, gpuMeshDecodeStepsPerFrame);
-            adaptiveGpuMeshDecodeStepBudgetMs = gpuMeshDecodeStepBudgetMs;
-            float loadMeshBudget = Mathf.Max(gpuMeshDecodeFrameBudgetMs, loadPhaseUpdateBudgetMs - 3f);
-            adaptiveGpuMeshDecodeFrameBudgetMs = loadMeshBudget;
-            return;
-        }
-
-        float smoothedMs = lastUpdateDurationMs;
-        float minScale = Mathf.Clamp01(adaptiveBudgetMinScale);
-        float growFactor = 1f + Mathf.Max(0f, adaptiveBudgetRecoverRate);
-        float shrinkFactor = 1f - Mathf.Clamp01(adaptiveBudgetBackoffRate);
-        float targetWithHeadroom = Mathf.Max(0.5f, updateTimeBudgetMs - adaptiveFrameHeadroomMs);
-
-        if (smoothedMs > updateTimeBudgetMs)
-        {
-            adaptiveGpuMeshDecodeStepBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeStepBudgetMs * shrinkFactor, gpuMeshDecodeStepBudgetMs * minScale, gpuMeshDecodeStepBudgetMs);
-            adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeFrameBudgetMs * shrinkFactor, gpuMeshDecodeFrameBudgetMs * minScale, gpuMeshDecodeFrameBudgetMs);
-            adaptiveGpuWorldgenStepBudgetMs = Mathf.Clamp(adaptiveGpuWorldgenStepBudgetMs * shrinkFactor, gpuWorldgenStepBudgetMs * minScale, gpuWorldgenStepBudgetMs);
-
-            if (adaptiveGpuMeshDecodeStepsPerFrame > 1 && smoothedMs > updateTimeBudgetMs + 1f)
-            {
-                adaptiveGpuMeshDecodeStepsPerFrame--;
-            }
-            if (adaptiveGpuWorldgenStepsPerFrame > 1 && smoothedMs > updateTimeBudgetMs + 1f)
-            {
-                adaptiveGpuWorldgenStepsPerFrame--;
-            }
-            return;
-        }
-
-        if (smoothedMs >= targetWithHeadroom)
-        {
-            return;
-        }
-
-        adaptiveGpuMeshDecodeStepBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeStepBudgetMs * growFactor, gpuMeshDecodeStepBudgetMs * minScale, gpuMeshDecodeStepBudgetMs);
-        adaptiveGpuMeshDecodeFrameBudgetMs = Mathf.Clamp(adaptiveGpuMeshDecodeFrameBudgetMs * growFactor, gpuMeshDecodeFrameBudgetMs * minScale, gpuMeshDecodeFrameBudgetMs);
-        adaptiveGpuWorldgenStepBudgetMs = Mathf.Clamp(adaptiveGpuWorldgenStepBudgetMs * growFactor, gpuWorldgenStepBudgetMs * minScale, gpuWorldgenStepBudgetMs);
-
-        if (adaptiveGpuMeshDecodeStepsPerFrame < Mathf.Max(1, gpuMeshDecodeStepsPerFrame) && smoothedMs < targetWithHeadroom - 1f)
-        {
-            adaptiveGpuMeshDecodeStepsPerFrame++;
-        }
-        if (adaptiveGpuWorldgenStepsPerFrame < Mathf.Max(1, gpuWorldgenStepsPerFrame) && smoothedMs < targetWithHeadroom - 1f)
-        {
-            adaptiveGpuWorldgenStepsPerFrame++;
-        }
+        // FRAME GOVERNOR: the adaptive budget controller is retired — the shared per-Update
+        // envelope (anchored in Update()) is now the ONE mechanism trading lane time against
+        // frame time. The controller had long been inert (backoffRate=0 / minScale=1 /
+        // headroom=-100 disabled shrinking, and it only ran in LOGGING builds at all) EXCEPT
+        // for a load-phase branch that silently inflated the mesh-decode lane to
+        // loadPhaseUpdateBudgetMs-3 — exactly the per-lane stacking the governor removes.
+        // Budgets stay pinned to their configured values, matching non-LOGGING builds.
+        adaptiveGpuMeshDecodeStepBudgetMs = gpuMeshDecodeStepBudgetMs;
+        adaptiveGpuMeshDecodeStepsPerFrame = Mathf.Max(1, gpuMeshDecodeStepsPerFrame);
+        adaptiveGpuMeshDecodeFrameBudgetMs = gpuMeshDecodeFrameBudgetMs;
+        adaptiveGpuWorldgenStepBudgetMs = gpuWorldgenStepBudgetMs;
+        adaptiveGpuWorldgenStepsPerFrame = Mathf.Max(1, gpuWorldgenStepsPerFrame);
     }
 
     void InitializeWorldParameters()
@@ -5376,6 +5338,12 @@ public partial class McWorld : UdonSharpBehaviour
         // Safety check: Don't process if not initialized
         if (chunks_1D == null || terrainGenerator == null) return;
 
+        // FRAME GOVERNOR anchor: everything budgeted this Update (scheduler + all PAC lanes)
+        // measures against this single envelope. Mandatory unbudgeted work (collision,
+        // rehydration drain, water anim) runs inside it too, so budgeted chunk work yields
+        // to it automatically instead of stacking on top.
+        _frameStartSec = Time.realtimeSinceStartup;
+
         // BOX COLLIDER COLLISION: keep the player's collision grid current every frame, before (and
         // independent of) the budgeted chunk processing below — collision must never be skipped on a
         // heavy frame or the player falls through the world. No-op unless useBoxColliderCollision.
@@ -5386,11 +5354,15 @@ public partial class McWorld : UdonSharpBehaviour
         // readback pipeline do much more per frame). Once gen completes, restore the normal
         // runtime budget so steady-state frame rate is protected. Accuracy is unaffected —
         // this only changes how much already-scheduled work runs per frame.
+        // IsWorldGenComplete() fires on the scheduler's completion PLATEAU
+        // (_initialBulkLoadDone) — with data-gen streaming, completion never reaches
+        // totalWorldChunks, so the plateau is the real end-of-load signal.
         if (!_loadPhaseBudgetRestored && IsWorldGenComplete())
         {
             _loadPhaseBudgetRestored = true;
             updateTimeBudgetMs = _runtimeUpdateBudgetMs;
         }
+        _frameDeadlineSec = _frameStartSec + updateTimeBudgetMs * 0.001f;
 
         // Drain pending GPU-resident chunk rehydrations (cheap no-op when the queue is empty).
         GpuMaintainRehydrationQueue(8);
@@ -5446,11 +5418,14 @@ public partial class McWorld : UdonSharpBehaviour
 
     private void ProcessActiveChunks()
     {
-        float frameStart = Time.realtimeSinceStartup;
-        float frameBudget = updateTimeBudgetMs * 0.001f;
+        // FRAME GOVERNOR: consume the remainder of the shared per-Update envelope (the
+        // scheduler already spent its share from the same anchor). Lanes that must never
+        // fully starve get small work-gated floors from NOW instead of full fresh budgets.
+        float frameStart = _frameStartSec;
+        float frameBudget = _frameDeadlineSec - _frameStartSec;
 
 #if LOGGING
-        float processStartTime = frameStart;
+        float processStartTime = Time.realtimeSinceStartup;
 #endif
 
 #if LOGGING
@@ -5459,7 +5434,9 @@ public partial class McWorld : UdonSharpBehaviour
         // CHUNK GO POOL: pre-warm the pool to the render-distance set at startup (time-sliced), before
         // the heavy GPU maintain/lighting work, so chunks pop a ready GameObject during the initial
         // load rather than Instantiate one each as they generate. No-op once the target is reached.
-        _PrewarmChunkGoPool(frameStart);
+        // Keeps its own fresh anchor: its 2ms slice must survive the scheduler having spent
+        // the envelope, or the pool never fills during the load's first seconds.
+        _PrewarmChunkGoPool(Time.realtimeSinceStartup);
 
         // Flush any batched slot lookup changes from this or previous frames
         if (gpuSlotLookupDirty)
@@ -5470,8 +5447,10 @@ public partial class McWorld : UdonSharpBehaviour
 
         // Keep nearby chunks resident in the GPU atlases before running lighting.
         // Otherwise visible chunks can be evicted by distant worldgen and slowly fall
-        // back to stale mesh lighting.
-        _GpuMaintainResidentChunks(frameStart, frameBudget);
+        // back to stale mesh lighting. Floor: ~1ms from NOW even on a blown frame —
+        // starved maintenance lets distant worldgen evict visible chunks from the atlases.
+        _GpuMaintainResidentChunks(frameStart,
+            Mathf.Max(frameBudget, (Time.realtimeSinceStartup - frameStart) + 0.001f));
 
         // Flush again if maintain created new slot assignments
         if (gpuSlotLookupDirty)
@@ -5485,8 +5464,11 @@ public partial class McWorld : UdonSharpBehaviour
 #endif
         // Run GPU lighting first so atlas propagation still gets time while worldgen and
         // meshing are busy. Otherwise repeated chunk uploads can keep reseeding lighting
-        // without enough passes to converge.
-        _ProcessGpuLighting(frameStart, frameBudget);
+        // without enough passes to converge. Floor: laneFloorLightingMs from NOW — under the
+        // shared envelope the scheduler can spend everything before lighting runs, and
+        // lighting must keep converging or uploads reseed faster than propagation drains.
+        _ProcessGpuLighting(frameStart,
+            Mathf.Max(frameBudget, (Time.realtimeSinceStartup - frameStart) + laneFloorLightingMs * 0.001f));
 #if LOGGING
         if (enableDetailedTimings) { float _n2 = Time.realtimeSinceStartup; stats_pacLightingMs += (_n2 - _pacT1) * 1000f; _pacT1 = _n2; }
 #endif
@@ -5529,6 +5511,12 @@ public partial class McWorld : UdonSharpBehaviour
                 i--; // Re-check this index
                 continue;
             }
+            // FRAME GOVERNOR dedupe: the scheduler worker loop already stepped this chunk
+            // this frame (each StepChunkDataGeneration carries its own worldgen step
+            // envelope). Re-stepping here spent a second envelope out of the PAC remainder
+            // that the mesh lane — the pipeline bottleneck — needs. Chunks the scheduler
+            // missed (budget cutoff, no worker) still step normally.
+            if (chunk._dataGenStepFrame == Time.frameCount) continue;
             StepChunkDataGeneration(chunk);
         }
 
@@ -5536,13 +5524,15 @@ public partial class McWorld : UdonSharpBehaviour
         if (enableDetailedTimings) { float _n4 = Time.realtimeSinceStartup; stats_pacDataGenMs += (_n4 - _pacT1) * 1000f; _pacT1 = _n4; }
 #endif
         // --- NEAR meshing guarantee (Minecraft: near chunks rebuild unconditionally each frame) ---
-        // Runs BEFORE the shared budget loop, with its OWN time budget that the shared aggregate cap
-        // does not deduct from, so a far-chunk backlog (the deferred mesh queue can sit at 256/256)
-        // can never starve meshing the chunks right around the player. Bounded by
-        // gpuNearMeshDecodeFrameBudgetMs so it can't spike frames (MC bounds its near rebuilds by a
-        // per-frame deadline the same way).
+        // Runs BEFORE the shared budget loop so a far-chunk backlog (the deferred mesh queue
+        // can sit at 256/256) can never starve meshing the chunks right around the player.
+        // FRAME GOVERNOR: runs inside the shared envelope with a laneFloorNearMeshMs floor on
+        // blown frames (was a full private 5ms budget stacked on top every busy frame), and
+        // stays capped by gpuNearMeshDecodeFrameBudgetMs so it can't spike frames either way.
         float nearMeshBudgetSec = Mathf.Max(0.25f, gpuNearMeshDecodeFrameBudgetMs) * 0.001f;
-        float nearMeshDeadline = Time.realtimeSinceStartup + nearMeshBudgetSec;
+        float nearMeshDeadline = Mathf.Min(
+            Mathf.Max(_frameDeadlineSec, Time.realtimeSinceStartup + laneFloorNearMeshMs * 0.001f),
+            Time.realtimeSinceStartup + nearMeshBudgetSec);
         for (int ni = 0; ni < activeMeshingCount; ni++)
         {
             if (Time.realtimeSinceStartup > nearMeshDeadline) break;
@@ -5594,7 +5584,9 @@ public partial class McWorld : UdonSharpBehaviour
         // the hundreds of frames the load-phase gen storm runs, then trip the 300-frame mesh
         // watchdog and get force-released — losing chunks. Mirrors the readback guarantee above:
         // the slice is only consumed when there is actually mesh work queued (activeMeshingCount>0).
-        float meshDeadline = Mathf.Max(frameStart + frameBudget, Time.realtimeSinceStartup + gpuMeshDecodeFrameBudgetSec);
+        // FRAME GOVERNOR: the floor is laneFloorMeshDecodeMs (was the full 5ms decode budget —
+        // enough progress to outrun the watchdog, without re-stacking on blown frames).
+        float meshDeadline = Mathf.Max(_frameDeadlineSec, Time.realtimeSinceStartup + laneFloorMeshDecodeMs * 0.001f);
 
         // COMPACTION PASS (unbudgeted, O(n) flag checks): remove completed entries over the WHOLE
         // list every frame. The old combined scan removed only entries the budget cutoff reached —
@@ -6438,6 +6430,10 @@ public partial class McWorld : UdonSharpBehaviour
     {
         if (!chunk.isGeneratingData) return;
 
+        // FRAME GOVERNOR dedupe stamp: lets the PAC data-gen lane skip chunks the scheduler
+        // worker loop already stepped this frame (see ProcessActiveChunks).
+        chunk._dataGenStepFrame = Time.frameCount;
+
         McTerrainGenerator gen = _GeneratorForColumn(chunk.chunkX_world, chunk.chunkZ_world);
         bool useGpuWorldgen = gen != null && gen.enableGpuWorldgen;
         byte[] generatedData = null;
@@ -6517,8 +6513,12 @@ public partial class McWorld : UdonSharpBehaviour
                 // Break now; the worker stays in DATA_GEN and we poll exactly once next frame.
                 if (gen.gpuStepBlockedOnReadback) break;
 
-                // Stop if we've used our budget (prevents stutters)
+                // Stop if we've used our budget (prevents stutters). FRAME GOVERNOR: also stop
+                // at the shared frame deadline — one step per call is always guaranteed above,
+                // so blown frames keep gen liveness (the readback un-park poll) without paying
+                // the full per-call step envelope on top of the envelope that blew.
                 if (Time.realtimeSinceStartup - stepStart > stepBudget) break;
+                if (Time.realtimeSinceStartup > _frameDeadlineSec) break;
             }
         }
 #if LOGGING
@@ -6569,12 +6569,11 @@ public partial class McWorld : UdonSharpBehaviour
             float _finTailT0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
 
-            // Check homogeneous cheaply — full RLE is deferred
-            bool isHomogeneous = true;
+            // Check homogeneous cheaply — full RLE is deferred. Strided sample + one bulk
+            // base64-equality extern instead of the old 4096-iteration byte scan (which cost
+            // ~350ms/window: its full price landed exactly on the homogeneous chunks).
             byte firstBlock = generatedData[0];
-            for (int ci = 1; ci < generatedData.Length; ci++) {
-                if (generatedData[ci] != firstBlock) { isHomogeneous = false; break; }
-            }
+            bool isHomogeneous = _IsHomogeneousChunkData(generatedData, firstBlock);
 
             // GPU OFFLOAD #2 NOTE: A previous attempt set _chunkData = null for distant
             // chunks (marking them GPU-resident). This broke the chunk because mesh/light
@@ -12870,14 +12869,8 @@ public partial class McWorld : UdonSharpBehaviour
         int bytesIn = fullChunkData != null ? fullChunkData.Length : 0;
 #endif
 
-        isHomogeneous = true;
         byte firstBlock = fullChunkData[0];
-        for (int i = 1; i < fullChunkData.Length; i++) {
-            if (fullChunkData[i] != firstBlock) {
-                isHomogeneous = false;
-                break;
-            }
-        }
+        isHomogeneous = _IsHomogeneousChunkData(fullChunkData, firstBlock);
 
         if (isHomogeneous) {
 #if LOGGING
@@ -13321,9 +13314,17 @@ public partial class McWorld : UdonSharpBehaviour
         float reconciliationBudget = RECONCILIATION_TIME_BUDGET_MS * 0.001f;
         int processedCount = 0;
 
+        // FRAME GOVERNOR floor: the headroom gate below reserves RECONCILIATION_TIME_BUDGET_MS
+        // (12ms) inside the shared envelope — the 8ms steady-state envelope can NEVER satisfy
+        // that (threshold goes negative), and this loop is the ONLY drain of
+        // deferredReconciliationQueue (CPU-lighting fallback path), so without a floor the
+        // queue starves forever -> permanent cross-chunk lighting seams. Guarantee ONE
+        // reconciliation per frame whenever the queue is non-empty; additional dequeues still
+        // require the headroom gate.
         while (deferredReconciliationQueue.Count > 0 &&
                processedCount < MAX_RECONCILIATION_PER_FRAME &&
-               Time.realtimeSinceStartup - frameStart < frameBudget - reconciliationBudget)
+               (processedCount == 0 ||
+                Time.realtimeSinceStartup - frameStart < frameBudget - reconciliationBudget))
         {
             ChunkData chunk = deferredReconciliationQueue.Dequeue();
             reconciliationPending.Remove(chunk);
@@ -15069,6 +15070,75 @@ public partial class McWorld : UdonSharpBehaviour
 
     private byte[] _fluidSurfRingTable;
 
+    // HOMOGENEITY FAST CHECK: replaces the up-to-4096-iteration Udon byte scans. The full cost
+    // of those scans hit exactly the chunks that ARE homogeneous (all-air above terrain,
+    // all-stone deep — roughly half the world), and even "early-break" mixed chunks often paid
+    // thousands of iterations (Y-major layout: a stone-bottom/air-top chunk only differs once
+    // the scan reaches the air). Strategy: a 16-point strided sample rejects mixed chunks in
+    // ~16 iterations, then survivors are CONFIRMED byte-exactly with one bulk extern —
+    // Convert.ToBase64String over the buffer compared against a cached per-blockID reference
+    // string. No false positives possible: base64 is a bijection on the byte content.
+    private string[] _homogChunkB64;  // per blockID: base64 of a 4096-byte buffer of that ID
+    private string[] _layerB64Cache;  // per blockID: base64 of a 256-byte layer of that ID
+    private byte[] _homogFillScratch; // shared fill buffer for building reference strings
+
+    private string _BuildUniformB64(byte b, int length)
+    {
+        if (_homogFillScratch == null || _homogFillScratch.Length < length)
+            _homogFillScratch = new byte[length];
+        byte[] scratch = _homogFillScratch;
+        scratch[0] = b;
+        int filled = 1;
+        while (filled < length)
+        {
+            int copyLen = filled < length - filled ? filled : length - filled;
+            System.Array.Copy(scratch, 0, scratch, filled, copyLen);
+            filled = filled + copyLen;
+        }
+        return System.Convert.ToBase64String(scratch, 0, length);
+    }
+
+    private bool _IsHomogeneousChunkData(byte[] data, byte firstBlock)
+    {
+        int len = data.Length;
+        int sampleStride = len >> 4;
+        if (sampleStride > 0)
+        {
+            for (int s = len - 1; s >= 0; s -= sampleStride)
+            {
+                if (data[s] != firstBlock) return false;
+            }
+        }
+        if (len != 4096)
+        {
+            // Unexpected size (never in practice): exact fallback scan.
+            for (int ci = 1; ci < len; ci++) { if (data[ci] != firstBlock) return false; }
+            return true;
+        }
+        if (_homogChunkB64 == null) _homogChunkB64 = new string[256];
+        string refB64 = _homogChunkB64[firstBlock];
+        if (refB64 == null)
+        {
+            refB64 = _BuildUniformB64(firstBlock, 4096);
+            _homogChunkB64[firstBlock] = refB64;
+        }
+        return System.Convert.ToBase64String(data) == refB64;
+    }
+
+    // Confirms data[offset..offset+256) is entirely block id b (callers pre-sample a few bytes
+    // so mixed layers never reach the extern). Used by the derived scan's uniform-layer path.
+    private bool _IsUniformLayer256(byte[] data, int offset, byte b)
+    {
+        if (_layerB64Cache == null) _layerB64Cache = new string[256];
+        string refB64 = _layerB64Cache[b];
+        if (refB64 == null)
+        {
+            refB64 = _BuildUniformB64(b, 256);
+            _layerB64Cache[b] = refB64;
+        }
+        return System.Convert.ToBase64String(data, offset, 256) == refB64;
+    }
+
     private void _RefreshChunkDerivedData(ChunkData chunk, byte[] fullData)
     {
         if (chunk == null || fullData == null) return;
@@ -15144,117 +15214,14 @@ public partial class McWorld : UdonSharpBehaviour
             return;
         }
 
-        if (chunk._crossBlockPackedPositions == null || chunk._crossBlockPackedPositions.Length != fullData.Length)
-        {
-            chunk._crossBlockPackedPositions = new int[fullData.Length];
-        }
-        if (chunk._torchBlockPackedPositions == null || chunk._torchBlockPackedPositions.Length != fullData.Length)
-        {
-            chunk._torchBlockPackedPositions = new int[fullData.Length];
-        }
-        if (chunk._ambientEmitterPacked == null || chunk._ambientEmitterPacked.Length < AMBIENT_EMITTER_CAP)
-        {
-            chunk._ambientEmitterPacked = new int[AMBIENT_EMITTER_CAP];
-        }
-
-        chunk._crossBlockCount = 0;
-        chunk._torchBlockCount = 0;
-        chunk._ambientEmitterCount = 0;
-        chunk._isAllAir = true;
-        chunk._hasWaterBlocks = false;
-        chunk._hasEmissiveBlocks = false;
-        chunk._hasTorchBlocks = false;
-        chunk._hasNonOpaqueContent = false;
-        chunk._isAllOpaqueSolid = false;
-        chunk._derivedSolidOpaqueCount = 0;
-        chunk._chunkGlobalMinY = 255; chunk._chunkGlobalMaxY = 0;
-        chunk._chunkGlobalMinX = 255; chunk._chunkGlobalMaxX = 0;
-        chunk._chunkGlobalMinZ = 255; chunk._chunkGlobalMaxZ = 0;
-
-        for (int i = 0; i < columnCount; i++)
-        {
-            chunk._columnMinY[i] = 255;
-            chunk._columnMaxY[i] = 255;
-        }
-
-        int stride = chunkSizeXZ * chunkSizeXZ;
-        for (int y = 0; y < chunkSizeY; y++)
-        {
-            int yBase = y * stride;
-            for (int z = 0; z < chunkSizeXZ; z++)
-            {
-                int zBase = yBase + z * chunkSizeXZ;
-                for (int x = 0; x < chunkSizeXZ; x++)
-                {
-                    int idx = zBase + x;
-                    byte blockID = fullData[idx];
-                    if (blockID == 0) continue;
-
-                    chunk._isAllAir = false;
-                    if (visibilityCache != null && blockID < visibilityCache.Length && visibilityCache[blockID] == BlockVisibilityType.Opaque)
-                        chunk._derivedSolidOpaqueCount = chunk._derivedSolidOpaqueCount + 1;
-                    else
-                        chunk._hasNonOpaqueContent = true;
-                    if (!chunk._hasWaterBlocks && (_IsWaterBlock(blockID) || _IsLavaBlock(blockID)))
-                    {
-                        chunk._hasWaterBlocks = true;
-                    }
-                    int columnIndex = z * chunkSizeXZ + x;
-                    if (chunk._columnMinY[columnIndex] == 255) chunk._columnMinY[columnIndex] = (byte)y;
-                    chunk._columnMaxY[columnIndex] = (byte)y;
-
-                    // OPTIMIZATION: Track chunk-global spatial bounds
-                    if (y < chunk._chunkGlobalMinY) chunk._chunkGlobalMinY = (byte)y;
-                    if (y > chunk._chunkGlobalMaxY) chunk._chunkGlobalMaxY = (byte)y;
-                    if (x < chunk._chunkGlobalMinX) chunk._chunkGlobalMinX = (byte)x;
-                    if (x > chunk._chunkGlobalMaxX) chunk._chunkGlobalMaxX = (byte)x;
-                    if (z < chunk._chunkGlobalMinZ) chunk._chunkGlobalMinZ = (byte)z;
-                    if (z > chunk._chunkGlobalMaxZ) chunk._chunkGlobalMaxZ = (byte)z;
-
-                    if (!chunk._hasEmissiveBlocks && blockID < lightEmissionCache.Length && lightEmissionCache[blockID] > 0)
-                    {
-                        chunk._hasEmissiveBlocks = true;
-                    }
-
-                    if (blockID < shapeTypeCache.Length && shapeTypeCache[blockID] == McBlockShapeType.Cross)
-                    {
-                        chunk._crossBlockPackedPositions[chunk._crossBlockCount++] = (x << 16) | (y << 8) | z;
-                    }
-                    else if (_IsTorchBlock(blockID))
-                    {
-                        chunk._hasTorchBlocks = true;
-                        chunk._torchBlockPackedPositions[chunk._torchBlockCount++] = (x << 16) | (y << 8) | z;
-                        // Torches (and lit redstone torches) emit ambient flame/smoke particles.
-                        if (blockID != BLOCK_REDSTONE_TORCH_OFF)
-                        {
-                            int aec = chunk._ambientEmitterCount;
-                            if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
-                            {
-                                chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
-                                chunk._ambientEmitterCount = aec + 1;
-                            }
-                        }
-                    }
-                    else if (blockID == BLOCK_FIRE || blockID == BLOCK_FURNACE_LIT || blockID == BLOCK_PORTAL
-                             || ((blockID == 10 || blockID == 11) && (y == chunkSizeY - 1 || fullData[idx + stride] == 0)))
-                    {
-                        // Ambient particle emitters: fire, lit furnace, portal, and lava cells with air
-                        // above (chunk-top lava re-checks air at emission time). Registry consumed by
-                        // McParticleManager instead of 1000 random GetBlock samples per frame.
-                        int aec = chunk._ambientEmitterCount;
-                        if (aec < AMBIENT_EMITTER_CAP && chunk._ambientEmitterPacked != null)
-                        {
-                            chunk._ambientEmitterPacked[aec] = (blockID << 24) | (x << 16) | (y << 8) | z;
-                            chunk._ambientEmitterCount = aec + 1;
-                        }
-                    }
-                }
-            }
-        }
-        chunk._isAllOpaqueSolid = !chunk._isAllAir
-            && chunk._derivedSolidOpaqueCount == chunkSizeY * chunkSizeXZ * chunkSizeXZ;
-        chunk._derivedForDataVersion = chunk._cachedDataVersion;
-        chunk._derivedDirty = false;
+        // NON-HOMOGENEOUS: delegate to the sliced implementation in one full-range call. It is
+        // byte-identical by contract (see its header comment), runs the table-driven hot loop
+        // (ONE class-table read per voxel vs the 2-3 method calls + 3 cache lookups this method
+        // used to do) plus the uniform-layer fast path, and also fills the per-column fluid
+        // Y-span — so fluid scans after an atomic re-derive (e.g. block edits) take the span
+        // fast path instead of falling back to occupied bounds. No recursion: the sliced
+        // version only calls back here for CHUNK_KIND_HOMOGENEOUS, handled above.
+        _RefreshChunkDerivedDataSliced(chunk, fullData, 0, chunkSizeY);
     }
 
     // Resumable variant of _RefreshChunkDerivedData for the GPU render-prep time-slicer: scans Y in
@@ -15354,11 +15321,63 @@ public partial class McWorld : UdonSharpBehaviour
 
         int stride = chunkSizeXZ * chunkSizeXZ;
         int topYIdx = chunkSizeY - 1;
+        int topXZIdx = chunkSizeXZ - 1;
+        // UNIFORM-LAYER FAST PATH gate (16x16 layers only — always true in practice).
+        bool layerFastOk = stride == 256;
         int yEnd = yStart + yCount;
         if (yEnd > chunkSizeY) yEnd = chunkSizeY;
         for (int y = yStart; y < yEnd; y++)
         {
             int yBase = y * stride;
+
+            // UNIFORM-LAYER FAST PATH: 4 spread samples, then ONE bulk extern (256-byte base64
+            // equality) confirms the whole layer is a single block id. All-air layers contribute
+            // nothing — skip. Uniform layers of plain block classes (stone/dirt/sand/water/ice…)
+            // take a bulk per-column update instead of the ~18-op per-voxel path — this is most
+            // of a deep chunk (near-4096 solid voxels) and of an ocean chunk's water body.
+            // Layers containing cross/torch/static-emitter/lava classes fall through to the
+            // exact loop (they need per-cell registry work). Derived outputs are byte-identical:
+            // every flag/counter/bound below matches what the per-voxel loop computes for a
+            // uniform layer, in the same ascending-Y order.
+            if (layerFastOk)
+            {
+                byte lb0 = fullData[yBase];
+                if (fullData[yBase + 85] == lb0 && fullData[yBase + 170] == lb0
+                    && fullData[yBase + 255] == lb0 && _IsUniformLayer256(fullData, yBase, lb0))
+                {
+                    if (lb0 == 0) continue; // all-air layer
+                    int lcls = clsTable[lb0];
+                    if ((lcls & (DBC_CROSS | DBC_TORCH | DBC_STATIC_EMITTER | DBC_LAVA)) == 0)
+                    {
+                        locAllAir = false;
+                        if ((lcls & DBC_OPAQUE) != 0) locSolidOpaque = locSolidOpaque + 256;
+                        else locNonOpaque = true;
+                        if ((lcls & DBC_EMISSIVE) != 0) locHasEmissive = true;
+                        byte yb = (byte)y;
+                        if ((lcls & DBC_FLUID) != 0)
+                        {
+                            locHasWater = true;
+                            for (int fc = 0; fc < 256; fc++)
+                            {
+                                if (colFluidArrD[fc] == 255) colFluidArrD[fc] = yb;
+                                colFluidMaxArrD[fc] = yb;
+                            }
+                        }
+                        for (int cc = 0; cc < 256; cc++)
+                        {
+                            if (colMinArrD[cc] == 255) colMinArrD[cc] = yb;
+                            colMaxArrD[cc] = yb;
+                        }
+                        if (y < gMinY) gMinY = y;
+                        if (y > gMaxY) gMaxY = y;
+                        gMinX = 0; gMinZ = 0;
+                        if (topXZIdx > gMaxX) gMaxX = topXZIdx;
+                        if (topXZIdx > gMaxZ) gMaxZ = topXZIdx;
+                        continue;
+                    }
+                }
+            }
+
             for (int z = 0; z < chunkSizeXZ; z++)
             {
                 int zBase = yBase + z * chunkSizeXZ;
