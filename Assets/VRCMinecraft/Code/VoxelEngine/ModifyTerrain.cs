@@ -39,7 +39,10 @@ public class ModifyTerrain : UdonSharpBehaviour
     [SerializeField] private Material blockOutlineMaterial;
 
     [Header("Logging")]
-#if UNITY_EDITOR
+    // Player builds compile the #if LOGGING blocks too (LOGGING is defined project-wide), so
+    // this field must exist whenever either define is active — the UNITY_EDITOR-only gate
+    // made the standalone world build fail at the LOGGING use site below (CS0103).
+#if UNITY_EDITOR || LOGGING
     public bool enableVerboseLogging = true;
 #endif
 

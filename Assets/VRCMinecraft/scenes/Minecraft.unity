@@ -85315,7 +85315,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   launchedFromSDKPipeline: 0
   completedSDKPipeline: 0
-  blueprintId: wrld_9ad08c7d-8c83-48a0-882d-63511cf9dc48
+  blueprintId: 
   contentType: 1
   assetBundleUnityVersion: 
   fallbackStatus: 0
@@ -85481,9 +85481,9 @@ MonoBehaviour:
   - {fileID: 15303, guid: 0000000000000000f000000000000000, type: 0}
   - {fileID: 2100000, guid: 10590d1d1a97f5d48a96bd1ee2c12340, type: 2}
   - {fileID: 2100000, guid: 6ae04fd2824448848b31d74e759dba49, type: 2}
-  - {fileID: 2100000, guid: e8eab87cfe7da7f4287515ef2c066f32, type: 2}
   - {fileID: 2100000, guid: beafd7eb95a8aad498df2db5b5604e46, type: 2}
   - {fileID: 2100000, guid: 41aa5e46aa617e34baf5a8f8a5921257, type: 2}
+  - {fileID: 2100000, guid: e8eab87cfe7da7f4287515ef2c066f32, type: 2}
   - {fileID: 2100000, guid: b4240e46d94d6d2458f6bd0cc90564d8, type: 2}
   LightMapsNear: []
   LightMapsFar: []
