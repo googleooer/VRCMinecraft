@@ -71,7 +71,6 @@ public partial class McWorld
     private int    chunksCompletedCount    = 0;
     private bool[] _positionAssigned;
     private int    _lastPickedDataGenPos   = -1;
-    private int[]  _genSlotCache;
     // Anti-spin: once the picker finds nothing pickable in a cycle, scanning again for every other
     // idle worker that cycle is pure waste (state can't improve mid-assign) — it cost ~12ms/cycle with
     // a restrictive column cap + many idle workers. Latched per assign cycle, reset at its start.
@@ -141,15 +140,9 @@ public partial class McWorld
 #endif
     }
 
-    // Memoized GeneratorSlotForChunkIndex — avoids a cross-VM call per scanned
-    // position each cycle.
-    private int _GenSlotForChunk(int ci)
-    {
-        if (_genSlotCache == null || ci < 0 || ci >= _genSlotCache.Length) return GeneratorSlotForChunkIndex(ci);
-        int s = _genSlotCache[ci];
-        if (s < 0) { s = GeneratorSlotForChunkIndex(ci); _genSlotCache[ci] = s; }
-        return s;
-    }
+    // (The old memoized per-index slot cache is gone: with DYNAMIC GENERATOR ASSIGNMENT a
+    // column has no fixed slot to memoize — the picker gates on PickGeneratorSlotForNewColumn
+    // (per-frame free-slot early-out inside) and assignment reads the freshly written map.)
 
     // PICKER PARKING: when a full pick attempt found nothing, no generator is mid-column, and the
     // player hasn't entered a new chunk, eligibility cannot change — skip the scans for a few
@@ -200,7 +193,7 @@ public partial class McWorld
             {
                 _lastPickedDataGenPos = p; return true; // sibling from column cache — free; drain before any new column
             }
-            if (newColumnPos < 0 && canStartNewColumn && _GenSlotIsFreeForNewColumn(_GenSlotForChunk(ci)) && _NewColumnPickAllowed(ci))
+            if (newColumnPos < 0 && canStartNewColumn && _NewColumnPickAllowed(ci))
             {
                 newColumnPos = p; // radially-first new-column candidate; used only if no cache-hit exists
             }
@@ -228,7 +221,7 @@ public partial class McWorld
                 if (!_positionAssigned[p])
                 {
                     int ci = radialChunkOrder[p];
-                    if (ShouldGenerateChunkData(ci) && _GenSlotIsFreeForNewColumn(_GenSlotForChunk(ci)) && _NewColumnPickAllowed(ci))
+                    if (ShouldGenerateChunkData(ci) && _NewColumnPickAllowed(ci))
                     {
                         _lastPickedDataGenPos = p;
                         _fallbackScanCursor = (p + 1 >= totalWorldChunks) ? scanEnd : p + 1;
@@ -254,9 +247,11 @@ public partial class McWorld
         return false;
     }
 
-    // CACHE-DRAIN GUARD (pick side): a new-column pick must not stomp a generator cache that
-    // still has drainable siblings. Cached-column chunks are exempt inside the guard (they use
-    // the generator's cached start path), so a column's own top chunk stays pickable.
+    // DYNAMIC GENERATOR ASSIGNMENT (pick side): a new-column candidate is pickable when SOME
+    // free slot could take it — free (unreserved + idle machine) and not blocked by that
+    // slot's own cache drain (the guard exempts the candidate if it IS the slot's cached
+    // column). Subsumes the old fixed-hash slot gate; the actual binding happens at
+    // StartChunkDataGeneration via the same PickGeneratorSlotForNewColumn.
     private bool _NewColumnPickAllowed(int ci)
     {
         // Coords from the INDEX: unassigned candidates have no ChunkData yet (lazy creation),
@@ -265,7 +260,7 @@ public partial class McWorld
         Chunk1DToArrrayCoords(ci, out int ax, out int ay, out int az);
         int cx = ax - chunkOffsetX;
         int cz = az - chunkOffsetZ;
-        return !GenBlocksNewColumnForCacheDrain(_GeneratorForColumn(cx, cz), _GenSlotForChunk(ci), cx, cz);
+        return PickGeneratorSlotForNewColumn(cx, cz) >= 0;
     }
 
     // Any generator currently holding a copyable cache with pending siblings? (Used to keep the
@@ -530,7 +525,9 @@ public partial class McWorld
                     worker_isDeferredMeshWake[i] = false;
                     if (worker_usesExclusiveGenerator[i])
                     {
-                        int genSlot = _GenSlotForChunk(newChunkIndex);
+                        // DYNAMIC ASSIGNMENT: read the map fresh — StartChunkDataGeneration
+                        // just bound this column to whichever slot was free.
+                        int genSlot = GeneratorSlotForChunkIndex(newChunkIndex);
                         worker_generatorSlot[i] = genSlot;
                         if (genSlot >= 0 && genSlot < genSlotBusy.Length) genSlotBusy[genSlot] = true;
                     }
@@ -981,8 +978,10 @@ public partial class McWorld
         chunkRebuildQueue = new int[MAX_REBUILD_QUEUE_SIZE];
         deferredMeshQueue = new int[MAX_DEFERRED_MESH_QUEUE_SIZE];
         _positionAssigned = new bool[totalWorldChunks];
-        _genSlotCache     = new int[totalWorldChunks];
-        for (int i = 0; i < _genSlotCache.Length; i++) _genSlotCache[i] = -1;
+        // DYNAMIC GENERATOR ASSIGNMENT: per-column slot map, -1 = never assigned (falls back
+        // to the legacy spread hash in _GeneratorSlotForColumn).
+        _columnGenSlot = new int[worldDimensionX * worldDimensionZ];
+        for (int i = 0; i < _columnGenSlot.Length; i++) _columnGenSlot[i] = -1;
 
         _schedulerReady = true;
     }
