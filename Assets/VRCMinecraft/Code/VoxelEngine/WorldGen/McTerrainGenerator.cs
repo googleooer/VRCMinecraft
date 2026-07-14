@@ -443,6 +443,18 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuDecorCandidateCount = 0;
     private int gpuDecorAnchorMask = 0;
     private RenderTexture gpuDecorCurrentTex;
+    // TREE-ANCHOR CACHE: gpuTreeAnchorChunkTextures (minus index 4, the own-column snapshot)
+    // act as a pool keyed by WORLD column coords — int.MaxValue = invalid entry. Anchor
+    // content is deterministic (seed+coords), so entries never go stale; adjacent columns
+    // reuse each other's anchors instead of re-running the ~20-50ms mini pipeline.
+    private int[] gpuTreeAnchorPoolCx;
+    private int[] gpuTreeAnchorPoolCz;
+    private int[] gpuDecorSlotPool; // per decoration slot 0-8: bound pool index, -1 = unused
+    private int gpuTreeAnchorPoolClock = 0;
+#if LOGGING
+    private int agg_anchorCacheHits;
+    private int agg_anchorCacheMisses;
+#endif
     private RenderTexture gpuSandNoiseTexture;
     private RenderTexture gpuGravelNoiseTexture;
     private RenderTexture gpuStoneNoiseTexture;
@@ -883,6 +895,11 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 sb.AppendFormat("  Readback Request() submit-block: {0} calls, {1:F1}ms total, {2:F2}ms avg\n",
                     agg_readbackRequestCalls, agg_readbackRequestMs, agg_readbackRequestMs / agg_readbackRequestCalls);
             }
+            if (agg_anchorCacheHits > 0 || agg_anchorCacheMisses > 0)
+            {
+                sb.AppendFormat("  Tree-anchor cache: {0} hits, {1} misses\n",
+                    agg_anchorCacheHits, agg_anchorCacheMisses);
+            }
 
             if (agg_gpuDiagnosticReadbacksCompleted > 0 || agg_gpuDiagnosticReadbackFailures > 0)
             {
@@ -921,6 +938,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         agg_stepTimeMin = float.MaxValue;
         agg_readbackRequestCalls = 0;
         agg_readbackRequestMs = 0f;
+        agg_anchorCacheHits = 0;
+        agg_anchorCacheMisses = 0;
         if (dbgStateTimeMs != null)
         {
             for (int si = 0; si < dbgStateTimeMs.Length; si++)
@@ -2813,41 +2832,137 @@ public class McTerrainGenerator : UdonSharpBehaviour
             VRCGraphics.Blit(gpuColumnFinalTexture, gpuTreeAnchorChunkTextures[4]);
             gpuDecorCurrentTex = gpuTreeAnchorChunkTextures[4];
             gpuDecorAnchorMask = requiredTreeAnchorMask & ~(1 << 4);
+
+            // TREE-ANCHOR CACHE: reset this column's slot->pool bindings. Pool arrays are
+            // allocated lazily; entries persist across columns (see _GpuDecorationRenderNextAnchor).
+            if (gpuTreeAnchorPoolCx == null)
+            {
+                gpuTreeAnchorPoolCx = new int[9];
+                gpuTreeAnchorPoolCz = new int[9];
+                gpuDecorSlotPool = new int[9];
+                for (int pi = 0; pi < 9; pi++) { gpuTreeAnchorPoolCx[pi] = int.MaxValue; gpuTreeAnchorPoolCz[pi] = int.MaxValue; }
+            }
+            for (int si = 0; si < 9; si++) gpuDecorSlotPool[si] = -1;
+            gpuDecorSlotPool[4] = 4; // own-column snapshot always lives in texture 4
         }
     }
 
-    // FINALIZE SLICING step 2 of Prepare_GpuDecorate: render ONE pending tree-anchor chunk
-    // per call (each is a full mini column pipeline). Returns true while more remain.
+    // FINALIZE SLICING step 2 of Prepare_GpuDecorate, with the TREE-ANCHOR CACHE: anchor
+    // renders are keyed by WORLD column coords — the content is purely deterministic
+    // (seed + coords; no caves, no decoration), so a cached texture never goes stale, and
+    // adjacent columns need the same anchor up to 4x. Cache HITS just bind the pooled
+    // texture (free — they don't consume a step); only a true MISS renders the full mini
+    // column pipeline (~20-50ms), ONE per call. Returns true while pending anchors remain.
     private bool _GpuDecorationRenderNextAnchor(int sizeXZ)
     {
         if (gpuDecorAnchorMask == 0) return false;
-        if (gpuTreeAnchorChunkTextures == null || gpuTreeAnchorBiomeBuffer == null)
+        if (gpuTreeAnchorChunkTextures == null || gpuTreeAnchorBiomeBuffer == null || gpuDecorSlotPool == null)
         {
             gpuDecorAnchorMask = 0;
             return false;
         }
+
+        // PHASE 1 (free, every call): resolve ALL pending cache hits before ANY victim is
+        // chosen. Otherwise a miss on a low slot could round-robin-evict the exact pooled
+        // entry a higher pending slot of THIS column would have hit — turning a free hit into
+        // a redundant ~20-50ms render. Binding all hits first makes _GpuAnchorPoolIndexBound
+        // protect every entry this column still needs.
         for (int treeChunkSlot = 0; treeChunkSlot < 9; treeChunkSlot++)
         {
             if (treeChunkSlot == 4) continue;
             if ((gpuDecorAnchorMask & (1 << treeChunkSlot)) == 0) continue;
-            gpuDecorAnchorMask &= ~(1 << treeChunkSlot);
+
+            int hcx = currentChunkX + ((treeChunkSlot % 3) - 1);
+            int hcz = currentChunkZ + ((treeChunkSlot / 3) - 1);
+            for (int p = 0; p < 9; p++)
+            {
+                if (p == 4) continue;
+                if (gpuTreeAnchorPoolCx[p] != hcx || gpuTreeAnchorPoolCz[p] != hcz) continue;
+                if (gpuTreeAnchorChunkTextures[p] == null || !gpuTreeAnchorChunkTextures[p].IsCreated())
+                {
+                    // Content lost (device reset/alt-tab) — invalidate; re-render below.
+                    gpuTreeAnchorPoolCx[p] = int.MaxValue;
+                    gpuTreeAnchorPoolCz[p] = int.MaxValue;
+                    continue;
+                }
+                gpuDecorSlotPool[treeChunkSlot] = p;
+                gpuDecorAnchorMask &= ~(1 << treeChunkSlot);
+#if LOGGING
+                if (enableDetailedTimings) agg_anchorCacheHits++;
+#endif
+                break;
+            }
+        }
+
+        // PHASE 2: render at most ONE remaining (miss) anchor per call.
+        for (int treeChunkSlot = 0; treeChunkSlot < 9; treeChunkSlot++)
+        {
+            if (treeChunkSlot == 4) continue;
+            if ((gpuDecorAnchorMask & (1 << treeChunkSlot)) == 0) continue;
 
             int chunkOffsetX = (treeChunkSlot % 3) - 1;
             int chunkOffsetZ = (treeChunkSlot / 3) - 1;
             int chunkX = currentChunkX + chunkOffsetX;
             int chunkZ = currentChunkZ + chunkOffsetZ;
 
+            // MISS: pick a victim pool texture — an invalid entry if any, else round-robin
+            // among entries NOT bound to this column's other slots (and never 4).
+            int victim = -1;
+            for (int p = 0; p < 9; p++)
+            {
+                if (p == 4) continue;
+                if (gpuTreeAnchorPoolCx[p] == int.MaxValue && !_GpuAnchorPoolIndexBound(p)) { victim = p; break; }
+            }
+            if (victim < 0)
+            {
+                for (int tries = 0; tries < 9; tries++)
+                {
+                    gpuTreeAnchorPoolClock = gpuTreeAnchorPoolClock + 1;
+                    if (gpuTreeAnchorPoolClock >= 9) gpuTreeAnchorPoolClock = 0;
+                    int p = gpuTreeAnchorPoolClock;
+                    if (p == 4 || _GpuAnchorPoolIndexBound(p)) continue;
+                    victim = p;
+                    break;
+                }
+            }
+            if (victim < 0) victim = treeChunkSlot; // unreachable (>=4 free entries); stay safe
+
+            gpuDecorAnchorMask &= ~(1 << treeChunkSlot);
+            gpuDecorSlotPool[treeChunkSlot] = victim;
+#if LOGGING
+            if (enableDetailedTimings) agg_anchorCacheMisses++;
+#endif
             if (!_FillGpuTreeAnchorBiomes(chunkX, chunkZ))
             {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
+                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
+                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
             }
-            else if (!_RenderGpuTreeAnchorChunk(chunkX, chunkZ, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorChunkTextures[treeChunkSlot], sizeXZ))
+            else if (!_RenderGpuTreeAnchorChunk(chunkX, chunkZ, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorChunkTextures[victim], sizeXZ))
             {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[treeChunkSlot]);
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
+                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
+                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
             }
-            break; // one anchor per step
+            else
+            {
+                gpuTreeAnchorPoolCx[victim] = chunkX;
+                gpuTreeAnchorPoolCz[victim] = chunkZ;
+            }
+            break; // one RENDER per step
         }
         return gpuDecorAnchorMask != 0;
+    }
+
+    // TREE-ANCHOR CACHE: is this pool index already bound to one of the current column's
+    // decoration slots? (Bound entries must not be evicted mid-column.)
+    private bool _GpuAnchorPoolIndexBound(int poolIndex)
+    {
+        for (int s = 0; s < 9; s++)
+        {
+            if (gpuDecorSlotPool[s] == poolIndex) return true;
+        }
+        return false;
     }
 
     // FINALIZE SLICING step 3 of Prepare_GpuDecorate: the tree/flower decoration blits.
@@ -2877,7 +2992,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
             gpuColumnTreeDecorationMaterial.SetInt(gpuPropLeavesBlockIdDecor, leavesBlockID);
             for (int treeChunkSlot = 0; treeChunkSlot < gpuTreeAnchorChunkTextures.Length; treeChunkSlot++)
             {
-                gpuColumnTreeDecorationMaterial.SetTexture(gpuTreeAnchorChunkTexIds[treeChunkSlot], gpuTreeAnchorChunkTextures[treeChunkSlot]);
+                // TREE-ANCHOR CACHE: bind the pooled texture this slot resolved to (cache hit
+                // or freshly rendered victim). Unbound slots (-1) get their own-index texture,
+                // matching the old behavior for slots the shader never samples.
+                int poolIdx = (gpuDecorSlotPool != null && gpuDecorSlotPool[treeChunkSlot] >= 0)
+                    ? gpuDecorSlotPool[treeChunkSlot] : treeChunkSlot;
+                gpuColumnTreeDecorationMaterial.SetTexture(gpuTreeAnchorChunkTexIds[treeChunkSlot], gpuTreeAnchorChunkTextures[poolIdx]);
             }
 
             VRCGraphics.Blit(currentTex, gpuTreeWorkTexture, gpuColumnTreeDecorationMaterial);
