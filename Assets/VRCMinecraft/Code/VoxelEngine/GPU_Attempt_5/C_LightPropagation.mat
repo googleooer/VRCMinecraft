@@ -181,7 +181,7 @@ Material:
     - _DstBlend: 0
     - _FalloffBlock: 1
     - _FalloffSky: 1
-    - _FrameJitter: 3214
+    - _FrameJitter: 3285
     - _GlossMapScale: 1
     - _Glossiness: 0.5
     - _GlossyReflections: 1
