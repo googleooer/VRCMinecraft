@@ -70,8 +70,8 @@ Material:
     m_Ints: []
     m_Floats:
     - _Amplitude: 10000
-    - _ChunkX: 128
-    - _ChunkZ: 0
+    - _ChunkX: -16
+    - _ChunkZ: -48
     - _ClimateOctaveCount0: 4
     - _ClimateOctaveCount1: 4
     - _ClimateOctaveCount2: 2
@@ -87,13 +87,13 @@ Material:
     - _OctaveRowOffset: 64
     - _XCoord: 135.346
     - _XPos: -4
-    - _XSize: 5
+    - _XSize: 16
     - _YCoord: 216.11534
     - _YPos: 0
     - _YSize: 1
     - _ZCoord: 210.33266
     - _ZPos: -12
-    - _ZSize: 5
+    - _ZSize: 16
     m_Colors:
     - _Color: {r: 1, g: 1, b: 1, a: 1}
   m_BuildTextureStacks: []
