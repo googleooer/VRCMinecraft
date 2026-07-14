@@ -234,6 +234,23 @@ public class ChunkData
     // Flattened as: y * (sizeXZ*sizeXZ) + (z * sizeXZ + x)
     public byte[] _decompSelf;
     public byte[] _decompPX, _decompNX, _decompPY, _decompNY, _decompPZ, _decompNZ;
+    // FLUID V3: up-diagonal neighbor block data (the +Y chunk of each lateral face neighbor),
+    // used by the border-column still-surface fast path at y==15 — the ocean surface sits at
+    // local y 15, so its above-ring crosses into these chunks. Fetched once per fluid build
+    // (zStart==0 slice), cleared with the other _decomp* refs.
+    public byte[] _decompPYNX, _decompPYPX, _decompPYNZ, _decompPYPZ;
+    // FLUID V3 HEAL: source chunk + data version captured with each up-diagonal snapshot.
+    // Edits in an up-diagonal chunk have NO trigger path back to this chunk (edits only
+    // rebuild face neighbors + same-Y diagonals), so the sliced build re-validates these at
+    // every slice boundary — a version change drops the snapshot and requests the standard
+    // pendingChunkMeshRebuild follow-up, mirroring the face-neighbor mid-build heal.
+    public ChunkData _udChunkNX, _udChunkPX, _udChunkNZ, _udChunkPZ;
+    public int _udVerNX, _udVerPX, _udVerNZ, _udVerPZ;
+    // FLUID V3: per-build layer-enclosed mask — bit y set when layer y of this chunk is
+    // uniform water sealed by uniform water/opaque layers below and uniform water/ice above:
+    // every interior-column (x,z in [1,14]) cell of such a layer is provably enclosed (all
+    // six faces culled), skippable with zero reads. Recomputed at every build's zStart==0.
+    public int _fluidLayerEnclosedMask = 0;
 
     // --- Neighbor Caches (for meshing) ---
     // These are direct references to neighbor data, fetched once at the start of meshing.

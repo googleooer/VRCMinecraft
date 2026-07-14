@@ -59962,7 +59962,7 @@ MonoBehaviour:
   colliderPriorityRadiusXZ: 2
   colliderPriorityRadiusY: 1
   colliderPriorityBelowRadiusY: 3
-  terrainGenerator: {fileID: 1881050431}
+  terrainGenerator: {fileID: 660800870}
   extraGenerators:
   - {fileID: 1796555790}
   - {fileID: 1881050431}
