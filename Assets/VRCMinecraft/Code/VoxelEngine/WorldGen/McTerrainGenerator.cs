@@ -443,6 +443,21 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuDecorCandidateCount = 0;
     private int gpuDecorAnchorMask = 0;
     private RenderTexture gpuDecorCurrentTex;
+    // ANCHOR SLICING: a cache-MISS anchor render no longer runs its ~45-64ms mini column
+    // pipeline in one call — it's split into 3 sub-steps (see _GpuAnchorRenderStep), one per
+    // StepChunkGeneration call. 0 = idle; 1-3 = next pending sub-step of the anchor at
+    // (gpuAnchorCx, gpuAnchorCz) targeting pool texture gpuAnchorVictim. Pool coords are
+    // committed only by the final sub-step, so an abort mid-render leaves the victim's OLD
+    // cached content valid under its old key.
+    private int gpuAnchorPhase = 0;
+    private int gpuAnchorCx = 0;
+    private int gpuAnchorCz = 0;
+    private int gpuAnchorVictim = -1;
+    // Phase 10 = biome fill in progress: the CPU getBiomeBlock (3 climate octave noises,
+    // ~40-60ms for 16x16 — the DOMINANT cost of a miss, not the render) is sliced into
+    // four 8x8 quadrant queries, one per call. gpuAnchorBiomeQuad = next quadrant (0-3).
+    private int gpuAnchorBiomeQuad = 0;
+    private BetaBiomeEnum[] gpuAnchorBiomeQuadBuffer;
     // TREE-ANCHOR CACHE: gpuTreeAnchorChunkTextures (minus index 4, the own-column snapshot)
     // act as a pool keyed by WORLD column coords — int.MaxValue = invalid entry. Anchor
     // content is deterministic (seed+coords), so entries never go stale; adjacent columns
@@ -2783,47 +2798,67 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return true;
     }
 
+    // COLLECT SLICING: step 0 runs ONE contributing chunk's candidate collection per call —
+    // a forest chunk's JavaRandom scatter sims (trees + 64-attempt flowers + 128-attempt
+    // grass) cost ~15ms; all 4 in one call was the remaining 45-60ms decorate spike (ocean
+    // chunks are near-free, which is why it only showed on land-heavy columns).
+    // Accumulators live in fields across the 4 calls; each chunk's PRNG stream is its own
+    // fresh JavaRandom(decorSeed), so slicing cannot perturb determinism or output order.
+    private int gpuDecorCollectIdx = 0;
+    private int gpuDecorCollectTreeCount = 0;
+    private int gpuDecorCollectCandCount = 0;
+    private int gpuDecorCollectAnchorMask = 0;
+
     // FINALIZE SLICING step 1 of Prepare_GpuDecorate: run the CPU candidate collection
-    // (JavaRandom decoration streams of the 4 contributing chunks) and, when trees are
-    // present, snapshot this column's final content into anchor slot 4 BEFORE any anchor
-    // render — anchor renders reuse/overwrite gpuColumnBase/SurfaceInfo/FinalTexture.
-    private void _GpuDecorationCollect(int sizeXZ)
+    // (JavaRandom decoration streams of the 4 contributing chunks, COLLECT-SLICED to one
+    // chunk per call — returns true while more remain) and, when trees are present,
+    // snapshot this column's final content into anchor slot 4 BEFORE any anchor render —
+    // anchor renders reuse/overwrite gpuColumnBase/SurfaceInfo/FinalTexture.
+    private bool _GpuDecorationCollect(int sizeXZ)
     {
-        gpuDecorTreeCount = 0;
-        gpuDecorCandidateCount = 0;
-        gpuDecorAnchorMask = 0;
-        gpuDecorCurrentTex = gpuColumnFinalTexture;
-        if (match1to1TerrainBaseline || gpuColumnDecorationMaterial == null || currentChunkBiomes == null) return;
+        if (gpuDecorCollectIdx == 0)
+        {
+            gpuDecorTreeCount = 0;
+            gpuDecorCandidateCount = 0;
+            gpuDecorAnchorMask = 0;
+            gpuDecorCurrentTex = gpuColumnFinalTexture;
+            if (match1to1TerrainBaseline || gpuColumnDecorationMaterial == null || currentChunkBiomes == null) return false;
+            gpuDecorCollectTreeCount = 0;
+            gpuDecorCollectCandCount = 0;
+            gpuDecorCollectAnchorMask = 1 << 4;
+        }
 
         int worldHeight = gpuWorldHeightBlocks;
         int colOriginX = currentChunkX * sizeXZ;
         int colOriginZ = currentChunkZ * sizeXZ;
-
-        int candidateCount = 0;
         int maxCandidates = GPU_DECORATION_TEX_WIDTH * GPU_DECORATION_TEX_HEIGHT;
-        int treeCount = 0;
         int maxTrees = GPU_TREE_TEX_WIDTH;
-        int requiredTreeAnchorMask = 1 << 4;
 
-        // Collect candidates from 4 contributing chunks.
+        // Collect candidates from 4 contributing chunks, offsets (x, z) in call order:
+        // (0,-1), (1,-1), (0,0), (1,0).
         // With BUILTIN_OFFSET_X=-16, trees from chunk cx land at world X = (cx-1)*16+8..23
         //   cx=currentChunkX   -> localX -8..+7,  cx=currentChunkX+1 -> localX +8..+23
         // With BUILTIN_OFFSET_Z=0,  trees from chunk cz land at world Z = cz*16+8..23
         //   cz=currentChunkZ-1 -> localZ -8..+7,  cz=currentChunkZ   -> localZ +8..+23
-        int[] neighborOffsetX = new int[] { 0, 1, 0, 1 };
-        int[] neighborOffsetZ = new int[] { -1, -1, 0, 0 };
+        int ni = gpuDecorCollectIdx;
+        int ncx = currentChunkX + (ni & 1);
+        int ncz = currentChunkZ + (ni < 2 ? -1 : 0);
 
-        for (int ni = 0; ni < 4; ni++)
-        {
-            int ncx = currentChunkX + neighborOffsetX[ni];
-            int ncz = currentChunkZ + neighborOffsetZ[ni];
+        int treeCount = gpuDecorCollectTreeCount;
+        int candidateCount = gpuDecorCollectCandCount;
+        int requiredTreeAnchorMask = gpuDecorCollectAnchorMask;
+        _GpuDecorationCollectFromChunk(ncx, ncz, colOriginX, colOriginZ,
+            sizeXZ, worldHeight,
+            ref treeCount, maxTrees,
+            ref candidateCount, maxCandidates,
+            ref requiredTreeAnchorMask);
+        gpuDecorCollectTreeCount = treeCount;
+        gpuDecorCollectCandCount = candidateCount;
+        gpuDecorCollectAnchorMask = requiredTreeAnchorMask;
 
-            _GpuDecorationCollectFromChunk(ncx, ncz, colOriginX, colOriginZ,
-                sizeXZ, worldHeight,
-                ref treeCount, maxTrees,
-                ref candidateCount, maxCandidates,
-                ref requiredTreeAnchorMask);
-        }
+        gpuDecorCollectIdx = ni + 1;
+        if (gpuDecorCollectIdx < 4) return true;
+        gpuDecorCollectIdx = 0;
 
         gpuDecorTreeCount = treeCount;
         gpuDecorCandidateCount = candidateCount;
@@ -2845,16 +2880,27 @@ public class McTerrainGenerator : UdonSharpBehaviour
             for (int si = 0; si < 9; si++) gpuDecorSlotPool[si] = -1;
             gpuDecorSlotPool[4] = 4; // own-column snapshot always lives in texture 4
         }
+        return false;
     }
 
     // FINALIZE SLICING step 2 of Prepare_GpuDecorate, with the TREE-ANCHOR CACHE: anchor
     // renders are keyed by WORLD column coords — the content is purely deterministic
     // (seed + coords; no caves, no decoration), so a cached texture never goes stale, and
     // adjacent columns need the same anchor up to 4x. Cache HITS just bind the pooled
-    // texture (free — they don't consume a step); only a true MISS renders the full mini
-    // column pipeline (~20-50ms), ONE per call. Returns true while pending anchors remain.
+    // texture (free — they don't consume a step); only a true MISS runs the mini column
+    // pipeline, ANCHOR-SLICED: 4 biome quadrant sub-steps + 3 render sub-steps on the
+    // calls after selection (worst single call ~10-15ms instead of the old 45-64ms
+    // synchronous biome fill + render). Returns true while pending anchors/sub-steps remain.
     private bool _GpuDecorationRenderNextAnchor(int sizeXZ)
     {
+        // ANCHOR SLICING: an anchor render is in progress — run its next sub-step and nothing
+        // else this call. (Its mask bit is already cleared, so this check must come before
+        // the mask==0 early-out.)
+        if (gpuAnchorPhase != 0)
+        {
+            _GpuAnchorRenderStep(sizeXZ);
+            return gpuDecorAnchorMask != 0 || gpuAnchorPhase != 0;
+        }
         if (gpuDecorAnchorMask == 0) return false;
         if (gpuTreeAnchorChunkTextures == null || gpuTreeAnchorBiomeBuffer == null || gpuDecorSlotPool == null)
         {
@@ -2932,26 +2978,18 @@ public class McTerrainGenerator : UdonSharpBehaviour
 #if LOGGING
             if (enableDetailedTimings) agg_anchorCacheMisses++;
 #endif
-            if (!_FillGpuTreeAnchorBiomes(chunkX, chunkZ))
-            {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
-                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
-                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
-            }
-            else if (!_RenderGpuTreeAnchorChunk(chunkX, chunkZ, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorChunkTextures[victim], sizeXZ))
-            {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
-                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
-                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
-            }
-            else
-            {
-                gpuTreeAnchorPoolCx[victim] = chunkX;
-                gpuTreeAnchorPoolCz[victim] = chunkZ;
-            }
-            break; // one RENDER per step
+            // ANCHOR SLICING: nothing heavy runs on the selection call — the biome fill
+            // (four 8x8 quadrant sub-steps, phase 10) and the render (phases 1-3) each run
+            // one sub-step per following call. Anchor slots are always neighbors of the
+            // current column (slot 4 excluded above), so no own-column biome fast path.
+            gpuAnchorCx = chunkX;
+            gpuAnchorCz = chunkZ;
+            gpuAnchorVictim = victim;
+            gpuAnchorPhase = 10;
+            gpuAnchorBiomeQuad = 0;
+            break; // one selection or sub-step per step
         }
-        return gpuDecorAnchorMask != 0;
+        return gpuDecorAnchorMask != 0 || gpuAnchorPhase != 0;
     }
 
     // TREE-ANCHOR CACHE: is this pool index already bound to one of the current column's
@@ -3039,42 +3077,138 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // (The old _PrepareGpuTreeAnchorChunks — all pending anchors in one atomic call — was
     // replaced by the per-step _GpuDecorationRenderNextAnchor above.)
 
-    private bool _FillGpuTreeAnchorBiomes(int chunkX, int chunkZ)
+    // ANCHOR SLICING phase 10: fill ONE 8x8 quadrant of the anchor's 16x16 biome block per
+    // call. getBiomeBlock's climate noises are pure functions of absolute block coords (the
+    // 1x1 _QueryBiomeAtChunkCenter queries already rely on this), so four quadrant queries
+    // are bit-identical to the old single 16x16 call — just ~1/4 the per-call CPU cost.
+    // Layout: 16x16 index = localX*16 + localZ; an 8x8 result indexes qx*8 + qz.
+    private void _GpuAnchorBiomeQuadStep(int victim)
     {
-        if (gpuTreeAnchorBiomeBuffer == null) return false;
-
-        if (chunkX == currentChunkX && chunkZ == currentChunkZ && currentChunkBiomes != null &&
-            currentChunkBiomes.Length == gpuTreeAnchorBiomeBuffer.Length)
+        if (gpuTreeAnchorBiomeBuffer == null || gpuTreeAnchorBiomeBuffer.Length != 256)
         {
-            System.Array.Copy(currentChunkBiomes, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorBiomeBuffer.Length);
-            return true;
+            VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
+            gpuTreeAnchorPoolCx[victim] = int.MaxValue;
+            gpuTreeAnchorPoolCz[victim] = int.MaxValue;
+            gpuAnchorPhase = 0;
+            return;
         }
-
-        int blockX = _GetTerrainBlockStartX(chunkX);
-        int blockZ = _GetTerrainBlockStartZ(chunkZ);
         if (biomeQueryWcm == null)
         {
             biomeQueryWcm = new WorldChunkManagerOld(generatorSeed);
         }
+        if (gpuAnchorBiomeQuadBuffer == null)
+        {
+            gpuAnchorBiomeQuadBuffer = new BetaBiomeEnum[64];
+        }
 
-        BetaBiomeEnum[] result = biomeQueryWcm.getBiomeBlock(null, blockX, blockZ, world.chunkSizeXZ, world.chunkSizeXZ);
-        if (result == null || result.Length < gpuTreeAnchorBiomeBuffer.Length) return false;
+        int quad = gpuAnchorBiomeQuad;
+        int xOff = (quad & 1) * 8;
+        int zOff = (quad >> 1) * 8;
+        int blockX = _GetTerrainBlockStartX(gpuAnchorCx) + xOff;
+        int blockZ = _GetTerrainBlockStartZ(gpuAnchorCz) + zOff;
+        BetaBiomeEnum[] quadResult = biomeQueryWcm.getBiomeBlock(gpuAnchorBiomeQuadBuffer, blockX, blockZ, 8, 8);
+        gpuAnchorBiomeQuadBuffer = quadResult;
+        for (int qx = 0; qx < 8; qx++)
+        {
+            System.Array.Copy(quadResult, qx * 8, gpuTreeAnchorBiomeBuffer, (xOff + qx) * 16 + zOff, 8);
+        }
 
-        System.Array.Copy(result, gpuTreeAnchorBiomeBuffer, gpuTreeAnchorBiomeBuffer.Length);
-        return true;
+        gpuAnchorBiomeQuad = quad + 1;
+        if (gpuAnchorBiomeQuad >= 4)
+        {
+            gpuAnchorPhase = 1;
+        }
     }
 
-    private bool _RenderGpuTreeAnchorChunk(int chunkX, int chunkZ, BetaBiomeEnum[] chunkBiomes, RenderTexture targetTexture, int sizeXZ)
+    // ANCHOR SLICING driver: run ONE sub-step of the in-progress anchor render per call.
+    // The old code ran biome fill + the whole mini column pipeline synchronously (45-64ms,
+    // dominated by the ~40-60ms CPU getBiomeBlock); it's now phase 10 (biome fill, four 8x8
+    // quadrants — one per call), phase 1 (coords + all density/base/surface-info blits),
+    // phase 2 (sand + gravel noises), phase 3 (stone noise + surface params + final blits
+    // + pool-coord commit). Every phase is self-contained w.r.t. material state (sets all
+    // its properties and blits in the same call), so shared material assets can't tear;
+    // the intermediate RTs it spans (gpuColumnBase/SurfaceInfo/SandNoise...) are per-
+    // generator-instance, and this generator is parked in Prepare_GpuDecorate meanwhile.
+    private void _GpuAnchorRenderStep(int sizeXZ)
     {
-        if (!gpuWorldgenReady || targetTexture == null || chunkBiomes == null || chunkBiomes.Length != sizeXZ * sizeXZ) return false;
+        int victim = gpuAnchorVictim;
+        if (victim < 0 || gpuTreeAnchorChunkTextures == null || gpuTreeAnchorChunkTextures[victim] == null)
+        {
+            gpuAnchorPhase = 0;
+            return;
+        }
+        // Phase 10: biome fill quadrants (before any render phase). Loss of the RTs during
+        // this window is self-healing — phase 1 rewrites them all.
+        if (gpuAnchorPhase == 10)
+        {
+            _GpuAnchorBiomeQuadStep(victim);
+            return;
+        }
+        // RT content loss (device reset / alt-tab / headset pause) landing BETWEEN sub-steps
+        // would otherwise be laundered into the anchor cache as valid (seed,coords)-keyed
+        // content: phase 3's commit blit re-creates the victim texture, so the hit path's
+        // IsCreated() guard could never catch the poisoning later. Re-validate the RTs that
+        // span sub-steps and abort like a phase-1 failure (clear + invalidate — the victim's
+        // old content likely died in the same loss event, so dropping its old key is right;
+        // adjacent columns just re-render on their next miss).
+        if (gpuAnchorPhase == 2 || gpuAnchorPhase == 3)
+        {
+            bool spanLost = gpuColumnBaseTexture == null || !gpuColumnBaseTexture.IsCreated()
+                || gpuColumnSurfaceInfoTexture == null || !gpuColumnSurfaceInfoTexture.IsCreated();
+            if (!spanLost && gpuAnchorPhase == 3)
+            {
+                spanLost = gpuSandNoiseTexture == null || !gpuSandNoiseTexture.IsCreated()
+                    || gpuGravelNoiseTexture == null || !gpuGravelNoiseTexture.IsCreated();
+            }
+            if (spanLost)
+            {
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
+                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
+                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
+                gpuAnchorPhase = 0;
+                return;
+            }
+        }
+        if (gpuAnchorPhase == 1)
+        {
+            if (!_GpuAnchorRenderPhase1(sizeXZ))
+            {
+                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
+                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
+                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
+                gpuAnchorPhase = 0;
+                return;
+            }
+            gpuAnchorPhase = 2;
+            return;
+        }
+        if (gpuAnchorPhase == 2)
+        {
+            _GpuAnchorRenderPhase2(sizeXZ);
+            gpuAnchorPhase = 3;
+            return;
+        }
+        _GpuAnchorRenderPhase3(sizeXZ, gpuTreeAnchorChunkTextures[victim]);
+        gpuTreeAnchorPoolCx[victim] = gpuAnchorCx;
+        gpuTreeAnchorPoolCz[victim] = gpuAnchorCz;
+        gpuAnchorPhase = 0;
+    }
+
+    // Anchor phase 1: climate blit, density noise coord writes + flush, the 5 octave runs,
+    // noise combine, base fill and surface info — the coord writes are the CPU cost here.
+    // currentChunkX/Z/Biomes are swapped to the anchor's ONLY inside each phase's
+    // synchronous body so external observers between frames never see anchor coords.
+    private bool _GpuAnchorRenderPhase1(int sizeXZ)
+    {
+        if (!gpuWorldgenReady || gpuTreeAnchorBiomeBuffer == null || gpuTreeAnchorBiomeBuffer.Length != sizeXZ * sizeXZ) return false;
 
         int savedChunkX = currentChunkX;
         int savedChunkZ = currentChunkZ;
         BetaBiomeEnum[] savedChunkBiomes = currentChunkBiomes;
 
-        currentChunkX = chunkX;
-        currentChunkZ = chunkZ;
-        currentChunkBiomes = chunkBiomes;
+        currentChunkX = gpuAnchorCx;
+        currentChunkZ = gpuAnchorCz;
+        currentChunkBiomes = gpuTreeAnchorBiomeBuffer;
 
         gpuNoiseOctaveMaterial.SetTexture(gpuPropClimatePermTex0Id, gpuClimatePermTextureTemp);
         gpuNoiseOctaveMaterial.SetTexture(gpuPropClimatePermTex1Id, gpuClimatePermTextureRain);
@@ -3146,14 +3280,41 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuColumnSurfaceInfoMaterial.SetInt(gpuPropStoneBlockId, stoneBlockID);
         VRCGraphics.Blit(gpuColumnBaseTexture, gpuColumnSurfaceInfoTexture, gpuColumnSurfaceInfoMaterial);
 
-        int noiseX = _GetTerrainBlockStartX(currentChunkX);
-        int noiseZ = _GetTerrainBlockStartZ(currentChunkZ);
+        currentChunkX = savedChunkX;
+        currentChunkZ = savedChunkZ;
+        currentChunkBiomes = savedChunkBiomes;
+        return true;
+    }
+
+    // Anchor phase 2: the two noiseGen4 surface noises (~10ms CPU). Nothing here reads
+    // currentChunk state — coords come straight from the anchor fields.
+    private void _GpuAnchorRenderPhase2(int sizeXZ)
+    {
+        int noiseX = _GetTerrainBlockStartX(gpuAnchorCx);
+        int noiseZ = _GetTerrainBlockStartZ(gpuAnchorCz);
         double[] cpuSandN = noiseGen4.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.03125D, 0.03125D, 1.0D);
         _UploadCpuSurfaceNoise(cpuSandN, sizeXZ, gpuSandNoiseTexture);
         double[] cpuGravelN = noiseGen4.generateNoiseOctaves(null, noiseX, 109.0134D, noiseZ, sizeXZ, 1, sizeXZ, 0.03125D, 1.0D, 0.03125D);
         _UploadCpuSurfaceNoise(cpuGravelN, sizeXZ, gpuGravelNoiseTexture);
+    }
+
+    // Anchor phase 3: stone noise, surface params build (JavaRandom reseeded from the
+    // anchor coords inside the swap, so cross-frame interleaving can't perturb it), the
+    // surface replace blit, and the commit copy into the victim pool texture.
+    private void _GpuAnchorRenderPhase3(int sizeXZ, RenderTexture targetTexture)
+    {
+        int noiseX = _GetTerrainBlockStartX(gpuAnchorCx);
+        int noiseZ = _GetTerrainBlockStartZ(gpuAnchorCz);
         double[] cpuStoneN = noiseGen5.generateNoiseOctaves(null, noiseX, noiseZ, 0.0D, sizeXZ, sizeXZ, 1, 0.0625D, 0.0625D, 0.0625D);
         _UploadCpuSurfaceNoise(cpuStoneN, sizeXZ, gpuStoneNoiseTexture);
+
+        int savedChunkX = currentChunkX;
+        int savedChunkZ = currentChunkZ;
+        BetaBiomeEnum[] savedChunkBiomes = currentChunkBiomes;
+
+        currentChunkX = gpuAnchorCx;
+        currentChunkZ = gpuAnchorCz;
+        currentChunkBiomes = gpuTreeAnchorBiomeBuffer;
 
         _BuildGpuSurfaceParamsFromSurfaceInfo();
 
@@ -3181,7 +3342,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
         currentChunkX = savedChunkX;
         currentChunkZ = savedChunkZ;
         currentChunkBiomes = savedChunkBiomes;
-        return true;
     }
 
     // Collect tree + flower/grass candidates from one chunk into the current column
@@ -4313,18 +4473,26 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
                     // FINALIZE SLICING: decoration + readback moved to their own state.
                     gpuDecorStep = 0;
+                    // ANCHOR/COLLECT SLICING: stale in-progress sub-state from an aborted
+                    // column must not leak into this one.
+                    gpuAnchorPhase = 0;
+                    gpuDecorCollectIdx = 0;
                     currentState = GenerationState.Prepare_GpuDecorate;
                 }
                 break;
 
             case GenerationState.Prepare_GpuDecorate:
                 {
-                    // FINALIZE SLICING: 0 = CPU candidate collect (+ column snapshot into
-                    // anchor slot 4), 1 = ONE tree-anchor chunk render per step, 2 = the
-                    // decoration blits + resident latch / base-column readback request.
+                    // FINALIZE SLICING: 0 = CPU candidate collect (COLLECT SLICING — one
+                    // contributing chunk per call, snapshot into anchor slot 4 on the last),
+                    // 1 = ONE tree-anchor selection or render SUB-STEP per step (ANCHOR
+                    // SLICING — a cache miss spans 8 calls: selection + 4 biome quadrants +
+                    // 3 render phases), 2 = the decoration blits + resident latch /
+                    // base-column readback request.
                     if (gpuDecorStep == 0)
                     {
-                        _GpuDecorationCollect(world.chunkSizeXZ);
+                        // COLLECT SLICING: one contributing chunk's collection per call.
+                        if (_GpuDecorationCollect(world.chunkSizeXZ)) break;
                         gpuDecorStep = 1;
                         break;
                     }
