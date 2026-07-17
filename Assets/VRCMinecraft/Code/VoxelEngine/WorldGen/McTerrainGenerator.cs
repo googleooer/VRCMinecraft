@@ -458,14 +458,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // four 8x8 quadrant queries, one per call. gpuAnchorBiomeQuad = next quadrant (0-3).
     private int gpuAnchorBiomeQuad = 0;
     private BetaBiomeEnum[] gpuAnchorBiomeQuadBuffer;
-    // TREE-ANCHOR CACHE: gpuTreeAnchorChunkTextures (minus index 4, the own-column snapshot)
-    // act as a pool keyed by WORLD column coords — int.MaxValue = invalid entry. Anchor
-    // content is deterministic (seed+coords), so entries never go stale; adjacent columns
-    // reuse each other's anchors instead of re-running the ~20-50ms mini pipeline.
-    private int[] gpuTreeAnchorPoolCx;
-    private int[] gpuTreeAnchorPoolCz;
-    private int[] gpuDecorSlotPool; // per decoration slot 0-8: bound pool index, -1 = unused
-    private int gpuTreeAnchorPoolClock = 0;
+    // TREE-ANCHOR CACHE: anchor content is deterministic (seed+coords), so entries never go
+    // stale. The pool itself is WORLD-SHARED (owned by McWorld, refcounted — see
+    // SharedAnchorLookupAddRef and friends); per-generator only the own-column snapshot
+    // texture (index 4) remains. gpuDecorSlotPool encodes each decoration slot's binding:
+    // -1 = unused, 4 = own snapshot, ANCHOR_SHARED_BASE+i = shared pool entry i.
+    private int[] gpuDecorSlotPool;
+    private const int ANCHOR_SHARED_BASE = 10;
 #if LOGGING
     private int agg_anchorCacheHits;
     private int agg_anchorCacheMisses;
@@ -1444,15 +1443,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuTreeInfoTexture.wrapMode = TextureWrapMode.Clamp;
         gpuTreeInfoPixels = new Color[GPU_TREE_TEX_WIDTH];
         gpuTreeWorkTexture = _CreateGpuBlockIdRenderTexture(world.chunkSizeXZ, gpuWorldHeightBlocks * world.chunkSizeXZ, "GPU_TreeWork");
+        // WORLD-SHARED ANCHOR POOL: only the own-column snapshot (index 4) is per-generator;
+        // pooled anchor textures live in McWorld's shared pool (created via
+        // CreateAnchorPoolTexture below). Was 9 RTs x N generators; now 1 x N + 32 shared.
         gpuTreeAnchorChunkTextures = new RenderTexture[9];
-        for (int treeChunkSlot = 0; treeChunkSlot < gpuTreeAnchorChunkTextures.Length; treeChunkSlot++)
-        {
-            gpuTreeAnchorChunkTextures[treeChunkSlot] = _CreateGpuBlockIdRenderTexture(
-                world.chunkSizeXZ,
-                gpuWorldHeightBlocks * world.chunkSizeXZ,
-                "GPU_TreeAnchorChunk_" + treeChunkSlot
-            );
-        }
+        gpuTreeAnchorChunkTextures[4] = _CreateGpuBlockIdRenderTexture(
+            world.chunkSizeXZ,
+            gpuWorldHeightBlocks * world.chunkSizeXZ,
+            "GPU_TreeAnchorChunk_4"
+        );
         gpuTreeAnchorBiomeBuffer = new BetaBiomeEnum[world.chunkSizeXZ * world.chunkSizeXZ];
 
         // GPU cave carving RT
@@ -2936,14 +2935,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
             gpuDecorCurrentTex = gpuTreeAnchorChunkTextures[4];
             gpuDecorAnchorMask = requiredTreeAnchorMask & ~(1 << 4);
 
-            // TREE-ANCHOR CACHE: reset this column's slot->pool bindings. Pool arrays are
-            // allocated lazily; entries persist across columns (see _GpuDecorationRenderNextAnchor).
-            if (gpuTreeAnchorPoolCx == null)
+            // WORLD-SHARED ANCHOR POOL: reset this column's slot bindings. The previous
+            // column's shared refs were already released (finish-blits / decorate entry).
+            if (gpuDecorSlotPool == null)
             {
-                gpuTreeAnchorPoolCx = new int[9];
-                gpuTreeAnchorPoolCz = new int[9];
                 gpuDecorSlotPool = new int[9];
-                for (int pi = 0; pi < 9; pi++) { gpuTreeAnchorPoolCx[pi] = int.MaxValue; gpuTreeAnchorPoolCz[pi] = int.MaxValue; }
+                for (int pi = 0; pi < 9; pi++) gpuDecorSlotPool[pi] = -1;
             }
             for (int si = 0; si < 9; si++) gpuDecorSlotPool[si] = -1;
             gpuDecorSlotPool[4] = 4; // own-column snapshot always lives in texture 4
@@ -2976,11 +2973,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
             return false;
         }
 
-        // PHASE 1 (free, every call): resolve ALL pending cache hits before ANY victim is
-        // chosen. Otherwise a miss on a low slot could round-robin-evict the exact pooled
-        // entry a higher pending slot of THIS column would have hit — turning a free hit into
-        // a redundant ~20-50ms render. Binding all hits first makes _GpuAnchorPoolIndexBound
-        // protect every entry this column still needs.
+        // PHASE 1 (cheap, every call): resolve ALL pending cache hits against the WORLD-SHARED
+        // pool before any victim is chosen. Each hit refcounts its entry, which protects it
+        // from every generator's victim picks until this column's bindings are released.
         for (int treeChunkSlot = 0; treeChunkSlot < 9; treeChunkSlot++)
         {
             if (treeChunkSlot == 4) continue;
@@ -2988,24 +2983,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
 
             int hcx = currentChunkX + ((treeChunkSlot % 3) - 1);
             int hcz = currentChunkZ + ((treeChunkSlot / 3) - 1);
-            for (int p = 0; p < 9; p++)
-            {
-                if (p == 4) continue;
-                if (gpuTreeAnchorPoolCx[p] != hcx || gpuTreeAnchorPoolCz[p] != hcz) continue;
-                if (gpuTreeAnchorChunkTextures[p] == null || !gpuTreeAnchorChunkTextures[p].IsCreated())
-                {
-                    // Content lost (device reset/alt-tab) — invalidate; re-render below.
-                    gpuTreeAnchorPoolCx[p] = int.MaxValue;
-                    gpuTreeAnchorPoolCz[p] = int.MaxValue;
-                    continue;
-                }
-                gpuDecorSlotPool[treeChunkSlot] = p;
-                gpuDecorAnchorMask &= ~(1 << treeChunkSlot);
+            int hit = world.SharedAnchorLookupAddRef(hcx, hcz);
+            if (hit < 0) continue;
+            gpuDecorSlotPool[treeChunkSlot] = ANCHOR_SHARED_BASE + hit;
+            gpuDecorAnchorMask &= ~(1 << treeChunkSlot);
 #if LOGGING
-                if (enableDetailedTimings) agg_anchorCacheHits++;
+            if (enableDetailedTimings) agg_anchorCacheHits++;
 #endif
-                break;
-            }
         }
 
         // PHASE 2: render at most ONE remaining (miss) anchor per call.
@@ -3019,30 +3003,15 @@ public class McTerrainGenerator : UdonSharpBehaviour
             int chunkX = currentChunkX + chunkOffsetX;
             int chunkZ = currentChunkZ + chunkOffsetZ;
 
-            // MISS: pick a victim pool texture — an invalid entry if any, else round-robin
-            // among entries NOT bound to this column's other slots (and never 4).
-            int victim = -1;
-            for (int p = 0; p < 9; p++)
-            {
-                if (p == 4) continue;
-                if (gpuTreeAnchorPoolCx[p] == int.MaxValue && !_GpuAnchorPoolIndexBound(p)) { victim = p; break; }
-            }
-            if (victim < 0)
-            {
-                for (int tries = 0; tries < 9; tries++)
-                {
-                    gpuTreeAnchorPoolClock = gpuTreeAnchorPoolClock + 1;
-                    if (gpuTreeAnchorPoolClock >= 9) gpuTreeAnchorPoolClock = 0;
-                    int p = gpuTreeAnchorPoolClock;
-                    if (p == 4 || _GpuAnchorPoolIndexBound(p)) continue;
-                    victim = p;
-                    break;
-                }
-            }
-            if (victim < 0) victim = treeChunkSlot; // unreachable (>=4 free entries); stay safe
+            // MISS: acquire a refcounted victim from the WORLD-SHARED pool. Its key stays
+            // invalid until phase 3 commits, so no other generator can hit half-rendered
+            // content. A -1 (every entry refcounted — transient) keeps the mask bit set and
+            // retries next call; a holder's release guarantees progress.
+            int victim = world.SharedAnchorAcquireVictim();
+            if (victim < 0) break;
 
             gpuDecorAnchorMask &= ~(1 << treeChunkSlot);
-            gpuDecorSlotPool[treeChunkSlot] = victim;
+            gpuDecorSlotPool[treeChunkSlot] = ANCHOR_SHARED_BASE + victim;
 #if LOGGING
             if (enableDetailedTimings) agg_anchorCacheMisses++;
 #endif
@@ -3052,7 +3021,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
             // current column (slot 4 excluded above), so no own-column biome fast path.
             gpuAnchorCx = chunkX;
             gpuAnchorCz = chunkZ;
-            gpuAnchorVictim = victim;
+            gpuAnchorVictim = victim; // WORLD-SHARED pool index
             gpuAnchorPhase = 10;
             gpuAnchorBiomeQuad = 0;
             break; // one selection or sub-step per step
@@ -3060,36 +3029,30 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return gpuDecorAnchorMask != 0 || gpuAnchorPhase != 0;
     }
 
-    // TREE-ANCHOR CACHE affinity query (used by McWorld's generator picker): how many pool
-    // anchors lie within the 3x3 neighborhood of column (cx, cz)? A new column assigned to
-    // the generator that already rendered nearby anchors turns up to 4 of its anchor cache
-    // misses into free hits — with first-free-slot picking the frontier hit rate was ~0%.
-    public int CountCachedAnchorsNear(int cx, int cz)
+    // WORLD-SHARED ANCHOR POOL: RT factory for McWorld's pool — same dims/format as the
+    // column pipeline textures anchors are blitted from.
+    public RenderTexture CreateAnchorPoolTexture(int index)
     {
-        if (gpuTreeAnchorPoolCx == null) return 0;
-        int hits = 0;
-        for (int p = 0; p < 9; p++)
-        {
-            int px = gpuTreeAnchorPoolCx[p];
-            if (px == int.MaxValue) continue;
-            int dx = px - cx;
-            if (dx < -1 || dx > 1) continue;
-            int dz = gpuTreeAnchorPoolCz[p] - cz;
-            if (dz < -1 || dz > 1) continue;
-            hits = hits + 1;
-        }
-        return hits;
+        return _CreateGpuBlockIdRenderTexture(
+            world.chunkSizeXZ,
+            gpuWorldHeightBlocks * world.chunkSizeXZ,
+            "GPU_SharedTreeAnchor_" + index
+        );
     }
 
-    // TREE-ANCHOR CACHE: is this pool index already bound to one of the current column's
-    // decoration slots? (Bound entries must not be evicted mid-column.)
-    private bool _GpuAnchorPoolIndexBound(int poolIndex)
+    // WORLD-SHARED ANCHOR POOL: release this column's shared refs and clear the bindings.
+    // Called after the finish-blits are SUBMITTED (GPU executes blits in submission order,
+    // so a later render into a released entry cannot corrupt the already-submitted sample)
+    // and defensively at decorate entry (abort coverage; idempotent — released slots are -1).
+    private void _ReleaseSharedAnchorBindings()
     {
-        for (int s = 0; s < 9; s++)
+        if (gpuDecorSlotPool == null || world == null) return;
+        for (int si = 0; si < 9; si++)
         {
-            if (gpuDecorSlotPool[s] == poolIndex) return true;
+            int b = gpuDecorSlotPool[si];
+            gpuDecorSlotPool[si] = -1;
+            if (b >= ANCHOR_SHARED_BASE) world.SharedAnchorRelease(b - ANCHOR_SHARED_BASE);
         }
-        return false;
     }
 
     // FINALIZE SLICING step 3 of Prepare_GpuDecorate: the tree/flower decoration blits.
@@ -3117,14 +3080,17 @@ public class McTerrainGenerator : UdonSharpBehaviour
             gpuColumnTreeDecorationMaterial.SetInt(gpuPropDirtBlockIdDecor, dirtBlockID);
             gpuColumnTreeDecorationMaterial.SetInt(gpuPropLogBlockIdDecor, logBlockID);
             gpuColumnTreeDecorationMaterial.SetInt(gpuPropLeavesBlockIdDecor, leavesBlockID);
-            for (int treeChunkSlot = 0; treeChunkSlot < gpuTreeAnchorChunkTextures.Length; treeChunkSlot++)
+            for (int treeChunkSlot = 0; treeChunkSlot < 9; treeChunkSlot++)
             {
-                // TREE-ANCHOR CACHE: bind the pooled texture this slot resolved to (cache hit
-                // or freshly rendered victim). Unbound slots (-1) get their own-index texture,
-                // matching the old behavior for slots the shader never samples.
-                int poolIdx = (gpuDecorSlotPool != null && gpuDecorSlotPool[treeChunkSlot] >= 0)
-                    ? gpuDecorSlotPool[treeChunkSlot] : treeChunkSlot;
-                gpuColumnTreeDecorationMaterial.SetTexture(gpuTreeAnchorChunkTexIds[treeChunkSlot], gpuTreeAnchorChunkTextures[poolIdx]);
+                // WORLD-SHARED ANCHOR POOL: bind the texture this slot resolved to — shared
+                // pool entry (>= ANCHOR_SHARED_BASE), own snapshot (4), or the snapshot as a
+                // fallback for unbound slots the shader never samples.
+                int bind = gpuDecorSlotPool != null ? gpuDecorSlotPool[treeChunkSlot] : -1;
+                RenderTexture bindTex = bind >= ANCHOR_SHARED_BASE
+                    ? world.GetSharedAnchorTexture(bind - ANCHOR_SHARED_BASE)
+                    : gpuTreeAnchorChunkTextures[4];
+                if (bindTex == null) bindTex = gpuTreeAnchorChunkTextures[4];
+                gpuColumnTreeDecorationMaterial.SetTexture(gpuTreeAnchorChunkTexIds[treeChunkSlot], bindTex);
             }
 
             VRCGraphics.Blit(currentTex, gpuTreeWorkTexture, gpuColumnTreeDecorationMaterial);
@@ -3153,6 +3119,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
             currentTex = gpuDecorationWorkTexture;
         }
 
+        // WORLD-SHARED ANCHOR POOL: the tree blit above is SUBMITTED — GPU command order
+        // guarantees it samples the bound anchors before any later render overwrites them,
+        // so the refs can release now (holding them until the next column risked pool
+        // exhaustion from parked generators at end-of-load).
+        _ReleaseSharedAnchorBindings();
+
         return currentTex;
     }
 
@@ -3175,9 +3147,9 @@ public class McTerrainGenerator : UdonSharpBehaviour
     {
         if (gpuTreeAnchorBiomeBuffer == null || gpuTreeAnchorBiomeBuffer.Length != 256)
         {
-            VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
-            gpuTreeAnchorPoolCx[victim] = int.MaxValue;
-            gpuTreeAnchorPoolCz[victim] = int.MaxValue;
+            RenderTexture qvt = world.GetSharedAnchorTexture(victim);
+            if (qvt != null) VRCGraphics.Blit(gpuClearTexture, qvt);
+            world.SharedAnchorInvalidate(victim);
             gpuAnchorPhase = 0;
             return;
         }
@@ -3221,7 +3193,10 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private void _GpuAnchorRenderStep(int sizeXZ)
     {
         int victim = gpuAnchorVictim;
-        if (victim < 0 || gpuTreeAnchorChunkTextures == null || gpuTreeAnchorChunkTextures[victim] == null)
+        // WORLD-SHARED ANCHOR POOL: victim is a shared-pool index; the ref taken at
+        // selection protects it from other generators' victim picks until release.
+        RenderTexture victimTex = victim >= 0 ? world.GetSharedAnchorTexture(victim) : null;
+        if (victimTex == null)
         {
             gpuAnchorPhase = 0;
             return;
@@ -3251,9 +3226,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
             }
             if (spanLost)
             {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
-                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
-                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
+                VRCGraphics.Blit(gpuClearTexture, victimTex);
+                world.SharedAnchorInvalidate(victim);
                 gpuAnchorPhase = 0;
                 return;
             }
@@ -3262,9 +3236,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
         {
             if (!_GpuAnchorRenderPhase1(sizeXZ))
             {
-                VRCGraphics.Blit(gpuClearTexture, gpuTreeAnchorChunkTextures[victim]);
-                gpuTreeAnchorPoolCx[victim] = int.MaxValue;
-                gpuTreeAnchorPoolCz[victim] = int.MaxValue;
+                VRCGraphics.Blit(gpuClearTexture, victimTex);
+                world.SharedAnchorInvalidate(victim);
                 gpuAnchorPhase = 0;
                 return;
             }
@@ -3277,9 +3250,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
             gpuAnchorPhase = 3;
             return;
         }
-        _GpuAnchorRenderPhase3(sizeXZ, gpuTreeAnchorChunkTextures[victim]);
-        gpuTreeAnchorPoolCx[victim] = gpuAnchorCx;
-        gpuTreeAnchorPoolCz[victim] = gpuAnchorCz;
+        _GpuAnchorRenderPhase3(sizeXZ, victimTex);
+        world.SharedAnchorCommit(victim, gpuAnchorCx, gpuAnchorCz);
         gpuAnchorPhase = 0;
     }
 
@@ -4600,10 +4572,12 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     // FINALIZE SLICING: decoration + readback moved to their own state.
                     gpuDecorStep = 0;
                     // ANCHOR/COLLECT SLICING: stale in-progress sub-state from an aborted
-                    // column must not leak into this one.
+                    // column must not leak into this one. The shared-anchor release is
+                    // abort coverage (idempotent — the normal release ran at finish-blits).
                     gpuAnchorPhase = 0;
                     gpuDecorCollectIdx = 0;
                     gpuDecorCollectSub = -1;
+                    _ReleaseSharedAnchorBindings();
                     currentState = GenerationState.Prepare_GpuDecorate;
                 }
                 break;
