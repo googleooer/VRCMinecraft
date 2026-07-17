@@ -64,8 +64,19 @@ public partial class McWorld : UdonSharpBehaviour
     public ChunkData[] chunks_1D; // OPTIMIZED: Public for direct coordinator access
 
     [Header("Performance Tuning")]
-    // Approximate time budget per mesh step (CPU-only mesh path).
-    [System.NonSerialized] public float meshStepTimeBudgetMs = 15.0f;
+    // Approximate time budget per CPU greedy mesh STEP. Lowered 15->6: a single step could
+    // otherwise burn up to 15ms of greedy slicing, so the interaction-loop wall-clock cap
+    // (interactionMeshBudgetMs, below) and every sliced CPU build overshot to ~15ms per step.
+    // 6ms fits the frame envelope (8ms steady / 24ms load); the greedy mask/emit order and the
+    // resulting mesh are unchanged — this only controls how much greedy work runs before a yield.
+    [System.NonSerialized] public float meshStepTimeBudgetMs = 6.0f;
+    // Wall-clock cap on the SYNCHRONOUS interaction-priority mesh completion loop (player
+    // edits + load-time cross/torch rebuilds). Without it the loop ran until the whole mesh
+    // finished — a heavy cross/torch chunk = a 60-120ms single-Update spike (the observed
+    // 70-127ms Update max). Bounded, the remainder finishes via the normal sliced mesh loop
+    // over the next frame or two (deterministic cursor resume -> byte-identical geometry), so
+    // a real edit still appears within ~1-2 frames while load-time rebuilds stop spiking.
+    [System.NonSerialized] public float interactionMeshBudgetMs = 7.0f;
     // FRAME GOVERNOR: ONE envelope per Update(), anchored at Update() entry and shared by the
     // scheduler AND every ProcessActiveChunks lane. They used to each anchor their own full
     // updateTimeBudgetMs (scheduler 22 + PAC 22 + per-lane floors), stacking busy frames to
@@ -8778,16 +8789,22 @@ public partial class McWorld : UdonSharpBehaviour
 
         if (interactionPriority)
         {
-            // Player edits must update THIS frame. Finish the whole rebuild on the interaction
-            // call path (bounded) so the placed/broken block — and its collider, applied at the
-            // finalize branch above — appear immediately instead of being parked behind the
-            // load-starved ProcessActiveChunks mesh budget. A single chunk rebuild is a few ms;
-            // that's the right trade for a deliberate user action. The bound is a safety cap
-            // (well above any real per-chunk step count), not an expected limit.
+            // Player edits must update THIS frame. Finish the rebuild on the interaction call
+            // path so the placed/broken block — and its collider, applied at the finalize
+            // branch above — appear immediately instead of being parked behind the load-starved
+            // ProcessActiveChunks mesh budget. WALL-CLOCK BOUNDED: a heavy cross/torch chunk
+            // used to run this loop until the whole mesh finished (a 60-120ms single-Update
+            // spike); now it yields at interactionMeshBudgetMs and the fallthrough re-queues to
+            // activeMeshingChunks, where the normal sliced loop (which grants interaction
+            // chunks 9999 steps/frame up to the frame deadline) completes it over the next
+            // frame or two. _BuildChunkMeshStep resumes deterministically from its greedy
+            // cursors, so the spread-out build is byte-identical.
             int immediateStepBudget = 4096;
+            float interactionDeadline = Time.realtimeSinceStartup + interactionMeshBudgetMs * 0.001f;
             while (chunk.isBuildingMesh && immediateStepBudget-- > 0)
             {
                 _BuildChunkMeshStep(chunk);
+                if (Time.realtimeSinceStartup > interactionDeadline) break;
             }
 
             if (!chunk.isBuildingMesh)
@@ -15702,13 +15719,15 @@ public partial class McWorld : UdonSharpBehaviour
         int locCrossCount = chunk._crossBlockCount;
         int locTorchCount = chunk._torchBlockCount;
         int locAec = chunk._ambientEmitterCount;
-        int gMinY = chunk._chunkGlobalMinY, gMaxY = chunk._chunkGlobalMaxY;
-        int gMinX = chunk._chunkGlobalMinX, gMaxX = chunk._chunkGlobalMaxX;
-        int gMinZ = chunk._chunkGlobalMinZ, gMaxZ = chunk._chunkGlobalMaxZ;
+        // GLOBAL BOUNDS HOIST: the per-chunk _chunkGlobalMin/Max X/Y/Z are no longer accumulated
+        // per voxel (6 compares × ~4000 voxels on a full-scan chunk). They are fully determined
+        // by the per-column min/max arrays this loop already writes, so they are derived in ONE
+        // 256-iteration post-pass in the final slice below. Globals are only read after prep
+        // completes (render stage / greedy-mesh axis skip), so leaving them stale across
+        // intermediate slices is safe.
 
         int stride = chunkSizeXZ * chunkSizeXZ;
         int topYIdx = chunkSizeY - 1;
-        int topXZIdx = chunkSizeXZ - 1;
         // UNIFORM-LAYER FAST PATH gate (16x16 layers only — always true in practice).
         bool layerFastOk = stride == 256;
         int yEnd = yStart + yCount;
@@ -15755,11 +15774,7 @@ public partial class McWorld : UdonSharpBehaviour
                             if (colMinArrD[cc] == 255) colMinArrD[cc] = yb;
                             colMaxArrD[cc] = yb;
                         }
-                        if (y < gMinY) gMinY = y;
-                        if (y > gMaxY) gMaxY = y;
-                        gMinX = 0; gMinZ = 0;
-                        if (topXZIdx > gMaxX) gMaxX = topXZIdx;
-                        if (topXZIdx > gMaxZ) gMaxZ = topXZIdx;
+                        // (global bounds derived from column arrays in the final slice)
                         continue;
                     }
                 }
@@ -15789,13 +15804,7 @@ public partial class McWorld : UdonSharpBehaviour
                     }
                     if (colMinArrD[columnIndex] == 255) colMinArrD[columnIndex] = (byte)y;
                     colMaxArrD[columnIndex] = (byte)y;
-
-                    if (y < gMinY) gMinY = y;
-                    if (y > gMaxY) gMaxY = y;
-                    if (x < gMinX) gMinX = x;
-                    if (x > gMaxX) gMaxX = x;
-                    if (z < gMinZ) gMinZ = z;
-                    if (z > gMaxZ) gMaxZ = z;
+                    // (global bounds derived from column arrays in the final slice — no per-voxel compares)
 
                     if ((cls & DBC_EMISSIVE) != 0) locHasEmissive = true;
 
@@ -15842,12 +15851,33 @@ public partial class McWorld : UdonSharpBehaviour
         chunk._crossBlockCount = locCrossCount;
         chunk._torchBlockCount = locTorchCount;
         chunk._ambientEmitterCount = locAec;
-        chunk._chunkGlobalMinY = (byte)gMinY; chunk._chunkGlobalMaxY = (byte)gMaxY;
-        chunk._chunkGlobalMinX = (byte)gMinX; chunk._chunkGlobalMaxX = (byte)gMaxX;
-        chunk._chunkGlobalMinZ = (byte)gMinZ; chunk._chunkGlobalMaxZ = (byte)gMaxZ;
 
         if (yEnd >= chunkSizeY)
         {
+            // GLOBAL BOUNDS HOIST: derive _chunkGlobalMin/Max from the now-complete column
+            // min/max arrays in ONE 256-pass, byte-identical to the old per-voxel accumulation.
+            // A column (x,z) = (col&15, col>>4) is occupied iff colMinArrD[col] != 255; the set
+            // of occupied (x,z) equals the set of non-air (x,z), so gMinX/gMaxX/gMinZ/gMaxZ over
+            // occupied columns == over non-air voxels, and gMinY/gMaxY == min-colMin/max-colMax.
+            // All-air chunk -> every column 255 -> 255/0/255/0/255/0, matching the old 255/0 init.
+            int dMinY = 255, dMaxY = 0, dMinX = 255, dMaxX = 0, dMinZ = 255, dMaxZ = 0;
+            for (int col = 0; col < columnCount; col++)
+            {
+                byte cm = colMinArrD[col];
+                if (cm == 255) continue;
+                int cx = col & 15, cz = col >> 4;
+                if (cm < dMinY) dMinY = cm;
+                byte cM = colMaxArrD[col];
+                if (cM > dMaxY) dMaxY = cM;
+                if (cx < dMinX) dMinX = cx;
+                if (cx > dMaxX) dMaxX = cx;
+                if (cz < dMinZ) dMinZ = cz;
+                if (cz > dMaxZ) dMaxZ = cz;
+            }
+            chunk._chunkGlobalMinY = (byte)dMinY; chunk._chunkGlobalMaxY = (byte)dMaxY;
+            chunk._chunkGlobalMinX = (byte)dMinX; chunk._chunkGlobalMaxX = (byte)dMaxX;
+            chunk._chunkGlobalMinZ = (byte)dMinZ; chunk._chunkGlobalMaxZ = (byte)dMaxZ;
+
             chunk._isAllOpaqueSolid = !chunk._isAllAir
                 && chunk._derivedSolidOpaqueCount == chunkSizeY * chunkSizeXZ * chunkSizeXZ;
             chunk._derivedForDataVersion = chunk._cachedDataVersion;
