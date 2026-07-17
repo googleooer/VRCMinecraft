@@ -6366,6 +6366,129 @@ public partial class McWorld : UdonSharpBehaviour
     // not mid-drain for a foreign column. -1 = nothing available this instant, or the
     // column is ALREADY in flight on its mapped generator (siblings must wait and drain
     // from its cache, never rebind the column).
+    // =========================================================================
+    // WORLD-SHARED TREE-ANCHOR POOL
+    // Anchor chunk content is a pure function of (seed, coords), so ONE pool serves ALL
+    // generators — the per-generator 9-texture pools fragmented the cache across 16 workers
+    // (~15% hit rate: the pool-holding generator was rarely the one free at pick time for
+    // the adjacent column). Entries are REFCOUNTED while bound to some generator's
+    // in-progress column so a victim pick can never evict a texture another generator's
+    // finish-blits still read; a key of int.MaxValue marks invalid OR being-rendered (the
+    // renderer commits the key only when the content is complete, so concurrent lookups
+    // can't hit half-rendered entries). Two generators missing the same key concurrently
+    // just render identical content into two entries — wasteful, never wrong.
+    // =========================================================================
+    private RenderTexture[] sharedAnchorTextures;
+    private int[] sharedAnchorCx;
+    private int[] sharedAnchorCz;
+    private int[] sharedAnchorRef;
+    private int sharedAnchorClock = 0;
+    private int sharedAnchorPoolSize = 0;
+    private const int SHARED_ANCHOR_POOL_MIN = 32;
+
+    private bool _EnsureSharedAnchorPool()
+    {
+        if (sharedAnchorTextures != null) return true;
+        if (terrainGenerator == null) return false;
+        // DEADLOCK-PROOF SIZING: a generator holds at most 8 refs (its column's 8 anchor
+        // slots) and only while parked in Prepare_GpuDecorate, so worst-case live refs =
+        // generatorCount * 8. Size the pool ABOVE that (+8 slack) so SharedAnchorAcquireVictim
+        // can always find an unreferenced entry — otherwise, with enough generators, every
+        // holder could wait on a victim while no holder can ever finish and release (an
+        // absorbing wedge). This keeps the invariant enforced for ANY extraGenerators count.
+        sharedAnchorPoolSize = Mathf.Max(SHARED_ANCHOR_POOL_MIN, GetGeneratorCount() * 8 + 8);
+        sharedAnchorTextures = new RenderTexture[sharedAnchorPoolSize];
+        sharedAnchorCx = new int[sharedAnchorPoolSize];
+        sharedAnchorCz = new int[sharedAnchorPoolSize];
+        sharedAnchorRef = new int[sharedAnchorPoolSize];
+        for (int i = 0; i < sharedAnchorPoolSize; i++)
+        {
+            sharedAnchorTextures[i] = terrainGenerator.CreateAnchorPoolTexture(i);
+            sharedAnchorCx[i] = int.MaxValue;
+            sharedAnchorCz[i] = int.MaxValue;
+        }
+        return true;
+    }
+
+    // Find a valid pooled anchor for (cx, cz) and refcount it for the caller. -1 = miss.
+    public int SharedAnchorLookupAddRef(int cx, int cz)
+    {
+        if (!_EnsureSharedAnchorPool()) return -1;
+        for (int i = 0; i < sharedAnchorPoolSize; i++)
+        {
+            if (sharedAnchorCx[i] != cx || sharedAnchorCz[i] != cz) continue;
+            RenderTexture rt = sharedAnchorTextures[i];
+            if (rt == null || !rt.IsCreated())
+            {
+                // Content lost (device reset/alt-tab) — invalidate; the caller re-renders.
+                sharedAnchorCx[i] = int.MaxValue;
+                sharedAnchorCz[i] = int.MaxValue;
+                continue;
+            }
+            sharedAnchorRef[i] = sharedAnchorRef[i] + 1;
+            return i;
+        }
+        return -1;
+    }
+
+    // Pick + refcount a victim entry for a fresh render; its key stays INVALID until the
+    // caller commits. -1 = every entry is refcounted right now — callers retry. The pool is
+    // sized generatorCount*8+8 (see _EnsureSharedAnchorPool), so an unreferenced entry
+    // always exists and -1 is theoretically unreachable; the retry path is defense in depth.
+    public int SharedAnchorAcquireVictim()
+    {
+        if (!_EnsureSharedAnchorPool()) return -1;
+        for (int i = 0; i < sharedAnchorPoolSize; i++)
+        {
+            if (sharedAnchorCx[i] == int.MaxValue && sharedAnchorRef[i] == 0)
+            {
+                sharedAnchorRef[i] = 1;
+                return i;
+            }
+        }
+        for (int tries = 0; tries < sharedAnchorPoolSize; tries++)
+        {
+            sharedAnchorClock = sharedAnchorClock + 1;
+            if (sharedAnchorClock >= sharedAnchorPoolSize) sharedAnchorClock = 0;
+            int i = sharedAnchorClock;
+            if (sharedAnchorRef[i] != 0) continue;
+            sharedAnchorCx[i] = int.MaxValue;
+            sharedAnchorCz[i] = int.MaxValue;
+            sharedAnchorRef[i] = 1;
+            return i;
+        }
+        return -1;
+    }
+
+    // Commit the key once the render finished (content is now valid for lookups).
+    public void SharedAnchorCommit(int poolIdx, int cx, int cz)
+    {
+        if (sharedAnchorCx == null || poolIdx < 0 || poolIdx >= sharedAnchorPoolSize) return;
+        sharedAnchorCx[poolIdx] = cx;
+        sharedAnchorCz[poolIdx] = cz;
+    }
+
+    // Render failed / content unusable — key stays invalid (the ref is still released by
+    // the owner's normal binding release).
+    public void SharedAnchorInvalidate(int poolIdx)
+    {
+        if (sharedAnchorCx == null || poolIdx < 0 || poolIdx >= sharedAnchorPoolSize) return;
+        sharedAnchorCx[poolIdx] = int.MaxValue;
+        sharedAnchorCz[poolIdx] = int.MaxValue;
+    }
+
+    public void SharedAnchorRelease(int poolIdx)
+    {
+        if (sharedAnchorRef == null || poolIdx < 0 || poolIdx >= sharedAnchorPoolSize) return;
+        if (sharedAnchorRef[poolIdx] > 0) sharedAnchorRef[poolIdx] = sharedAnchorRef[poolIdx] - 1;
+    }
+
+    public RenderTexture GetSharedAnchorTexture(int poolIdx)
+    {
+        if (sharedAnchorTextures == null || poolIdx < 0 || poolIdx >= sharedAnchorPoolSize) return null;
+        return sharedAnchorTextures[poolIdx];
+    }
+
     public int PickGeneratorSlotForNewColumn(int cx, int cz)
     {
         int n = GetGeneratorCount();
@@ -6392,26 +6515,18 @@ public partial class McWorld : UdonSharpBehaviour
             if (g.HasCopyableColumnCache() && g.CachedColumnChunkX() == cx && g.CachedColumnChunkZ() == cz)
                 return s;
         }
-        // Pass 2 (with TREE-ANCHOR affinity): ONE eligibility scan — among free,
-        // non-drain-blocked slots prefer the one whose anchor pool holds the most anchors in
-        // this column's 3x3 neighborhood (radial pick order already puts consecutive new
-        // columns near each other; routing them to the pool-holding generator turns up to 4
-        // anchor cache misses — 8 sliced render calls each — into free hits). Falls back to
-        // the first eligible slot. Single loop so the eligibility cross-VM calls stay at the
-        // pre-affinity count; the anchor query runs only for slots that pass eligibility.
-        int firstSlot = -1;
-        int anchorSlot = -1;
-        int anchorBest = 0;
+        // Pass 2: first free slot not blocked by its own cache drain (the drain guard exempts
+        // this column if it happens to BE the slot's cached column). Anchor-affinity scoring
+        // was removed here — the WORLD-SHARED anchor pool made it moot: every generator now
+        // hits the same pool, so slot choice no longer affects the anchor hit rate.
         for (int s = 0; s < n; s++)
         {
             McTerrainGenerator g = _GeneratorForSlot(s);
             if (g == null || !_GenSlotIsFreeForNewColumn(s)) continue;
             if (GenBlocksNewColumnForCacheDrain(g, s, cx, cz)) continue;
-            if (firstSlot < 0) firstSlot = s;
-            int a = g.CountCachedAnchorsNear(cx, cz);
-            if (a > anchorBest) { anchorBest = a; anchorSlot = s; }
+            return s;
         }
-        return anchorSlot >= 0 ? anchorSlot : firstSlot;
+        return -1;
     }
 
     // Generator slot for a chunks_1D index, computed from the index ALONE so the coordinator can
