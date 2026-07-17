@@ -6392,16 +6392,26 @@ public partial class McWorld : UdonSharpBehaviour
             if (g.HasCopyableColumnCache() && g.CachedColumnChunkX() == cx && g.CachedColumnChunkZ() == cz)
                 return s;
         }
-        // Pass 2: first free slot not blocked by its own cache drain (the drain guard exempts
-        // this column if it happens to BE the slot's cached column).
+        // Pass 2 (with TREE-ANCHOR affinity): ONE eligibility scan — among free,
+        // non-drain-blocked slots prefer the one whose anchor pool holds the most anchors in
+        // this column's 3x3 neighborhood (radial pick order already puts consecutive new
+        // columns near each other; routing them to the pool-holding generator turns up to 4
+        // anchor cache misses — 8 sliced render calls each — into free hits). Falls back to
+        // the first eligible slot. Single loop so the eligibility cross-VM calls stay at the
+        // pre-affinity count; the anchor query runs only for slots that pass eligibility.
+        int firstSlot = -1;
+        int anchorSlot = -1;
+        int anchorBest = 0;
         for (int s = 0; s < n; s++)
         {
             McTerrainGenerator g = _GeneratorForSlot(s);
             if (g == null || !_GenSlotIsFreeForNewColumn(s)) continue;
             if (GenBlocksNewColumnForCacheDrain(g, s, cx, cz)) continue;
-            return s;
+            if (firstSlot < 0) firstSlot = s;
+            int a = g.CountCachedAnchorsNear(cx, cz);
+            if (a > anchorBest) { anchorBest = a; anchorSlot = s; }
         }
-        return -1;
+        return anchorSlot >= 0 ? anchorSlot : firstSlot;
     }
 
     // Generator slot for a chunks_1D index, computed from the index ALONE so the coordinator can
@@ -6681,6 +6691,34 @@ public partial class McWorld : UdonSharpBehaviour
         float stepBudget = useGpuWorldgen ? Mathf.Max(0.5f, adaptiveGpuWorldgenStepBudgetMs) * 0.001f : 0.008f;
         int maxStepsPerFrame = useGpuWorldgen ? Mathf.Max(1, adaptiveGpuWorldgenStepsPerFrame) : 1;
 
+        // IDLE-BUDGET DEEPENING: late in load only 1-3 columns are active and Update runs
+        // ~7-10ms against the 24ms envelope, yet the 3ms per-call envelope let a ~40-sub-step
+        // sliced decorate chain advance ONE sub-step per frame (~0.7s wall-clock per land
+        // column). When the shared frame envelope has headroom, give this call the headroom
+        // split across the active chunks — CAPPED at half the envelope, so the scheduler's
+        // other half (assign work: player rebuild pops, border heals, deferred wakes) always
+        // survives a deepened worker-loop call. Every existing break condition still applies,
+        // and the step loop additionally ends the call after any HEAVY sub-step (see loop) so
+        // two ~22ms anchor sub-steps can never chain inside one call.
+        bool deepened = false;
+        if (useGpuWorldgen)
+        {
+            float idleHeadroomSec = _frameDeadlineSec - stepStart;
+            if (idleHeadroomSec > stepBudget)
+            {
+                int activeCols = activeDataGenCount > 0 ? activeDataGenCount : 1;
+                float shareSec = idleHeadroomSec / activeCols;
+                float deepCapSec = updateTimeBudgetMs * 0.0005f; // half the envelope, in seconds
+                if (shareSec > deepCapSec) shareSec = deepCapSec;
+                if (shareSec > stepBudget)
+                {
+                    stepBudget = shareSec;
+                    maxStepsPerFrame = 64;
+                    deepened = true;
+                }
+            }
+        }
+
         // GPU-RESIDENT (#2 step 2): a sibling of an already-finalized resident column — the
         // generator is NOT currently mid-gen on this chunk — repacks its Y-slice straight from
         // the still-valid column texture and is done. No readback, no re-gen.
@@ -6768,8 +6806,15 @@ public partial class McWorld : UdonSharpBehaviour
             }
             for (int step = 0; step < maxStepsPerFrame; step++)
             {
+                float subStepStart = Time.realtimeSinceStartup;
                 isComplete = gen.StepChunkGeneration(out generatedData);
                 if (isComplete) { completedViaStepLoop = true; break; }
+
+                // IDLE-BUDGET DEEPENING spike cap: a HEAVY sub-step (anchor render phases run
+                // up to ~22ms) ends a deepened call immediately — the pre-deepening 3ms budget
+                // guaranteed at most ONE heavy sub-step per call, and packing a second would
+                // double the worst-case gen spike. Cheap sub-steps keep packing normally.
+                if (deepened && Time.realtimeSinceStartup - subStepStart > 0.004f) break;
 
                 // EVENT-DRIVEN GEN: the generator is parked on an async GPU readback (base-column or
                 // climate) that only its OnAsyncGpuReadbackComplete callback can finish. Re-stepping it
