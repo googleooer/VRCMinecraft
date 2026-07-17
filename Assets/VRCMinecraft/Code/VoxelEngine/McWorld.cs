@@ -3059,6 +3059,12 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk._gpuFluidZCursor = -2;
                 return;
             }
+            if (chunk._gpuFluidZCursor == -3)
+            {
+                _FluidEnclosedSetup(chunk);
+                chunk._gpuFluidZCursor = 0;
+                return;
+            }
             if (chunk._gpuFluidZCursor < 0)
             {
                 if (!_GpuFluidPrefetchStep(chunk)) return; // warmed up to 2 cold caches; more remain
@@ -3114,7 +3120,9 @@ public partial class McWorld : UdonSharpBehaviour
                 chunk.neighborPY = fluidNeighbors[2]; chunk.neighborNY = fluidNeighbors[3];
                 chunk.neighborPZ = fluidNeighbors[4]; chunk.neighborNZ = fluidNeighbors[5];
                 _DecompressNeighborsOnce(chunk);
-                chunk._gpuFluidZCursor = 0;
+                // FLUID R3: enclosed-mask scan + up-diagonal snapshot get their own sub-step
+                // (cursor -3) before z=0 — was the ~8-10ms head of the first slice call.
+                chunk._gpuFluidZCursor = -3;
 #if LOGGING
                 if (enableDetailedTimings)
                 {
@@ -12411,9 +12419,40 @@ public partial class McWorld : UdonSharpBehaviour
             heightNE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ, isLava);
         }
 
+        // FLUID R3 — FLOW PRECHECK (exact): _GetFluidFlowDecay returns the raw metadata for
+        // same-fluid blocks, so when all four laterals are same-fluid with metadata equal to
+        // this block's, every decay delta is 0 -> magnitude 0 -> the helper returns -1000.
+        // Interior-only (all metas from local arrays); anything else calls the exact helper.
+        // Old code computed the angle only under renderTop — preserved.
+        float flowAngle = -1000.0f;
+        if (renderTop)
+        {
+            bool flowKnownStill = false;
+            if (localX >= 1 && localX <= 14 && localZ >= 1 && localZ <= 14
+                && nXP >= 0 && nXN >= 0 && nZP >= 0 && nZN >= 0)
+            {
+                bool famXP = isLava ? (clsTable[nXP] & DBC_LAVA) != 0 : (clsTable[nXP] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                bool famXN = isLava ? (clsTable[nXN] & DBC_LAVA) != 0 : (clsTable[nXN] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                bool famZP = isLava ? (clsTable[nZP] & DBC_LAVA) != 0 : (clsTable[nZP] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                bool famZN = isLava ? (clsTable[nZN] & DBC_LAVA) != 0 : (clsTable[nZN] & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                if (famXP && famXN && famZP && famZN)
+                {
+                    byte[] fMeta = chunk.blockMetadata;
+                    int mi0 = (localY << 8) | (localZ << 4) | localX;
+                    int m0 = (fMeta != null && mi0 < fMeta.Length) ? fMeta[mi0] : 0;
+                    int mXP = (fMeta != null && mi0 + 1 < fMeta.Length) ? fMeta[mi0 + 1] : 0;
+                    int mXN = (fMeta != null && mi0 - 1 >= 0) ? fMeta[mi0 - 1] : 0;
+                    int mZP = (fMeta != null && mi0 + 16 < fMeta.Length) ? fMeta[mi0 + 16] : 0;
+                    int mZN = (fMeta != null && mi0 - 16 >= 0) ? fMeta[mi0 - 16] : 0;
+                    if (mXP == m0 && mXN == m0 && mZP == m0 && mZN == m0) flowKnownStill = true;
+                }
+            }
+            if (!flowKnownStill) flowAngle = _GetFluidFlowAngle(chunk, localX, localY, localZ, isLava);
+        }
+
         _EmitWaterBlockFaces(chunk, localX, localY, localZ, blockID, isLava,
             renderTop, renderBottom, renderSouth, renderNorth, renderWest, renderEast,
-            heightNW, heightSW, heightSE, heightNE);
+            heightNW, heightSW, heightSE, heightNE, flowAngle);
     }
 
     // Inline mirror of _GetFluidCornerHeight for the fully array-resolvable case: same
@@ -12486,16 +12525,25 @@ public partial class McWorld : UdonSharpBehaviour
         float heightSE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ + 1, isLava);
         float heightNE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ, isLava);
 
+        // FLUID R3: flow angle computed by the caller (only under renderTop — same as when
+        // it lived inside the emit) so the fast path can precheck it away.
+        float flowAngle = renderTop ? _GetFluidFlowAngle(chunk, localX, localY, localZ, isLava) : -1000.0f;
+
         _EmitWaterBlockFaces(chunk, localX, localY, localZ, blockID, isLava,
             renderTop, renderBottom, renderSouth, renderNorth, renderWest, renderEast,
-            heightNW, heightSW, heightSE, heightNE);
+            heightNW, heightSW, heightSE, heightNE, flowAngle);
     }
 
     // Shared quad-emission tail of _AddWaterBlock / _AddWaterBlockFast — the exact original
     // emit sequence, factored out so both variants produce identical geometry by construction.
+    // FLUID R3: flowAngle is computed by the CALLER (fast path prechecks still water away;
+    // legacy path calls the exact helper under renderTop as before), and the six per-face
+    // brightness reads are INLINE — _GetWaterBlockBrightness was 2 nested user-method calls
+    // per face (~12 VM re-entries per water block); the math is a light-byte fetch + table
+    // lookup, byte-identical here including the out-of-bounds -> 1.0 convention.
     private void _EmitWaterBlockFaces(ChunkData chunk, int localX, int localY, int localZ, byte blockID, bool isLava,
         bool renderTop, bool renderBottom, bool renderSouth, bool renderNorth, bool renderWest, bool renderEast,
-        float heightNW, float heightSW, float heightSE, float heightNE)
+        float heightNW, float heightSW, float heightSE, float heightNE, float flowAngle)
     {
         float stillSlice = 0;
         float flowSlice = 0;
@@ -12506,9 +12554,12 @@ public partial class McWorld : UdonSharpBehaviour
         }
         // Lava: textureSlice is ignored since the shader samples from _LavaTex
 
+        byte[] briLd = chunk.lightData;
+        float[] briTbl = lightBrightnessTable;
+        int briSub = skylightSubtracted;
+
         if (renderTop)
         {
-            float flowAngle = _GetFluidFlowAngle(chunk, localX, localY, localZ, isLava);
             float sinOffset = 0.0f;
             float cosOffset = 0.5f;
             float topSlice = stillSlice;
@@ -12519,6 +12570,23 @@ public partial class McWorld : UdonSharpBehaviour
                 topSlice = flowSlice;
             }
 
+            float briT = 1.0f;
+            if (briLd != null)
+            {
+                int lbA = briLd[(localY << 8) | (localZ << 4) | localX];
+                int skyA = ((lbA >> 4) & 0xF) - briSub; if (skyA < 0) skyA = 0;
+                int blkA = lbA & 0xF;
+                float bA = briTbl[skyA > blkA ? skyA : blkA];
+                float bB = 1.0f;
+                if (localY < 15)
+                {
+                    int lbB = briLd[((localY + 1) << 8) | (localZ << 4) | localX];
+                    int skyB = ((lbB >> 4) & 0xF) - briSub; if (skyB < 0) skyB = 0;
+                    int blkB = lbB & 0xF;
+                    bB = briTbl[skyB > blkB ? skyB : blkB];
+                }
+                briT = bA > bB ? bA : bB;
+            }
             _AddWaterQuad(
                 chunk,
                 new Vector3(localX, localY + heightNW, localZ),
@@ -12531,12 +12599,29 @@ public partial class McWorld : UdonSharpBehaviour
                 new Vector2(0.5f + cosOffset + sinOffset, 0.5f + cosOffset - sinOffset),
                 new Vector2(0.5f + cosOffset - sinOffset, 0.5f - cosOffset - sinOffset),
                 topSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY, localZ),
+                briT,
                 isLava, isLava && flowAngle > -999.0f);
         }
 
         if (renderBottom)
         {
+            float briB = 1.0f;
+            if (briLd != null)
+            {
+                float bA = 1.0f;
+                if (localY > 0)
+                {
+                    int lbA = briLd[((localY - 1) << 8) | (localZ << 4) | localX];
+                    int skyA = ((lbA >> 4) & 0xF) - briSub; if (skyA < 0) skyA = 0;
+                    int blkA = lbA & 0xF;
+                    bA = briTbl[skyA > blkA ? skyA : blkA];
+                }
+                int lbB = briLd[(localY << 8) | (localZ << 4) | localX];
+                int skyB = ((lbB >> 4) & 0xF) - briSub; if (skyB < 0) skyB = 0;
+                int blkB = lbB & 0xF;
+                float bB = briTbl[skyB > blkB ? skyB : blkB];
+                briB = bA > bB ? bA : bB;
+            }
             _AddWaterQuad(
                 chunk,
                 new Vector3(localX + 1, localY, localZ),
@@ -12549,7 +12634,7 @@ public partial class McWorld : UdonSharpBehaviour
                 new Vector2(1.0f, 1.0f),
                 new Vector2(1.0f, 0.0f),
                 stillSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY - 1, localZ),
+                briB,
                 isLava, false);
         }
 
@@ -12557,6 +12642,23 @@ public partial class McWorld : UdonSharpBehaviour
 
         if (renderSouth)
         {
+            float briS = 1.0f;
+            if (briLd != null && localZ > 0)
+            {
+                int lbA = briLd[(localY << 8) | ((localZ - 1) << 4) | localX];
+                int skyA = ((lbA >> 4) & 0xF) - briSub; if (skyA < 0) skyA = 0;
+                int blkA = lbA & 0xF;
+                float bA = briTbl[skyA > blkA ? skyA : blkA];
+                float bB = 1.0f;
+                if (localY < 15)
+                {
+                    int lbB = briLd[((localY + 1) << 8) | ((localZ - 1) << 4) | localX];
+                    int skyB = ((lbB >> 4) & 0xF) - briSub; if (skyB < 0) skyB = 0;
+                    int blkB = lbB & 0xF;
+                    bB = briTbl[skyB > blkB ? skyB : blkB];
+                }
+                briS = bA > bB ? bA : bB;
+            }
             _AddWaterQuad(
                 chunk,
                 new Vector3(localX, localY + heightNW, localZ),
@@ -12569,12 +12671,29 @@ public partial class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY, localZ - 1),
+                briS,
                 isLava, isLava);
         }
 
         if (renderNorth)
         {
+            float briN = 1.0f;
+            if (briLd != null && localZ < 15)
+            {
+                int lbA = briLd[(localY << 8) | ((localZ + 1) << 4) | localX];
+                int skyA = ((lbA >> 4) & 0xF) - briSub; if (skyA < 0) skyA = 0;
+                int blkA = lbA & 0xF;
+                float bA = briTbl[skyA > blkA ? skyA : blkA];
+                float bB = 1.0f;
+                if (localY < 15)
+                {
+                    int lbB = briLd[((localY + 1) << 8) | ((localZ + 1) << 4) | localX];
+                    int skyB = ((lbB >> 4) & 0xF) - briSub; if (skyB < 0) skyB = 0;
+                    int blkB = lbB & 0xF;
+                    bB = briTbl[skyB > blkB ? skyB : blkB];
+                }
+                briN = bA > bB ? bA : bB;
+            }
             _AddWaterQuad(
                 chunk,
                 new Vector3(localX + 1, localY + heightSE, localZ + 1),
@@ -12587,12 +12706,29 @@ public partial class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX, localY, localZ + 1),
+                briN,
                 isLava, isLava);
         }
 
         if (renderWest)
         {
+            float briW = 1.0f;
+            if (briLd != null && localX > 0)
+            {
+                int lbA = briLd[(localY << 8) | (localZ << 4) | (localX - 1)];
+                int skyA = ((lbA >> 4) & 0xF) - briSub; if (skyA < 0) skyA = 0;
+                int blkA = lbA & 0xF;
+                float bA = briTbl[skyA > blkA ? skyA : blkA];
+                float bB = 1.0f;
+                if (localY < 15)
+                {
+                    int lbB = briLd[((localY + 1) << 8) | (localZ << 4) | (localX - 1)];
+                    int skyB = ((lbB >> 4) & 0xF) - briSub; if (skyB < 0) skyB = 0;
+                    int blkB = lbB & 0xF;
+                    bB = briTbl[skyB > blkB ? skyB : blkB];
+                }
+                briW = bA > bB ? bA : bB;
+            }
             _AddWaterQuad(
                 chunk,
                 new Vector3(localX, localY + heightSW, localZ + 1),
@@ -12605,12 +12741,29 @@ public partial class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX - 1, localY, localZ),
+                briW,
                 isLava, isLava);
         }
 
         if (renderEast)
         {
+            float briE = 1.0f;
+            if (briLd != null && localX < 15)
+            {
+                int lbA = briLd[(localY << 8) | (localZ << 4) | (localX + 1)];
+                int skyA = ((lbA >> 4) & 0xF) - briSub; if (skyA < 0) skyA = 0;
+                int blkA = lbA & 0xF;
+                float bA = briTbl[skyA > blkA ? skyA : blkA];
+                float bB = 1.0f;
+                if (localY < 15)
+                {
+                    int lbB = briLd[((localY + 1) << 8) | (localZ << 4) | (localX + 1)];
+                    int skyB = ((lbB >> 4) & 0xF) - briSub; if (skyB < 0) skyB = 0;
+                    int blkB = lbB & 0xF;
+                    bB = briTbl[skyB > blkB ? skyB : blkB];
+                }
+                briE = bA > bB ? bA : bB;
+            }
             _AddWaterQuad(
                 chunk,
                 new Vector3(localX + 1, localY + heightNE, localZ),
@@ -12623,13 +12776,16 @@ public partial class McWorld : UdonSharpBehaviour
                 new Vector2(sideMaxV, sideMaxV),
                 new Vector2(0.0f, sideMaxV),
                 flowSlice,
-                _GetWaterBlockBrightness(chunk, localX + 1, localY, localZ),
+                briE,
                 isLava, isLava);
         }
     }
 
     private void _AddWaterBlocks(ChunkData chunk)
     {
+        // FLUID R3: the sliced path runs the enclosed setup as its own sub-step; this atomic
+        // path must run it explicitly first (it was the old zStart==0 branch).
+        _FluidEnclosedSetup(chunk);
         _AddWaterBlocksSliced(chunk, 0, chunkSizeXZ);
     }
 
@@ -12653,6 +12809,71 @@ public partial class McWorld : UdonSharpBehaviour
         ChunkData nb = chunks_1D[ci];
         if (nb == null || !nb.isDataReady) return null;
         return nb;
+    }
+
+    // FLUID R3: per-build enclosed-mask scan + up-diagonal snapshot — was the head of the
+    // first z-slice call (~8-10ms on lava cave chunks, the recurring stage-103 mesh-step
+    // max); now its own stage-3 sub-step (cursor -3) between the setup tail and z=0.
+    // Body is verbatim from the old zStart==0 branch of _AddWaterBlocksSliced.
+    private void _FluidEnclosedSetup(ChunkData chunk)
+    {
+        // The _hasWaterBlocks guard mirrors the slice head: dry chunks (e.g. the CPU greedy
+        // path's unconditional _AddWaterBlocks call after torch/flower edits) must stay a
+        // zero-side-effect no-op — the up-diagonal snapshot below can pay cold decompresses
+        // and even fire rehydrate readbacks for GPU-resident neighbors.
+        if (chunk == null || !chunk._hasWaterBlocks || chunk._decompSelf == null) return;
+        _EnsureDerivedBlockClassTable();
+        byte[] clsTable = _derivedBlockClass;
+        byte[] data = chunk._decompSelf;
+        int stride = chunkSizeXZ * chunkSizeXZ;
+
+        int enclMask = 0;
+        if (stride == 256 && chunkSizeY == 16)
+        {
+            int lAllWater = 0, lCull = 0, lTopCull = 0;
+            for (int ly = 0; ly < 16; ly++)
+            {
+                int lbase = ly << 8;
+                byte lb0 = data[lbase];
+                if (data[lbase + 85] == lb0 && data[lbase + 170] == lb0
+                    && data[lbase + 255] == lb0 && _IsUniformLayer256(data, lbase, lb0))
+                {
+                    int lcls = clsTable[lb0];
+                    bool lw = (lcls & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+                    if (lw) lAllWater |= 1 << ly;
+                    if (lw || (lcls & DBC_OPAQUE) != 0) lCull |= 1 << ly;
+                    if (lw || lb0 == BLOCK_ICE) lTopCull |= 1 << ly;
+                }
+            }
+            for (int ly = 1; ly <= 14; ly++)
+            {
+                if (((lAllWater >> ly) & 1) != 0
+                    && ((lCull >> (ly - 1)) & 1) != 0
+                    && ((lTopCull >> (ly + 1)) & 1) != 0)
+                {
+                    enclMask |= 1 << ly;
+                }
+            }
+        }
+        chunk._fluidLayerEnclosedMask = enclMask;
+
+        chunk._decompPYNX = null; chunk._decompPYPX = null;
+        chunk._decompPYNZ = null; chunk._decompPYPZ = null;
+        chunk._udChunkNX = null; chunk._udChunkPX = null;
+        chunk._udChunkNZ = null; chunk._udChunkPZ = null;
+        if (chunk._decompPY != null)
+        {
+            int wcx = chunk.chunkX_world, wcy = chunk.chunkY_world, wcz = chunk.chunkZ_world;
+            ChunkData ud;
+            ud = _GetUpDiagonalChunk(wcx - 1, wcy + 1, wcz);
+            if (ud != null) { chunk._decompPYNX = _GetDecompressedDataRaw(ud); chunk._udChunkNX = ud; chunk._udVerNX = ud._cachedDataVersion; }
+            ud = _GetUpDiagonalChunk(wcx + 1, wcy + 1, wcz);
+            if (ud != null) { chunk._decompPYPX = _GetDecompressedDataRaw(ud); chunk._udChunkPX = ud; chunk._udVerPX = ud._cachedDataVersion; }
+            ud = _GetUpDiagonalChunk(wcx, wcy + 1, wcz - 1);
+            if (ud != null) { chunk._decompPYNZ = _GetDecompressedDataRaw(ud); chunk._udChunkNZ = ud; chunk._udVerNZ = ud._cachedDataVersion; }
+            ud = _GetUpDiagonalChunk(wcx, wcy + 1, wcz + 1);
+            if (ud != null) { chunk._decompPYPZ = _GetDecompressedDataRaw(ud); chunk._udChunkPZ = ud; chunk._udVerPZ = ud._cachedDataVersion; }
+        }
     }
 
     private void _AddWaterBlocksSliced(ChunkData chunk, int zStart, int zCount)
@@ -12702,57 +12923,11 @@ public partial class McWorld : UdonSharpBehaviour
         // (b) UP-DIAGONAL ARRAYS — decompressed data of the +Y chunk of each lateral face
         //     neighbor, needed by the border-column surface fast path when the water surface
         //     sits at local y==15 (sea level): its above-ring crosses into those chunks.
-        if (zStart == 0)
-        {
-            int enclMask = 0;
-            if (stride == 256 && chunkSizeY == 16)
-            {
-                int lAllWater = 0, lCull = 0, lTopCull = 0;
-                for (int ly = 0; ly < 16; ly++)
-                {
-                    int lbase = ly << 8;
-                    byte lb0 = data[lbase];
-                    if (data[lbase + 85] == lb0 && data[lbase + 170] == lb0
-                        && data[lbase + 255] == lb0 && _IsUniformLayer256(data, lbase, lb0))
-                    {
-                        int lcls = clsTable[lb0];
-                        bool lw = (lcls & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
-                        if (lw) lAllWater |= 1 << ly;
-                        if (lw || (lcls & DBC_OPAQUE) != 0) lCull |= 1 << ly;
-                        if (lw || lb0 == BLOCK_ICE) lTopCull |= 1 << ly;
-                    }
-                }
-                for (int ly = 1; ly <= 14; ly++)
-                {
-                    if (((lAllWater >> ly) & 1) != 0
-                        && ((lCull >> (ly - 1)) & 1) != 0
-                        && ((lTopCull >> (ly + 1)) & 1) != 0)
-                    {
-                        enclMask |= 1 << ly;
-                    }
-                }
-            }
-            chunk._fluidLayerEnclosedMask = enclMask;
-
-            chunk._decompPYNX = null; chunk._decompPYPX = null;
-            chunk._decompPYNZ = null; chunk._decompPYPZ = null;
-            chunk._udChunkNX = null; chunk._udChunkPX = null;
-            chunk._udChunkNZ = null; chunk._udChunkPZ = null;
-            if (dPY != null)
-            {
-                int wcx = chunk.chunkX_world, wcy = chunk.chunkY_world, wcz = chunk.chunkZ_world;
-                ChunkData ud;
-                ud = _GetUpDiagonalChunk(wcx - 1, wcy + 1, wcz);
-                if (ud != null) { chunk._decompPYNX = _GetDecompressedDataRaw(ud); chunk._udChunkNX = ud; chunk._udVerNX = ud._cachedDataVersion; }
-                ud = _GetUpDiagonalChunk(wcx + 1, wcy + 1, wcz);
-                if (ud != null) { chunk._decompPYPX = _GetDecompressedDataRaw(ud); chunk._udChunkPX = ud; chunk._udVerPX = ud._cachedDataVersion; }
-                ud = _GetUpDiagonalChunk(wcx, wcy + 1, wcz - 1);
-                if (ud != null) { chunk._decompPYNZ = _GetDecompressedDataRaw(ud); chunk._udChunkNZ = ud; chunk._udVerNZ = ud._cachedDataVersion; }
-                ud = _GetUpDiagonalChunk(wcx, wcy + 1, wcz + 1);
-                if (ud != null) { chunk._decompPYPZ = _GetDecompressedDataRaw(ud); chunk._udChunkPZ = ud; chunk._udVerPZ = ud._cachedDataVersion; }
-            }
-        }
-        else
+        // FLUID R3: the enclosed-mask scan + up-diagonal snapshot moved to
+        // _FluidEnclosedSetup, its own stage-3 sub-step (cursor -3) — it was the recurring
+        // ~8-10ms head of the first z-slice call. The HEAL validation below now runs on
+        // EVERY slice call including z=0 (right after setup it is trivially valid; an edit
+        // landing between the setup sub-step and z=0 is caught exactly like a mid-build one).
         {
             // FLUID V3 HEAL (slice boundary re-validation): edits in an up-diagonal chunk have
             // NO trigger path back to this chunk (edits only rebuild face neighbors + same-Y
