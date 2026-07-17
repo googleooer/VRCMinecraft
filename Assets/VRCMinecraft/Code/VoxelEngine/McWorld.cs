@@ -5632,6 +5632,15 @@ public partial class McWorld : UdonSharpBehaviour
             if (doneChunk != null && doneChunk.pendingChunkMeshRebuild)
             {
                 doneChunk.pendingChunkMeshRebuild = false;
+                // KEEP the interaction promotion — it is load-bearing, not just latency: the
+                // flag routes this followup through RequestChunkMeshUpdate's IMMEDIATE branch.
+                // Without it the request goes to the scheduler queue, which SILENTLY DROPS on
+                // a full rebuild queue (256 cap) or a still-assigned worker — and since the
+                // flag is cleared above and the fluid one-heal's expected mask is already
+                // empty, a dropped followup is never retried: permanently stale water borders
+                // (verified failure during the end-of-load heal wave). The old spike this
+                // path caused is fixed separately by the interactionMeshBudgetMs wall-clock
+                // bound in BuildChunkMesh's completion loop.
                 doneChunk.interactionMeshPriority = true;
                 followupChunkIndex = ChunkCenteredCoordsTo1D(doneChunk.chunkX_world, doneChunk.chunkY_world, doneChunk.chunkZ_world);
                 needsFollowupMeshBuild = followupChunkIndex != -1;
@@ -12054,6 +12063,149 @@ public partial class McWorld : UdonSharpBehaviour
 #endif
     }
 
+    // FLUID FULL-PATH FAST VARIANT (sliced path only): byte-identical output to
+    // _AddWaterBlock, but (a) face render decisions come from the six neighbor IDs the
+    // slice already resolved (-1 = crosses a missing/unloaded array -> per-face fallback to
+    // the exact helper, preserving the missing=still-water sentinel), and (b) corner
+    // heights are computed inline from the decompressed arrays when the whole 3x3x2 sample
+    // neighborhood is array-resolvable (x,z in [1,14]; the above row from data or dPY).
+    // The inline corner math replicates _GetFluidCornerHeight's float accumulation ORDER
+    // exactly (incl. the meta>=8 -> level 0 mapping and the *10 weighting quirk) so heights
+    // are bit-identical. Flow angle and brightness intentionally keep the exact helpers.
+    // Face-decision equivalences (established by the V2 fast paths): water-family ==
+    // (cls&(DBC_FLUID|DBC_LAVA))==DBC_FLUID, lava == (cls&DBC_LAVA)!=0, and
+    // _IsOpaqueCubeForWater(b) == (b>0 && (cls&DBC_OPAQUE)!=0).
+    private void _AddWaterBlockFast(ChunkData chunk, int localX, int localY, int localZ, byte blockID,
+        int nUp, int nDn, int nXP, int nXN, int nZP, int nZN)
+    {
+        bool isLava = _IsLavaBlock(blockID);
+        byte[] clsTable = _derivedBlockClass;
+
+        bool renderTop, renderBottom, renderSouth, renderNorth, renderWest, renderEast;
+        if (nUp >= 0)
+        {
+            int c = clsTable[nUp];
+            bool same = isLava ? (c & DBC_LAVA) != 0 : (c & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            renderTop = !(same || (!isLava && nUp == BLOCK_ICE)); // side 1 (top): no opaque cull
+        }
+        else renderTop = _ShouldRenderFluidFace(chunk, localX, localY + 1, localZ, 1, isLava);
+        if (nDn >= 0)
+        {
+            int c = clsTable[nDn];
+            bool same = isLava ? (c & DBC_LAVA) != 0 : (c & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            renderBottom = !(same || (!isLava && nDn == BLOCK_ICE)) && !(nDn > 0 && (c & DBC_OPAQUE) != 0);
+        }
+        else renderBottom = _ShouldRenderFluidFace(chunk, localX, localY - 1, localZ, 0, isLava);
+        if (nZN >= 0)
+        {
+            int c = clsTable[nZN];
+            bool same = isLava ? (c & DBC_LAVA) != 0 : (c & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            renderSouth = !(same || (!isLava && nZN == BLOCK_ICE)) && !(nZN > 0 && (c & DBC_OPAQUE) != 0);
+        }
+        else renderSouth = _ShouldRenderFluidFace(chunk, localX, localY, localZ - 1, 2, isLava);
+        if (nZP >= 0)
+        {
+            int c = clsTable[nZP];
+            bool same = isLava ? (c & DBC_LAVA) != 0 : (c & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            renderNorth = !(same || (!isLava && nZP == BLOCK_ICE)) && !(nZP > 0 && (c & DBC_OPAQUE) != 0);
+        }
+        else renderNorth = _ShouldRenderFluidFace(chunk, localX, localY, localZ + 1, 3, isLava);
+        if (nXN >= 0)
+        {
+            int c = clsTable[nXN];
+            bool same = isLava ? (c & DBC_LAVA) != 0 : (c & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            renderWest = !(same || (!isLava && nXN == BLOCK_ICE)) && !(nXN > 0 && (c & DBC_OPAQUE) != 0);
+        }
+        else renderWest = _ShouldRenderFluidFace(chunk, localX - 1, localY, localZ, 4, isLava);
+        if (nXP >= 0)
+        {
+            int c = clsTable[nXP];
+            bool same = isLava ? (c & DBC_LAVA) != 0 : (c & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            renderEast = !(same || (!isLava && nXP == BLOCK_ICE)) && !(nXP > 0 && (c & DBC_OPAQUE) != 0);
+        }
+        else renderEast = _ShouldRenderFluidFace(chunk, localX + 1, localY, localZ, 5, isLava);
+
+        if (!renderTop && !renderBottom && !renderSouth && !renderNorth && !renderWest && !renderEast) return;
+
+        float heightNW, heightSW, heightSE, heightNE;
+        byte[] cData = chunk._decompSelf;
+        byte[] cMeta = chunk.blockMetadata;
+        byte[] cPY = chunk._decompPY;
+        if (cData != null && localX >= 1 && localX <= 14 && localZ >= 1 && localZ <= 14
+            && (localY < 15 || cPY != null))
+        {
+            heightNW = _FluidCornerHeightInline(cData, cMeta, cPY, localX, localY, localZ, isLava, clsTable);
+            heightSW = _FluidCornerHeightInline(cData, cMeta, cPY, localX, localY, localZ + 1, isLava, clsTable);
+            heightSE = _FluidCornerHeightInline(cData, cMeta, cPY, localX + 1, localY, localZ + 1, isLava, clsTable);
+            heightNE = _FluidCornerHeightInline(cData, cMeta, cPY, localX + 1, localY, localZ, isLava, clsTable);
+        }
+        else
+        {
+            heightNW = _GetFluidCornerHeight(chunk, localX, localY, localZ, isLava);
+            heightSW = _GetFluidCornerHeight(chunk, localX, localY, localZ + 1, isLava);
+            heightSE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ + 1, isLava);
+            heightNE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ, isLava);
+        }
+
+        _EmitWaterBlockFaces(chunk, localX, localY, localZ, blockID, isLava,
+            renderTop, renderBottom, renderSouth, renderNorth, renderWest, renderEast,
+            heightNW, heightSW, heightSE, heightNE);
+    }
+
+    // Inline mirror of _GetFluidCornerHeight for the fully array-resolvable case: same
+    // iteration order, same early 1.0 return on same-fluid-above, same float accumulation
+    // sequence (percentAir*10 weight then +percentAir), same metadata null/bounds -> 0.
+    private float _FluidCornerHeightInline(byte[] data, byte[] metaArr, byte[] dPY,
+        int cornerX, int localY, int cornerZ, bool isLava, byte[] clsTable)
+    {
+        int sampleCount = 0;
+        float sampleSum = 0.0f;
+        int yBase = localY << 8;
+        bool aboveInData = localY < 15;
+        int aboveBase = aboveInData ? (localY + 1) << 8 : 0;
+
+        for (int i = 0; i < 4; i++)
+        {
+            int sampleX = cornerX - (i & 1);
+            int sampleZ = cornerZ - ((i >> 1) & 1);
+            int ci = sampleZ * 16 + sampleX;
+
+            byte aboveBlock = aboveInData ? data[aboveBase + ci] : dPY[ci];
+            int ac = clsTable[aboveBlock];
+            bool aboveSame = isLava ? (ac & DBC_LAVA) != 0 : (ac & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            if (aboveSame)
+            {
+                return 1.0f;
+            }
+
+            byte sampleBlock = data[yBase + ci];
+            int sc = clsTable[sampleBlock];
+            bool sampleSame = isLava ? (sc & DBC_LAVA) != 0 : (sc & (DBC_FLUID | DBC_LAVA)) == DBC_FLUID;
+            if (!sampleSame)
+            {
+                if (!_IsBlockSolid(sampleBlock))
+                {
+                    sampleSum += 1.0f;
+                    sampleCount++;
+                }
+            }
+            else
+            {
+                int mi = yBase + ci;
+                int meta = (metaArr != null && mi < metaArr.Length) ? metaArr[mi] : 0;
+                int effectiveLevel = meta >= 8 ? 0 : meta;
+                float percentAir = (effectiveLevel + 1) / 9.0f;
+                sampleSum += percentAir * 10.0f;
+                sampleCount += 10;
+                sampleSum += percentAir;
+                sampleCount++;
+            }
+        }
+
+        if (sampleCount == 0) return 0.0f;
+        return 1.0f - sampleSum / sampleCount;
+    }
+
     private void _AddWaterBlock(ChunkData chunk, int localX, int localY, int localZ, byte blockID)
     {
         bool isLava = _IsLavaBlock(blockID);
@@ -12065,6 +12217,22 @@ public partial class McWorld : UdonSharpBehaviour
         bool renderEast = _ShouldRenderFluidFace(chunk, localX + 1, localY, localZ, 5, isLava);
         if (!renderTop && !renderBottom && !renderSouth && !renderNorth && !renderWest && !renderEast) return;
 
+        float heightNW = _GetFluidCornerHeight(chunk, localX, localY, localZ, isLava);
+        float heightSW = _GetFluidCornerHeight(chunk, localX, localY, localZ + 1, isLava);
+        float heightSE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ + 1, isLava);
+        float heightNE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ, isLava);
+
+        _EmitWaterBlockFaces(chunk, localX, localY, localZ, blockID, isLava,
+            renderTop, renderBottom, renderSouth, renderNorth, renderWest, renderEast,
+            heightNW, heightSW, heightSE, heightNE);
+    }
+
+    // Shared quad-emission tail of _AddWaterBlock / _AddWaterBlockFast — the exact original
+    // emit sequence, factored out so both variants produce identical geometry by construction.
+    private void _EmitWaterBlockFaces(ChunkData chunk, int localX, int localY, int localZ, byte blockID, bool isLava,
+        bool renderTop, bool renderBottom, bool renderSouth, bool renderNorth, bool renderWest, bool renderEast,
+        float heightNW, float heightSW, float heightSE, float heightNE)
+    {
         float stillSlice = 0;
         float flowSlice = 0;
         if (!isLava)
@@ -12073,11 +12241,6 @@ public partial class McWorld : UdonSharpBehaviour
             flowSlice = betaWaterFlowSlice >= 0 ? betaWaterFlowSlice : _GetTextureSlice(blockID, FACE_INDEX_SIDE);
         }
         // Lava: textureSlice is ignored since the shader samples from _LavaTex
-
-        float heightNW = _GetFluidCornerHeight(chunk, localX, localY, localZ, isLava);
-        float heightSW = _GetFluidCornerHeight(chunk, localX, localY, localZ + 1, isLava);
-        float heightSE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ + 1, isLava);
-        float heightNE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ, isLava);
 
         if (renderTop)
         {
@@ -12651,7 +12814,9 @@ public partial class McWorld : UdonSharpBehaviour
 #if LOGGING
                     stats_fluidCellsFull++;
 #endif
-                    _AddWaterBlock(chunk, x, y, z, blockID);
+                    // Full path, fast variant: reuses the six neighbor IDs resolved above and
+                    // inlines corner heights when array-resolvable — byte-identical output.
+                    _AddWaterBlockFast(chunk, x, y, z, blockID, nUp, nDn, nXP, nXN, nZP, nZN);
                 }
             }
         }
