@@ -837,6 +837,24 @@ public partial class McWorld : UdonSharpBehaviour
     private float stats_pacMeshLoopMs = 0f;   // shared meshing loop
     private float stats_pacSweepsMs = 0f;     // deferred-interior sweep + GO recycle + border heal/cleanup
     private float stats_pacSecondaryMs = 0f;  // _ProcessDeferredChunkSecondaryWork
+    // SPIKE ATTRIBUTION: worst single-frame slice per PAC phase + worst single mesh step —
+    // pins load-phase Update maxes (40-54ms against a 24ms envelope) to a specific lane and,
+    // for mesh steps, to the exact chunk + build stage of the atomic overrun (the loop's
+    // deadline checks run BETWEEN _BuildChunkMeshStep calls, so one long step is the
+    // un-preemptable unit).
+    private float stats_pacMaintainMaxMs = 0f;
+    private float stats_pacLightingMaxMs = 0f;
+    private float stats_pacReadbackMaxMs = 0f;
+    private float stats_pacDataGenMaxMs = 0f;
+    private float stats_pacNearMeshMaxMs = 0f;
+    private float stats_pacMeshLoopMaxMs = 0f;
+    private float stats_pacSweepsMaxMs = 0f;
+    private float stats_pacSecondaryMaxMs = 0f;
+    private float stats_meshStepMaxMs = 0f;
+    private int stats_meshStepMaxCx = 0;
+    private int stats_meshStepMaxCy = 0;
+    private int stats_meshStepMaxCz = 0;
+    private int stats_meshStepMaxStage = -1; // 0-5 greedy axis, >5 fluid/apply tail; 100+N gpuPrep stage N, 110 gpuDecode, 111 gpuRetry
     // REBUILD-SOURCE ATTRIBUTION: who is feeding the mesh rebuild queue (storm diagnosis).
     private int stats_rqHealSweep = 0;      // _HealStaleBorderChunks
     private int stats_rqHealImmediate = 0;  // _TryImmediateBorderHeal
@@ -2932,8 +2950,11 @@ public partial class McWorld : UdonSharpBehaviour
     // 4 rows = 1024 voxels ≈ 2-4ms per step; the meshing loop's deadline checks between steps can
     // now actually bound the frame.
     private const int GPU_PREP_DERIVED_SLICE_Y = 4;
-    // Stage-3 fluid build: z-rows of _AddWaterBlocks per step (2 rows = 32 columns ≈ 1-4ms).
-    private const int GPU_PREP_FLUID_SLICE_Z = 2;
+    // Stage-3 fluid build: z-rows of _AddWaterBlocks per step. 1 row = 16 columns; 2 rows
+    // looked like 1-4ms on ocean chunks but the spike-attribution instrumentation caught
+    // 18ms on y=0 lava cave chunks (full-path fluid cells with the not-yet-inlined
+    // flow-angle/brightness helpers) — halve the slice so the worst step is ~9ms.
+    private const int GPU_PREP_FLUID_SLICE_Z = 1;
     // Rotating cursor for the meshing starvation-rescue lane (see ProcessActiveChunks).
     private int _meshRescueCursor = 0;
 
@@ -3026,8 +3047,21 @@ public partial class McWorld : UdonSharpBehaviour
             // Stage 3: TIME-SLICED fluid mesh build (was a 10-30ms atomic step for ocean chunks,
             // rate-limited to one chunk per frame — which serialized ocean streaming).
             MeshFilter fluidMf = chunk.transparentMeshFilter;
+            if (chunk._gpuFluidZCursor == -1)
+            {
+                // FLUID SETUP PREFETCH (spike fix): the all-in-one setup below paid up to 6
+                // cold neighbor RLE decompresses in one call, and the first fluid slice up to
+                // 4 more (up-diagonals) — the measured 20ms mesh-step spikes (stage 100, cold
+                // caches during the load storm). Detach the mesh now, then spend the next
+                // call(s) warming those decomp caches, max 2 cold per call. Cache warming is
+                // semantically invisible; the original setup body then runs unchanged (warm).
+                if (fluidMf != null && fluidMf.sharedMesh == gpuVoxelChunkMesh) fluidMf.sharedMesh = null;
+                chunk._gpuFluidZCursor = -2;
+                return;
+            }
             if (chunk._gpuFluidZCursor < 0)
             {
+                if (!_GpuFluidPrefetchStep(chunk)) return; // warmed up to 2 cold caches; more remain
 #if LOGGING
                 float _fset0 = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
@@ -3183,6 +3217,50 @@ public partial class McWorld : UdonSharpBehaviour
         }
         _GpuHideFluidMesh(chunk);
         _GpuFinishChunkPrep(chunk);
+    }
+
+    // FLUID SETUP PREFETCH: warm the RLE decomp caches the fluid setup + first slice will
+    // read — 6 face neighbors and 4 up-diagonals — at most 2 COLD decompresses per call
+    // (warm entries are skipped for free). Returns true when nothing cold remains. Pure
+    // cache warming: results are discarded, so behavior is byte-identical to the unwarmed
+    // path, just spread over frames. Skips: self (its _GetDecompressedData has a derived-
+    // refresh side effect — left to the setup body, ≤1 cold decompress), GPU-resident
+    // chunks (their decompress path fires a rehydrate readback request — a real side
+    // effect the old code only paid when the setup/slice actually touched them), and
+    // not-ready chunks (may warm on a later call if they become ready — still inert).
+    private bool _GpuFluidPrefetchStep(ChunkData chunk)
+    {
+        int coldBudget = 2;
+        int wcx = chunk.chunkX_world, wcy = chunk.chunkY_world, wcz = chunk.chunkZ_world;
+        // Up-diagonals are only read by the first fluid slice when dPY != null — i.e. the +Y
+        // FACE neighbor exists, is data-ready, and will decompress (non-resident, or resident
+        // with a warm cache). Mirror that gate here or we'd pay cold decompresses the build
+        // never samples (streaming frontier: own +Y still generating, diagonal +Y ready).
+        ChunkData pyNb = GetChunkAt(wcx, wcy + 1, wcz);
+        bool wantUpDiag = pyNb != null && pyNb.isDataReady
+            && (!pyNb._isGpuResident || (pyNb._decompCacheValid && pyNb._cachedDecompressedData != null));
+        for (int ci = 0; ci < 10; ci++)
+        {
+            if (ci >= 6 && !wantUpDiag) break;
+            ChunkData target;
+            if (ci == 0) target = GetChunkAt(wcx - 1, wcy, wcz);
+            else if (ci == 1) target = GetChunkAt(wcx + 1, wcy, wcz);
+            else if (ci == 2) target = GetChunkAt(wcx, wcy - 1, wcz);
+            else if (ci == 3) target = GetChunkAt(wcx, wcy + 1, wcz);
+            else if (ci == 4) target = GetChunkAt(wcx, wcy, wcz - 1);
+            else if (ci == 5) target = GetChunkAt(wcx, wcy, wcz + 1);
+            else if (ci == 6) target = _GetUpDiagonalChunk(wcx - 1, wcy + 1, wcz);
+            else if (ci == 7) target = _GetUpDiagonalChunk(wcx + 1, wcy + 1, wcz);
+            else if (ci == 8) target = _GetUpDiagonalChunk(wcx, wcy + 1, wcz - 1);
+            else target = _GetUpDiagonalChunk(wcx, wcy + 1, wcz + 1);
+
+            if (target == null || !target.isDataReady || target._isGpuResident) continue;
+            if (target._decompCacheValid && target._cachedDecompressedData != null) continue; // warm
+            if (coldBudget == 0) return false; // more cold work remains — continue next call
+            _GetDecompressedDataRaw(target);
+            coldBudget = coldBudget - 1;
+        }
+        return true;
     }
 
     // Hide/clear any stale fluid mesh on a dry chunk's transparent filter (never Clear() the
@@ -5487,7 +5565,7 @@ public partial class McWorld : UdonSharpBehaviour
         }
 
 #if LOGGING
-        if (enableDetailedTimings) { float _n1 = Time.realtimeSinceStartup; stats_pacMaintainMs += (_n1 - _pacT1) * 1000f; _pacT1 = _n1; }
+        if (enableDetailedTimings) { float _n1 = Time.realtimeSinceStartup; float _d1 = (_n1 - _pacT1) * 1000f; stats_pacMaintainMs += _d1; if (_d1 > stats_pacMaintainMaxMs) stats_pacMaintainMaxMs = _d1; _pacT1 = _n1; }
 #endif
         // Run GPU lighting first so atlas propagation still gets time while worldgen and
         // meshing are busy. Otherwise repeated chunk uploads can keep reseeding lighting
@@ -5497,7 +5575,7 @@ public partial class McWorld : UdonSharpBehaviour
         _ProcessGpuLighting(frameStart,
             Mathf.Max(frameBudget, (Time.realtimeSinceStartup - frameStart) + laneFloorLightingMs * 0.001f));
 #if LOGGING
-        if (enableDetailedTimings) { float _n2 = Time.realtimeSinceStartup; stats_pacLightingMs += (_n2 - _pacT1) * 1000f; _pacT1 = _n2; }
+        if (enableDetailedTimings) { float _n2 = Time.realtimeSinceStartup; float _d2 = (_n2 - _pacT1) * 1000f; stats_pacLightingMs += _d2; if (_d2 > stats_pacLightingMaxMs) stats_pacLightingMaxMs = _d2; _pacT1 = _n2; }
 #endif
 
         // Process completed GPU face readbacks. Guarantee at least 1ms of budget so
@@ -5505,7 +5583,7 @@ public partial class McWorld : UdonSharpBehaviour
         float readbackBudget = Mathf.Max(frameBudget, Time.realtimeSinceStartup - frameStart + 0.001f);
         _ProcessGpuFaceReadback(frameStart, readbackBudget);
 #if LOGGING
-        if (enableDetailedTimings) { float _n3 = Time.realtimeSinceStartup; stats_pacReadbackMs += (_n3 - _pacT1) * 1000f; _pacT1 = _n3; }
+        if (enableDetailedTimings) { float _n3 = Time.realtimeSinceStartup; float _d3 = (_n3 - _pacT1) * 1000f; stats_pacReadbackMs += _d3; if (_d3 > stats_pacReadbackMaxMs) stats_pacReadbackMaxMs = _d3; _pacT1 = _n3; }
 #endif
 
         // DATA-GEN STREAMING: refresh the cached player chunk once per frame so the coordinator's
@@ -5548,7 +5626,7 @@ public partial class McWorld : UdonSharpBehaviour
         }
 
 #if LOGGING
-        if (enableDetailedTimings) { float _n4 = Time.realtimeSinceStartup; stats_pacDataGenMs += (_n4 - _pacT1) * 1000f; _pacT1 = _n4; }
+        if (enableDetailedTimings) { float _n4 = Time.realtimeSinceStartup; float _d4 = (_n4 - _pacT1) * 1000f; stats_pacDataGenMs += _d4; if (_d4 > stats_pacDataGenMaxMs) stats_pacDataGenMaxMs = _d4; _pacT1 = _n4; }
 #endif
         // --- NEAR meshing guarantee (Minecraft: near chunks rebuild unconditionally each frame) ---
         // Runs BEFORE the shared budget loop so a far-chunk backlog (the deferred mesh queue
@@ -5601,7 +5679,7 @@ public partial class McWorld : UdonSharpBehaviour
             }
         }
 #if LOGGING
-        if (enableDetailedTimings) { float _n5 = Time.realtimeSinceStartup; stats_pacNearMeshMs += (_n5 - _pacT1) * 1000f; _pacT1 = _n5; }
+        if (enableDetailedTimings) { float _n5 = Time.realtimeSinceStartup; float _d5 = (_n5 - _pacT1) * 1000f; stats_pacNearMeshMs += _d5; if (_d5 > stats_pacNearMeshMaxMs) stats_pacNearMeshMaxMs = _d5; _pacT1 = _n5; }
 #endif
         // --- Process Meshing ---
         float gpuMeshDecodeFrameBudgetSec = Mathf.Max(0.25f, adaptiveGpuMeshDecodeFrameBudgetMs) * 0.001f;
@@ -5704,14 +5782,14 @@ public partial class McWorld : UdonSharpBehaviour
         }
 
 #if LOGGING
-        if (enableDetailedTimings) { float _n6 = Time.realtimeSinceStartup; stats_pacMeshLoopMs += (_n6 - _pacT1) * 1000f; _pacT1 = _n6; }
+        if (enableDetailedTimings) { float _n6 = Time.realtimeSinceStartup; float _d6 = (_n6 - _pacT1) * 1000f; stats_pacMeshLoopMs += _d6; if (_d6 > stats_pacMeshLoopMaxMs) stats_pacMeshLoopMaxMs = _d6; _pacT1 = _n6; }
 #endif
         _ScheduleDeferredInteriorMeshUpdates(frameStart, frameBudget);
         _ProcessChunkGoRecycle(frameStart, frameBudget);
         _HealStaleBorderChunks();
         _PostWorldGenBorderCleanup();
 #if LOGGING
-        if (enableDetailedTimings) { float _n7 = Time.realtimeSinceStartup; stats_pacSweepsMs += (_n7 - _pacT1) * 1000f; _pacT1 = _n7; }
+        if (enableDetailedTimings) { float _n7 = Time.realtimeSinceStartup; float _d7 = (_n7 - _pacT1) * 1000f; stats_pacSweepsMs += _d7; if (_d7 > stats_pacSweepsMaxMs) stats_pacSweepsMaxMs = _d7; _pacT1 = _n7; }
 #endif
 
         // --- FIXED: Process Incremental Lighting (managed by coordinator) ---
@@ -5741,7 +5819,7 @@ public partial class McWorld : UdonSharpBehaviour
 #endif
             _ProcessGpuLighting(frameStart, frameBudget);
 #if LOGGING
-            if (enableDetailedTimings) stats_pacLightingMs += (Time.realtimeSinceStartup - _pacL2) * 1000f;
+            if (enableDetailedTimings) { float _dL2 = (Time.realtimeSinceStartup - _pacL2) * 1000f; stats_pacLightingMs += _dL2; if (_dL2 > stats_pacLightingMaxMs) stats_pacLightingMaxMs = _dL2; }
 #endif
         }
 
@@ -5750,7 +5828,7 @@ public partial class McWorld : UdonSharpBehaviour
 #endif
         _ProcessDeferredChunkSecondaryWork(frameStart, frameBudget);
 #if LOGGING
-        if (enableDetailedTimings) stats_pacSecondaryMs += (Time.realtimeSinceStartup - _pacT8) * 1000f;
+        if (enableDetailedTimings) { float _d8 = (Time.realtimeSinceStartup - _pacT8) * 1000f; stats_pacSecondaryMs += _d8; if (_d8 > stats_pacSecondaryMaxMs) stats_pacSecondaryMaxMs = _d8; }
 #endif
 
 #if LOGGING
@@ -8835,7 +8913,33 @@ public partial class McWorld : UdonSharpBehaviour
         }
     }
 
+    // SPIKE ATTRIBUTION wrapper: record the worst single mesh step (chunk + stage). The
+    // mesh loops' deadline checks run BETWEEN steps, so one long step is the atomic unit
+    // that blows past the frame envelope — this identifies exactly which stage to slice.
     private void _BuildChunkMeshStep(ChunkData chunk)
+    {
+#if LOGGING
+        if (enableDetailedTimings && chunk != null)
+        {
+            int stepStage = chunk._gpuPrepActive ? (100 + chunk._gpuPrepStage) : (chunk._gpuFaceBuildActive ? 110 : (chunk._gpuMeshPending ? 111 : chunk._greedyAxis));
+            float stepT0 = Time.realtimeSinceStartup;
+            _BuildChunkMeshStepInner(chunk);
+            float stepMs = (Time.realtimeSinceStartup - stepT0) * 1000f;
+            if (stepMs > stats_meshStepMaxMs)
+            {
+                stats_meshStepMaxMs = stepMs;
+                stats_meshStepMaxCx = chunk.chunkX_world;
+                stats_meshStepMaxCy = chunk.chunkY_world;
+                stats_meshStepMaxCz = chunk.chunkZ_world;
+                stats_meshStepMaxStage = stepStage;
+            }
+            return;
+        }
+#endif
+        _BuildChunkMeshStepInner(chunk);
+    }
+
+    private void _BuildChunkMeshStepInner(ChunkData chunk)
     {
         if (!chunk.isBuildingMesh) return;
 
@@ -17701,6 +17805,9 @@ public partial class McWorld : UdonSharpBehaviour
             {
                 logBuilder.AppendLine($"  Active processing: {stats_processActiveChunksTime:F2}ms total, reconciliation {stats_reconciliationTime:F2}ms total");
                 logBuilder.AppendLine($"  PAC phases (totals): maintain {stats_pacMaintainMs:F1}ms, lighting {stats_pacLightingMs:F1}ms, readback {stats_pacReadbackMs:F1}ms, datagen {stats_pacDataGenMs:F1}ms, nearMesh {stats_pacNearMeshMs:F1}ms, meshLoop {stats_pacMeshLoopMs:F1}ms, sweeps {stats_pacSweepsMs:F1}ms, secondary {stats_pacSecondaryMs:F1}ms");
+                logBuilder.AppendLine($"  PAC phase max/frame: maintain {stats_pacMaintainMaxMs:F1}, lighting {stats_pacLightingMaxMs:F1}, readback {stats_pacReadbackMaxMs:F1}, datagen {stats_pacDataGenMaxMs:F1}, nearMesh {stats_pacNearMeshMaxMs:F1}, meshLoop {stats_pacMeshLoopMaxMs:F1}, sweeps {stats_pacSweepsMaxMs:F1}, secondary {stats_pacSecondaryMaxMs:F1}");
+                if (stats_meshStepMaxMs > 0f)
+                    logBuilder.AppendLine($"  Mesh step max: {stats_meshStepMaxMs:F2}ms at ({stats_meshStepMaxCx},{stats_meshStepMaxCy},{stats_meshStepMaxCz}) stage {stats_meshStepMaxStage} (0-5=greedy axis, >5=fluid/apply, 100+N=gpuPrep stage N, 110=gpuDecode, 111=gpuRetry)");
                 logBuilder.AppendLine($"  Rebuild sources: healSweep {stats_rqHealSweep}, healImmediate {stats_rqHealImmediate}, healInterior {stats_rqHealInterior}, followup {stats_rqFollowup}, neighborTriggers {stats_rqNeighborTrigger}");
                 if (stats_finalizeCount > 0)
                     logBuilder.AppendLine($"  Chunk finalize (per chunk, {stats_finalizeCount} done): slice {stats_finalizeSliceTime / stats_finalizeCount:F2}ms, derived {stats_finalizeDerivedTime / stats_finalizeCount:F2}ms, gpuSync {stats_finalizeGpuSyncTime / stats_finalizeCount:F2}ms");
@@ -17905,6 +18012,19 @@ public partial class McWorld : UdonSharpBehaviour
         stats_pacMeshLoopMs = 0f;
         stats_pacSweepsMs = 0f;
         stats_pacSecondaryMs = 0f;
+        stats_pacMaintainMaxMs = 0f;
+        stats_pacLightingMaxMs = 0f;
+        stats_pacReadbackMaxMs = 0f;
+        stats_pacDataGenMaxMs = 0f;
+        stats_pacNearMeshMaxMs = 0f;
+        stats_pacMeshLoopMaxMs = 0f;
+        stats_pacSweepsMaxMs = 0f;
+        stats_pacSecondaryMaxMs = 0f;
+        stats_meshStepMaxMs = 0f;
+        stats_meshStepMaxCx = 0;
+        stats_meshStepMaxCy = 0;
+        stats_meshStepMaxCz = 0;
+        stats_meshStepMaxStage = -1;
         stats_rqHealSweep = 0;
         stats_rqHealImmediate = 0;
         stats_rqHealInterior = 0;
