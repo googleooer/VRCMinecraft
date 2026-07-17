@@ -55,6 +55,14 @@ public class JavaRandom
         this.seed = (seed ^ multiplier) & mask;
     }
 
+    // INLINE-LCG support: expose the raw 48-bit LCG state so perf-critical Udon loops can
+    // advance the stream inline (every user-method call costs ~5-20us in the Udon VM; a
+    // single grass decorator draws ~770 times) and hand the state back afterwards. Callers
+    // MUST replicate the draw math of the methods below byte-for-byte — one advance
+    // `s = (s * 0x5DEECE66D + 0xB) & ((1<<48)-1)` per draw, in the identical order.
+    public long GetStateRaw() { return seed; }
+    public void SetStateRaw(long s) { seed = s; }
+
     protected int Next(int bits)
     {
         // Java spec: this.seed = (this.seed * 0x5DEECE66DL + 0xBL) & ((1L << 48) - 1);

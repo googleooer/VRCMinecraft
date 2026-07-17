@@ -2887,12 +2887,13 @@ public class McTerrainGenerator : UdonSharpBehaviour
             return true;
         }
 
-        // Decorator phase: at most 2 flower/grass invocations per call, PRNG stream order
+        // Decorator phase: at most 4 flower/grass invocations per call (INLINE LCG cut each
+        // grass unit ~5ms -> ~1.5-2.5ms, so 4 units stay under ~10ms), PRNG stream order
         // unchanged (yellow flowers, then grass, then the 50% red flower).
         int yellowCount = BetaBiome.getFlowersPerChunk(gpuDecorChunkBiome);
         int grassCount = BetaBiome.getGrassPerChunk(gpuDecorChunkBiome);
         int units = 0;
-        while (units < 2 && gpuDecorCollectSub <= yellowCount + grassCount)
+        while (units < 4 && gpuDecorCollectSub <= yellowCount + grassCount)
         {
             int k = gpuDecorCollectSub;
             if (k < yellowCount)
@@ -3057,6 +3058,27 @@ public class McTerrainGenerator : UdonSharpBehaviour
             break; // one selection or sub-step per step
         }
         return gpuDecorAnchorMask != 0 || gpuAnchorPhase != 0;
+    }
+
+    // TREE-ANCHOR CACHE affinity query (used by McWorld's generator picker): how many pool
+    // anchors lie within the 3x3 neighborhood of column (cx, cz)? A new column assigned to
+    // the generator that already rendered nearby anchors turns up to 4 of its anchor cache
+    // misses into free hits — with first-free-slot picking the frontier hit rate was ~0%.
+    public int CountCachedAnchorsNear(int cx, int cz)
+    {
+        if (gpuTreeAnchorPoolCx == null) return 0;
+        int hits = 0;
+        for (int p = 0; p < 9; p++)
+        {
+            int px = gpuTreeAnchorPoolCx[p];
+            if (px == int.MaxValue) continue;
+            int dx = px - cx;
+            if (dx < -1 || dx > 1) continue;
+            int dz = gpuTreeAnchorPoolCz[p] - cz;
+            if (dz < -1 || dz > 1) continue;
+            hits = hits + 1;
+        }
+        return hits;
     }
 
     // TREE-ANCHOR CACHE: is this pool index already bound to one of the current column's
@@ -3484,20 +3506,57 @@ public class McTerrainGenerator : UdonSharpBehaviour
         return BetaBiomeEnum.PLAINS;
     }
 
+    // INLINE LCG: byte-for-byte port of JavaRandom's draws (one masked LCG advance per
+    // draw, identical order; pow2 bounds use Java's multiply-shift path, non-pow2 the
+    // rejection loop). ~390-770 user-method calls per decorator collapse to 2 state
+    // round-trips — in the Udon VM each call costs ~5-20us, so this is a 3-5x cut on the
+    // decoration scatter sims with an unchanged PRNG stream.
+    private const long JRAND_MULT = 0x5DEECE66DL;
+    private const long JRAND_ADD = 0xBL;
+    private const long JRAND_MASK = (1L << 48) - 1;
+
     // Flower: 64 scatter attempts from a source chunk, filtered to current column
     private void _GpuDecorationAddFlowerCandidates(JavaRandom dRand, int srcChunkX, int srcChunkZ,
         int colOriginX, int colOriginZ,
         int sizeXZ, int worldHeight, byte blockType, ref int candidateCount, int maxCandidates)
     {
-        int baseX = srcChunkX * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
-        int baseY = dRand.NextInt(worldHeight);
-        int baseZ = srcChunkZ * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+        long s = dRand.GetStateRaw();
+
+        s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+        int baseX = srcChunkX * 16 + (int)((16L * (s >> 17)) >> 31) + 8 + BUILTIN_OFFSET_X;
+        int baseY;
+        if ((worldHeight & -worldHeight) == worldHeight)
+        {
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            baseY = (int)(((long)worldHeight * (s >> 17)) >> 31);
+        }
+        else
+        {
+            int rejBits;
+            do
+            {
+                s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+                rejBits = (int)(s >> 17);
+                baseY = rejBits % worldHeight;
+            } while (rejBits - baseY + (worldHeight - 1) < 0);
+        }
+        s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+        int baseZ = srcChunkZ * 16 + (int)((16L * (s >> 17)) >> 31) + 8 + BUILTIN_OFFSET_Z;
 
         for (int attempt = 0; attempt < 64; attempt++)
         {
-            int fx = baseX + dRand.NextInt(8) - dRand.NextInt(8);
-            int fy = baseY + dRand.NextInt(4) - dRand.NextInt(4);
-            int fz = baseZ + dRand.NextInt(8) - dRand.NextInt(8);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            int fx = baseX + (int)((8L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            fx = fx - (int)((8L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            int fy = baseY + (int)((4L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            fy = fy - (int)((4L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            int fz = baseZ + (int)((8L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            fz = fz - (int)((8L * (s >> 17)) >> 31);
 
             int localX = fx - colOriginX;
             int localZ = fz - colOriginZ;
@@ -3510,22 +3569,53 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 candidateCount++;
             }
         }
+
+        dRand.SetStateRaw(s);
     }
 
-    // Tall grass: 128 scatter attempts from a source chunk, filtered to current column
+    // Tall grass: 128 scatter attempts from a source chunk, filtered to current column.
+    // INLINE LCG — see _GpuDecorationAddFlowerCandidates; identical technique and parity rules.
     private void _GpuDecorationAddGrassCandidates(JavaRandom dRand, int srcChunkX, int srcChunkZ,
         int colOriginX, int colOriginZ,
         int sizeXZ, int worldHeight, byte blockType, ref int candidateCount, int maxCandidates)
     {
-        int baseX = srcChunkX * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_X;
-        dRand.NextInt(worldHeight); // consume baseY from PRNG (GPU finds surface instead)
-        int baseZ = srcChunkZ * 16 + dRand.NextInt(16) + 8 + BUILTIN_OFFSET_Z;
+        long s = dRand.GetStateRaw();
+
+        s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+        int baseX = srcChunkX * 16 + (int)((16L * (s >> 17)) >> 31) + 8 + BUILTIN_OFFSET_X;
+        // Consume baseY from the PRNG exactly like nextInt(worldHeight) would (the GPU finds
+        // the surface instead, but the stream must advance identically — incl. rejections).
+        if ((worldHeight & -worldHeight) == worldHeight)
+        {
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+        }
+        else
+        {
+            int rejBits, rejVal;
+            do
+            {
+                s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+                rejBits = (int)(s >> 17);
+                rejVal = rejBits % worldHeight;
+            } while (rejBits - rejVal + (worldHeight - 1) < 0);
+        }
+        s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+        int baseZ = srcChunkZ * 16 + (int)((16L * (s >> 17)) >> 31) + 8 + BUILTIN_OFFSET_Z;
 
         for (int attempt = 0; attempt < 128; attempt++)
         {
-            int gx = baseX + dRand.NextInt(8) - dRand.NextInt(8);
-            int dY = dRand.NextInt(4) - dRand.NextInt(4);
-            int gz = baseZ + dRand.NextInt(8) - dRand.NextInt(8);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            int gx = baseX + (int)((8L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            gx = gx - (int)((8L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            int dY = (int)((4L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            dY = dY - (int)((4L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            int gz = baseZ + (int)((8L * (s >> 17)) >> 31);
+            s = (s * JRAND_MULT + JRAND_ADD) & JRAND_MASK;
+            gz = gz - (int)((8L * (s >> 17)) >> 31);
 
             int localX = gx - colOriginX;
             int localZ = gz - colOriginZ;
@@ -3538,6 +3628,8 @@ public class McTerrainGenerator : UdonSharpBehaviour
                 candidateCount++;
             }
         }
+
+        dRand.SetStateRaw(s);
     }
 
     private void _BuildGpuChunkSliceCache()
