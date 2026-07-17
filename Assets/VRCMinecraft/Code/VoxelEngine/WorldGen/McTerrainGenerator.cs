@@ -2808,6 +2808,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuDecorCollectTreeCount = 0;
     private int gpuDecorCollectCandCount = 0;
     private int gpuDecorCollectAnchorMask = 0;
+    // WITHIN-CHUNK COLLECT SLICING: one chunk per call was not enough — a single PLAINS or
+    // RAINFOREST chunk runs 10 grass decorators x 128 scatter attempts (~7700 JavaRandom
+    // calls, the measured 45ms collect step). -1 = current chunk's PRNG seed + TREE phase
+    // still pending (runs alone in one call); k >= 0 = next flower/grass decorator
+    // invocation, at most 2 per call. gpuDecorChunkRand carries the chunk's PRNG stream
+    // across calls; the stream order (trees -> yellow flowers -> grass -> red flower) and
+    // every candidate written are byte-identical to the single-call version.
+    private int gpuDecorCollectSub = -1;
+    private JavaRandom gpuDecorChunkRand;
+    private BetaBiomeEnum gpuDecorChunkBiome;
 
     // FINALIZE SLICING step 1 of Prepare_GpuDecorate: run the CPU candidate collection
     // (JavaRandom decoration streams of the 4 contributing chunks, COLLECT-SLICED to one
@@ -2816,7 +2826,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
     // anchor renders reuse/overwrite gpuColumnBase/SurfaceInfo/FinalTexture.
     private bool _GpuDecorationCollect(int sizeXZ)
     {
-        if (gpuDecorCollectIdx == 0)
+        if (gpuDecorCollectIdx == 0 && gpuDecorCollectSub == -1)
         {
             gpuDecorTreeCount = 0;
             gpuDecorCandidateCount = 0;
@@ -2847,21 +2857,78 @@ public class McTerrainGenerator : UdonSharpBehaviour
         int treeCount = gpuDecorCollectTreeCount;
         int candidateCount = gpuDecorCollectCandCount;
         int requiredTreeAnchorMask = gpuDecorCollectAnchorMask;
-        _GpuDecorationCollectFromChunk(ncx, ncz, colOriginX, colOriginZ,
-            sizeXZ, worldHeight,
-            ref treeCount, maxTrees,
-            ref candidateCount, maxCandidates,
-            ref requiredTreeAnchorMask);
-        gpuDecorCollectTreeCount = treeCount;
-        gpuDecorCollectCandCount = candidateCount;
-        gpuDecorCollectAnchorMask = requiredTreeAnchorMask;
 
+        if (gpuDecorCollectSub == -1)
+        {
+            // Chunk start: seed the PRNG, resolve centerBiome, run the TREE phase — its own
+            // call (a forest chunk's tree sims are ~2-4ms of JavaRandom work).
+            long worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
+            long decorSeed = (long)ncx * 1364927L + (long)ncz * 7420851L ^ worldSeed;
+            if (gpuDecorChunkRand == null) gpuDecorChunkRand = new JavaRandom(decorSeed);
+            else gpuDecorChunkRand.SetSeed(decorSeed);
+
+            if (ncx == currentChunkX && ncz == currentChunkZ && currentChunkBiomes != null)
+            {
+                gpuDecorChunkBiome = currentChunkBiomes[8 * 16 + 8];
+            }
+            else
+            {
+                gpuDecorChunkBiome = _QueryBiomeAtChunkCenter(ncx, ncz);
+            }
+
+            _GpuDecorCollectChunkTrees(gpuDecorChunkRand, ncx, ncz, colOriginX, colOriginZ,
+                sizeXZ, gpuDecorChunkBiome,
+                ref treeCount, maxTrees,
+                ref requiredTreeAnchorMask);
+
+            gpuDecorCollectTreeCount = treeCount;
+            gpuDecorCollectAnchorMask = requiredTreeAnchorMask;
+            gpuDecorCollectSub = 0;
+            return true;
+        }
+
+        // Decorator phase: at most 2 flower/grass invocations per call, PRNG stream order
+        // unchanged (yellow flowers, then grass, then the 50% red flower).
+        int yellowCount = BetaBiome.getFlowersPerChunk(gpuDecorChunkBiome);
+        int grassCount = BetaBiome.getGrassPerChunk(gpuDecorChunkBiome);
+        int units = 0;
+        while (units < 2 && gpuDecorCollectSub <= yellowCount + grassCount)
+        {
+            int k = gpuDecorCollectSub;
+            if (k < yellowCount)
+            {
+                _GpuDecorationAddFlowerCandidates(gpuDecorChunkRand, ncx, ncz, colOriginX, colOriginZ,
+                    sizeXZ, worldHeight, flowerYellowBlockID, ref candidateCount, maxCandidates);
+            }
+            else if (k < yellowCount + grassCount)
+            {
+                _GpuDecorationAddGrassCandidates(gpuDecorChunkRand, ncx, ncz, colOriginX, colOriginZ,
+                    sizeXZ, worldHeight, tallGrassBlockID, ref candidateCount, maxCandidates);
+            }
+            else
+            {
+                // Red flower (50% chance) — last unit of the chunk's stream.
+                if (gpuDecorChunkRand.NextInt(2) == 0)
+                {
+                    _GpuDecorationAddFlowerCandidates(gpuDecorChunkRand, ncx, ncz, colOriginX, colOriginZ,
+                        sizeXZ, worldHeight, flowerRedBlockID, ref candidateCount, maxCandidates);
+                }
+            }
+            gpuDecorCollectSub = k + 1;
+            units = units + 1;
+        }
+        gpuDecorCollectCandCount = candidateCount;
+        if (gpuDecorCollectSub <= yellowCount + grassCount) return true; // more decorators in this chunk
+
+        gpuDecorCollectSub = -1;
         gpuDecorCollectIdx = ni + 1;
         if (gpuDecorCollectIdx < 4) return true;
         gpuDecorCollectIdx = 0;
 
-        gpuDecorTreeCount = treeCount;
+        gpuDecorTreeCount = gpuDecorCollectTreeCount;
         gpuDecorCandidateCount = candidateCount;
+        treeCount = gpuDecorCollectTreeCount;
+        requiredTreeAnchorMask = gpuDecorCollectAnchorMask;
         if (treeCount > 0 && gpuColumnTreeDecorationMaterial != null && gpuTreeAnchorChunkTextures != null)
         {
             VRCGraphics.Blit(gpuColumnFinalTexture, gpuTreeAnchorChunkTextures[4]);
@@ -3344,27 +3411,16 @@ public class McTerrainGenerator : UdonSharpBehaviour
         currentChunkBiomes = savedChunkBiomes;
     }
 
-    // Collect tree + flower/grass candidates from one chunk into the current column
-    private void _GpuDecorationCollectFromChunk(int chunkX, int chunkZ,
-        int colOriginX, int colOriginZ, int sizeXZ, int worldHeight,
+    // WITHIN-CHUNK COLLECT SLICING: the TREE phase of one contributing chunk's collection.
+    // PRNG seeding, centerBiome resolution and the flower/grass/red decorator invocations
+    // moved to _GpuDecorationCollect's sub-stepped driver — dRand carries the SAME stream
+    // this method continues consuming, so the sequence is byte-identical to the old
+    // single-call _GpuDecorationCollectFromChunk.
+    private void _GpuDecorCollectChunkTrees(JavaRandom dRand, int chunkX, int chunkZ,
+        int colOriginX, int colOriginZ, int sizeXZ, BetaBiomeEnum centerBiome,
         ref int treeCount, int maxTrees,
-        ref int candidateCount, int maxCandidates,
         ref int requiredTreeAnchorMask)
     {
-        long worldSeed = McUtils.GetMinecraftSeed(world.worldSeedString);
-        long decorSeed = (long)chunkX * 1364927L + (long)chunkZ * 7420851L ^ worldSeed;
-        JavaRandom dRand = new JavaRandom(decorSeed);
-
-        BetaBiomeEnum centerBiome;
-        if (chunkX == currentChunkX && chunkZ == currentChunkZ && currentChunkBiomes != null)
-        {
-            centerBiome = currentChunkBiomes[8 * 16 + 8];
-        }
-        else
-        {
-            centerBiome = _QueryBiomeAtChunkCenter(chunkX, chunkZ);
-        }
-
         // Trees: compute count, then generate tree info
         int numTrees = BetaBiome.getTreesPerChunk(dRand, treeNoise, chunkX, chunkZ, centerBiome);
         for (int ti = 0; ti < numTrees && treeCount < maxTrees; ti++)
@@ -3413,28 +3469,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
             }
         }
 
-        // Yellow flowers
-        int yellowFlowerCount = BetaBiome.getFlowersPerChunk(centerBiome);
-        for (int fi = 0; fi < yellowFlowerCount; fi++)
-        {
-            _GpuDecorationAddFlowerCandidates(dRand, chunkX, chunkZ, colOriginX, colOriginZ,
-                sizeXZ, worldHeight, flowerYellowBlockID, ref candidateCount, maxCandidates);
-        }
-
-        // Tall grass
-        int grassCount = BetaBiome.getGrassPerChunk(centerBiome);
-        for (int gi = 0; gi < grassCount; gi++)
-        {
-            _GpuDecorationAddGrassCandidates(dRand, chunkX, chunkZ, colOriginX, colOriginZ,
-                sizeXZ, worldHeight, tallGrassBlockID, ref candidateCount, maxCandidates);
-        }
-
-        // Red flower (50% chance)
-        if (dRand.NextInt(2) == 0)
-        {
-            _GpuDecorationAddFlowerCandidates(dRand, chunkX, chunkZ, colOriginX, colOriginZ,
-                sizeXZ, worldHeight, flowerRedBlockID, ref candidateCount, maxCandidates);
-        }
     }
 
     private BetaBiomeEnum _QueryBiomeAtChunkCenter(int chunkX, int chunkZ)
@@ -4477,6 +4511,7 @@ public class McTerrainGenerator : UdonSharpBehaviour
                     // column must not leak into this one.
                     gpuAnchorPhase = 0;
                     gpuDecorCollectIdx = 0;
+                    gpuDecorCollectSub = -1;
                     currentState = GenerationState.Prepare_GpuDecorate;
                 }
                 break;

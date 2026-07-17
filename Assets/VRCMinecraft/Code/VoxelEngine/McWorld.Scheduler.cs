@@ -920,7 +920,9 @@ public partial class McWorld
 #if LOGGING
         if (sch_enableDetailedTimings || sch_enableAggregateLogging)
         {
-            sch_time_UpdateWorkers += (float)(System.DateTime.UtcNow - _swStart).TotalMilliseconds;
+            float _uwMs = (float)(System.DateTime.UtcNow - _swStart).TotalMilliseconds;
+            sch_time_UpdateWorkers += _uwMs;
+            if (_uwMs > sch_time_UpdateWorkersMaxMs) sch_time_UpdateWorkersMaxMs = _uwMs;
         }
 #endif
     }
@@ -1087,7 +1089,9 @@ public partial class McWorld
         // Aggregate cycle stats
         if (sch_enableDetailedTimings || sch_enableAggregateLogging)
         {
-            sch_time_TotalCycle += (float)(System.DateTime.UtcNow - cycleStart).TotalMilliseconds;
+            float _cycMs = (float)(System.DateTime.UtcNow - cycleStart).TotalMilliseconds;
+            sch_time_TotalCycle += _cycMs;
+            if (_cycMs > sch_time_CycleMaxMs) sch_time_CycleMaxMs = _cycMs;
             sch_cycles_Processed++;
 
             int activeWorkers = 0;
@@ -1161,6 +1165,10 @@ public partial class McWorld
     private float sch_time_RebuildQueue;
     private float sch_time_WorldGen;
     private float sch_time_TotalCycle;
+    // SPIKE ATTRIBUTION: worst single cycle / worst update-workers section, to tell whether
+    // load-phase Update maxes live in the coordinator (worker stepping) or the PAC phases.
+    private float sch_time_CycleMaxMs;
+    private float sch_time_UpdateWorkersMaxMs;
     private int   sch_cycles_Processed;
     private int   sch_workers_DataGenCompleted;
     private int   sch_workers_MeshCompleted;
@@ -1293,8 +1301,8 @@ public partial class McWorld
         float avgAssign = sch_time_AssignWork    / sch_cycles_Processed;
 
         sb.AppendLine("Coordinator:");
-        sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms, update workers {2:F3}ms, assign work {3:F3}ms\n",
-            sch_cycles_Processed, avgCycle, avgUpdate, avgAssign);
+        sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms (max {2:F1}), update workers {3:F3}ms (max {4:F1}), assign work {5:F3}ms\n",
+            sch_cycles_Processed, avgCycle, sch_time_CycleMaxMs, avgUpdate, sch_time_UpdateWorkersMaxMs, avgAssign);
         sb.AppendFormat("  Assign breakdown (per cycle): pick {0:F3}ms ({1} calls), startGen {2:F3}ms ({3} cols), siblingStep {4:F3}ms ({5}), rest {6:F3}ms\n",
             sch_time_AssignPick / sch_cycles_Processed, sch_assign_PickCalls,
             sch_time_AssignStartGen / sch_cycles_Processed, sch_assign_NewColumns,
@@ -1321,6 +1329,8 @@ public partial class McWorld
         sch_assign_NewColumns         = 0;
         sch_assign_SiblingSteps       = 0;
         sch_time_TotalCycle           = 0f;
+        sch_time_CycleMaxMs           = 0f;
+        sch_time_UpdateWorkersMaxMs   = 0f;
         sch_cycles_Processed          = 0;
         sch_workers_DataGenCompleted  = 0;
         sch_workers_MeshCompleted     = 0;
