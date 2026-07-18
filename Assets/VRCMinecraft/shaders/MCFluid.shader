@@ -152,7 +152,10 @@ Shader "VRCM/MCFluid"
                 lightBrightness = max(minLightLevel, g >= 0.0 ? g : (_UdonVRCM_GpuEnabled >= 0.5 ? gpuVoxelAtlasMissBrightness() : i.color.a));
             }
 
-            half faceBrightness = (isWater || isLava) ? 1.0 : calcFaceBrightness(i.normal);
+            // b1.7.3 renderBlockFluids applies the SAME directional face shading to fluids as to
+            // solid blocks: top 1.0, bottom 0.5, N/S (Z) 0.8, E/W (X) 0.6 (var14-17, lines 1485-88 /
+            // 1601-05). The old "fluids = 1.0" override made water/lava sides read too bright.
+            half faceBrightness = calcFaceBrightness(i.normal);
             half combined = lightBrightness * faceBrightness;
             combined = GammaToLinearSpace(combined.xxx).x;
             col.rgb *= combined;

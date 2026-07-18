@@ -84,7 +84,7 @@ Material:
     - _AirBlockId: 0
     - _BuiltinOffsetX: -16
     - _BuiltinOffsetZ: 0
-    - _CandidateCount: 1854
+    - _CandidateCount: 692
     - _CandidateTexHeight: 32
     - _CandidateTexWidth: 256
     - _ChunkSizeXZ: 16

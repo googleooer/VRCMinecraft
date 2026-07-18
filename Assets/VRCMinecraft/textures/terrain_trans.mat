@@ -152,7 +152,7 @@ Material:
     - _Color: {r: 1, g: 1, b: 1, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 0}
     - _Flip: {r: 1, g: 1, b: 1, a: 1}
-    - _FogColor: {r: 0.5795224, g: 0.6745807, b: 0.8465719, a: 1}
+    - _FogColor: {r: 0.68701375, g: 0.79996777, b: 1, a: 1}
     - _RendererColor: {r: 1, g: 1, b: 1, a: 1}
     - _Specular: {r: 0, g: 0, b: 0, a: 0}
   m_BuildTextureStacks: []
