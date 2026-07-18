@@ -12983,7 +12983,11 @@ public partial class McWorld : UdonSharpBehaviour
         byte block = _GetFluidRenderBlock(chunk, localX, localY, localZ);
         bool isSameFluid = isLava ? _IsLavaBlock(block) : _IsWaterBlock(block);
         if (!isSameFluid) return -1;
-        return _GetFluidRenderMetadata(chunk, localX, localY, localZ);
+        // b1.7.3 BlockFluid.getEffectiveFlowDecay: falling fluid (metadata >= 8) counts as a full
+        // source (decay 0) for flow-vector purposes. Without this clamp the flow angle points the
+        // wrong way next to waterfalls/lavafalls (a meta-8 falling column read as near-empty).
+        int meta = _GetFluidRenderMetadata(chunk, localX, localY, localZ);
+        return meta >= 8 ? 0 : meta;
     }
 
     private int _GetFluidRenderMetadata(ChunkData originChunk, int localX, int localY, int localZ)
@@ -13050,8 +13054,14 @@ public partial class McWorld : UdonSharpBehaviour
                 int meta = _GetFluidRenderMetadata(chunk, sampleX, localY, sampleZ);
                 int effectiveLevel = meta >= 8 ? 0 : meta;
                 float percentAir = _GetWaterPercentAir(effectiveLevel);
-                sampleSum += percentAir * 10.0f;
-                sampleCount += 10;
+                // MC func_1224_a: only source (meta 0) and falling (meta >= 8) neighbors get the
+                // x10 weight; flowing blocks (meta 1-7) contribute a single sample. Keeps the
+                // surface near-full close to sources and tapers only at the flowing edges.
+                if (meta >= 8 || meta == 0)
+                {
+                    sampleSum += percentAir * 10.0f;
+                    sampleCount += 10;
+                }
                 sampleSum += percentAir;
                 sampleCount++;
             }
@@ -13259,9 +13269,10 @@ public partial class McWorld : UdonSharpBehaviour
             heightNE = _GetFluidCornerHeight(chunk, localX + 1, localY, localZ, isLava);
         }
 
-        // FLUID R3 — FLOW PRECHECK (exact): _GetFluidFlowDecay returns the raw metadata for
-        // same-fluid blocks, so when all four laterals are same-fluid with metadata equal to
-        // this block's, every decay delta is 0 -> magnitude 0 -> the helper returns -1000.
+        // FLUID R3 — FLOW PRECHECK (exact): when all four laterals are same-fluid with RAW
+        // metadata equal to this block's, their effective decays (getEffectiveFlowDecay clamps
+        // >=8 to 0) are also all equal, so every decay delta is 0 -> magnitude 0 -> still (-1000).
+        // Raw-equal is a strict subset of effective-equal, so this never falsely declares still.
         // Interior-only (all metas from local arrays); anything else calls the exact helper.
         // Old code computed the angle only under renderTop — preserved.
         float flowAngle = -1000.0f;
@@ -13297,7 +13308,7 @@ public partial class McWorld : UdonSharpBehaviour
 
     // Inline mirror of _GetFluidCornerHeight for the fully array-resolvable case: same
     // iteration order, same early 1.0 return on same-fluid-above, same float accumulation
-    // sequence (percentAir*10 weight then +percentAir), same metadata null/bounds -> 0.
+    // sequence (x10 weight for source/falling then +percentAir), same metadata null/bounds -> 0.
     private float _FluidCornerHeightInline(byte[] data, byte[] metaArr, byte[] dPY,
         int cornerX, int localY, int cornerZ, bool isLava, byte[] clsTable)
     {
@@ -13338,8 +13349,11 @@ public partial class McWorld : UdonSharpBehaviour
                 int meta = (metaArr != null && mi < metaArr.Length) ? metaArr[mi] : 0;
                 int effectiveLevel = meta >= 8 ? 0 : meta;
                 float percentAir = (effectiveLevel + 1) / 9.0f;
-                sampleSum += percentAir * 10.0f;
-                sampleCount += 10;
+                if (meta >= 8 || meta == 0)   // MC func_1224_a: only source/falling get the x10 weight
+                {
+                    sampleSum += percentAir * 10.0f;
+                    sampleCount += 10;
+                }
                 sampleSum += percentAir;
                 sampleCount++;
             }
