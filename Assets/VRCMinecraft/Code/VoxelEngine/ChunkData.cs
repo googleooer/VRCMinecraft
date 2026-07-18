@@ -18,6 +18,21 @@ public class ChunkData
     public MeshRenderer opaqueRenderer;     // (c) GPU chunk-mesh render path: cached opaque renderer
     public MeshRenderer transparentRenderer; // cutout/transparent renderers for the GPU passes
     public MeshRenderer cutoutRenderer;
+    // DECOR pass (instanced-path chunks only): tiny private mesh holding the sub-voxel geometry the
+    // shared-voxel-mesh passes cannot draw — torches + cross blocks (flowers/tall grass/saplings/fire).
+    // Renders through the CPU cutout material (terrain_cutout). Null when the chunk prefab has no
+    // "Decor" child (feature safely off). The CPU mesh path re-emits this geometry into its own
+    // cutout mesh, so conversions CLEAR the decor mesh to avoid doubles.
+    public MeshFilter decorMeshFilter;
+    public MeshRenderer decorRenderer;
+    // Sliced decor build state: data version the decor mesh was last applied for on the CURRENT
+    // GameObject (-1 = none; reset on re-pairing and on GPU->CPU conversion), the cross-position
+    // cursor for the sliced emit, and the running vert/tri counts carried across slices (the
+    // world-shared scratch keeps the actual data; only one chunk emits at a time).
+    public int _decorBuiltVersion = -1;
+    public int _decorEmitCursor = 0;
+    public int _decorVertCount = 0;
+    public int _decorTriCount = 0;
     public Material opaqueOriginalMaterial; // sharedOpaque material to restore if a chunk leaves GPU render
     public bool _isGpuMeshRendered = false; // true while this chunk shows the shared GPU voxel mesh
     public MeshCollider meshCollider; // Player collision (solid blocks only)
