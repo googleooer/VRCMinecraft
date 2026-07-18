@@ -146,8 +146,8 @@ public partial class McWorld : UdonSharpBehaviour
     public bool enableMeshRenderDistanceCull = true;
     [Tooltip("RENDER DISTANCE (PC): radial chunk radius (full Y columns) within which terrain meshes AND stays GPU-lit. Minecraft-style. Used on standalone/desktop builds. Auto-clamped at init so the radial column set fits the GPU light-slot capacity.")]
     public int renderDistanceChunksPC = 8;
-    [Tooltip("RENDER DISTANCE (Android/iOS): radial chunk radius (full Y columns) used on mobile/Quest builds. Lower than PC to fit Quest memory/perf.")]
-    public int renderDistanceChunksMobile = 4;
+    [Tooltip("RENDER DISTANCE (Android/iOS): radial chunk radius (full Y columns) used on mobile/Quest builds. Lower than PC to fit Quest memory/perf. Must fit the Quest gpuChunkSlotCapacity (1023 -> up to 6 chunks).")]
+    public int renderDistanceChunksMobile = 6;
     // The active render distance, selected at init from the build target (InitializeWorldParameters)
     // then capacity-clamped (_InitializeGpuVoxelBackend). Drives BOTH the mesh cull
     // (_IsChunkWithinMeshRenderDistance) and the GPU lit/resident set (eviction protection +
@@ -221,12 +221,14 @@ public partial class McWorld : UdonSharpBehaviour
 
     [Header("GPU Voxel Backend")]
     public bool enableGpuVoxelBackend = true;
-    // Atlas resident-chunk capacity. Bumped 1023->2047 so far chunks keep their light-atlas slot
-    // longer (evicted chunks lose GPU light -> dim/black, see MCTerrain AO-LOD miss path). Cost:
-    // the 5 capacity-scaled atlases grow ~2x (2048^2 -> ~2896x3072, ~+90MB total VRAM) and the
-    // per-sync full-atlas overlay blit (_GpuOverlayTextureIntoAtlas) does ~2x the fill — absorbed
-    // by the idle gen-phase GPU here, but DIAL BACK toward 1023 if Quest VRAM/load regresses.
-    // Clamped to [1,4095] in _InitializeGpuVoxelBackend.
+    // Atlas resident-chunk capacity. SET PER-PLATFORM in InitializeWorldParameters (PC 2047 to fit
+    // an 8-chunk lit set / 1576 slots; Quest 1023 to fit 6 chunks / 904 slots) — it MUST cover the
+    // platform's render-distance radial column set * worldDimensionY, or _InitializeGpuVoxelBackend's
+    // capacity clamp silently shrinks the render distance. Higher = far chunks keep their light-atlas
+    // slot longer (evicted chunks lose GPU light -> dim/black, see MCTerrain AO-LOD miss path). Cost:
+    // the 5 capacity-scaled atlases grow ~linearly (2047 ~= 2896x3072, ~+90MB VRAM vs 1023) and the
+    // per-sync full-atlas overlay blit (_GpuOverlayTextureIntoAtlas) fills ~proportionally. The
+    // default below is the Quest value; the PC branch raises it. Clamped [1,4095] at backend init.
     [System.NonSerialized] public int gpuChunkSlotCapacity = 1023;
     [System.NonSerialized] public int gpuLightingIterationsPerUpdate = 15;
     [System.NonSerialized] public int gpuLightingTotalIterations = 15;
@@ -1082,12 +1084,19 @@ public partial class McWorld : UdonSharpBehaviour
 
         // RENDER DISTANCE: pick the platform default from the build target. VRChat builds PC and
         // Android/iOS separately and Udon exposes no runtime platform query, so the active build
-        // target's compile symbols are the reliable selector. The capacity-fit clamp happens later
-        // in _InitializeGpuVoxelBackend once the GPU light-slot capacity is known.
+        // target's compile symbols are the reliable selector.
+        //
+        // The GPU light-slot capacity is ALSO platform-specific and MUST be large enough to hold
+        // the platform's render-distance radial lit set, or _InitializeGpuVoxelBackend's capacity
+        // clamp silently shrinks the render distance (a shared 1023 clamped PC's intended 8 chunks
+        // down to 6 — the "render distance / fog too close on PC" report). Slots needed = (radial
+        // column count) * worldDimensionY: 8 chunks = 197*8 = 1576, 6 chunks = 113*8 = 904.
 #if UNITY_ANDROID || UNITY_IOS
         _activeRenderDistanceChunks = Mathf.Max(1, renderDistanceChunksMobile);
+        gpuChunkSlotCapacity = 1023; // fits 6-chunk radial lit set (904 slots); lean VRAM for Quest
 #else
         _activeRenderDistanceChunks = Mathf.Max(1, renderDistanceChunksPC);
+        gpuChunkSlotCapacity = 2047; // fits 8-chunk radial lit set (1576 slots); PC VRAM is plentiful
 #endif
     }
 
@@ -5640,7 +5649,6 @@ public partial class McWorld : UdonSharpBehaviour
     private bool _dayNightInit = false;
     private bool _dayNightWasRunning = false; // toggle-off restore gate (NOT skylightSubtracted != 0 — that is 0 for ALL daylight hours, which skipped the restore and could freeze e.g. underwater fog world-wide)
     private int _dayNightPropSkylightSubId;
-    private int _dayNightPropDayProgressId;
     private int _dayNightPropCelestialId;
     private int _dayNightPropFogColorId;
     private Material _dayNightSkyboxMat;
@@ -5650,7 +5658,7 @@ public partial class McWorld : UdonSharpBehaviour
     // weatherless) + star/sunrise publishes. renderDistance is EMULATED: the fog math is
     // parameterized exactly like gameSettings.renderDistance (farPlane = 256 >> rd), and
     // our radial render distance (8 chunks PC / 4 mobile) equals vanilla Normal/Short.
-    [Tooltip("b1.7.3 gameSettings.renderDistance emulated by the fog math (0=Far/256m, 1=Normal/128m, 2=Short/64m, 3=Tiny/32m). -1 = auto: Normal on PC, Short on Android — matches the world's 8/4-chunk radial render distance exactly.")]
+    [Tooltip("Fog distance. -1 = AUTO (recommended): fog reaches the world's actual render edge (renderChunks*16 blocks), matching vanilla where fog end == render distance. 0-3 forces a vanilla bucket (0=Far/256m, 1=Normal/128m, 2=Short/64m, 3=Tiny/32m) regardless of the real edge.")]
     public int fogRenderDistanceSetting = -1;
     private float _fogFarPlane = 256f;
     private float _fogSkyBlend = 0.29289322f;  // 1-(1/(4-rd))^0.25 (updateFogColor sky blend)
@@ -5669,6 +5677,12 @@ public partial class McWorld : UdonSharpBehaviour
     private int _dayNightPropSunriseColorId;
     private int _dayNightPropFluidFogColorId;
     private int _dayNightPropFluidFogDensityId;
+    // Skybox 1:1 sky/fog composition (b1.7.3 renderSky fogged flat dome): the zenith sky color
+    // (func_4079_a), the horizon fog color (== the terrain fog, keeps them in sync), and the
+    // far-plane distance that sets the sky-pass fog end (farPlane * 0.8).
+    private int _dayNightPropMcSkyColorId;
+    private int _dayNightPropMcHorizonColorId;
+    private int _dayNightPropMcFarPlaneId;
 
     // b1.7.3 WorldProvider.calculateCelestialAngle, verbatim (0 = noon at tick 6000,
     // 0.5 = midnight at tick 18000; cosine-eased with weight 1/3 — NOT linear in time).
@@ -5733,20 +5747,23 @@ public partial class McWorld : UdonSharpBehaviour
         return new Color(r, g, b, 1.0f);
     }
 
-    // b1.7.3 end-user fog: EntityRenderer.updateFogColor blends the base fog toward the
-    // biome sky color by 1-(1/(4-renderDistance))^0.25 (_fogSkyBlend, from the emulated
-    // renderDistance set at init). Sky color = biome getSkyColorByTemp scaled by the same
-    // clamped day factor. Biome temp uses the temperate default 0.7 for now — the
-    // temp-driven hue shift is +-0.017 max, far below the ~24-29% blend this restores.
-    private Color _CalculateCompositedFogColor(float celestialAngle)
+    // b1.7.3 day factor: clamp(cos(celestial*2pi)*2 + 0.5, 0, 1) — shared by getSkyColor,
+    // func_4096_a, getFogColor, getCloudColour. 1 at noon, 0 from dusk through dawn.
+    private float _DayFactor(float celestialAngle)
     {
-        Color baseFog = _CalculateFogColor(celestialAngle);
-        float dayFactor = _MathHelperCos(celestialAngle * (float)System.Math.PI * 2.0f) * 2.0f + 0.5f;
-        if (dayFactor < 0.0f) dayFactor = 0.0f;
-        if (dayFactor > 1.0f) dayFactor = 1.0f;
+        float f = _MathHelperCos(celestialAngle * (float)System.Math.PI * 2.0f) * 2.0f + 0.5f;
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        return f;
+    }
 
-        // BiomeGenBase.getSkyColorByTemp(0.7) via java.awt HSBtoRGB, ported exactly:
-        // hue = 224/360 - t*0.05, sat = 0.5 + t*0.1, val = 1.0, t = clamp(temp/3, -1, 1).
+    // b1.7.3 BiomeGenBase.getSkyColorByTemp(temp) via java.awt Color.getHSBColor, ported
+    // exactly: t = clamp(temp/3, -1, 1); hue = 224/360 - t*0.05, sat = 0.5 + t*0.1, val 1.0.
+    // Temperature is the temperate default 0.7 (the biome temp at the player would shift the
+    // hue by at most +-0.017 and varies per position; below perceptual threshold for the sky).
+    // Returns the base color (before the day-factor scale) as 0-1 RGB.
+    private Color _GetSkyColorByTempBase()
+    {
         float t = 0.7f / 3.0f;
         float hue = 224.0f / 360.0f - t * 0.05f;
         float sat = 0.5f + t * 0.1f;
@@ -5763,16 +5780,32 @@ public partial class McWorld : UdonSharpBehaviour
         else if (hcase == 3) { ri = (int)(p * 255.0f + 0.5f); gi = (int)(q * 255.0f + 0.5f); bi = (int)(255.0f + 0.5f); }
         else if (hcase == 4) { ri = (int)(u * 255.0f + 0.5f); gi = (int)(p * 255.0f + 0.5f); bi = (int)(255.0f + 0.5f); }
         else { ri = (int)(255.0f + 0.5f); gi = (int)(p * 255.0f + 0.5f); bi = (int)(q * 255.0f + 0.5f); }
-        float skyR = (ri / 255.0f) * dayFactor;
-        float skyG = (gi / 255.0f) * dayFactor;
-        float skyB = (bi / 255.0f) * dayFactor;
+        return new Color(ri / 255.0f, gi / 255.0f, bi / 255.0f, 1.0f);
+    }
 
-        float blend = _fogSkyBlend; // 1 - (1/(4-renderDistance))^0.25, set at day/night init
+    // b1.7.3 World.func_4079_a (getSkyColor) weatherless: getSkyColorByTemp(temp) scaled by
+    // the day factor. THIS is the zenith color the sky dome (glSkyList) is drawn at — black at
+    // midnight (dayFactor 0), full blue at noon. The skybox samples this + the fog color.
+    private Color _CalculateSkyColor(float celestialAngle)
+    {
+        Color b = _GetSkyColorByTempBase();
+        float d = _DayFactor(celestialAngle);
+        return new Color(b.r * d, b.g * d, b.b * d, 1.0f);
+    }
+
+    // b1.7.3 end-user fog: EntityRenderer.updateFogColor blends the base fog (func_4096_a)
+    // toward the sky color (func_4079_a) by 1-(1/(4-renderDistance))^0.25 (_fogSkyBlend, set at
+    // init). This is the HORIZON color — the terrain fog AND the skybox's low-elevation band.
+    private Color _CalculateCompositedFogColor(float celestialAngle)
+    {
+        Color baseFog = _CalculateFogColor(celestialAngle);
+        Color sky = _CalculateSkyColor(celestialAngle); // func_4079_a (already day-scaled)
+        float blend = _fogSkyBlend;
         float inv = 1.0f - blend;
         return new Color(
-            baseFog.r * inv + skyR * blend,
-            baseFog.g * inv + skyG * blend,
-            baseFog.b * inv + skyB * blend,
+            baseFog.r * inv + sky.r * blend,
+            baseFog.g * inv + sky.g * blend,
+            baseFog.b * inv + sky.b * blend,
             1.0f);
     }
 
@@ -5848,10 +5881,7 @@ public partial class McWorld : UdonSharpBehaviour
                 skylightSubtracted = 0;
                 VRCShader.SetGlobalFloat(_dayNightPropSkylightSubId, 0.0f);
                 if (_dayNightSkyboxMat != null)
-                {
-                    _dayNightSkyboxMat.SetFloat(_dayNightPropDayProgressId, 0.25f); // tick 6000
                     _dayNightSkyboxMat.SetFloat(_dayNightPropCelestialId, 0.0f);
-                }
                 Color noonFog = _CalculateCompositedFogColor(0.0f);
                 _fogMedium = 0;
                 _fogColor1 = 1.0f;
@@ -5861,6 +5891,8 @@ public partial class McWorld : UdonSharpBehaviour
                 {
                     _dayNightSkyboxMat.SetFloat(_dayNightPropStarBrightnessId, 0f);
                     _dayNightSkyboxMat.SetColor(_dayNightPropSunriseColorId, new Color(0f, 0f, 0f, 0f));
+                    _dayNightSkyboxMat.SetColor(_dayNightPropMcSkyColorId, _CalculateSkyColor(0.0f));
+                    _dayNightSkyboxMat.SetColor(_dayNightPropMcHorizonColorId, noonFog);
                 }
             }
             return;
@@ -5869,7 +5901,6 @@ public partial class McWorld : UdonSharpBehaviour
         {
             _dayNightInit = true;
             _dayNightPropSkylightSubId = VRCShader.PropertyToID("_UdonVRCM_SkylightSub");
-            _dayNightPropDayProgressId = VRCShader.PropertyToID("_DayProgress");
             _dayNightPropCelestialId = VRCShader.PropertyToID("_CelestialAngle");
             _dayNightPropFogColorId = VRCShader.PropertyToID("_FogColor");
             _dayNightPropFogModeId = VRCShader.PropertyToID("_FogMode");
@@ -5880,27 +5911,41 @@ public partial class McWorld : UdonSharpBehaviour
             _dayNightPropSunriseColorId = VRCShader.PropertyToID("_SunriseColor");
             _dayNightPropFluidFogColorId = VRCShader.PropertyToID("_FluidFogColor");
             _dayNightPropFluidFogDensityId = VRCShader.PropertyToID("_FluidFogDensity");
+            _dayNightPropMcSkyColorId = VRCShader.PropertyToID("_McSkyColor");
+            _dayNightPropMcHorizonColorId = VRCShader.PropertyToID("_McHorizonColor");
+            _dayNightPropMcFarPlaneId = VRCShader.PropertyToID("_McFarPlane");
             _dayNightSkyboxMat = RenderSettings.skybox;
             VRCShader.SetGlobalFloat(_dayNightPropSkylightSubId, (float)skylightSubtracted);
 
-            // Emulated gameSettings.renderDistance for the fog math (see field tooltip).
-            // Auto mode derives it from the ACTUAL radial mesh render distance (already
-            // platform-selected and capacity-clamped at init), so fog start/end track the real
-            // world edge exactly like vanilla: farPlaneDistance = 256 >> renderDistance, i.e.
-            // Far 256m / Normal 128m / Short 64m / Tiny 32m, start = far * 0.25, end = far.
+            // FOG DISTANCE = the ACTUAL render edge in blocks. Vanilla ties farPlaneDistance to
+            // gameSettings.renderDistance (256 >> rd) AND loads chunks to exactly that distance,
+            // so fog end == render edge. Our render distance is _activeRenderDistanceChunks (set
+            // per-platform, then CAPACITY-CLAMPED down in _InitializeGpuVoxelBackend), which is
+            // NOT necessarily a clean power-of-two bucket. Bucketing it (the old 256>>rd) mapped
+            // e.g. a 7-chunk (112-block) clamp down to Short/64 — HALVING the fog vs the true
+            // edge (the "fog is much closer than real Minecraft" report). Use the real edge
+            // directly: farPlane = renderChunks * 16, start = far*0.25, end = far, so fog reaches
+            // the render edge exactly like vanilla at the same distance.
             int rd = fogRenderDistanceSetting;
-            if (rd < 0)
+            if (rd >= 0)
             {
-                int rdBlocks = _activeRenderDistanceChunks * chunkSizeXZ;
-                if (rdBlocks >= 256) rd = 0;
-                else if (rdBlocks >= 128) rd = 1;
-                else if (rdBlocks >= 64) rd = 2;
+                if (rd > 3) rd = 3;
+                _fogFarPlane = (float)(256 >> rd); // explicit override: vanilla bucket
+            }
+            else
+            {
+                _fogFarPlane = (float)(_activeRenderDistanceChunks * chunkSizeXZ); // actual edge
+                // Nearest vanilla bucket, ONLY for the secondary blend/bright terms below (they
+                // are tied to the discrete render-distance setting; the distance uses the real edge).
+                if (_fogFarPlane >= 192f) rd = 0;
+                else if (_fogFarPlane >= 96f) rd = 1;
+                else if (_fogFarPlane >= 48f) rd = 2;
                 else rd = 3;
             }
-            if (rd > 3) rd = 3;
-            _fogFarPlane = (float)(256 >> rd);                              // EntityRenderer.setupCameraTransform
             _fogSkyBlend = 1.0f - Mathf.Pow(1.0f / (float)(4 - rd), 0.25f); // updateFogColor var4
             _fogBrightBase = (float)(3 - rd) / 3.0f;                        // updateRenderer var2
+            if (_dayNightSkyboxMat != null)
+                _dayNightSkyboxMat.SetFloat(_dayNightPropMcFarPlaneId, _fogFarPlane); // sky-pass fog end = *0.8
         }
         _dayNightWasRunning = true; // arm the toggle-off noon restore
 
@@ -5952,11 +5997,8 @@ public partial class McWorld : UdonSharpBehaviour
 
         float partial = (float)(tickDouble - System.Math.Floor(tickDouble));
         float celestial = _CalculateCelestialAngle(worldTime, partial);
-        double wtd = (double)worldTime;
-        float dayProgress = (float)((wtd - System.Math.Floor(wtd / 24000.0) * 24000.0) / 24000.0);
         if (_dayNightSkyboxMat != null)
         {
-            _dayNightSkyboxMat.SetFloat(_dayNightPropDayProgressId, dayProgress);
             _dayNightSkyboxMat.SetFloat(_dayNightPropCelestialId, celestial);
             _dayNightSkyboxMat.SetFloat(_dayNightPropStarBrightnessId, _GetStarBrightness(celestial));
             _dayNightSkyboxMat.SetColor(_dayNightPropSunriseColorId, _CalcSunriseSunsetColor(celestial));
@@ -5985,6 +6027,22 @@ public partial class McWorld : UdonSharpBehaviour
         float fogMult = _fogColor2 + (_fogColor1 - _fogColor2) * partial;
         fog = new Color(fog.r * fogMult, fog.g * fogMult, fog.b * fogMult, 1.0f);
         _PublishFogState(fog, fogMode, fogDensity, _fogFarPlane * 0.25f, _fogFarPlane, fluidDensity);
+
+        // SKYBOX 1:1 (b1.7.3 renderSky): the sky dome is drawn at the SKY color and linear-
+        // fogged toward the composited fog color — so the skybox needs both, live. The zenith
+        // is the raw sky color (func_4079_a, no brightness multiplier); the horizon is the
+        // clear-sky composited fog WITH the same fogColor1/2 multiplier the terrain fog uses,
+        // so the skybox's low band and the terrain fog are the identical color (in sync). When
+        // submerged the separate _FluidFog* override drowns the whole dome, so the horizon
+        // value staying clear-sky here is fine.
+        if (_dayNightSkyboxMat != null)
+        {
+            Color mcSky = _CalculateSkyColor(celestial);
+            Color mcHorizon = _CalculateCompositedFogColor(celestial);
+            mcHorizon = new Color(mcHorizon.r * fogMult, mcHorizon.g * fogMult, mcHorizon.b * fogMult, 1.0f);
+            _dayNightSkyboxMat.SetColor(_dayNightPropMcSkyColorId, mcSky);
+            _dayNightSkyboxMat.SetColor(_dayNightPropMcHorizonColorId, mcHorizon);
+        }
     }
 
     // Pushes one fog state to RenderSettings (standard-shader props/avatars), the three

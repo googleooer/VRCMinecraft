@@ -88,10 +88,10 @@ Material:
     m_Floats:
     - _BottomRatio: 1
     - _BumpScale: 1
-    - _CelestialAngle: 0.684971
+    - _CelestialAngle: 0.399641
     - _CelestialBodySize: 0.1
     - _Cutoff: 0.5
-    - _DayProgress: 0.9082083
+    - _DayProgress: 0.06745833
     - _DetailNormalMapScale: 1
     - _DstBlend: 0
     - _Exposure: 1
@@ -106,6 +106,7 @@ Material:
     - _ImageType: 0
     - _Layout: 0
     - _Mapping: 1
+    - _McFarPlane: 128
     - _Metallic: 0
     - _MirrorOnBack: 0
     - _Mode: 0
@@ -142,11 +143,13 @@ Material:
     - _FluidFogColor: {r: 0.034326695, g: 0.038617533, b: 0.06838522, a: 1}
     - _FogColorDay: {r: 0.6509804, g: 0.7686275, b: 0.9725491, a: 1}
     - _FogColorNight: {r: 0.039, g: 0.039, b: 0.09, a: 1}
+    - _McHorizonColor: {r: 0.034326695, g: 0.038617533, b: 0.06838522, a: 1}
+    - _McSkyColor: {r: 0, g: 0, b: 0, a: 1}
     - _NightColor: {r: 0, g: 0, b: 0, a: 0.5}
     - _SkyColor: {r: 0.466, g: 0.686, b: 1, a: 1}
     - _SkyColorDay: {r: 0.49803925, g: 0.67058825, b: 1, a: 1}
     - _SkyColorNight: {r: 0.003, g: 0.003, b: 0.003, a: 1}
-    - _SunriseColor: {r: 0.70099825, g: 0.20000775, b: 0.2, a: 0.00041394215}
+    - _SunriseColor: {r: 0, g: 0, b: 0, a: 0}
     - _SunsetColor: {r: 1, g: 0.5, b: 0, a: 1}
     - _Tint: {r: 0.46666667, g: 0.6862745, b: 1, a: 0.5}
     - _Top: {r: 0.468, g: 0.68773735, b: 1, a: 0}
