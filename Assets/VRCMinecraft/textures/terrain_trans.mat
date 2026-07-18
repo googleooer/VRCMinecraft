@@ -8,23 +8,22 @@ Material:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_Name: terrain_trans
-  m_Shader: {fileID: 4800000, guid: 234396ca6c1c79f498edb7707d6654a0, type: 3}
+  m_Shader: {fileID: 4800000, guid: c449305abd509bb4b8e28d996e8b342b, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
-  m_ValidKeywords:
-  - _SURFACETYPE_TRANSPARENT
+  m_ValidKeywords: []
   m_InvalidKeywords:
   - _EMISSION
   - _GLOSSYREFLECTIONS_OFF
   - _MODE_TRANSPARENT
   - _SPECULARHIGHLIGHTS_OFF
+  - _SURFACETYPE_TRANSPARENT
   m_LightmapFlags: 1
   m_EnableInstancingVariants: 1
   m_DoubleSidedGI: 0
   m_CustomRenderQueue: 3000
   stringTagMap:
     IGNOREPROJECTOR: true
-    RenderType: Transparent
   disabledShaderPasses: []
   m_LockedProperties: 
   m_SavedProperties:
@@ -147,13 +146,13 @@ Material:
     - _UseVertexLight: 0
     - _WaterFlowSlice: 206
     - _WaterStillSlice: 205
-    - _ZWrite: 0
+    - _ZWrite: 1
     m_Colors:
     - _BiomeColor: {r: 1, g: 1, b: 1, a: 1}
     - _Color: {r: 1, g: 1, b: 1, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 0}
     - _Flip: {r: 1, g: 1, b: 1, a: 1}
-    - _FogColor: {r: 0.034326695, g: 0.038617533, b: 0.06838522, a: 1}
+    - _FogColor: {r: 0.5795224, g: 0.6745807, b: 0.8465719, a: 1}
     - _RendererColor: {r: 1, g: 1, b: 1, a: 1}
     - _Specular: {r: 0, g: 0, b: 0, a: 0}
   m_BuildTextureStacks: []

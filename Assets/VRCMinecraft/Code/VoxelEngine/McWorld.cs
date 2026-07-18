@@ -5646,6 +5646,25 @@ public partial class McWorld : UdonSharpBehaviour
     public bool enableDayNightCycle = true;
     [Tooltip("Added to the server-clock-derived world time, in ticks (0-23999 shifts the phase; e.g. 6000 starts at noon).")]
     public int worldTimeOffsetTicks = 0;
+    [Tooltip("b1.7.3 clouds: the two CloudTile mesh renderers (baked 3D cloud boxes, one texture period wide). The driver scrolls them by moving the tiles and wraps them by a period so the layer tiles seamlessly; it also pushes the cloud color (getCloudColour) and the fog state. Leave null to disable.")]
+    public Transform cloudTileA;
+    public Transform cloudTileB;
+    [Tooltip("A MeshRenderer using the cloud material (VRCM/MCClouds) — usually cloudTileA's. The driver pushes _CloudColor and the fog to its shared material.")]
+    public MeshRenderer cloudRenderer;
+    [Tooltip("Cloud distance cull: hide cloud cluster chunks whose center is farther than (fog end + this margin) blocks from the player. Chunks beyond the fog are invisible anyway; this stops overhead chunks the camera frustum still includes (when looking up) from reaching the GPU.")]
+    public float cloudCullMarginBlocks = 320f;
+    private Material _cloudMat;
+    private int _cloudPropColorId;
+    private const float CLOUD_PERIOD = 12f * 256f; // cell 12 * 256 cells = one texture period (X)
+    // Cloud cluster-chunk renderers (both tiles) + their local bounds centers and tile membership,
+    // for per-frame distance culling. Cached once at day/night init.
+    private MeshRenderer[] _cloudChunkRenderers;
+    private Vector3[] _cloudChunkLocalCenter;
+    private bool[] _cloudChunkIsTileB;
+    // Cloud perf instrumentation (aggregated into the 300-frame summary).
+    private float stats_cloudUpdateMs = 0f;
+    private int stats_cloudActiveChunksMax = 0;
+    private int stats_cloudChunkCount = 0;
     private bool _dayNightInit = false;
     private bool _dayNightWasRunning = false; // toggle-off restore gate (NOT skylightSubtracted != 0 — that is 0 for ALL daylight hours, which skipped the restore and could freeze e.g. underwater fog world-wide)
     private int _dayNightPropSkylightSubId;
@@ -5814,6 +5833,17 @@ public partial class McWorld : UdonSharpBehaviour
         return skylightSubtracted < 4; // b1.7.3 World.isDaytime
     }
 
+    // b1.7.3 World.func_628_d (getCloudColour), weatherless. Base cloud color is WHITE
+    // (field_1019_F = 0xFFFFFF), scaled by the day factor: R,G *= day*0.9+0.1, B *= day*0.85+0.15.
+    // White at noon, dark blue-gray at midnight. Alpha (0.8) is applied in-shader (_CloudAlpha).
+    private Color _CalculateCloudColor(float celestialAngle)
+    {
+        float d = _DayFactor(celestialAngle);
+        float rg = d * 0.9f + 0.1f;
+        float b = d * 0.85f + 0.15f;
+        return new Color(rg, rg, b, 1.0f);
+    }
+
     // b1.7.3 World.getStarBrightness, verbatim (weatherless: the renderSky rain multiplier
     // is 1). The shader squares this (vanilla draws stars with color=alpha=b under
     // GL_SRC_ALPHA/GL_ONE, contributing coverage * b^2).
@@ -5917,6 +5947,44 @@ public partial class McWorld : UdonSharpBehaviour
             _dayNightSkyboxMat = RenderSettings.skybox;
             VRCShader.SetGlobalFloat(_dayNightPropSkylightSubId, (float)skylightSubtracted);
 
+            // b1.7.3 clouds: cache the cloud material + color property ID. The tiles are grids of
+            // 3D box cluster-chunk meshes (VRCM/MCClouds); color/fog pushed below, position/scroll
+            // + distance-cull every frame.
+            if (cloudRenderer != null)
+            {
+                _cloudMat = cloudRenderer.sharedMaterial;
+                _cloudPropColorId = VRCShader.PropertyToID("_CloudColor");
+            }
+            if (cloudTileA != null || cloudTileB != null)
+            {
+                int cc = 0;
+                if (cloudTileA != null) cc += cloudTileA.childCount;
+                if (cloudTileB != null) cc += cloudTileB.childCount;
+                _cloudChunkRenderers = new MeshRenderer[cc];
+                _cloudChunkLocalCenter = new Vector3[cc];
+                _cloudChunkIsTileB = new bool[cc];
+                int ck = 0;
+                if (cloudTileA != null)
+                    for (int i = 0; i < cloudTileA.childCount; i++)
+                    {
+                        Transform ch = cloudTileA.GetChild(i);
+                        MeshRenderer r = ch.GetComponent<MeshRenderer>();
+                        MeshFilter mf = ch.GetComponent<MeshFilter>();
+                        if (r == null || mf == null || mf.sharedMesh == null) continue;
+                        _cloudChunkRenderers[ck] = r; _cloudChunkLocalCenter[ck] = mf.sharedMesh.bounds.center; _cloudChunkIsTileB[ck] = false; ck++;
+                    }
+                if (cloudTileB != null)
+                    for (int i = 0; i < cloudTileB.childCount; i++)
+                    {
+                        Transform ch = cloudTileB.GetChild(i);
+                        MeshRenderer r = ch.GetComponent<MeshRenderer>();
+                        MeshFilter mf = ch.GetComponent<MeshFilter>();
+                        if (r == null || mf == null || mf.sharedMesh == null) continue;
+                        _cloudChunkRenderers[ck] = r; _cloudChunkLocalCenter[ck] = mf.sharedMesh.bounds.center; _cloudChunkIsTileB[ck] = true; ck++;
+                    }
+                stats_cloudChunkCount = ck;
+            }
+
             // FOG DISTANCE = the ACTUAL render edge in blocks. Vanilla ties farPlaneDistance to
             // gameSettings.renderDistance (256 >> rd) AND loads chunks to exactly that distance,
             // so fog end == render edge. Our render distance is _activeRenderDistanceChunks (set
@@ -5956,6 +6024,53 @@ public partial class McWorld : UdonSharpBehaviour
         double tickDouble = Networking.GetServerTimeInSeconds() * 20.0 + (double)worldTimeOffsetTicks;
         if (tickDouble < 0.0) tickDouble += 24000.0 * (System.Math.Floor(-tickDouble / 24000.0) + 1.0); // clock skew safety
         long worldTime = (long)tickDouble;
+
+        // b1.7.3 cloud scroll (cloudOffsetX * 0.03 blocks/tick in +X). The two period tiles are
+        // 3072 (12*256) wide; move them together and wrap by a period so the pattern tiles
+        // seamlessly. Every frame (2 transform sets) for smooth drift. The offset is wrapped to
+        // [-P/2, P/2) so the tile world X stays small (float-safe) and the pair always brackets
+        // the player (world is +-256): tile A at [o, o+3072], tile B at [o-3072, o] -> adjacent.
+        if (cloudTileA != null || cloudTileB != null)
+        {
+            float _cloudT0 = Time.realtimeSinceStartup;
+            double sc = tickDouble * 0.03;
+            sc -= System.Math.Floor(sc / (double)CLOUD_PERIOD) * (double)CLOUD_PERIOD; // [0, P)
+            if (sc >= CLOUD_PERIOD * 0.5) sc -= CLOUD_PERIOD;                           // [-P/2, P/2)
+            float o = (float)sc;
+            Vector3 tileAPos = new Vector3(o, 0f, 0f);
+            Vector3 tileBPos = new Vector3(o - CLOUD_PERIOD, 0f, 0f);
+            if (cloudTileA != null) cloudTileA.position = tileAPos;
+            if (cloudTileB != null) cloudTileB.position = tileBPos;
+
+            // DISTANCE CULL: hide cluster chunks the player can't see. Unity frustum-culls off-
+            // screen, but overhead chunks beyond the fog stay in the frustum when looking up and
+            // would still render fully fogged (invisible) — so cull by horizontal distance to the
+            // fog edge. Chunk world-center = its tile's position + the mesh's local bounds center.
+            if (_cloudChunkRenderers != null)
+            {
+                VRCPlayerApi _clp = Networking.LocalPlayer;
+                if (_clp != null && _clp.IsValid())
+                {
+                    Vector3 pp = _clp.GetPosition();
+                    float cullD = _fogFarPlane + cloudCullMarginBlocks;
+                    float cull2 = cullD * cullD;
+                    int active = 0;
+                    for (int ci = 0; ci < _cloudChunkRenderers.Length; ci++)
+                    {
+                        MeshRenderer cr = _cloudChunkRenderers[ci];
+                        if (cr == null) continue;
+                        Vector3 tp = _cloudChunkIsTileB[ci] ? tileBPos : tileAPos;
+                        float ddx = tp.x + _cloudChunkLocalCenter[ci].x - pp.x;
+                        float ddz = tp.z + _cloudChunkLocalCenter[ci].z - pp.z;
+                        bool vis = (ddx * ddx + ddz * ddz) <= cull2;
+                        if (cr.enabled != vis) cr.enabled = vis;
+                        if (vis) active++;
+                    }
+                    if (active > stats_cloudActiveChunksMax) stats_cloudActiveChunksMax = active;
+                }
+            }
+            stats_cloudUpdateMs += (Time.realtimeSinceStartup - _cloudT0) * 1000f;
+        }
 
         // Per-tick integer skylight (b1.7.3 recomputes once per World.tick with partial=1).
         int sub = _CalculateSkylightSubtracted(worldTime);
@@ -6043,6 +6158,11 @@ public partial class McWorld : UdonSharpBehaviour
             _dayNightSkyboxMat.SetColor(_dayNightPropMcSkyColorId, mcSky);
             _dayNightSkyboxMat.SetColor(_dayNightPropMcHorizonColorId, mcHorizon);
         }
+
+        // b1.7.3 clouds: push the live cloud color (getCloudColour). The scroll is applied by
+        // moving the tiles above (every frame); the fog is pushed by _PublishFogState.
+        if (_cloudMat != null)
+            _cloudMat.SetColor(_cloudPropColorId, _CalculateCloudColor(celestial));
     }
 
     // Pushes one fog state to RenderSettings (standard-shader props/avatars), the three
@@ -6113,6 +6233,16 @@ public partial class McWorld : UdonSharpBehaviour
         {
             _dayNightSkyboxMat.SetColor(_dayNightPropFluidFogColorId, fog);
             _dayNightSkyboxMat.SetFloat(_dayNightPropFluidFogDensityId, fluidDensity);
+        }
+        // Clouds fog with the WORLD fog (b1.7.3 renderClouds runs in the setupFog(0) pass), same
+        // values as terrain — so distant clouds dissolve into the same horizon color.
+        if (_cloudMat != null)
+        {
+            _cloudMat.SetColor(_dayNightPropFogColorId, fog);
+            _cloudMat.SetFloat(_dayNightPropFogModeId, fogMode);
+            _cloudMat.SetFloat(_dayNightPropFogDensityId, fogDensity);
+            _cloudMat.SetFloat(_dayNightPropFogStartId, fogStart);
+            _cloudMat.SetFloat(_dayNightPropFogEndId, fogEnd);
         }
     }
 
@@ -18868,6 +18998,10 @@ public partial class McWorld : UdonSharpBehaviour
             {
                 logBuilder.AppendLine($"  Adaptive budgets: mesh decode {adaptiveGpuMeshDecodeStepBudgetMs:F2}ms x{adaptiveGpuMeshDecodeStepsPerFrame}, frame {adaptiveGpuMeshDecodeFrameBudgetMs:F2}ms, worldgen {adaptiveGpuWorldgenStepBudgetMs:F2}ms x{adaptiveGpuWorldgenStepsPerFrame}");
             }
+            if (stats_cloudChunkCount > 0)
+            {
+                logBuilder.AppendLine($"  Clouds: CPU update (scroll+cull) {stats_cloudUpdateMs:F1}ms total, avg {stats_cloudUpdateMs / stats_frameCount:F3}ms/frame; rendered cluster chunks max {stats_cloudActiveChunksMax} of {stats_cloudChunkCount}");
+            }
         }
 
         _SchedAppendAggregatePerformanceStats(logBuilder);
@@ -19052,6 +19186,8 @@ public partial class McWorld : UdonSharpBehaviour
         stats_updateTimeMin = float.MaxValue;
         stats_updateTimeMax = 0f;
         stats_budgetExceededCount = 0;
+        stats_cloudUpdateMs = 0f;
+        stats_cloudActiveChunksMax = 0;
         stats_processActiveChunksTime = 0f;
         stats_pacMaintainMs = 0f;
         stats_pacLightingMs = 0f;
