@@ -38,7 +38,7 @@ RenderSettings:
   m_ReflectionIntensity: 1
   m_CustomReflection: {fileID: 0}
   m_Sun: {fileID: 0}
-  m_IndirectSpecularColor: {r: 0.19418415, g: 0.3295141, b: 0.83417714, a: 1}
+  m_IndirectSpecularColor: {r: 0.038558263, g: 0.0062593035, b: 0.007816196, a: 1}
   m_UseRadianceAmbientProbe: 0
 --- !u!157 &3
 LightmapSettings:
@@ -60039,6 +60039,9 @@ MonoBehaviour:
   enableCacheTracking: 0
   aggregateLogInterval: 300
   collisionGridSafetyRescanFrames: 30
+  enableDayNightCycle: 1
+  worldTimeOffsetTicks: 14000
+  fogRenderDistanceSetting: -1
   cpuMirrorRadiusXZ: 5
   cpuMirrorRadiusY: 3
   gpuSetBlockChainMaterial: {fileID: 2100000, guid: b1073cb9b08d4854fad69e8bdd675c87,

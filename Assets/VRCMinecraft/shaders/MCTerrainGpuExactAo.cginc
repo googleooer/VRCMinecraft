@@ -12,6 +12,22 @@ half gpuVoxelCalcBetaLightBrightnessFromLevel(float lightLevel)
     return (1.0 - darkness) / (darkness * 3.0 + 1.0) * 0.95 + 0.05;
 }
 
+// ATLAS-MISS POLICY: a sample that lands in a chunk with no atlas slot (just streamed in /
+// evicted from the lit set / beyond the world) or an unseeded light slot is treated as FULLY
+// SKYLIT with the day/night subtraction applied — bright by day, correctly dim at night.
+// Vanilla chunks always arrive pre-lit; any CONSTANT fallback here reads as a noon-bright
+// chunk at night (the old i.color.a/1.0 paths) or a black hole by day (the old level-0 paths).
+float gpuVoxelAtlasMissLightLevel()
+{
+    float skyLevel = 15.0 - _UdonVRCM_SkylightSub;
+    return skyLevel < 0.0 ? 0.0 : skyLevel;
+}
+
+half gpuVoxelAtlasMissBrightness()
+{
+    return gpuVoxelCalcBetaLightBrightnessFromLevel(gpuVoxelAtlasMissLightLevel());
+}
+
 float gpuVoxelTryLookupAtlasUv(float3 samplePos, out float2 atlasUv)
 {
     atlasUv = float2(0.0, 0.0);
@@ -64,7 +80,13 @@ float gpuVoxelTrySampleLightLevel(float3 samplePos, out float lightLevel)
     float4 lightSample = gpuVoxelSamplePoint(_UdonVRCM_GpuLightAtlas, atlasUv);
     if (lightSample.a < 0.5) return 0.0;
 
-    lightLevel = floor(max(lightSample.r, lightSample.g) * 15.0 + 0.5);
+    // DAY/NIGHT: the atlas stores skylight at MAX (noon) — the time-of-day darkening happens
+    // here at sample time, subtracted from SKY ONLY and then maxed with block light
+    // (b1.7.3 Chunk.getBlockLightValue order; max-then-subtract would darken torch-lit
+    // areas at night). _UdonVRCM_SkylightSub is 0-11, set once per tick change from Udon.
+    float skyLevel = floor(lightSample.r * 15.0 + 0.5) - _UdonVRCM_SkylightSub;
+    if (skyLevel < 0.0) skyLevel = 0.0;
+    lightLevel = max(skyLevel, floor(lightSample.g * 15.0 + 0.5));
     return 1.0;
 }
 
@@ -117,7 +139,10 @@ float gpuVoxelCanBlockGrass(float3 samplePos)
 float gpuVoxelSampleLightLevelWithEmissionFloor(float3 samplePos, float emittedLight)
 {
     float lightLevel;
-    if (gpuVoxelTrySampleLightLevel(samplePos, lightLevel) < 0.5) return emittedLight;
+    // Miss -> assume skylit (see gpuVoxelAtlasMissLightLevel): AO corners at the lit-set /
+    // world edge used to collapse to level 0, dark-banding the far edges by day.
+    if (gpuVoxelTrySampleLightLevel(samplePos, lightLevel) < 0.5)
+        return max(gpuVoxelAtlasMissLightLevel(), emittedLight);
     return max(lightLevel, emittedLight);
 }
 

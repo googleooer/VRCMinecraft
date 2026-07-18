@@ -79,7 +79,6 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             struct v2f
             {
                 float3 uvw : TEXCOORD0; // MODIFIED: Changed to float3 for UV + Slice Index
-                UNITY_FOG_COORDS(2)
                 float4 vertex : SV_POSITION;
                 float3 normal: TEXCOORD1;
                 fixed4 color : COLOR; // ADDED: Vertex color to pass to fragment shader
@@ -124,6 +123,7 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
             float4 _UdonVRCM_GpuChunkInfo;
             float4 _UdonVRCM_GpuVoxelOffset;
             float _UdonVRCM_GpuEnabled;
+            float _UdonVRCM_SkylightSub; // DAY/NIGHT: 0-11, subtracted from SKY light at sample time
 
             #include "MCTerrainGpuExactAo.cginc"
 
@@ -138,7 +138,6 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                 
                 // Calculate world position for radial fog (Quest-compatible, no depth buffer needed)
                 o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
-                UNITY_TRANSFER_FOG(o,o.vertex);
                 return o;
             }
 
@@ -248,7 +247,16 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                     half selfLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos);
                     half aboveLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos + float3(0, 1, 0));
                     half fluidLight = max(selfLight, aboveLight);
-                    lightBrightness = max(minLightLevel, fluidLight >= 0.0 ? fluidLight : i.color.a);
+                    // Atlas miss with the GPU pipeline ON -> skylit fallback (the vertex alpha is
+                    // a fullbright 1.0 placeholder on GPU-lit chunks — far-edge water glowed at
+                    // night). LAVA stays fullbright: it emits block light 15, so a hit always
+                    // resolves to 1.0 — a skylit fallback would make just-streamed lava go
+                    // near-black at night and pop when its light slot seeds (review-confirmed).
+                    // i.color.a remains the CPU-lit-world fallback.
+                    if (fluidLight < 0.0) fluidLight = _UdonVRCM_GpuEnabled >= 0.5
+                        ? (isLava ? 1.0 : gpuVoxelAtlasMissBrightness())
+                        : i.color.a;
+                    lightBrightness = max(minLightLevel, fluidLight);
                 }
                 else if (_UseGpuExactAo > 0.5)
                 {
@@ -257,7 +265,9 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                     if (isCrossNormal)
                     {
                         half crossLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos);
-                        lightBrightness = max(minLightLevel, crossLight >= 0.0 ? crossLight : i.color.a);
+                        // Miss -> skylit (decor/cross meshes carry alpha 1.0, which fullbrights at night).
+                        if (crossLight < 0.0) crossLight = gpuVoxelAtlasMissBrightness();
+                        lightBrightness = max(minLightLevel, crossLight);
                     }
                     else
                     {
@@ -270,10 +280,10 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                         {
                             aoBrightness = gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
                             // Atlas miss (e.g. a far chunk whose light slot has been evicted) returns
-                            // -1. The exact-AO path returns a dim floor on a miss; match it here so
-                            // far chunks stay dimly lit instead of dropping to i.color.a, which is ~0
-                            // on GPU-exact-AO meshes (vertex light isn't baked) and renders them BLACK.
-                            if (aoBrightness < 0.0) aoBrightness = gpuVoxelCalcBetaLightBrightnessFromLevel(0.0);
+                            // -1 -> skylit fallback (day-bright, night-dim), matching the exact-AO
+                            // corner policy — a constant floor was black-by-day, and i.color.a is ~0
+                            // on GPU-exact-AO meshes (vertex light isn't baked).
+                            if (aoBrightness < 0.0) aoBrightness = gpuVoxelAtlasMissBrightness();
                         }
                         else
                             aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
@@ -288,7 +298,7 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                     half oneLight = isCrossNormalB
                         ? gpuVoxelSampleLightBrightnessAtPosition(i.worldPos)
                         : gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
-                    if (oneLight < 0.0) oneLight = gpuVoxelCalcBetaLightBrightnessFromLevel(0.0); // atlas miss floor
+                    if (oneLight < 0.0) oneLight = gpuVoxelAtlasMissBrightness(); // atlas miss -> skylit
                     half bakedAo = isCrossNormalB ? 1.0 : i.color.a;
                     lightBrightness = max(minLightLevel, oneLight * bakedAo);
                 }
@@ -305,7 +315,8 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
                     }
                     else
                     {
-                        lightBrightness = max(minLightLevel, i.color.a);
+                        // GPU ON but the sample missed -> skylit; GPU OFF -> CPU vertex light.
+                        lightBrightness = max(minLightLevel, _UdonVRCM_GpuEnabled >= 0.5 ? gpuVoxelAtlasMissBrightness() : i.color.a);
                     }
                 }
                 
@@ -322,9 +333,11 @@ Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
 
                 half fogFactor = calcMinecraftFog(i.worldPos);
                 col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
-                
-                UNITY_APPLY_FOG(i.fogCoord, col);
-                
+
+                // (Built-in UNITY_APPLY_FOG removed: it stacked RenderSettings fog — which the
+                // day/night driver now publishes aggressively — on top of calcMinecraftFog,
+                // double-fogging this family while the instanced family fogs once.)
+
                 return col;
             }
             ENDCG

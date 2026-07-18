@@ -142,14 +142,15 @@ Shader "VRCM/GpuVoxelLightPropagate"
                     return float4(0.0, 0.0, 0.0, 1.0);
                 }
 
+                // DAY/NIGHT FIX (here and at each neighbor below): the old partial-opacity
+                // hack mirrored attenuated sky into the block channel — a no-op under
+                // max(sky, block) while the skylight subtraction was 0, but block light is
+                // exempt from the day/night subtraction, so it made water/leaves/ice glow
+                // with frozen noon light all night. Block light = emission + BFS spread.
                 if (worldY >= topWorldY && opacity < 15.0)
                 {
                     float topSkyLight = max(0.0, _TopSkyLight - opacity);
                     skyLight = max(skyLight, topSkyLight);
-                    if (opacity > 0.0 && topSkyLight > blockLight)
-                    {
-                        blockLight = topSkyLight;
-                    }
                 }
 
                 float4 neighborLight;
@@ -169,10 +170,6 @@ Shader "VRCM/GpuVoxelLightPropagate"
                 skyLight = max(skyLight, propagatedSkyLight);
                 neighborBlockLight = floor(neighborLight.g * 15.0 + 0.5);
                 blockLight = max(blockLight, max(0.0, neighborBlockLight - spreadAttenuation));
-                if (opacity > 0.0 && opacity < 15.0 && neighborSkyLight > propagatedSkyLight && propagatedSkyLight > 0.0)
-                {
-                    blockLight = max(blockLight, propagatedSkyLight);
-                }
 
                 float nx = localX - 1.0;
                 float nChunkX = chunkX;
@@ -183,10 +180,6 @@ Shader "VRCM/GpuVoxelLightPropagate"
                 skyLight = max(skyLight, propagatedSkyLight);
                 neighborBlockLight = floor(neighborLight.g * 15.0 + 0.5);
                 blockLight = max(blockLight, max(0.0, neighborBlockLight - spreadAttenuation));
-                if (opacity > 1.0 && opacity < 15.0 && neighborSkyLight > propagatedSkyLight && propagatedSkyLight > 0.0)
-                {
-                    blockLight = max(blockLight, propagatedSkyLight);
-                }
 
                 float px = localX + 1.0;
                 float pChunkX = chunkX;
@@ -197,10 +190,6 @@ Shader "VRCM/GpuVoxelLightPropagate"
                 skyLight = max(skyLight, propagatedSkyLight);
                 neighborBlockLight = floor(neighborLight.g * 15.0 + 0.5);
                 blockLight = max(blockLight, max(0.0, neighborBlockLight - spreadAttenuation));
-                if (opacity > 1.0 && opacity < 15.0 && neighborSkyLight > propagatedSkyLight && propagatedSkyLight > 0.0)
-                {
-                    blockLight = max(blockLight, propagatedSkyLight);
-                }
 
                 float ny = localY - 1.0;
                 float nChunkY = chunkY;
@@ -211,10 +200,6 @@ Shader "VRCM/GpuVoxelLightPropagate"
                 skyLight = max(skyLight, propagatedSkyLight);
                 neighborBlockLight = floor(neighborLight.g * 15.0 + 0.5);
                 blockLight = max(blockLight, max(0.0, neighborBlockLight - spreadAttenuation));
-                if (opacity > 1.0 && opacity < 15.0 && neighborSkyLight > propagatedSkyLight && propagatedSkyLight > 0.0)
-                {
-                    blockLight = max(blockLight, propagatedSkyLight);
-                }
 
                 float nz = localZ - 1.0;
                 float nChunkZ = chunkZ;
@@ -225,10 +210,6 @@ Shader "VRCM/GpuVoxelLightPropagate"
                 skyLight = max(skyLight, propagatedSkyLight);
                 neighborBlockLight = floor(neighborLight.g * 15.0 + 0.5);
                 blockLight = max(blockLight, max(0.0, neighborBlockLight - spreadAttenuation));
-                if (opacity > 1.0 && opacity < 15.0 && neighborSkyLight > propagatedSkyLight && propagatedSkyLight > 0.0)
-                {
-                    blockLight = max(blockLight, propagatedSkyLight);
-                }
 
                 float pz = localZ + 1.0;
                 float pChunkZ = chunkZ;
@@ -239,10 +220,6 @@ Shader "VRCM/GpuVoxelLightPropagate"
                 skyLight = max(skyLight, propagatedSkyLight);
                 neighborBlockLight = floor(neighborLight.g * 15.0 + 0.5);
                 blockLight = max(blockLight, max(0.0, neighborBlockLight - spreadAttenuation));
-                if (opacity > 1.0 && opacity < 15.0 && neighborSkyLight > propagatedSkyLight && propagatedSkyLight > 0.0)
-                {
-                    blockLight = max(blockLight, propagatedSkyLight);
-                }
 
                 float combined = max(skyLight, blockLight);
                 return float4(skyLight / 15.0, blockLight / 15.0, combined / 15.0, 1.0);

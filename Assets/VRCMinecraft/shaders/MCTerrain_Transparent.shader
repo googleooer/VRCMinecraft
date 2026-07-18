@@ -81,6 +81,7 @@ Shader "Unlit/MCTerrain (Transparent)"
             float4 _UdonVRCM_GpuChunkInfo;
             float4 _UdonVRCM_GpuVoxelOffset;
             float _UdonVRCM_GpuEnabled;
+            float _UdonVRCM_SkylightSub; // DAY/NIGHT: 0-11, subtracted from SKY light at sample time
 
             #include "MCTerrainGpuExactAo.cginc"
 

@@ -156,11 +156,12 @@ Shader "VRCM/GpuVoxelLightSeed"
                     runningSkyLight = nextSkyLight;
                 }
 
+                // DAY/NIGHT FIX: block light is EMISSION ONLY (b1.7.3 semantics). The old
+                // partial-opacity hack mirrored attenuated sky into the block channel —
+                // a no-op under max(sky, block) while the skylight subtraction was 0, but
+                // block light is exempt from the day/night subtraction, so it made water/
+                // leaves/ice glow with frozen noon light all night.
                 float blockLight = emission;
-                if (opacity > 0.0 && opacity < 15.0 && runningSkyLight > skyLight && skyLight > blockLight)
-                {
-                    blockLight = skyLight;
-                }
 
                 // Per-slot dirty tracking via alpha channel:
                 // Cleared slots (alpha < 0.5) get fresh column-scan seed values.

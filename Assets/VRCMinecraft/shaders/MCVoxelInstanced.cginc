@@ -24,6 +24,7 @@ float4 _UdonVRCM_GpuWorldInfo;   // (numChunksX, numChunksY, numChunksZ, numY*nu
 float4 _UdonVRCM_GpuChunkInfo;   // (chunkSizeXZ, chunkSizeY, offX, offZ)
 float4 _UdonVRCM_GpuVoxelOffset; // (offX, offY, offZ, slotCapacity)
 float _UdonVRCM_GpuEnabled;
+float _UdonVRCM_SkylightSub; // DAY/NIGHT: 0-11, subtracted from SKY light at sample time
 
 #define _UseGpuExactAo 1.0
 #include "MCTerrainGpuExactAo.cginc"
@@ -39,6 +40,11 @@ sampler2D _InstSlotLookup;
 
 fixed4 _FogColor;
 float _FogStart, _FogEnd;
+// DAY/NIGHT FOG: driven by McWorld._PublishFogState at ~10Hz alongside the terrain.mat
+// family — mode 0 = linear (land, start/end), 1 = exp (water 0.1 / lava 2.0 densities),
+// 2 = exp2, matching MCTerrain's calcMinecraftFog exactly.
+float _FogMode;
+float _FogDensity;
 
 struct appdata
 {
@@ -163,9 +169,13 @@ fixed4 frag(v2f i) : SV_Target
     b = GammaToLinearSpace(b.xxx).x;
     col.rgb *= b;
 
-    // Minecraft linear distance fog
+    // Minecraft distance fog — same modes as MCTerrain.calcMinecraftFog (b1.7.3 setupFog):
+    // linear for land, exp for water/lava immersion, exp2 spare.
     float d = distance(i.worldPos, _WorldSpaceCameraPos);
-    float fog = saturate((_FogEnd - d) / max(0.001, _FogEnd - _FogStart));
+    float fog;
+    if (_FogMode < 0.5)      fog = saturate((_FogEnd - d) / max(0.001, _FogEnd - _FogStart));
+    else if (_FogMode < 1.5) fog = saturate(exp(-_FogDensity * d));
+    else                     fog = saturate(exp(-_FogDensity * _FogDensity * d * d));
     col.rgb = lerp(_FogColor.rgb, col.rgb, fog);
 
 #if PASS_CLASS == 2

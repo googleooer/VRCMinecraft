@@ -18,6 +18,8 @@ Shader "Unlit/MCVoxelInstanced"
         _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0)
         _FogStart ("Fog Start Distance", Float) = 32.0
         _FogEnd ("Fog End Distance", Float) = 128.0
+        _FogMode ("Fog Mode (0 linear, 1 exp, 2 exp2)", Float) = 0.0
+        _FogDensity ("Fog Density (exp modes)", Float) = 0.0
     }
     SubShader
     {

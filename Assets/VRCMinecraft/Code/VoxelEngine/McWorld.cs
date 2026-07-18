@@ -3005,6 +3005,7 @@ public partial class McWorld : UdonSharpBehaviour
             // Block data vanished (eviction mid-prep) — abort and re-defer so it re-meshes when ready.
             chunk._gpuPrepActive = false;
             chunk.isBuildingMesh = false;
+            if (_decorStageOwner == chunk) _decorStageOwner = null; // free the decor scratch
             int ci = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
             if (ci != -1) MarkChunkMeshDeferred(ci);
             return;
@@ -3020,6 +3021,13 @@ public partial class McWorld : UdonSharpBehaviour
                 && gpuChunkSyncedDataVersion[chunkIndex] == chunk._cachedDataVersion;
             if (!instSynced) _GpuSyncChunkBlocks(chunk, data);
             if (chunk.opaqueMeshFilter != null) chunk.opaqueMeshFilter.sharedMesh = gpuVoxelChunkMesh;
+            // Assign the instanced material WITH the mesh: the atlas slot is synced above, so the
+            // voxel shader renders correctly right away. Leaving terrain.mat here made the chunk
+            // draw the 98k-vert voxel mesh through MCTerrain until stage 2 — wrong texture slices
+            // (uv.z = local Y) and the OTHER fog family for the multi-frame prep window ("fresh
+            // chunks aren't affected by fog / look off, fixes after a bit").
+            if (chunk.opaqueRenderer != null && gpuVoxelInstancedMaterial != null)
+                chunk.opaqueRenderer.sharedMaterial = gpuVoxelInstancedMaterial;
             chunk._derivedScanCursor = 0;
             chunk._gpuPrepStage = 1;
             return;
@@ -3039,6 +3047,14 @@ public partial class McWorld : UdonSharpBehaviour
             bool done = _RefreshChunkDerivedDataSliced(chunk, data, chunk._derivedScanCursor, GPU_PREP_DERIVED_SLICE_Y);
             chunk._derivedScanCursor = chunk._derivedScanCursor + GPU_PREP_DERIVED_SLICE_Y;
             if (done) chunk._gpuPrepStage = 2;
+            return;
+        }
+
+        if (chunk._gpuPrepStage == 4)
+        {
+            // Sliced decor emit continuation (cross-heavy chunks; entered from stage 2).
+            if (!_GpuStepDecorMesh(chunk)) return;
+            _GpuPrepEnterFluidOrFinish(chunk);
             return;
         }
 
@@ -3170,6 +3186,7 @@ public partial class McWorld : UdonSharpBehaviour
             chunk._gpuPrepActive = false;
             chunk._gpuPrepData = null;
             chunk.isBuildingMesh = false;
+            if (_decorStageOwner == chunk) _decorStageOwner = null; // free the decor scratch
             int ciMissing = ChunkCenteredCoordsTo1D(chunk.chunkX_world, chunk.chunkY_world, chunk.chunkZ_world);
             if (ciMissing != -1) MarkChunkMeshDeferred(ciMissing);
             return;
@@ -3216,6 +3233,22 @@ public partial class McWorld : UdonSharpBehaviour
             else if (chunk.cutoutMeshFilter.sharedMesh != null) chunk.cutoutMeshFilter.sharedMesh.Clear();
             if (chunk.cutoutRenderer != null) chunk.cutoutRenderer.enabled = false;
         }
+        // DECOR (SLICED): torches + crosses are invisible to the shared-voxel-mesh passes — give
+        // them their own tiny mesh on the Decor renderer. Grassy b1.7.3 chunks carry 100-250
+        // crosses; emitting them atomically here was a multi-ms step (the exact spike class
+        // stages 1/3 were sliced to kill), so big emits continue in stage 4.
+        if (!_GpuStepDecorMesh(chunk))
+        {
+            chunk._gpuPrepStage = 4;
+            return;
+        }
+        _GpuPrepEnterFluidOrFinish(chunk);
+    }
+
+    // Shared stage-2/stage-4 tail: route watery chunks into the sliced stage-3 fluid build,
+    // finish everything else.
+    private void _GpuPrepEnterFluidOrFinish(ChunkData chunk)
+    {
         if (chunk._hasWaterBlocks)
         {
             // Watery chunk: fluid mesh builds sliced in stage 3 (setup on the next step).
@@ -3268,6 +3301,123 @@ public partial class McWorld : UdonSharpBehaviour
             _GetDecompressedDataRaw(target);
             coldBudget = coldBudget - 1;
         }
+        return true;
+    }
+
+    // DECOR MESH (instanced-path chunks): the shared-voxel-mesh passes cannot draw sub-voxel
+    // geometry — crosses (flowers/tall grass/saplings, class-gated to 0) and torches (zeroed
+    // shouldDraw row) — so they were simply INVISIBLE on every never-edited chunk. Build a tiny
+    // private mesh from the derived-scan position caches (no voxel rescan) with the existing CPU
+    // emitters, applied to the 4th "Decor" renderer through the CPU cutout material (which
+    // samples GPU light per-fragment, so lighting matches). The emitters write the chunk's
+    // pooled cutout buffers; those are NOT allocated during a GPU prep, so the chunk's buffer
+    // refs are temporarily pointed at these world-owned scratch arrays (safe: prep steps are
+    // atomic within a call, and a prep-active chunk is never simultaneously CPU-meshing).
+    private Vector3[] _decorScratchVerts;
+    private int[] _decorScratchTris;
+    private Vector3[] _decorScratchUVs;
+    private Vector3[] _decorScratchNormals;
+    private Color[] _decorScratchColors;
+    // SLICED DECOR: the emit uses the world-shared scratch above, and preps step round-robin —
+    // two interleaved sliced builds would corrupt each other's verts. One owner at a time;
+    // non-owners return not-done and retry next step. Ownership is released on completion and
+    // on every prep abort (data-null, watchdog kill, GO recycle); acquisition always restarts
+    // the emit from cursor 0, so a stale cursor from an aborted run can never resume mid-scratch.
+    private ChunkData _decorStageOwner = null;
+    private const int DECOR_EMIT_SLICE = 48; // crosses per call (~1-3ms worst case in Udon)
+
+    // One bounded slice of the decor build. Returns true when the decor mesh is DONE for this
+    // prep (built, version-fresh, or not applicable); false = call again next step.
+    private bool _GpuStepDecorMesh(ChunkData chunk)
+    {
+        MeshFilter dmf = chunk.decorMeshFilter;
+        if (dmf == null) return true; // prefab without the Decor child — feature off
+        int crossCount = chunk._crossBlockCount;
+        int torchCount = chunk._torchBlockCount;
+        byte[] data = chunk._gpuPrepData;
+        if ((crossCount <= 0 && torchCount <= 0) || data == null)
+        {
+            // No decor content (or stale from a previous tenant/build) — clear + hide.
+            if (dmf.sharedMesh != null) dmf.sharedMesh.Clear();
+            dmf.gameObject.SetActive(false);
+            chunk._decorBuiltVersion = data != null ? chunk._cachedDataVersion : -1;
+            if (_decorStageOwner == chunk) _decorStageOwner = null;
+            return true;
+        }
+        // RE-PREP SKIP: decor already applied to THIS GameObject for this exact data version —
+        // the neighbor-rebuild re-preps that flood the mesh loop during load would otherwise
+        // re-pay the whole emit every time. (_EnsureChunkGo resets the stamp on re-pairing,
+        // and the GPU->CPU conversion resets it when the CPU cutout mesh takes over.)
+        if (chunk._decorBuiltVersion == chunk._cachedDataVersion && dmf.sharedMesh != null)
+            return true;
+
+        if (_decorStageOwner != chunk)
+        {
+            if (_decorStageOwner != null) return false; // scratch busy — retry next step
+            _decorStageOwner = chunk;
+            chunk._decorEmitCursor = 0; // acquisition always restarts the emit
+        }
+        if (_decorScratchVerts == null)
+        {
+            _decorScratchVerts = new Vector3[MAX_VERTS];
+            _decorScratchTris = new int[MAX_VERTS / 4 * 6];
+            _decorScratchUVs = new Vector3[MAX_VERTS];
+            _decorScratchNormals = new Vector3[MAX_VERTS];
+            _decorScratchColors = new Color[MAX_VERTS];
+        }
+        if (chunk._decorEmitCursor == 0) { chunk._decorVertCount = 0; chunk._decorTriCount = 0; }
+
+        // Repoint the chunk's cutout buffers at the scratch for this call only (they are
+        // guaranteed unused during a GPU prep), restoring everything before returning.
+        Vector3[] savedVerts = chunk._cutoutVertices; int[] savedTris = chunk._cutoutTriangles;
+        Vector3[] savedUVs = chunk._cutoutUVs; Vector3[] savedNormals = chunk._cutoutNormals;
+        Color[] savedColors = chunk._cutoutColors;
+        int savedVertCount = chunk._cutoutVertexCount; int savedTriCount = chunk._cutoutTriangleCount;
+        byte[] savedDecomp = chunk._decompSelf;
+        chunk._cutoutVertices = _decorScratchVerts; chunk._cutoutTriangles = _decorScratchTris;
+        chunk._cutoutUVs = _decorScratchUVs; chunk._cutoutNormals = _decorScratchNormals;
+        chunk._cutoutColors = _decorScratchColors;
+        chunk._cutoutVertexCount = chunk._decorVertCount; chunk._cutoutTriangleCount = chunk._decorTriCount;
+        chunk._decompSelf = data; // _AddTorchBlocks (and fire neighbor checks) read _decompSelf
+
+        int emitEnd = chunk._decorEmitCursor + DECOR_EMIT_SLICE;
+        if (emitEnd > crossCount) emitEnd = crossCount;
+        for (int i = chunk._decorEmitCursor; i < emitEnd; i++)
+        {
+            int packed = chunk._crossBlockPackedPositions[i];
+            int x = (packed >> 16) & 0xFF;
+            int y = (packed >> 8) & 0xFF;
+            int z = packed & 0xFF;
+            byte bid = data[y * (chunkSizeXZ * chunkSizeXZ) + z * chunkSizeXZ + x];
+            if (bid == 0) continue;
+            // Only Cutout-visibility content: _EmitCrossQuad routes other visibilities into the
+            // OPAQUE buffers, which are not allocated during a GPU prep (only the cutout refs
+            // were repointed at the scratch). Crosses and fire are all Cutout in practice.
+            BlockVisibilityType decorVis = bid < visibilityCache.Length ? visibilityCache[bid] : BlockVisibilityType.Cutout;
+            if (decorVis != BlockVisibilityType.Cutout) continue;
+            _AddCrossBlockQuads(chunk, bid, x, y, z);
+        }
+        chunk._decorEmitCursor = emitEnd;
+        bool crossesDone = emitEnd >= crossCount;
+        if (crossesDone) _AddTorchBlocks(chunk); // torches are few — ride the last slice
+
+        chunk._decorVertCount = chunk._cutoutVertexCount;
+        chunk._decorTriCount = chunk._cutoutTriangleCount;
+        chunk._cutoutVertices = savedVerts; chunk._cutoutTriangles = savedTris;
+        chunk._cutoutUVs = savedUVs; chunk._cutoutNormals = savedNormals;
+        chunk._cutoutColors = savedColors;
+        chunk._cutoutVertexCount = savedVertCount; chunk._cutoutTriangleCount = savedTriCount;
+        chunk._decompSelf = savedDecomp;
+        if (!crossesDone) return false;
+
+        // _ApplyDataToMesh owns the private mesh + the child GO active state (off when empty).
+        _ApplyDataToMesh(dmf, _decorScratchVerts, _decorScratchTris,
+            _decorScratchUVs, _decorScratchNormals, _decorScratchColors,
+            chunk._decorVertCount, chunk._decorTriCount);
+        if (chunk.decorRenderer != null) chunk.decorRenderer.enabled = true;
+        chunk._decorBuiltVersion = chunk._cachedDataVersion;
+        chunk._decorEmitCursor = 0;
+        _decorStageOwner = null;
         return true;
     }
 
@@ -5094,6 +5244,27 @@ public partial class McWorld : UdonSharpBehaviour
         chunk._fluidMeshBuilt = false; // fresh GO pairing — any water mesh on it is a previous tenant's
         chunk.cutoutMeshFilter = cutoutTransform != null ? cutoutTransform.GetComponent<MeshFilter>() : null;
         chunk.cutoutRenderer = cutoutTransform != null ? cutoutTransform.GetComponent<MeshRenderer>() : null;
+        // DECOR child (torches/crosses on instanced chunks). Optional: null when the prefab
+        // predates it — every decor consumer guards on the filter.
+        Transform decorTransform = go.transform.Find("Decor");
+        chunk.decorMeshFilter = decorTransform != null ? decorTransform.GetComponent<MeshFilter>() : null;
+        chunk.decorRenderer = decorTransform != null ? decorTransform.GetComponent<MeshRenderer>() : null;
+        if (decorTransform != null)
+        {
+            _AssignSharedChunkMaterial(decorTransform, sharedCutoutChunkMaterial);
+            if (chunk.decorMeshFilter != null && chunk.decorMeshFilter.sharedMesh != null)
+                chunk.decorMeshFilter.sharedMesh.Clear(); // previous tenant's decor
+            decorTransform.gameObject.SetActive(false);   // the decor build activates on content
+        }
+        chunk._decorBuiltVersion = -1; // fresh pairing — any decor stamp belongs to an old GO
+        chunk._decorEmitCursor = 0;
+        // POOLED-REUSE STATE RESET: the GPU prep's gates (enclosed skip, no-cutout-content skip)
+        // leave renderers DISABLED, and nothing else re-enables them for the next tenant — a fresh
+        // chunk could render invisible until its own prep stage 2. Start every pairing enabled;
+        // the prep re-gates within a few frames.
+        if (chunk.opaqueRenderer != null) chunk.opaqueRenderer.enabled = true;
+        if (chunk.cutoutRenderer != null) chunk.cutoutRenderer.enabled = true;
+        if (chunk.transparentRenderer != null) chunk.transparentRenderer.enabled = true;
         chunk.meshCollider = go.GetComponent<MeshCollider>();
         if (chunk.meshCollider != null) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; }
         go.SetActive(true);
@@ -5120,6 +5291,7 @@ public partial class McWorld : UdonSharpBehaviour
         _RecycleFilterMesh(chunk.opaqueMeshFilter);
         _RecycleFilterMesh(chunk.transparentMeshFilter);
         _RecycleFilterMesh(chunk.cutoutMeshFilter);
+        _RecycleFilterMesh(chunk.decorMeshFilter);
         if (chunk.meshCollider != null) { chunk.meshCollider.sharedMesh = null; chunk.meshCollider.enabled = false; }
         go.SetActive(false);
         if (_chunkGoPool != null && _chunkGoPoolCount < _chunkGoPool.Length) { _chunkGoPool[_chunkGoPoolCount] = go; _chunkGoPoolCount++; }
@@ -5128,12 +5300,16 @@ public partial class McWorld : UdonSharpBehaviour
         chunk.opaqueMeshFilter = null;
         chunk.transparentMeshFilter = null;
         chunk.cutoutMeshFilter = null;
+        chunk.decorMeshFilter = null;
+        chunk.decorRenderer = null;
         chunk.meshCollider = null;
         chunk.selectionCollider = null;
         // Abort any in-flight time-sliced GPU render-prep — its GameObject/filters are gone now.
         chunk._gpuPrepActive = false;
         chunk._gpuPrepData = null;
         chunk.isBuildingMesh = false;
+        if (_decorStageOwner == chunk) _decorStageOwner = null; // free the decor scratch
+        chunk._decorBuiltVersion = -1; // its decor mesh is gone with the GO
         chunk._renderMeshApplied = false; // its render mesh is gone — must re-apply on return
         chunk.isMeshDeferred = true; // re-mesh (re-acquires a GO) when it comes back into render distance
     }
@@ -5446,10 +5622,450 @@ public partial class McWorld : UdonSharpBehaviour
         else _goRecycleDryStreak = _goRecycleDryStreak + Mathf.Max(1, chunkGoRecycleScanPerFrame);
     }
 
+    // =========================================================================
+    // DAY/NIGHT CYCLE — b1.7.3 1:1 (restores the system deleted with TickWorld in the
+    // voxel-engine overhaul). worldTime derives from the VRChat server clock, so every
+    // client computes the identical time with zero networking (20 TPS, 24000-tick day =
+    // 20 real minutes). STORAGE-AT-MAX architecture: the light atlas and lightData keep
+    // skylight at noon values forever; skylightSubtracted is written here ONLY so CPU
+    // gameplay queries (GetFullBlockLightValue — b1.7.3 applies it at query time) track
+    // time, and the VISUAL darkening happens in the shaders via the _UdonVRCM_SkylightSub
+    // global (subtracted from SKY only, then maxed with block light, in
+    // MCTerrainGpuExactAo.cginc). No remesh, no relight, ever.
+    // =========================================================================
+    [Tooltip("Master toggle for the day/night cycle. Off = permanent noon (pre-restore behavior).")]
+    public bool enableDayNightCycle = true;
+    [Tooltip("Added to the server-clock-derived world time, in ticks (0-23999 shifts the phase; e.g. 6000 starts at noon).")]
+    public int worldTimeOffsetTicks = 0;
+    private bool _dayNightInit = false;
+    private bool _dayNightWasRunning = false; // toggle-off restore gate (NOT skylightSubtracted != 0 — that is 0 for ALL daylight hours, which skipped the restore and could freeze e.g. underwater fog world-wide)
+    private int _dayNightPropSkylightSubId;
+    private int _dayNightPropDayProgressId;
+    private int _dayNightPropCelestialId;
+    private int _dayNightPropFogColorId;
+    private Material _dayNightSkyboxMat;
+    private float _dayNightLastSkyPublish = -999f;
+
+    // --- b1.7.3 FOG STATE MACHINE (EntityRenderer.updateFogColor/setupFog/updateRenderer,
+    // weatherless) + star/sunrise publishes. renderDistance is EMULATED: the fog math is
+    // parameterized exactly like gameSettings.renderDistance (farPlane = 256 >> rd), and
+    // our radial render distance (8 chunks PC / 4 mobile) equals vanilla Normal/Short.
+    [Tooltip("b1.7.3 gameSettings.renderDistance emulated by the fog math (0=Far/256m, 1=Normal/128m, 2=Short/64m, 3=Tiny/32m). -1 = auto: Normal on PC, Short on Android — matches the world's 8/4-chunk radial render distance exactly.")]
+    public int fogRenderDistanceSetting = -1;
+    private float _fogFarPlane = 256f;
+    private float _fogSkyBlend = 0.29289322f;  // 1-(1/(4-rd))^0.25 (updateFogColor sky blend)
+    private float _fogBrightBase = 0f;         // (3-rd)/3 (updateRenderer light floor)
+    private float _fogColor1 = 1.0f;           // smoothed fog brightness (updateRenderer)
+    private float _fogColor2 = 1.0f;           // previous tick's value, lerped by partialTick
+    private long _fogLastTick = long.MinValue;
+    private int _fogMedium = 0;                // 0 air, 1 water, 2 lava (isInsideOfMaterial at eye)
+    private Vector3 _fogEyePos;
+    private bool _fogEyeValid = false;
+    private int _dayNightPropFogModeId;
+    private int _dayNightPropFogDensityId;
+    private int _dayNightPropFogStartId;
+    private int _dayNightPropFogEndId;
+    private int _dayNightPropStarBrightnessId;
+    private int _dayNightPropSunriseColorId;
+    private int _dayNightPropFluidFogColorId;
+    private int _dayNightPropFluidFogDensityId;
+
+    // b1.7.3 WorldProvider.calculateCelestialAngle, verbatim (0 = noon at tick 6000,
+    // 0.5 = midnight at tick 18000; cosine-eased with weight 1/3 — NOT linear in time).
+    private float _CalculateCelestialAngle(long worldTime, float partialTick)
+    {
+        // Udon exposes no long %/ operators — compute the 24000 modulo in doubles, exact
+        // for any worldTime below 2^53 (the server clock never gets remotely close).
+        double wt = (double)worldTime;
+        int t = (int)(wt - System.Math.Floor(wt / 24000.0) * 24000.0);
+        float f = ((float)t + partialTick) / 24000.0f - 0.25f;
+        if (f < 0.0f) f += 1.0f;
+        if (f > 1.0f) f -= 1.0f;
+        float f0 = f;
+        f = 1.0f - (float)((System.Math.Cos((double)f * System.Math.PI) + 1.0) / 2.0);
+        f = f0 + (f - f0) / 3.0f;
+        return f;
+    }
+
+    // b1.7.3 MathHelper.cos, bit-faithful WITHOUT the 256KB table: SIN_TABLE entries are
+    // exactly (float)Math.sin(i * 2pi/65536), so computing sin of the truncation-quantized
+    // index reproduces every table value (incl. the up-to ~9.6e-5 error that shifts
+    // skylight step ticks vs an exact cosine).
+    private float _MathHelperCos(float x)
+    {
+        int idx = ((int)(x * 10430.378f + 16384.0f)) & 0xFFFF;
+        return (float)System.Math.Sin((double)idx * (System.Math.PI * 2.0 / 65536.0));
+    }
+
+    // b1.7.3 MathHelper.sin — same table emulation, without the cos quarter-turn offset.
+    private float _MathHelperSin(float x)
+    {
+        int idx = ((int)(x * 10430.378f)) & 0xFFFF;
+        return (float)System.Math.Sin((double)idx * (System.Math.PI * 2.0 / 65536.0));
+    }
+
+    // b1.7.3 World.calculateSkylightSubtracted(1.0F) with zero rain/thunder strength (no
+    // weather system yet). The double inversion is kept LITERALLY (not algebraically
+    // collapsed): 1f-(1f-c) quantizes c to the 2^-24 grid for c < 0.5 in Java floats, so
+    // the collapse is not bit-exact. MathHelper.cos + float-evaluated argument as in Java.
+    private int _CalculateSkylightSubtracted(long worldTime)
+    {
+        float angle = _CalculateCelestialAngle(worldTime, 1.0f);
+        float f = 1.0f - (_MathHelperCos(angle * (float)System.Math.PI * 2.0f) * 2.0f + 0.5f);
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        f = 1.0f - f;
+        // (1 - rainStrength*5/16) and (1 - thunderStrength*5/16) factors go here when a
+        // weather system exists; both are exactly 1.0 today.
+        f = 1.0f - f;
+        return (int)(f * 11.0f);
+    }
+
+    // b1.7.3 WorldProvider.func_4096_a (base fog color vs celestial angle), weatherless.
+    private Color _CalculateFogColor(float celestialAngle)
+    {
+        float f = _MathHelperCos(celestialAngle * (float)System.Math.PI * 2.0f) * 2.0f + 0.5f;
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        float r = 192.0f / 255.0f * (f * 0.94f + 0.06f);
+        float g = 216.0f / 255.0f * (f * 0.94f + 0.06f);
+        float b = 1.0f * (f * 0.91f + 0.09f);
+        return new Color(r, g, b, 1.0f);
+    }
+
+    // b1.7.3 end-user fog: EntityRenderer.updateFogColor blends the base fog toward the
+    // biome sky color by 1-(1/(4-renderDistance))^0.25 (_fogSkyBlend, from the emulated
+    // renderDistance set at init). Sky color = biome getSkyColorByTemp scaled by the same
+    // clamped day factor. Biome temp uses the temperate default 0.7 for now — the
+    // temp-driven hue shift is +-0.017 max, far below the ~24-29% blend this restores.
+    private Color _CalculateCompositedFogColor(float celestialAngle)
+    {
+        Color baseFog = _CalculateFogColor(celestialAngle);
+        float dayFactor = _MathHelperCos(celestialAngle * (float)System.Math.PI * 2.0f) * 2.0f + 0.5f;
+        if (dayFactor < 0.0f) dayFactor = 0.0f;
+        if (dayFactor > 1.0f) dayFactor = 1.0f;
+
+        // BiomeGenBase.getSkyColorByTemp(0.7) via java.awt HSBtoRGB, ported exactly:
+        // hue = 224/360 - t*0.05, sat = 0.5 + t*0.1, val = 1.0, t = clamp(temp/3, -1, 1).
+        float t = 0.7f / 3.0f;
+        float hue = 224.0f / 360.0f - t * 0.05f;
+        float sat = 0.5f + t * 0.1f;
+        float h6 = (hue - (float)System.Math.Floor((double)hue)) * 6.0f;
+        float hf = h6 - (float)System.Math.Floor((double)h6);
+        float p = 1.0f * (1.0f - sat);
+        float q = 1.0f * (1.0f - sat * hf);
+        float u = 1.0f * (1.0f - sat * (1.0f - hf));
+        int ri = 0, gi = 0, bi = 0;
+        int hcase = (int)h6;
+        if (hcase == 0) { ri = (int)(255.0f + 0.5f); gi = (int)(u * 255.0f + 0.5f); bi = (int)(p * 255.0f + 0.5f); }
+        else if (hcase == 1) { ri = (int)(q * 255.0f + 0.5f); gi = (int)(255.0f + 0.5f); bi = (int)(p * 255.0f + 0.5f); }
+        else if (hcase == 2) { ri = (int)(p * 255.0f + 0.5f); gi = (int)(255.0f + 0.5f); bi = (int)(u * 255.0f + 0.5f); }
+        else if (hcase == 3) { ri = (int)(p * 255.0f + 0.5f); gi = (int)(q * 255.0f + 0.5f); bi = (int)(255.0f + 0.5f); }
+        else if (hcase == 4) { ri = (int)(u * 255.0f + 0.5f); gi = (int)(p * 255.0f + 0.5f); bi = (int)(255.0f + 0.5f); }
+        else { ri = (int)(255.0f + 0.5f); gi = (int)(p * 255.0f + 0.5f); bi = (int)(q * 255.0f + 0.5f); }
+        float skyR = (ri / 255.0f) * dayFactor;
+        float skyG = (gi / 255.0f) * dayFactor;
+        float skyB = (bi / 255.0f) * dayFactor;
+
+        float blend = _fogSkyBlend; // 1 - (1/(4-renderDistance))^0.25, set at day/night init
+        float inv = 1.0f - blend;
+        return new Color(
+            baseFog.r * inv + skyR * blend,
+            baseFog.g * inv + skyG * blend,
+            baseFog.b * inv + skyB * blend,
+            1.0f);
+    }
+
+    public bool IsDaytime()
+    {
+        return skylightSubtracted < 4; // b1.7.3 World.isDaytime
+    }
+
+    // b1.7.3 World.getStarBrightness, verbatim (weatherless: the renderSky rain multiplier
+    // is 1). The shader squares this (vanilla draws stars with color=alpha=b under
+    // GL_SRC_ALPHA/GL_ONE, contributing coverage * b^2).
+    private float _GetStarBrightness(float celestialAngle)
+    {
+        float f = 1.0f - (_MathHelperCos(celestialAngle * (float)System.Math.PI * 2.0f) * 2.0f + 12.0f / 16.0f);
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        return f * f * 0.5f;
+    }
+
+    // b1.7.3 WorldProvider.calcSunriseSunsetColors, verbatim. Vanilla returns null outside
+    // the |cos| <= 0.4 dawn/dusk window — encoded here as alpha 0 (the shader skips the fan).
+    private Color _CalcSunriseSunsetColor(float celestialAngle)
+    {
+        float range = 0.4f;
+        float c = _MathHelperCos(celestialAngle * (float)System.Math.PI * 2.0f) - 0.0f;
+        float center = -0.0f;
+        if (c >= center - range && c <= center + range)
+        {
+            float t = (c - center) / range * 0.5f + 0.5f;
+            float alpha = 1.0f - (1.0f - _MathHelperSin(t * (float)System.Math.PI)) * 0.99f;
+            alpha *= alpha;
+            return new Color(t * 0.3f + 0.7f, t * t * 0.7f + 0.2f, 0.2f, alpha);
+        }
+        return new Color(0f, 0f, 0f, 0f);
+    }
+
+    // b1.7.3 Entity.isInsideOfMaterial at the local player's EYE (the camera in VR — fog
+    // must flip when the camera submerges, not the torso): block at floor(eye), and the eye
+    // must sit below the fluid's meta-derived surface, surface = (y+1) - (getPercentAir(meta)
+    // - 1/9). Returns 0 air, 1 water, 2 lava. Also caches the eye position for the per-tick
+    // fog brightness sample.
+    private int _CalcFogMedium()
+    {
+        VRCPlayerApi lp = Networking.LocalPlayer;
+        if (lp == null || !lp.IsValid()) { _fogEyeValid = false; return 0; }
+        Vector3 eye = lp.GetTrackingData(VRCPlayerApi.TrackingDataType.Head).position;
+        _fogEyePos = eye;
+        _fogEyeValid = true;
+        int bx = Mathf.FloorToInt(eye.x);
+        int by = Mathf.FloorToInt(eye.y);
+        int bz = Mathf.FloorToInt(eye.z);
+        byte b = GetBlockAndMeta(bx, by, bz);
+        bool isWater = b == (byte)BlockMaterial.WATER || b == (byte)BlockMaterial.STATIONARY_WATER;
+        bool isLava = b == (byte)BlockMaterial.LAVA || b == (byte)BlockMaterial.STATIONARY_LAVA;
+        if (!isWater && !isLava) return 0;
+        int meta = lastMetaResult;
+        if (meta >= 8) meta = 0;                            // BlockFluid.getPercentAir
+        float percentAir = (float)(meta + 1) / 9.0f;
+        float surfaceY = (float)(by + 1) - (percentAir - 1.0f / 9.0f);
+        if (!(eye.y < surfaceY)) return 0;
+        return isWater ? 1 : 2;
+    }
+
+    private void _UpdateDayNightCycle()
+    {
+        if (!enableDayNightCycle)
+        {
+            // Tooltip contract: off = permanent NOON. If the cycle already ran, restore the
+            // noon state once instead of freezing whatever time it happened to be.
+            if (_dayNightInit && _dayNightWasRunning)
+            {
+                _dayNightWasRunning = false;
+                skylightSubtracted = 0;
+                VRCShader.SetGlobalFloat(_dayNightPropSkylightSubId, 0.0f);
+                if (_dayNightSkyboxMat != null)
+                {
+                    _dayNightSkyboxMat.SetFloat(_dayNightPropDayProgressId, 0.25f); // tick 6000
+                    _dayNightSkyboxMat.SetFloat(_dayNightPropCelestialId, 0.0f);
+                }
+                Color noonFog = _CalculateCompositedFogColor(0.0f);
+                _fogMedium = 0;
+                _fogColor1 = 1.0f;
+                _fogColor2 = 1.0f;
+                _PublishFogState(noonFog, 0f, 0f, _fogFarPlane * 0.25f, _fogFarPlane, 0f);
+                if (_dayNightSkyboxMat != null)
+                {
+                    _dayNightSkyboxMat.SetFloat(_dayNightPropStarBrightnessId, 0f);
+                    _dayNightSkyboxMat.SetColor(_dayNightPropSunriseColorId, new Color(0f, 0f, 0f, 0f));
+                }
+            }
+            return;
+        }
+        if (!_dayNightInit)
+        {
+            _dayNightInit = true;
+            _dayNightPropSkylightSubId = VRCShader.PropertyToID("_UdonVRCM_SkylightSub");
+            _dayNightPropDayProgressId = VRCShader.PropertyToID("_DayProgress");
+            _dayNightPropCelestialId = VRCShader.PropertyToID("_CelestialAngle");
+            _dayNightPropFogColorId = VRCShader.PropertyToID("_FogColor");
+            _dayNightPropFogModeId = VRCShader.PropertyToID("_FogMode");
+            _dayNightPropFogDensityId = VRCShader.PropertyToID("_FogDensity");
+            _dayNightPropFogStartId = VRCShader.PropertyToID("_FogStart");
+            _dayNightPropFogEndId = VRCShader.PropertyToID("_FogEnd");
+            _dayNightPropStarBrightnessId = VRCShader.PropertyToID("_StarBrightness");
+            _dayNightPropSunriseColorId = VRCShader.PropertyToID("_SunriseColor");
+            _dayNightPropFluidFogColorId = VRCShader.PropertyToID("_FluidFogColor");
+            _dayNightPropFluidFogDensityId = VRCShader.PropertyToID("_FluidFogDensity");
+            _dayNightSkyboxMat = RenderSettings.skybox;
+            VRCShader.SetGlobalFloat(_dayNightPropSkylightSubId, (float)skylightSubtracted);
+
+            // Emulated gameSettings.renderDistance for the fog math (see field tooltip).
+            // Auto mode derives it from the ACTUAL radial mesh render distance (already
+            // platform-selected and capacity-clamped at init), so fog start/end track the real
+            // world edge exactly like vanilla: farPlaneDistance = 256 >> renderDistance, i.e.
+            // Far 256m / Normal 128m / Short 64m / Tiny 32m, start = far * 0.25, end = far.
+            int rd = fogRenderDistanceSetting;
+            if (rd < 0)
+            {
+                int rdBlocks = _activeRenderDistanceChunks * chunkSizeXZ;
+                if (rdBlocks >= 256) rd = 0;
+                else if (rdBlocks >= 128) rd = 1;
+                else if (rdBlocks >= 64) rd = 2;
+                else rd = 3;
+            }
+            if (rd > 3) rd = 3;
+            _fogFarPlane = (float)(256 >> rd);                              // EntityRenderer.setupCameraTransform
+            _fogSkyBlend = 1.0f - Mathf.Pow(1.0f / (float)(4 - rd), 0.25f); // updateFogColor var4
+            _fogBrightBase = (float)(3 - rd) / 3.0f;                        // updateRenderer var2
+        }
+        _dayNightWasRunning = true; // arm the toggle-off noon restore
+
+        // NOTE: the Photon server clock is int32 milliseconds and wraps every ~49.7 days of
+        // node uptime — when it does, every client jumps phase by the same ~3346 ticks at
+        // the same moment (synchronized, momentary; not worth code to hide). All modular
+        // arithmetic is done in doubles (exact below 2^53) — Udon exposes no long %/.
+        double tickDouble = Networking.GetServerTimeInSeconds() * 20.0 + (double)worldTimeOffsetTicks;
+        if (tickDouble < 0.0) tickDouble += 24000.0 * (System.Math.Floor(-tickDouble / 24000.0) + 1.0); // clock skew safety
+        long worldTime = (long)tickDouble;
+
+        // Per-tick integer skylight (b1.7.3 recomputes once per World.tick with partial=1).
+        int sub = _CalculateSkylightSubtracted(worldTime);
+        if (sub != skylightSubtracted)
+        {
+            skylightSubtracted = sub;
+            VRCShader.SetGlobalFloat(_dayNightPropSkylightSubId, (float)sub);
+        }
+
+        // FOG MEDIUM (b1.7.3 checks every frame): eye-in-fluid must flip the fog state
+        // instantly, so it runs outside the 10Hz cadence and forces a publish on change.
+        int medium = _CalcFogMedium();
+        bool mediumChanged = medium != _fogMedium;
+        if (mediumChanged) _fogMedium = medium;
+
+        // b1.7.3 EntityRenderer.updateRenderer, once per tick: smooth the fog brightness
+        // multiplier toward the light at the player (matters at renderDistance > 0, where
+        // night/caves dim the fog color itself; at Far it converges to exactly 1.0).
+        if (worldTime != _fogLastTick)
+        {
+            _fogLastTick = worldTime;
+            _fogColor2 = _fogColor1;
+            float lb = 1.0f;
+            if (_fogEyeValid && lightBrightnessTable != null)
+            {
+                int lv = GetFullBlockLightValue(Mathf.FloorToInt(_fogEyePos.x), Mathf.FloorToInt(_fogEyePos.y), Mathf.FloorToInt(_fogEyePos.z));
+                if (lv < 0) lv = 0;
+                if (lv > 15) lv = 15;
+                lb = lightBrightnessTable[lv];
+            }
+            float target = lb * (1.0f - _fogBrightBase) + _fogBrightBase;
+            _fogColor1 += (target - _fogColor1) * 0.1f;
+        }
+
+        // Sky/fog visuals at ~10Hz — imperceptible for a 20-minute day, saves the externs.
+        float now = Time.realtimeSinceStartup;
+        if (!mediumChanged && now - _dayNightLastSkyPublish < 0.1f) return;
+        _dayNightLastSkyPublish = now;
+
+        float partial = (float)(tickDouble - System.Math.Floor(tickDouble));
+        float celestial = _CalculateCelestialAngle(worldTime, partial);
+        double wtd = (double)worldTime;
+        float dayProgress = (float)((wtd - System.Math.Floor(wtd / 24000.0) * 24000.0) / 24000.0);
+        if (_dayNightSkyboxMat != null)
+        {
+            _dayNightSkyboxMat.SetFloat(_dayNightPropDayProgressId, dayProgress);
+            _dayNightSkyboxMat.SetFloat(_dayNightPropCelestialId, celestial);
+            _dayNightSkyboxMat.SetFloat(_dayNightPropStarBrightnessId, _GetStarBrightness(celestial));
+            _dayNightSkyboxMat.SetColor(_dayNightPropSunriseColorId, _CalcSunriseSunsetColor(celestial));
+        }
+
+        // b1.7.3 EntityRenderer.updateFogColor + setupFog, weatherless: water/lava override
+        // the color outright (not a blend), then the smoothed brightness multiplier applies
+        // in every case; mode/density/start/end mirror setupFog exactly.
+        Color fog;
+        float fogMode, fogDensity, fluidDensity;
+        if (_fogMedium == 1)
+        {
+            fog = new Color(0.02f, 0.02f, 0.2f, 1.0f);
+            fogMode = 1f; fogDensity = 0.1f; fluidDensity = 0.1f;
+        }
+        else if (_fogMedium == 2)
+        {
+            fog = new Color(0.6f, 0.1f, 0.0f, 1.0f);
+            fogMode = 1f; fogDensity = 2.0f; fluidDensity = 2.0f;
+        }
+        else
+        {
+            fog = _CalculateCompositedFogColor(celestial);
+            fogMode = 0f; fogDensity = 0f; fluidDensity = 0f;
+        }
+        float fogMult = _fogColor2 + (_fogColor1 - _fogColor2) * partial;
+        fog = new Color(fog.r * fogMult, fog.g * fogMult, fog.b * fogMult, 1.0f);
+        _PublishFogState(fog, fogMode, fogDensity, _fogFarPlane * 0.25f, _fogFarPlane, fluidDensity);
+    }
+
+    // Pushes one fog state to RenderSettings (standard-shader props/avatars), the three
+    // shared terrain materials (their own radial fog via calcMinecraftFog reads _FogMode:
+    // 0 = linear start/end, 1 = exp density), and the skybox's fluid-fog override. The
+    // skybox's own _FogStart (gradient band, Range 0-1) is a DIFFERENT property on a
+    // different material and is never touched here.
+    private void _PublishFogState(Color fog, float fogMode, float fogDensity, float fogStart, float fogEnd, float fluidDensity)
+    {
+        RenderSettings.fogColor = fog;
+        RenderSettings.fogMode = fogMode > 0.5f ? FogMode.Exponential : FogMode.Linear;
+        RenderSettings.fogDensity = fogDensity;
+        RenderSettings.fogStartDistance = fogStart;
+        RenderSettings.fogEndDistance = fogEnd;
+        if (sharedOpaqueChunkMaterial != null)
+        {
+            sharedOpaqueChunkMaterial.SetColor(_dayNightPropFogColorId, fog);
+            sharedOpaqueChunkMaterial.SetFloat(_dayNightPropFogModeId, fogMode);
+            sharedOpaqueChunkMaterial.SetFloat(_dayNightPropFogDensityId, fogDensity);
+            sharedOpaqueChunkMaterial.SetFloat(_dayNightPropFogStartId, fogStart);
+            sharedOpaqueChunkMaterial.SetFloat(_dayNightPropFogEndId, fogEnd);
+        }
+        if (sharedCutoutChunkMaterial != null)
+        {
+            sharedCutoutChunkMaterial.SetColor(_dayNightPropFogColorId, fog);
+            sharedCutoutChunkMaterial.SetFloat(_dayNightPropFogModeId, fogMode);
+            sharedCutoutChunkMaterial.SetFloat(_dayNightPropFogDensityId, fogDensity);
+            sharedCutoutChunkMaterial.SetFloat(_dayNightPropFogStartId, fogStart);
+            sharedCutoutChunkMaterial.SetFloat(_dayNightPropFogEndId, fogEnd);
+        }
+        if (sharedTransparentChunkMaterial != null)
+        {
+            sharedTransparentChunkMaterial.SetColor(_dayNightPropFogColorId, fog);
+            sharedTransparentChunkMaterial.SetFloat(_dayNightPropFogModeId, fogMode);
+            sharedTransparentChunkMaterial.SetFloat(_dayNightPropFogDensityId, fogDensity);
+            sharedTransparentChunkMaterial.SetFloat(_dayNightPropFogStartId, fogStart);
+            sharedTransparentChunkMaterial.SetFloat(_dayNightPropFogEndId, fogEnd);
+        }
+        // The GPU chunk-mesh render path (stage-2 assign: shared voxel mesh + the
+        // M_MCVoxelInstanced family) is what MOST steady-state chunks render with — its
+        // shaders carry their own fog uniforms, which used to sit at static serialized
+        // values ("fog never changes with time/water/lava" bug).
+        if (gpuVoxelInstancedMaterial != null)
+        {
+            gpuVoxelInstancedMaterial.SetColor(_dayNightPropFogColorId, fog);
+            gpuVoxelInstancedMaterial.SetFloat(_dayNightPropFogModeId, fogMode);
+            gpuVoxelInstancedMaterial.SetFloat(_dayNightPropFogDensityId, fogDensity);
+            gpuVoxelInstancedMaterial.SetFloat(_dayNightPropFogStartId, fogStart);
+            gpuVoxelInstancedMaterial.SetFloat(_dayNightPropFogEndId, fogEnd);
+        }
+        if (gpuVoxelCutoutMaterial != null)
+        {
+            gpuVoxelCutoutMaterial.SetColor(_dayNightPropFogColorId, fog);
+            gpuVoxelCutoutMaterial.SetFloat(_dayNightPropFogModeId, fogMode);
+            gpuVoxelCutoutMaterial.SetFloat(_dayNightPropFogDensityId, fogDensity);
+            gpuVoxelCutoutMaterial.SetFloat(_dayNightPropFogStartId, fogStart);
+            gpuVoxelCutoutMaterial.SetFloat(_dayNightPropFogEndId, fogEnd);
+        }
+        if (gpuVoxelTransparentMaterial != null)
+        {
+            gpuVoxelTransparentMaterial.SetColor(_dayNightPropFogColorId, fog);
+            gpuVoxelTransparentMaterial.SetFloat(_dayNightPropFogModeId, fogMode);
+            gpuVoxelTransparentMaterial.SetFloat(_dayNightPropFogDensityId, fogDensity);
+            gpuVoxelTransparentMaterial.SetFloat(_dayNightPropFogStartId, fogStart);
+            gpuVoxelTransparentMaterial.SetFloat(_dayNightPropFogEndId, fogEnd);
+        }
+        if (_dayNightSkyboxMat != null)
+        {
+            _dayNightSkyboxMat.SetColor(_dayNightPropFluidFogColorId, fog);
+            _dayNightSkyboxMat.SetFloat(_dayNightPropFluidFogDensityId, fluidDensity);
+        }
+    }
+
     void Update()
     {
         // Safety check: Don't process if not initialized
         if (chunks_1D == null || terrainGenerator == null) return;
+
+        // DAY/NIGHT: cheap (a handful of float ops per frame; externs only on tick change
+        // or the 10Hz sky publish) — runs before the budgeted lanes, outside the envelope.
+        _UpdateDayNightCycle();
 
         // FRAME GOVERNOR anchor: everything budgeted this Update (scheduler + all PAC lanes)
         // measures against this single envelope. Mandatory unbudgeted work (collision,
@@ -8617,6 +9233,7 @@ public partial class McWorld : UdonSharpBehaviour
         chunk._gpuPrepData = null;
         chunk.isBuildingMesh = false;
         chunk.interactionMeshPriority = false;
+        if (_decorStageOwner == chunk) _decorStageOwner = null; // free the decor scratch
     }
 
     public void BuildChunkMesh(int chunkIndex)
@@ -8737,10 +9354,45 @@ public partial class McWorld : UdonSharpBehaviour
         // the GPU voxel mesh and the CPU mesh don't double up. Restore the original opaque material so
         // the CPU mesh shades normally (the GPU path swapped it to the voxel-cull material).
         chunk._isInstancedRendered = false;
-        if (chunk._isGpuMeshRendered)
+        // Gate on OBSERVABLE GPU render state, not just the completion flag: a watchdog-killed
+        // prep (ForceCompleteStuckMesh) leaves the shared mesh/instanced material/decor applied
+        // with _isGpuMeshRendered still false — skipping this cleanup then let the CPU build
+        // Clear() the SHARED voxel mesh (blanking every instanced chunk), draw CPU meshes
+        // through the voxel-cull shader, and double the decor geometry.
+        bool hadGpuRenderState = chunk._isGpuMeshRendered
+            || (chunk.opaqueMeshFilter != null && chunk.opaqueMeshFilter.sharedMesh == gpuVoxelChunkMesh)
+            || (gpuVoxelInstancedMaterial != null && chunk.opaqueRenderer != null
+                && chunk.opaqueRenderer.sharedMaterial == gpuVoxelInstancedMaterial);
+        if (hadGpuRenderState)
         {
-            if (chunk.opaqueRenderer != null && chunk.opaqueOriginalMaterial != null)
-                chunk.opaqueRenderer.sharedMaterial = chunk.opaqueOriginalMaterial;
+            if (chunk.opaqueRenderer != null)
+            {
+                if (chunk.opaqueOriginalMaterial != null)
+                    chunk.opaqueRenderer.sharedMaterial = chunk.opaqueOriginalMaterial;
+                chunk.opaqueRenderer.enabled = true; // the prep's enclosed gate may have disabled it
+            }
+            // FULL MATERIAL RESTORE (torch-invisibility fix): the GPU prep swaps the CUTOUT
+            // renderer to the instanced material too (and may leave it disabled via its
+            // no-cutout-content skip path) — restoring only the opaque material made every
+            // CPU-converted chunk draw its cutout mesh (leaves, crosses, TORCHES) through the
+            // voxel-cull shader, which degenerates CPU meshes (uv2/uv.z carry different data).
+            if (chunk.cutoutRenderer != null)
+            {
+                if (sharedCutoutChunkMaterial != null)
+                    chunk.cutoutRenderer.sharedMaterial = sharedCutoutChunkMaterial;
+                chunk.cutoutRenderer.enabled = true;
+            }
+            if (chunk.transparentRenderer != null && sharedTransparentChunkMaterial != null)
+                chunk.transparentRenderer.sharedMaterial = sharedTransparentChunkMaterial;
+            // The CPU cutout mesh re-emits crosses + torches — clear the instanced-path decor
+            // mesh so the geometry doesn't double up, and drop the stamp so a later instanced
+            // re-prep rebuilds it.
+            if (chunk.decorMeshFilter != null)
+            {
+                if (chunk.decorMeshFilter.sharedMesh != null) chunk.decorMeshFilter.sharedMesh.Clear();
+                chunk.decorMeshFilter.gameObject.SetActive(false);
+            }
+            chunk._decorBuiltVersion = -1;
             // Detach the SHARED static voxel mesh from this chunk's filters — the upcoming CPU
             // _ApplyDataToMesh would otherwise Clear() the shared mesh and blank every GPU chunk.
             // The fluid filter already builds a private mesh, but guard it too for pooled-reuse safety.
@@ -14072,12 +14724,16 @@ public partial class McWorld : UdonSharpBehaviour
             cullingCache[i] = (BlockCullingType)((blockDataCache[i] >> 3) & 0x7);
             shapeTypeCache[i] = (McBlockShapeType)((blockDataCache[i] >> 6) & 0x3); // NEW: Cache shape type (bits 6-7)
             // Box-collision set = exactly the blocks the per-chunk collision MESH included: a full-cube,
-            // opaque-or-cutout, non-fluid block. (Cross plants, torches, fluids, and invisible blocks
-            // never got a collision mesh, so they get no box collider either — preserves current feel.)
+            // opaque-or-cutout, non-fluid block. Torches must be EXPLICITLY excluded: they are
+            // authored shape=Cube + visibility=Cutout (there is no Torch shape type), which made
+            // every torch a full solid box — b1.7.3 BlockTorch.getCollisionBoundingBoxFromPool
+            // returns null, torches have NO collision. Targeting/breaking is unaffected (the
+            // selectionCollider is a separate mesh).
             _blockHasCollisionCache[i] = i != 0
                 && (visibilityCache[i] == BlockVisibilityType.Opaque || visibilityCache[i] == BlockVisibilityType.Cutout)
                 && shapeTypeCache[i] == McBlockShapeType.Cube
-                && !_IsFluidBlock((byte)i);
+                && !_IsFluidBlock((byte)i)
+                && !_IsTorchBlock((byte)i);
             if (i == 2 || i == 31) biomeTintModeCache[i] = 1;
             else if (i == 18) biomeTintModeCache[i] = 2;
             else if (i == 8 || i == 9) biomeTintModeCache[i] = 3;
