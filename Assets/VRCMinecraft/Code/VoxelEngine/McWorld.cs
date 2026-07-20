@@ -237,8 +237,6 @@ public partial class McWorld : UdonSharpBehaviour
     public bool useCompactGpuFaceExport = false;
     [Tooltip("Experimental (default OFF): extract many chunks' faces in ONE blit over a tiled RT + ONE region readback, then demux on the CPU. Cuts the per-chunk readback request/callback count by the batch tile count. Falls back to the per-chunk path for interaction/resident chunks. Off = unchanged per-chunk path.")]
     public bool enableBatchedFaceReadback = false;
-    [Tooltip("Default OFF: bake GEOMETRIC ambient occlusion (block-only, light-independent) into vertex-color alpha at decode time and let the shader do light x bakedAO with ONE light sample/fragment, instead of the ~16-sample per-fragment GPU-exact AO. Big render-fps win; keeps GPU lighting. Only active when ambientOcclusion + the GPU lighting backend are on. Off = unchanged per-fragment exact AO.")]
-    public bool useBakedVertexAo = false;
     [Tooltip("GPU-resident chunks (#2 migration, STEP 1 safety net — default OFF). When on, chunks outside cpuMirrorRadius drop their CPU block mirror after gen and rehydrate on demand from the atlas via rehydrateReceiver. Off = unchanged behaviour.")]
     public bool enableGpuResidentChunks = false;
 
@@ -264,18 +262,6 @@ public partial class McWorld : UdonSharpBehaviour
     public Material gpuWaterAnimMaterial;
     // GPU OFFLOAD #3: bakes per-column biome tint from climate texture + grass/foliage/water LUTs.
     public Material gpuBiomeColorBakeMaterial;
-    // GPU OFFLOAD #9: per-vertex ambient occlusion baker, reads from chunk atlas.
-    public Material gpuAOBakeMaterial;
-    // GPU OFFLOAD #4: copies neighbor-face borders into the per-chunk sentinel RT.
-    public Material gpuSentinelBorderMaterial;
-    // GPU OFFLOAD #6: writes one voxel + propagates light a few cells outward.
-    public Material gpuLightPokeMaterial;
-    // GPU OFFLOAD #7: fluid cellular automaton (water flow / lava sticky).
-    public Material gpuFluidTickMaterial;
-    // GPU OFFLOAD #10: voxel DDA raycast for block target.
-    public Material gpuRaycastMaterial;
-    // GPU OFFLOAD #11: column-RLE encoder (one Blit per chunk → small fixed-size RT).
-    public Material gpuRleEncodeMaterial;
     // GPU OFFLOAD #5: per-chunk instanced quad renderer (Mesh.DrawMeshInstanced).
     // When set, mesh build emits ZERO vertex arrays to CPU; instead we keep a
     // face-buffer RT per chunk and render via VRCGraphics.DrawMeshInstanced.
@@ -489,7 +475,6 @@ public partial class McWorld : UdonSharpBehaviour
     private RenderTexture gpuLightAtlasScratch;
     private bool gpuLightingSeedPending = false;
     private int gpuLightingIterationsRemaining = 0;
-    private int gpuLightingFrameCursor = 0;
 
     // --- GPU Face Extraction State ---
     // THROUGHPUT FIX: was 4. Caps how many chunks can be in flight at the GPU-mesh-face
@@ -1331,11 +1316,9 @@ public partial class McWorld : UdonSharpBehaviour
         Debug.Log("[McWorld][GPU-REPORT]   Lighting......: "
             + ((gpuLightingSeedMaterial != null && gpuLightingPropagateMaterial != null) ? "GPU" : "MISSING->CPU"));
         Debug.Log("[McWorld][GPU-REPORT]   FaceExtract...: " + (gpuFaceExtractMaterial != null ? "GPU" : "MISSING->CPU"));
-        Debug.Log("[McWorld][GPU-REPORT]   AO bake.......: " + (gpuAOBakeMaterial != null ? "GPU" : "MISSING->CPU")
-            + "  (ambientOcclusion=" + (ambientOcclusion ? "ON" : "OFF") + ")");
+        Debug.Log("[McWorld][GPU-REPORT]   AO............: per-fragment exact AO (ambientOcclusion=" + (ambientOcclusion ? "ON" : "OFF") + ")");
         Debug.Log("[McWorld][GPU-REPORT]   Biome bake....: " + (gpuBiomeColorBakeMaterial != null ? "GPU" : "MISSING->CPU"));
-        Debug.Log("[McWorld][GPU-REPORT]   Fluid tick....: " + ((blockTicker != null && blockTicker.gpuFluidTickMaterial != null) ? "GPU" : "MISSING->CPU"));
-        // (Raycast path is owned by ModifyTerrain, which logs its own GPU/CPU path at runtime.)
+        Debug.Log("[McWorld][GPU-REPORT]   Fluid tick....: CPU (by design; see McBlockTicker._UpdateTick_FlowingFluid)");
         Debug.Log("[McWorld][GPU-REPORT]   InstancedDraw.: "
             + ((gpuVoxelQuadDrawMaterial != null && gpuVoxelQuadMesh != null) ? "GPU" : "MISSING->CPU"));
         Debug.Log("[McWorld][GPU-REPORT]   Water anim....: " + (gpuWaterAnimMaterial != null ? "GPU" : "MISSING->CPU"));
@@ -2478,7 +2461,6 @@ public partial class McWorld : UdonSharpBehaviour
             for (int i = 0; i < iterations && gpuLightingIterationsRemaining > 0; i++)
             {
                 if (i >= guaranteedIterations && Time.realtimeSinceStartup - frameStart > frameBudget) break;
-                gpuLightingPropagateMaterial.SetInt("_FrameJitter", gpuLightingFrameCursor++);
 #if LOGGING
                 float blitStart = enableDetailedTimings ? Time.realtimeSinceStartup : 0f;
 #endif
@@ -5115,18 +5097,14 @@ public partial class McWorld : UdonSharpBehaviour
 
     private bool _UsesGpuExactAmbientOcclusion()
     {
-        // Per-fragment exact AO only when baked AO is NOT taking over.
-        return ambientOcclusion && UsesGpuLightingBackend() && !useBakedVertexAo;
+        return ambientOcclusion && UsesGpuLightingBackend();
     }
 
-    // Baked geometric AO: occlusion is light-independent, so we compute it from block data at
-    // decode time and bake it into vertex-color alpha; the shader then does (1 GPU light sample)
-    // x (baked AO) instead of the ~16-sample per-fragment exact AO. Only meaningful alongside the
-    // GPU lighting backend (which owns the light); with CPU lighting the existing _UsesCpuAmbientOcclusion
-    // path already bakes the (light-combined) signature.
+    // Baked vertex AO was an abandoned experiment (per-fragment exact AO is the live path);
+    // the predicate stays so its call sites keep one shape, but it is permanently false.
     private bool _UsesBakedVertexAo()
     {
-        return ambientOcclusion && UsesGpuLightingBackend() && useBakedVertexAo;
+        return false;
     }
 
     private bool _UsesCpuAmbientOcclusion()
@@ -17962,25 +17940,18 @@ public partial class McWorld : UdonSharpBehaviour
         if (chunk != null) chunk._gpuMirrorRehydratePending = false; // leave _isGpuResident so a later access retries
     }
 
-    // GPU OFFLOAD #6: Localized light poke for a single block change. Runs N iterations
-    // (one Blit each) where N is bounded by the max emission delta (≤15). The chunk's
-    // light atlas is updated in place via a ping-pong with `gpuLightPokeScratchRT`.
-    //
-    // Called from `_UpdateBlockLighting` (after _SetBlockLocal) instead of the iterative
-    // CPU BFS. Falls back to CPU if the material is missing or the GPU light atlas is unavailable.
-    private RenderTexture gpuLightPokeScratchRT;
-    private int gpuLightPokeMaxRadius = 8; // tune up to 15; 8 covers typical torch radius
-
+    // On a lighting-relevant block edit under the GPU lighting backend, request a fresh
+    // seed + a full propagation window instead of running the CPU BFS. (A dedicated
+    // "poke" shader pass was tried and retired: it never blitted, and the seed pass +
+    // per-frame propagate blits already smooth the change out. Same behavior, less machinery.)
     private bool _GpuLightPoke(ChunkData chunk, int localX, int localY, int localZ,
                                 byte oldBlockId, byte newBlockId)
     {
-        if (gpuLightPokeMaterial == null || chunk == null) return false;
-        // We need a per-chunk light RT to be GPU-resident. For chunks that don't yet have
-        // a GPU light atlas slot, fall back to the CPU path.
+        if (chunk == null) return false;
+        // Needs the chunk to have a GPU atlas slot; otherwise fall back to the CPU path.
         if (chunk._gpuFaceSlotIndex < 0) return false;
-        // Get the chunk's GPU light RT — currently lighting lives in a shared light atlas
-        // similar to the block atlas. We'd Blit a region; for safety we no-op if not wired.
         if (gpuBlockAtlas == null) return false;
+        if (gpuLightingSeedMaterial == null || gpuLightingPropagateMaterial == null) return false;
 
         int oldOp = lightOpacityCache != null ? lightOpacityCache[oldBlockId] : 1;
         int oldEm = lightEmissionCache != null ? lightEmissionCache[oldBlockId] : 0;
@@ -17990,39 +17961,6 @@ public partial class McWorld : UdonSharpBehaviour
         // Skip if nothing relevant changed.
         if (oldOp == newOp && oldEm == newEm) return true;
 
-        int radius = (newEm > oldEm) ? newEm : oldEm;
-        if (radius < 1) radius = 1;
-        if (radius > gpuLightPokeMaxRadius) radius = gpuLightPokeMaxRadius;
-
-        // Lazy-alloc a scratch RT for ping-pong (same size as the chunk's light atlas region).
-        // For now we ping-pong against itself via the existing GPU lighting RTs — if the
-        // dedicated atlas API isn't exposed we fall back to scheduling a full repropagate.
-        if (gpuLightingSeedMaterial == null || gpuLightingPropagateMaterial == null)
-        {
-            // No GPU lighting backend → can't poke usefully; fall through to CPU.
-            return false;
-        }
-
-        // Each iteration is a Blit that consumes the current light state and produces the
-        // next. The propagate shader (already on the project) does exactly this for the
-        // full chunk; the poke shader differs only by clipping to a distance window.
-        gpuLightPokeMaterial.SetTexture("_BlockTex", gpuBlockAtlas);
-        gpuLightPokeMaterial.SetTexture("_BlockPropsTex", gpuBlockPropertyTexture);
-        gpuLightPokeMaterial.SetInt("_ChunkSizeXZ", chunkSizeXZ);
-        gpuLightPokeMaterial.SetInt("_ChunkSizeY", chunkSizeY);
-        gpuLightPokeMaterial.SetInt("_PokeX", localX);
-        gpuLightPokeMaterial.SetInt("_PokeY", localY);
-        gpuLightPokeMaterial.SetInt("_PokeZ", localZ);
-        gpuLightPokeMaterial.SetInt("_PokeRadius", radius);
-        gpuLightPokeMaterial.SetInt("_OldEmission", oldEm);
-        gpuLightPokeMaterial.SetInt("_OldOpacity", oldOp);
-        gpuLightPokeMaterial.SetInt("_NewEmission", newEm);
-        gpuLightPokeMaterial.SetInt("_NewOpacity", newOp);
-
-        // Trigger one iteration; the existing per-frame GPU lighting propagate pass will
-        // pick up the disturbance and continue smoothing it across subsequent frames.
-        // (Calling N iterations here would stall the frame; one is enough to seed the
-        // change correctly.)
         gpuLightingSeedPending = true;
         _gpuLightDirtySinceConverge = true; // real light change (block edit) -> propagate until converged
         if (gpuLightingIterationsRemaining < gpuLightingTotalIterations)
@@ -18030,98 +17968,6 @@ public partial class McWorld : UdonSharpBehaviour
             gpuLightingIterationsRemaining = gpuLightingTotalIterations;
         }
         return true;
-    }
-
-    // GPU OFFLOAD #9: Bake the per-vertex AO + smooth-light texture for a chunk.
-    // Inputs: chunk._gpuSentinelRT (built by _GpuBuildSentinelRT), the light atlas,
-    //         and the block-props texture.
-    // Output: chunk._gpuAORT — sampled by the mesh shader at vertex time.
-    private bool _GpuBakeChunkAO(ChunkData chunk)
-    {
-        if (gpuAOBakeMaterial == null || chunk == null) return false;
-        if (chunk._gpuAOBaked) return true;
-        if (!chunk._gpuSentinelBuilt) { if (!_GpuBuildSentinelRT(chunk)) return false; }
-
-        int aoW = chunkSizeXZ * 6;
-        int aoH = chunkSizeY * chunkSizeXZ * 4;
-        if (chunk._gpuAORT == null)
-        {
-            chunk._gpuAORT = new RenderTexture(aoW, aoH, 0, RenderTextureFormat.ARGB32);
-            chunk._gpuAORT.filterMode = FilterMode.Point;
-            chunk._gpuAORT.wrapMode = TextureWrapMode.Clamp;
-            chunk._gpuAORT.useMipMap = false;
-            chunk._gpuAORT.autoGenerateMips = false;
-            chunk._gpuAORT.Create();
-        }
-
-        gpuAOBakeMaterial.SetTexture("_SentinelTex", chunk._gpuSentinelRT);
-        // Light tex: for now reuse the sentinel — proper integration with the lighting RT
-        // happens in the GPU-resident chunks pivot (#2). Mesh shader will sample G channel
-        // from this texture for smooth-light when GPU AO is active.
-        gpuAOBakeMaterial.SetTexture("_LightTex", chunk._gpuSentinelRT);
-        gpuAOBakeMaterial.SetTexture("_BlockPropsTex", gpuBlockPropertyTexture);
-        gpuAOBakeMaterial.SetInt("_ChunkSizeXZ", chunkSizeXZ);
-        gpuAOBakeMaterial.SetInt("_ChunkSizeY", chunkSizeY);
-
-        VRCGraphics.Blit(null, chunk._gpuAORT, gpuAOBakeMaterial, 0);
-        chunk._gpuAOBaked = true;
-        return true;
-    }
-
-    // GPU OFFLOAD #4: Build the sentinel border RT for a chunk via 7 Blits (one per face
-    // direction + one self-interior copy). Replaces the CPU `_DecompressNeighborsOnce` +
-    // manual border copies that walked each neighbor edge in Udon.
-    //
-    // Output is `chunk._gpuSentinelRT`, a (chunkSizeXZ+2) × ((chunkSizeY+2)*(chunkSizeXZ+2))
-    // R8 texture matching the existing CPU sentinel layout but readable by mesh shaders.
-    private bool _GpuBuildSentinelRT(ChunkData chunk)
-    {
-        if (gpuSentinelBorderMaterial == null || chunk == null) return false;
-        if (chunk._gpuSentinelBuilt) return true;
-
-        int sxz = chunkSizeXZ + 2;
-        int syt = chunkSizeY + 2;
-        if (chunk._gpuSentinelRT == null)
-        {
-            chunk._gpuSentinelRT = new RenderTexture(sxz, sxz * syt, 0, RenderTextureFormat.R8);
-            chunk._gpuSentinelRT.filterMode = FilterMode.Point;
-            chunk._gpuSentinelRT.wrapMode = TextureWrapMode.Clamp;
-            chunk._gpuSentinelRT.useMipMap = false;
-            chunk._gpuSentinelRT.autoGenerateMips = false;
-            chunk._gpuSentinelRT.Create();
-        }
-
-        // Set material uniforms common to all 7 passes.
-        gpuSentinelBorderMaterial.SetTexture("_BlockAtlas", gpuBlockAtlas);
-        gpuSentinelBorderMaterial.SetTexture("_SlotLookupTex", gpuSlotLookupTexture);
-        gpuSentinelBorderMaterial.SetInt("_ChunkSizeXZ", chunkSizeXZ);
-        gpuSentinelBorderMaterial.SetInt("_ChunkSizeY", chunkSizeY);
-        gpuSentinelBorderMaterial.SetInt("_SelfChunkX", chunk.chunkX_world);
-        gpuSentinelBorderMaterial.SetInt("_SelfChunkY", chunk.chunkY_world);
-        gpuSentinelBorderMaterial.SetInt("_SelfChunkZ", chunk.chunkZ_world);
-
-        // Pass 6: self interior copy — fills [1..N]³ from this chunk's own atlas slot.
-        VRCGraphics.Blit(null, chunk._gpuSentinelRT, gpuSentinelBorderMaterial, 6);
-
-        // Passes 0..5: each face from the matching neighbor (no-op if neighbor not loaded).
-        for (int p = 0; p < 6; p++)
-        {
-            VRCGraphics.Blit(null, chunk._gpuSentinelRT, gpuSentinelBorderMaterial, p);
-        }
-
-        chunk._gpuSentinelBuilt = true;
-#if LOGGING
-        if (enableDetailedTimings) stats_sentinelBuilds++;
-#endif
-        return true;
-    }
-
-    // Invalidate a chunk's sentinel when it or one of its 6 neighbors changes blocks.
-    // Called from _SetBlockLocal so a neighbor-boundary edit forces a rebuild before the
-    // next mesh pass.
-    private void _GpuInvalidateSentinel(ChunkData chunk)
-    {
-        if (chunk != null) chunk._gpuSentinelBuilt = false;
     }
 
     // GPU OFFLOAD #3: Bake biome tint colors into a 16x16 RT per chunk by running the

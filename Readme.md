@@ -30,7 +30,7 @@ The whole simulation runs client-side in a VRChat world on a scripting VM (Udon)
 3. Press Play. ClientSim (bundled with the VRChat Worlds SDK) spawns a local player; walk around and break or place blocks with the 9-slot palette in `ModifyTerrain`.
 4. Device builds go through the VRChat SDK control panel (Build & Test). Quest is selected purely by switching the Unity build target to Android: Udon has no runtime platform query, so all PC-vs-Quest behavior is compile-time `#if UNITY_ANDROID`.
 
-Dependencies (resolved via VPM/UPM, see `Packages/vpm-manifest.json` and `Packages/manifest.json`): VRChat Worlds SDK 3.10.2, standalone UdonSharp 1.2.0 (`com.merlin.UdonSharp`, not the SDK-bundled fork), BlueAmulet's UdonSharpOptimizer 1.0.12, NUMovement 0.4.2 (character controller base), VRRefAssist (the `[Singleton]` / auto-reference attributes that wire the scene together at build time), HierarchyDecorator, and MCPForUnity (lets an AI agent drive the editor).
+Dependencies (resolved via VPM/UPM, see `Packages/vpm-manifest.json` and `Packages/manifest.json`): VRChat Worlds SDK 3.10.2, standalone UdonSharp 1.2.0 (`com.merlin.UdonSharp`, not the SDK-bundled fork), BlueAmulet's UdonSharpOptimizer 1.0.12, NUMovement 0.4.2 (character controller base), VRRefAssist (the `[Singleton]` / auto-reference attributes that wire the scene together at build time), HierarchyDecorator, and MCPForUnity (an editor bridge used with AI assistance to speed up boilerplate and iteration).
 
 `Assets/csc.rsp` defines the `LOGGING` symbol. The verbose perf summaries and debug logs it gates are kept on intentionally; do not strip them as a perf fix.
 
@@ -57,7 +57,7 @@ UdonSharp quirks are load-bearing. No multidimensional arrays (jagged or flatten
 
 Coordinate handedness: Unity is left-handed, Minecraft is right-handed, so the world is stored X-mirrored relative to MC. The mapping is `x_mc = -x_vrcm - 1`, with y and z equal. Worldgen evaluates all noise and RNG in Minecraft coordinates and flips X when writing the column texture, so terrain is block-identical to a real b1.7.3 world at the same seed, just mirrored. The scene-view overlay (`SceneViewCameraPosition.cs`) shows both coordinate systems, and `McMovement.flipXAxis` applies the mirror when the player samples the world.
 
-Some older docs in the repo (including `CLAUDE.md`) still claim 16x64x16 chunks and a 256-block world height. Those are stale; the scene YAML is authoritative.
+The scene YAML is authoritative for all world dimensions.
 
 ## Architecture
 
@@ -138,19 +138,17 @@ Every mutation funnels through `McWorld._SetBlockGlobalWithMeta`, which mirrors 
 | `Assets/VRCMinecraft/Code/VoxelEngine/Static_or_Java/` | Direct Java ports: `JavaRandom`, biome/climate providers, Perlin octave generators, block-ID enums |
 | `Assets/VRCMinecraft/Code/VoxelEngine/GPU_Attempt_5/`, `GPU_Neo/` | Live GPU pass materials and legacy RT assets (see [Live vs dead code](#live-vs-dead-code)) |
 | `Assets/VRCMinecraft/Code/` | `McMovement.cs`, `Rendering/McParticleManager.cs`, `game/` (stubs), `gui/` (stubs) |
-| `Assets/VRCMinecraft/shaders/` | All ~35 shaders: worldgen chain, lighting, terrain/instanced render, `MCFluid`, `MCSkyV2`, `MCClouds`, water animation |
+| `Assets/VRCMinecraft/shaders/` | All 27 shaders/includes: worldgen chain, lighting, terrain/instanced render, `MCFluid`, `MCSkyV2`, `MCClouds`, water animation |
 | `Assets/VRCMinecraft/Materials/`, `textures/` | Live material instances; the terrain atlas (`b173_terrain.png`, a 256-slice Texture2DArray) and tint masks |
 | `Assets/VRCMinecraft/scenes/Minecraft.unity` | The scene, and the authoritative source of world configuration |
 | `Assets/VRCMinecraft/prefabs/`, `Meshes/`, `sounds/`, `models/` | Chunk prefab, collider cube, GUI button, baked cloud meshes, audio |
 | `Assets/Editor/VRCMinecraft/` | Editor-only tooling: cloud/star/fire bakers, block-registry inspector, seed tester, shader GUI, coordinate overlay |
-| `docs/superpowers/` | Current design docs (baselines, plans, specs) |
-| repo root `*.md` / `*.txt` / `_dbg_*.png` | Historical optimization notes and debug renders. An archive, not current documentation |
 
-Empty-by-design folders you will encounter: `RLE/` and `Coroutines/` (the RLE codec lives inside `McWorld.cs`; Udon has no coroutines), `Code/VoxelEngine/Lighting/`, `Code/Editor/`, `Code/Environment/`, `Assets/VRCMinecraft/Editor/`. `Assets/VRCMinecache/` is a dead leftover folder, and `old_McWorld.cs` at the root is an uncompiled snapshot.
+Note: the RLE codec lives inside `McWorld.cs` (Udon has no coroutines, so there is no coroutine folder either); folder structure under `Code/VoxelEngine/` is flat on purpose.
 
 ## Live vs dead code
 
-This repo carries its history in-tree, and several names lie. Before editing any shader or material, grep for the material's `m_Shader` GUID and the material's scene references.
+A few names carry history. Before editing any shader or material, grep for the material's `m_Shader` GUID and the material's scene references.
 
 Live but misleadingly named:
 
@@ -158,15 +156,12 @@ Live but misleadingly named:
 - `GPU_Neo/` is the current per-feature material folder, not a future experiment.
 - The "instanced" render path mostly is not `DrawMeshInstanced`: it is one shared 98k-vert mesh on every chunk's own renderer with vertex-stage culling.
 - `terrain_cutout.mat` uses `MCTerrain.shader` with a keyword; `terrain_trans.mat` points at `MCFluid.shader`.
+- Fluid simulation is 100% CPU in `McBlockTicker._UpdateTick_FlowingFluid`, however GPU-flavored the surrounding systems look.
 
-Dead or dormant (present, wired, but never executed):
+Dormant by scene toggle (implemented, off by default):
 
-- `GpuFluidTick.shader` and its material. A first-run log even claims "Fluid tick: GPU"; it checks only that the material is non-null. **Fluid simulation is 100% CPU** in `McBlockTicker._UpdateTick_FlowingFluid`.
-- `GpuTickMaskWrite`, `GpuLightPoke` (called, but never blits), `GpuAOBake` + `GpuSentinelBorderCopy` (live AO is per-fragment, not baked), `GpuRaycast` (CPU DDA is authoritative), `GpuVoxelQuadDraw`, `GpuRleEncode` (declared, never blitted).
-- `MCSky.shader`, `MCTerrain_Cutout.shader`, `MCTerrain_Transparent.shader`: referenced by no material.
-- Scene-gated paths currently off: batched face readback, GPU-resident chunks, resident-mesh-from-atlas, the GPU raycast experiment.
-- `GPU_Attempt_4/` (one unreferenced material), `GPU_Attempt_6/` (empty), the seven `.renderTexture` assets in `GPU_Attempt_5/` (runtime creates its own RTs).
-- Game-layer stubs with no callers yet: `MinecraftGame`, `MusicManager`, `BaseEntity`, `McButtonArguments`, `McBlockOutline` (the outline visual lives in `ModifyTerrain`).
+- Batched face readback, GPU-resident chunks (no CPU mirror), and resident-mesh-from-atlas with `GpuVoxelQuadDraw`. These are staged future work for the Quest readback pipeline; do not profile or reason about them as live.
+- Game-layer stubs with no callers yet: `MinecraftGame`, `MusicManager`, `BaseEntity`, `McButtonArguments`. The block-outline visual is driven directly by `ModifyTerrain`.
 
 ## Configuration: scene vs code
 
@@ -182,7 +177,7 @@ Two sources of truth, split on purpose:
 - Perf summaries: with `LOGGING` defined, the console prints a multi-section performance report every 300 frames (Update lanes, scheduler/"Coordinator", terrain gen state histogram, GPU worldgen, block ticker dispatch counts, mesh building, GPU backend blit/upload totals). Most fixes in this repo started from one of these sections.
 - Fluid debugging: `McBlockTicker.debugFluidFlow` logs every horizontal flow decision with per-direction neighbor/below/cost/optimal. On an anomalous all-directions-1000 flood-fill result it additionally dumps a `[FluidFlood1000]` block: the 7x7x2 neighborhood as the tick system's cache saw it versus direct world reads, plus per-cell readiness.
 - Editor tools (`Tools > VRCMinecraft > ...`): cloud mesh baker, star field baker, fire texture generator, the seed tester window, and the Udon exposure-list exporter. Baked outputs are committed; rebake only when sources or parity logic change.
-- MCPForUnity: the editor is scriptable by an AI agent (console reading, script validation, C# eval in-editor). `CLAUDE.md` carries the standing instructions, though note its chunk-size section is outdated.
+- MCPForUnity: an editor bridge (console reading, script validation, in-editor C# eval) used with AI assistance to speed up boilerplate and iteration.
 - Sky probing: shader visuals can be verified headlessly by rendering temp cameras from editor code and reading the PNGs; this caught a sun/moon 180-degree swap that playtesting missed.
 
 ## Parity reference
@@ -193,6 +188,6 @@ Two known simplifications are documented tolerances, not oversights: leaf decay 
 
 ## Known issues
 
-- Lava flow path divergence (active investigation): on identical terrain the flood fill occasionally returns no-drop (cost 1000) in every direction where a reachable drop exists, so lava puddles sideways on shelves instead of channeling down ledges like vanilla. Terrain parity, the algorithm itself, and the tick order have all been verified; the `[FluidFlood1000]` probe exists to catch the wrong layer in the act. See the project memory for the full investigation state.
+- Lava flow path divergence (active investigation): on identical terrain the flood fill occasionally returns no-drop (cost 1000) in every direction where a reachable drop exists, so lava puddles sideways on shelves instead of channeling down ledges like vanilla. Terrain parity, the algorithm itself, and the tick order have all been verified; the `[FluidFlood1000]` probe exists to catch the wrong layer in the act.
 - Sound, music, particles-for-everything, entities, and gamemodes are scaffolding-only so far.
 - The GPU-resident chunk mode (chunks with no CPU mirror at all) is implemented but disabled in the scene pending the readback pipeline being Quest-3-proven.

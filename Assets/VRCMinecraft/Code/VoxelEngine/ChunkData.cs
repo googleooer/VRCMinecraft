@@ -315,14 +315,6 @@ public class ChunkData
     public UnityEngine.RenderTexture _gpuSentinelRT;
     public bool _gpuSentinelBuilt = false;
 
-    // GPU OFFLOAD #7: per-chunk fluid level RT (8-bit) for the GPU water/lava CA pass.
-    public UnityEngine.RenderTexture _gpuFluidLevelRT;
-    public UnityEngine.RenderTexture _gpuFluidLevelRTNext;
-
-    // GPU OFFLOAD #8: per-chunk scheduled-tick bitmask RT (1 bit per voxel).
-    public UnityEngine.RenderTexture _gpuTickMaskRT;
-    public bool _gpuTickMaskDirty = false;
-
     // GPU OFFLOAD #5: Per-chunk face buffer RT — packed (x,y,z,face,blockId,ao,light)
     // for every visible face. Sized by face count from GpuVoxelFaceExtract's summary pass.
     // Sampled by GpuVoxelQuadDraw vertex shader at unity_InstanceID time.
