@@ -6,14 +6,6 @@
       "source": "embedded",
       "dependencies": {}
     },
-    "com.caeden117.udoncoroutines": {
-      "version": "file:com.caeden117.udoncoroutines",
-      "depth": 0,
-      "source": "embedded",
-      "dependencies": {
-        "com.vrchat.worlds": "3.4.0"
-      }
-    },
     "com.coplaydev.unity-mcp": {
       "version": "https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main",
       "depth": 0,
