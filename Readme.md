@@ -17,7 +17,7 @@ The whole simulation runs client-side in a VRChat world on a scripting VM (Udon)
   - [Block simulation](#block-simulation)
   - [Player movement](#player-movement)
 - [Directory map](#directory-map)
-- [Live vs dead code](#live-vs-dead-code)
+- [Naming notes and dormant paths](#naming-notes-and-dormant-paths)
 - [Configuration: scene vs code](#configuration-scene-vs-code)
 - [Debugging and tooling](#debugging-and-tooling)
 - [Parity reference](#parity-reference)
@@ -36,7 +36,7 @@ Dependencies (resolved via VPM/UPM, see `Packages/vpm-manifest.json` and `Packag
 
 ## Main constraints and how i got around them
 
-Udon is slow and single-threaded, so per-voxel CPU work is unaffordable. Anything that touches all 4096 voxels of a chunk either runs as a GPU fragment shader pass or is time-sliced across many frames with hand-rolled cursor state machines (Udon has no coroutines; the `Coroutines/` folder is empty on purpose).
+Udon is slow and single-threaded, so per-voxel CPU work is unaffordable. Anything that touches all 4096 voxels of a chunk either runs as a GPU fragment shader pass or is time-sliced across many frames with hand-rolled cursor state machines (Udon has no coroutines).
 
 The only GPU surface is VRChat's: `VRCGraphics.Blit` into RenderTextures, `VRCAsyncGPUReadback` for GPU-to-CPU transfers, `VRCShader.SetGlobal*` for `_Udon*`-prefixed globals. No compute shaders, no `Graphics.Blit` to null targets. One hard-won platform rule appears all over the code: globals set with `SetGlobalTexture` bind only at the fragment stage, so any texture a vertex shader needs must be material-bound and re-bound every frame (the block atlas ping-pongs between two RTs on every write).
 
@@ -86,7 +86,7 @@ A faithful port of b1.7.3's `ChunkProviderGenerate` + `MapGenCaves` + biome deco
 
 1. Climate: temperature/rainfall/modifier simplex octaves plus a 64x64 biome lookup texture, read back async so the CPU knows biomes for decoration counts and tinting.
 2. Density noise: the five Beta noise fields (16/16/8/10/16 octaves) as octave-accumulation blits over a 5x5x17 lattice, then `CombineFixed.shader` reproduces the exact Beta density formula, then trilinear interpolation fills stone/water/ice per block (`GpuColumnBaseFill`).
-3. Surface: highest-stone scan, then `GpuColumnSurfaceReplace` applies `replaceBlocksForBiome` (beaches, sandstone, bedrock) from CPU-computed per-column RNG draws. The 16x16 sand/gravel/stone surface noises stay on CPU deliberately; the GPU version was provably wrong.
+3. Surface: `GpuColumnSurfaceReplace` replays `replaceBlocksForBiome`'s top-down column state machine per fragment — the depth counter resets at every air block, so stone below terrain-noise overhangs gets its own grass/dirt surface exactly like vanilla, with top/filler mutations (sandstone exhaust, bare-stone, beach band) carried down the column. Per-column RNG draws come from the CPU; a separate highest-stone scan (`GpuColumnSurfaceInfo`) feeds decoration. The 16x16 sand/gravel/stone surface noises stay on CPU deliberately; the GPU version was provably wrong.
 4. Caves: `GpuCaveCarve.shader` re-runs the entire `MapGenCaves` worm simulation per fragment over a 17x17 chunk neighborhood, replaying bit-exact `java.util.Random` streams on the GPU via `JavaRandomGPU.cginc` (48-bit LCG stored as `uint2`).
 5. Decoration: the CPU replays the decoration PRNG of the 4 population-contributing chunks to produce tree/flower/grass candidates as texture pixels, and `GpuColumnTreeDecoration` / `GpuColumnDecoration` stamp them; cross-border tree trunks resolve against a pool of rendered neighbor "anchor" columns.
 6. Readback: one 32 KB R8 `VRCAsyncGPUReadback` per column (~150 ms latency, the generator parks instead of polling), split into eight 4096-byte chunk slices. A GPU-resident mode that skips readback entirely exists but is off in the scene.
@@ -134,33 +134,29 @@ Every mutation funnels through `McWorld._SetBlockGlobalWithMeta`, which mirrors 
 | Path | Contents |
 |---|---|
 | `Assets/VRCMinecraft/Code/VoxelEngine/` | The engine: `McWorld.cs`, `McWorld.Scheduler.cs`, `ChunkData.cs`, `McBlockTicker.cs`, `McBlockTypeManager.cs`, `ModifyTerrain.cs` |
-| `Assets/VRCMinecraft/Code/VoxelEngine/WorldGen/` | `McTerrainGenerator.cs` plus structure template stubs |
-| `Assets/VRCMinecraft/Code/VoxelEngine/Static_or_Java/` | Direct Java ports: `JavaRandom`, biome/climate providers, Perlin octave generators, block-ID enums |
-| `Assets/VRCMinecraft/Code/VoxelEngine/GPU_Attempt_5/`, `GPU_Neo/` | Live GPU pass materials and legacy RT assets (see [Live vs dead code](#live-vs-dead-code)) |
+| `Assets/VRCMinecraft/Code/VoxelEngine/WorldGen/` | `McTerrainGenerator.cs` |
+| `Assets/VRCMinecraft/Code/VoxelEngine/Static_or_Java/` | Direct Java ports: `JavaRandom`, biome/climate providers, Perlin octave generators, the `BlockMaterial` block-ID enum |
 | `Assets/VRCMinecraft/Code/` | `McMovement.cs`, `Rendering/McParticleManager.cs`, `game/` (stubs), `gui/` (stubs) |
-| `Assets/VRCMinecraft/shaders/` | All 27 shaders/includes: worldgen chain, lighting, terrain/instanced render, `MCFluid`, `MCSkyV2`, `MCClouds`, water animation |
-| `Assets/VRCMinecraft/Materials/`, `textures/` | Live material instances; the terrain atlas (`b173_terrain.png`, a 256-slice Texture2DArray) and tint masks |
+| `Assets/VRCMinecraft/Gpu/Shaders/` | All shaders/includes, by stage: `WorldGen/` (noise, base fill, surface, caves, decoration), `Backend/` (atlas overlay, set-block chain, lighting, water animation), `Render/` (terrain, instanced, fluid, sky, clouds, outline), `Resident/` (dormant Quest staging) |
+| `Assets/VRCMinecraft/Gpu/Materials/` | The material instance for every GPU pass and render shader, same `WorldGen/Backend/Render/Resident` split |
+| `Assets/VRCMinecraft/Materials/`, `textures/` | Particle/title materials; the terrain atlas (`b173_terrain.png`, a 256-slice Texture2DArray) and tint masks |
 | `Assets/VRCMinecraft/scenes/Minecraft.unity` | The scene, and the authoritative source of world configuration |
 | `Assets/VRCMinecraft/prefabs/`, `Meshes/`, `sounds/`, `models/` | Chunk prefab, collider cube, GUI button, baked cloud meshes, audio |
-| `Assets/Editor/VRCMinecraft/` | Editor-only tooling: cloud/star/fire bakers, block-registry inspector, seed tester, shader GUI, coordinate overlay |
+| `Assets/VRCMinecraft/Editor/` | Editor-only tooling: cloud/star/fire bakers, block-registry inspector, seed tester, shader GUI, coordinate overlay |
 
-Note: the RLE codec lives inside `McWorld.cs` (Udon has no coroutines, so there is no coroutine folder either); folder structure under `Code/VoxelEngine/` is flat on purpose.
+Note: the RLE codec lives inside `McWorld.cs` (Udon has no coroutines); folder structure under `Code/VoxelEngine/` is otherwise flat on purpose.
 
-## Live vs dead code
+## Naming notes and dormant paths
 
-A few names carry history. Before editing any shader or material, grep for the material's `m_Shader` GUID and the material's scene references.
+Everything in the tree is either live or explicitly staged; there is no dead code. A few names still deserve a warning:
 
-Live but misleadingly named:
-
-- `GPU_Attempt_5/C_LightCompute.mat` runs the light **seed** shader, `C_LightFinalize.mat` runs the **atlas copy** shader used for every upload. The names are one design generation stale.
-- `GPU_Neo/` is the current per-feature material folder, not a future experiment.
 - The "instanced" render path mostly is not `DrawMeshInstanced`: it is one shared 98k-vert mesh on every chunk's own renderer with vertex-stage culling.
 - `terrain_cutout.mat` uses `MCTerrain.shader` with a keyword; `terrain_trans.mat` points at `MCFluid.shader`.
 - Fluid simulation is 100% CPU in `McBlockTicker._UpdateTick_FlowingFluid`, however GPU-flavored the surrounding systems look.
 
 Dormant by scene toggle (implemented, off by default):
 
-- Batched face readback, GPU-resident chunks (no CPU mirror), and resident-mesh-from-atlas with `GpuVoxelQuadDraw`. These are staged future work for the Quest readback pipeline; do not profile or reason about them as live.
+- Batched face readback, GPU-resident chunks (no CPU mirror), and resident-mesh-from-atlas with `GpuVoxelQuadDraw` — everything under `Gpu/Shaders/Resident/` and `Gpu/Materials/Resident/`. These are staged future work for the Quest readback pipeline; do not profile or reason about them as live.
 - Game-layer stubs with no callers yet: `MinecraftGame`, `MusicManager`, `BaseEntity`, `McButtonArguments`. The block-outline visual is driven directly by `ModifyTerrain`.
 
 ## Configuration: scene vs code
