@@ -84,3 +84,8 @@ GEMINI.md
 .gemini/
 .agents/
 docs/superpowers/
+
+# Per-user local state (ClientSim play-mode data, IDE config, personal workspace)
+/ClientSimStorage/
+/.vscode/
+/VRCMinecraft.code-workspace

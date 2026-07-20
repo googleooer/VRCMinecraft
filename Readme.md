@@ -188,6 +188,6 @@ Two known simplifications are documented tolerances, not oversights: leaf decay 
 
 ## Known issues
 
-- Lava flow path divergence (active investigation): on identical terrain the flood fill occasionally returns no-drop (cost 1000) in every direction where a reachable drop exists, so lava puddles sideways on shelves instead of channeling down ledges like vanilla. Terrain parity, the algorithm itself, and the tick order have all been verified; the `[FluidFlood1000]` probe exists to catch the wrong layer in the act.
+- A hard-won UdonSharp rule, learned from a long fluid-flow divergence hunt: any method that calls itself must carry `[RecursiveMethod]`, or UdonSharp silently corrupts the caller's locals across the recursive call. `_CalculateFlowCost` is the one live recursive method and carries the attribute; the `debugFluidFlow` + `[FluidFlood1000]` diagnostics that caught it remain available.
 - Sound, music, particles-for-everything, entities, and gamemodes are scaffolding-only so far.
 - The GPU-resident chunk mode (chunks with no CPU mirror at all) is implemented but disabled in the scene pending the readback pipeline being Quest-3-proven.
