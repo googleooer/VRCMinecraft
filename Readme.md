@@ -7,7 +7,7 @@ The whole simulation runs client-side in a VRChat world on a scripting VM (Udon)
 ## Contents
 
 - [Quick start](#quick-start)
-- [The constraints that shaped everything](#the-constraints-that-shaped-everything)
+- [Main constraints and how i got around them](#main-constraints-and-how-i-got-around-them)
 - [World model and coordinates](#world-model-and-coordinates)
 - [Architecture](#architecture)
   - [Frame loop and scheduler](#frame-loop-and-scheduler)
