@@ -1,0 +1,196 @@
+#pragma kernel CSMain_SideView
+#pragma kernel CSMain_TopDownView
+
+RWTexture2D<float4> _Result;
+
+float4 _Params; // x: seaLevel, y: surfaceDepth, z: terrainHeightMultiplier, w: seed
+float4 _PreviewTransform; // x: originX, y: originZ, z: zoomH, w: zoomV
+float4 _NoiseScales; // x: coordinateScale (684.412), y: depthScale (200), z: mainScale (80), w: selectorScale (512)
+
+#define seaLevel _Params.x
+#define surfaceDepth _Params.y
+#define terrainMultiplier _Params.z
+#define worldSeed _Params.w
+#define previewOrigin _PreviewTransform.xy
+#define previewZoomH _PreviewTransform.z
+#define previewZoomV _PreviewTransform.w
+
+// Simple hash function for pseudo-random
+float hash(float n)
+{
+    return frac(sin(n) * 43758.5453123);
+}
+
+// 3D Perlin-style noise
+float noise3D(float3 p)
+{
+    float3 i = floor(p);
+    float3 f = frac(p);
+    f = f * f * (3.0 - 2.0 * f);
+    
+    float n = i.x + i.y * 57.0 + 113.0 * i.z;
+    
+    return lerp(lerp(lerp(hash(n + 0.0), hash(n + 1.0), f.x),
+                     lerp(hash(n + 57.0), hash(n + 58.0), f.x), f.y),
+                lerp(lerp(hash(n + 113.0), hash(n + 114.0), f.x),
+                     lerp(hash(n + 170.0), hash(n + 171.0), f.x), f.y), f.z);
+}
+
+// Octave noise similar to Beta 1.7.3
+float octaveNoise(float3 p, int octaves, float persistence)
+{
+    float total = 0.0;
+    float frequency = 1.0;
+    float amplitude = 1.0;
+    float maxValue = 0.0;
+    
+    for (int i = 0; i < octaves; i++)
+    {
+        total += noise3D(p * frequency) * amplitude;
+        maxValue += amplitude;
+        amplitude *= persistence;
+        frequency *= 2.0;
+    }
+    
+    return total / maxValue;
+}
+
+// Generate terrain density at a world position
+float generateDensity(float3 worldPos)
+{
+    // Beta 1.7.3 noise parameters
+    float coordinateScale = 684.412;
+    float depthScale = 200.0;
+    float selectorScale = 512.0;
+    
+    // Main terrain noise
+    float mainNoise = octaveNoise(worldPos / coordinateScale, 16, 0.5) * 2.0 - 1.0;
+    
+    // Min/max limit noises
+    float minLimit = octaveNoise(worldPos / selectorScale, 16, 0.5) * 2.0 - 1.0;
+    float maxLimit = octaveNoise(worldPos / selectorScale + float3(100, 100, 100), 16, 0.5) * 2.0 - 1.0;
+    
+    // Selector noise
+    float selector = octaveNoise(worldPos / selectorScale + float3(200, 200, 200), 8, 0.5);
+    
+    // Depth noise (only uses X and Z)
+    float depth = octaveNoise(float3(worldPos.x / depthScale, 0, worldPos.z / depthScale), 16, 0.5);
+    
+    // Height gradient
+    float heightGradient = (worldPos.y - seaLevel) / 64.0;
+    
+    // Combine noises Beta 1.7.3 style
+    float density = lerp(minLimit, maxLimit, selector) + mainNoise;
+    density -= heightGradient * (1.0 + depth * 0.5);
+    density *= terrainMultiplier;
+    
+    return density;
+}
+
+// Find surface height at X,Z position
+float findSurfaceHeight(float worldX, float worldZ)
+{
+    // Binary search for surface
+    float minY = 0;
+    float maxY = 256;
+    
+    for (int i = 0; i < 8; i++)
+    {
+        float midY = (minY + maxY) * 0.5;
+        float density = generateDensity(float3(worldX, midY, worldZ));
+        
+        if (density > 0)
+            minY = midY;
+        else
+            maxY = midY;
+    }
+    
+    return minY;
+}
+
+[numthreads(8,8,1)]
+void CSMain_SideView(uint3 id : SV_DispatchThreadID)
+{
+    float normalizedX = (float)id.x / 255.0 - 0.5;
+    float normalizedY = (float)id.y / 255.0 - 0.5;
+    float worldX = previewOrigin.x + normalizedX * previewZoomH;
+    float worldY = 128.0 + normalizedY * previewZoomV;
+    
+    // Sample density at this position
+    float density = generateDensity(float3(worldX, worldY, previewOrigin.y));
+    
+    // Get surface height for coloring
+    float surfaceY = findSurfaceHeight(worldX, previewOrigin.y);
+    
+    float4 color = float4(0.529, 0.808, 0.922, 1.0); // Sky blue
+    
+    if (density > 0)
+    {
+        // Solid terrain
+        if (worldY < 5)
+            color = float4(0.1, 0.1, 0.1, 1.0); // Bedrock
+        else if (abs(worldY - surfaceY) < 1)
+        {
+            // Surface blocks
+            if (surfaceY < seaLevel - 1)
+                color = float4(0.76, 0.70, 0.50, 1.0); // Sand
+            else
+                color = float4(0.38, 0.65, 0.26, 1.0); // Grass
+        }
+        else if (worldY < surfaceY && worldY > surfaceY - surfaceDepth)
+            color = float4(0.51, 0.37, 0.25, 1.0); // Dirt
+        else
+            color = float4(0.5, 0.5, 0.5, 1.0); // Stone
+    }
+    else if (worldY <= seaLevel)
+    {
+        color = float4(0.0, 0.0, 0.5, 1.0); // Water
+    }
+    
+    _Result[id.xy] = color;
+}
+
+[numthreads(8,8,1)]
+void CSMain_TopDownView(uint3 id : SV_DispatchThreadID)
+{
+    float normalizedX = (float)id.x / 255.0 - 0.5;
+    float normalizedZ = (float)id.y / 255.0 - 0.5;
+    float worldX = previewOrigin.x + normalizedX * previewZoomH;
+    float worldZ = previewOrigin.y + normalizedZ * previewZoomH;
+    
+    float surfaceY = findSurfaceHeight(worldX, worldZ);
+    
+    // Biome calculation
+    float temp = noise3D(float3(worldX * 0.025, 0, worldZ * 0.025)) * 0.5 + 0.5;
+    float humidity = noise3D(float3(worldX * 0.05 + 1000, 0, worldZ * 0.05 + 1000)) * 0.5 + 0.5;
+    humidity *= temp;
+    
+    bool isDesert = temp > 0.95 && humidity < 0.2;
+    bool isTundra = temp < 0.2;
+    
+    float4 color;
+    if (surfaceY < seaLevel - 2)
+        color = float4(0.0, 0.0, 0.4, 1.0); // Deep water
+    else if (surfaceY < seaLevel)
+        color = float4(0.0, 0.3, 0.7, 1.0); // Shallow water  
+    else if (surfaceY < seaLevel + 2)
+        color = float4(0.76, 0.70, 0.50, 1.0); // Beach/Sand
+    else if (isDesert)
+        color = float4(0.76, 0.70, 0.50, 1.0); // Desert sand
+    else if (isTundra && surfaceY > seaLevel + 20)
+        color = float4(0.8, 0.8, 0.8, 1.0); // Snow/Tundra
+    else if (surfaceY < seaLevel + 48)
+        color = float4(0.38, 0.65, 0.26, 1.0); // Grass
+    else
+        color = float4(0.6, 0.6, 0.6, 1.0); // Mountain/Stone
+    
+    // Add height-based shading
+    float heightNorm = saturate((surfaceY - seaLevel) / 128.0);
+    color.rgb *= (0.7 + heightNorm * 0.3);
+    
+    // Add subtle detail noise
+    float detail = noise3D(float3(worldX * 0.1, 0, worldZ * 0.1));
+    color.rgb *= (0.95 + detail * 0.05);
+    
+    _Result[id.xy] = color;
+}

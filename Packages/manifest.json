@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "com.coplaydev.unity-mcp": "https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main",
     "com.livedimensions.vrrefassist": "https://github.com/LiveDimensions/VRRefAssist.git?path=/Packages/com.livedimensions.vrrefassist",
     "com.unity.2d.sprite": "1.0.0",
     "com.unity.ide.rider": "3.0.26",

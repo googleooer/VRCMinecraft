@@ -14,12 +14,41 @@
         "com.vrchat.worlds": "3.4.0"
       }
     },
+    "com.coplaydev.unity-mcp": {
+      "version": "https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {
+        "com.unity.modules.animation": "1.0.0",
+        "com.unity.modules.imageconversion": "1.0.0",
+        "com.unity.modules.physics": "1.0.0",
+        "com.unity.modules.physics2d": "1.0.0",
+        "com.unity.modules.uielements": "1.0.0",
+        "com.unity.modules.screencapture": "1.0.0",
+        "com.unity.modules.unitywebrequest": "1.0.0",
+        "com.unity.nuget.newtonsoft-json": "3.0.2",
+        "com.unity.test-framework": "1.1.31"
+      },
+      "hash": "85c101f5329ec1b0c6f70cba44614166dd78f53c"
+    },
     "com.livedimensions.vrrefassist": {
       "version": "https://github.com/LiveDimensions/VRRefAssist.git?path=/Packages/com.livedimensions.vrrefassist",
       "depth": 0,
       "source": "git",
       "dependencies": {},
       "hash": "d44792a5cfe3bb0c45df607f25412a63a511239c"
+    },
+    "com.merlin.udonsharp": {
+      "version": "file:com.merlin.UdonSharp",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
+    "com.nessie.udon.movement": {
+      "version": "file:com.nessie.udon.movement",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
     },
     "com.unity.2d.sprite": {
       "version": "1.0.0",
@@ -249,12 +278,6 @@
       "source": "git",
       "dependencies": {},
       "hash": "2590c6a14a7230b8571383c379124c32d0712090"
-    },
-    "si.iwa.udontask": {
-      "version": "file:si.iwa.udontask",
-      "depth": 0,
-      "source": "embedded",
-      "dependencies": {}
     },
     "com.unity.modules.ai": {
       "version": "1.0.0",

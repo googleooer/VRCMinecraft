@@ -70,3 +70,22 @@ crashlytics-build.properties
 # Temporary auto-generated Android Assets
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
+
+# AI-assistant workflow files (local only; assistance used to speed up boilerplate and iteration)
+CLAUDE.md
+CLAUDE.local.md
+AGENT.md
+AGENTS.md
+GEMINI.md
+.claude/
+.codex/
+.cursor/
+.cursorignore
+.gemini/
+.agents/
+docs/superpowers/
+
+# Per-user local state (ClientSim play-mode data, IDE config, personal workspace)
+/ClientSimStorage/
+/.vscode/
+/VRCMinecraft.code-workspace

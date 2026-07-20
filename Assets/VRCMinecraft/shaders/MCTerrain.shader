@@ -1,126 +1,347 @@
-Shader "Unlit/MCTerrain"
+Shader "Unlit/MCTerrain_Combined" // MODIFIED: Renamed shader
 {
     Properties
     {
-        _MainTex ("Texture", 2D) = "white" {}
-        _TintMask ("Tint Mask", 2D) = "black" {}
-        _BiomeColor ("Biome Color", Color) = (1,1,1,0)
+        [KeywordEnum(Opaque, Cutout, Transparent)] _SurfaceType ("Surface Type", Float) = 0 // ADDED: Surface type dropdown
+        _MainTex ("Texture Array", 2DArray) = "white" {} // MODIFIED: Changed to 2DArray
+        _TintMask ("Tint Mask Array", 2DArray) = "black" {} // MODIFIED: Changed to 2DArray
+        [HideInInspector] _WaterStillTex ("Water Still Texture", 2D) = "white" {}
+        [HideInInspector] _WaterFlowTex ("Water Flow Texture", 2D) = "white" {}
+        [HideInInspector] _WaterStillSlice ("Water Still Slice", Float) = -1
+        [HideInInspector] _WaterFlowSlice ("Water Flow Slice", Float) = -1
         _SkyLight ("Sky Light", Integer) = 16
         _DayProgress("Day Progress", Range(0,1)) = 0
+        _FireTex ("Fire Strip Texture", 2D) = "black" {}
+        _LavaTex ("Lava Strip Texture", 2D) = "white" {}
+        _FireSpeed ("Fire Anim Speed", Float) = 20.0
+        _Cutoff ("Alpha Cutoff", Range(0.0, 1.0)) = 0.5 // ADDED: Alpha cutoff for Cutout mode
+        _UseVertexLight ("Use Vertex Light", Float) = 1
+        [HideInInspector] _UseGpuExactAo ("Use GPU Exact AO", Float) = 0
+        [HideInInspector] _UseBakedAo ("Use Baked Vertex AO (light x vertex.a)", Float) = 0
+        _AoFullDistance ("AO Full-Quality Distance (m)", Float) = 128
+
+        // MINECRAFT-STYLE RADIAL FOG PROPERTIES
+        _FogColor ("Fog Color", Color) = (0.5, 0.6, 0.7, 1.0) // Default sky fog color
+        _FogDensity ("Fog Density", Range(0.0, 0.1)) = 0.02 // Controls fog thickness
+        _FogStart ("Fog Start Distance", Float) = 32.0 // Distance where fog begins (25% of far plane)
+        _FogEnd ("Fog End Distance", Float) = 128.0 // Distance where fog is fully opaque (far plane)
+        _FogMode ("Fog Mode", Range(0, 2)) = 0 // 0=Linear, 1=Exponential, 2=Exponential Squared
+
+        // ADDED: Properties for render states (intended to be controlled by script/custom editor)
+        [HideInInspector] _SrcBlend ("SrcBlend Mode", Int) = 1 // MODIFIED: Float to Int. Default: UnityEngine.Rendering.BlendMode.One
+        [HideInInspector] _DstBlend ("DstBlend Mode", Int) = 0 // MODIFIED: Float to Int. Default: UnityEngine.Rendering.BlendMode.Zero
+        [HideInInspector] _ZWrite ("ZWrite", Int) = 1       // MODIFIED: Float to Int. Default: On (1)
+        [HideInInspector] _Cull ("Cull Mode", Int) = 2        // MODIFIED: Float to Int. Default: UnityEngine.Rendering.CullMode.Back (2)
+        [HideInInspector] _OffsetFactor ("Offset Factor", Float) = 0 // ADDED: Depth offset factor
+        [HideInInspector] _OffsetUnits ("Offset Units", Float) = 0 // ADDED: Depth offset units
     }
     SubShader
     {
-        Tags { "RenderType"="Opaque" "Queue"="Geometry" }
+        // IMPORTANT: For full transparency, Tags (especially "Queue") also need to change.
+        // This shader change focuses on Blend/ZWrite/Cull state configurability.
+        // A script/custom material editor would be needed to set these properties AND 
+        // material.renderQueue / material.SetOverrideTag("RenderType", ...) based on _SurfaceType.
+        Tags { "RenderType"="" "Queue"="Geometry" } // Base tags, will need to be overridden for Transparent by script/editor
         LOD 100
-        
-        
 
         Pass
         {
-            
+            // These states are now controlled by the material properties defined above.
+            // A script or custom MaterialEditor should set these properties based on the _SurfaceType keyword.
+            Blend [_SrcBlend] [_DstBlend]
+            ZWrite [_ZWrite]
+            Cull [_Cull]
+            Offset [_OffsetFactor], [_OffsetUnits]
+
+            // Default states for Opaque/Cutout: ZWrite On, Cull Back, Blend Off
+            // For Transparent mode, these need to be changed manually on the material:
+            // Blend SrcAlpha OneMinusSrcAlpha, ZWrite Off, Cull Off (optional)
+
             CGPROGRAM
             #pragma vertex vert
-            #pragma fragment frag
-            // make fog work
+            #pragma fragment frag 
+            #pragma target 3.0
+            // make fog work  
             #pragma multi_compile_fog
+            #pragma shader_feature_local _SURFACETYPE_OPAQUE _SURFACETYPE_CUTOUT _SURFACETYPE_TRANSPARENT // ADDED: Shader features for surface types
+
 
             #include "UnityCG.cginc"
 
             struct appdata
             {
                 float4 vertex : POSITION;
-                float2 uv : TEXCOORD0;
+                float3 uvw : TEXCOORD0; // MODIFIED: Changed to float3 for UV + Slice Index
                 float3 normal : NORMAL;
+                float4 color : COLOR; // ADDED: Vertex color input
             };
 
             struct v2f
             {
-                float2 uv : TEXCOORD0;
-                UNITY_FOG_COORDS(2)
+                float3 uvw : TEXCOORD0; // MODIFIED: Changed to float3 for UV + Slice Index
                 float4 vertex : SV_POSITION;
                 float3 normal: TEXCOORD1;
+                fixed4 color : COLOR; // ADDED: Vertex color to pass to fragment shader
+                float3 worldPos : TEXCOORD3; // ADDED: World position for radial fog calculation
             };
 
-            sampler2D _MainTex;
+            UNITY_DECLARE_TEX2DARRAY(_MainTex); // MODIFIED: Declared as Texture2DArray
             float4 _MainTex_ST;
 
-            sampler2D _TintMask;
+            UNITY_DECLARE_TEX2DARRAY(_TintMask); // MODIFIED: Declared as Texture2DArray
+            sampler2D _WaterStillTex;
+            sampler2D _WaterFlowTex;
+            float _WaterStillSlice;
+            float _WaterFlowSlice;
+
+            #if defined(_SURFACETYPE_CUTOUT) // ADDED: Conditional declaration
+            float _Cutoff; // ADDED: Declaration for Alpha Cutoff
+            #endif // ADDED: Conditional declaration
 
             int _SkyLight;
             half _DayProgress;
+            sampler2D _FireTex;
+            sampler2D _LavaTex;
+            float _FireSpeed;
+            
+            // MINECRAFT-STYLE RADIAL FOG VARIABLES
+            fixed4 _FogColor;
+            half _FogDensity;
+            half _FogStart;
+            half _FogEnd;
+            half _FogMode;
+            float _UseVertexLight;
+            float _UseGpuExactAo;
+            float _UseBakedAo;
+            float _AoFullDistance;
+            sampler2D _UdonVRCM_GpuLightAtlas;
+            sampler2D _UdonVRCM_GpuBlockAtlas;
+            sampler2D _UdonVRCM_GpuSlotLookup;
+            sampler2D _UdonVRCM_GpuBlockProps;
+            float4 _UdonVRCM_GpuAtlasInfo;
+            float4 _UdonVRCM_GpuWorldInfo;
+            float4 _UdonVRCM_GpuChunkInfo;
+            float4 _UdonVRCM_GpuVoxelOffset;
+            float _UdonVRCM_GpuEnabled;
+            float _UdonVRCM_SkylightSub; // DAY/NIGHT: 0-11, subtracted from SKY light at sample time
 
-            fixed4 _BiomeColor;
+            #include "MCTerrainGpuExactAo.cginc"
 
             v2f vert (appdata v)
             {
                 v2f o;
                 o.vertex = UnityObjectToClipPos(v.vertex);
                 o.normal = v.normal;
-                o.uv = TRANSFORM_TEX(v.uv, _MainTex);
-                UNITY_TRANSFER_FOG(o,o.vertex);
+                o.uvw.xy = TRANSFORM_TEX(v.uvw.xy, _MainTex); // MODIFIED: Transform only xy
+                o.uvw.z = v.uvw.z; // MODIFIED: Pass z (slice index) through
+                o.color = v.color; // ADDED: Pass vertex color to fragment shader
+                
+                // Calculate world position for radial fog (Quest-compatible, no depth buffer needed)
+                o.worldPos = mul(unity_ObjectToWorld, v.vertex).xyz;
                 return o;
-            }
-
-            float2 round(float2 uv)
-            {
-                return float2(  (uv.x / 0.0625) * 0.0625, (uv.y / 0.0625) * 0.0625);
             }
 
             fixed calcBrightness(fixed3 normal)
             {
-                fixed brightness;
-                if (normal.y > 0.5) // Top face
-                {
-                    brightness = 1.0;
-                }
-                else if (normal.y < -0.5) // Bottom face
-                {
-                    brightness = 0.2;
-                }
-                else if (normal.x > 0.5 || normal.x < -0.5) // Left and right faces
-                {
-                    brightness = 0.6;
-                }
-                else if (normal.z > 0.5 || normal.z < -0.5) // Front and back faces
-                {
-                    brightness = 0.4;
-                }
+                // Cross-shaped blocks have diagonal normals where no single component > 0.9
+                fixed maxComp = max(max(abs(normal.x), abs(normal.y)), abs(normal.z));
+                if (maxComp < 0.9) return 1.0;
 
-                return brightness;
+                if (normal.y > 0.5) return 1.0;
+                if (normal.y < -0.5) return 0.5;
+                if (abs(normal.x) > abs(normal.z)) return 0.6;
+                return 0.8;
+            }
+            
+            // MINECRAFT-STYLE RADIAL FOG CALCULATION
+            // Based on Minecraft Beta 1.7.3 fog implementation
+            // Supports Linear, Exponential, and Exponential Squared modes
+            half calcMinecraftFog(float3 worldPos)
+            {
+                // Calculate radial distance from camera (Quest-compatible)
+                float3 viewDir = worldPos - _WorldSpaceCameraPos;
+                half distance = length(viewDir);
+                
+                half fogFactor = 1.0;
+                
+                // Minecraft fog modes (matching EntityRenderer.java setupFog method)
+                if (_FogMode < 0.5) // Linear fog (default Minecraft terrain fog)
+                {
+                    // Linear fog: fogStart = farPlane * 0.25, fogEnd = farPlane
+                    // This creates the classic Minecraft fog that starts at 25% of render distance
+                    fogFactor = saturate((_FogEnd - distance) / (_FogEnd - _FogStart));
+                }
+                else if (_FogMode < 1.5) // Exponential fog (water, lava, clouds)
+                {
+                    // Exponential fog: density = 0.1 for water/clouds, 2.0 for lava
+                    fogFactor = exp(-_FogDensity * distance);
+                }
+                else // Exponential Squared fog (alternative exponential mode)
+                {
+                    // Exponential Squared: more gradual falloff
+                    fogFactor = exp(-_FogDensity * _FogDensity * distance * distance);
+                }
+                
+                return saturate(fogFactor);
             }
 
             fixed4 frag (v2f i) : SV_Target
             {
+                fixed4 col;
+                // Fire: green=0, blue=1. Lava: green=0, blue=0. Water: green=1, blue=0.
+                bool isFire = (i.color.g < 0.01 && i.color.b > 0.5);
+                bool isLava = (i.color.g < 0.01 && i.color.b < 0.01);
+                bool isWater = (!isLava && !isFire && i.color.b < 0.01);
 
-                
-                
-                // Snap the UVs to a 0.0625 grid
-                //float2 snappedUV = floor(i.uv / 0.0625) * 0.0625;
-                // sample the texture
-                //fixed4 col = tex2D(_MainTex, snappedUV) * _BiomeColor;
-                fixed4 col = tex2D(_MainTex, round(i.uv));
-                fixed4 overlay = tex2D(_TintMask, round(i.uv)) * half4(_BiomeColor.rgb,1);
-                // Put overlay on top of col
-                col.rgb = lerp(col.rgb, overlay.rgb, overlay.a);
-                half minLightLevel = 0.02;
-                float dayNightTransition;
-                if (_DayProgress < 0.0417) { // 0 to 1000 ticks
-                    dayNightTransition = (_DayProgress / 0.0417);
-                } else if (_DayProgress > 0.5 && _DayProgress < 0.5417) { // 12000 to 13000 ticks
-                    dayNightTransition = (1 - ((_DayProgress - 0.5) / 0.0417));
-                } else if (_DayProgress <= 0.5) {
-                    dayNightTransition = 1;
-                } else {
-                    dayNightTransition = 0;
+                if (isLava)
+                {
+                    float3 viewDir = normalize(_WorldSpaceCameraPos - i.worldPos);
+                    if (dot(i.normal, viewDir) < 0) discard;
+
+                    bool isFlowingLava = (i.color.r > 0.25);
+                    float frameIndex = floor(fmod(_Time.y * 10.0, 64.0));
+                    float frameOffset = frameIndex / 64.0;
+                    // Flowing lava scrolls downward (MC TextureLavaFlowFX), still lava doesn't
+                    float scrollOffset = isFlowingLava ? _Time.y * 1.25 : 0.0;
+                    float2 lavaUV = float2(frac(i.uvw.x), frac(i.uvw.y - scrollOffset) / 64.0 + frameOffset);
+                    col = tex2D(_LavaTex, lavaUV);
+                    // Fallback if texture not assigned (white default)
+                    if (col.r > 0.99 && col.g > 0.99 && col.b > 0.99)
+                        col = fixed4(1.0, 0.42, 0.0, 1.0);
+                    col.a = 1.0;
                 }
-                dayNightTransition = dayNightTransition;
-                col.rgb *= max(minLightLevel,(float)((_SkyLight+1)*dayNightTransition)/16);
-                col.rgb *= calcBrightness(i.normal);
-                // apply fog
-                UNITY_APPLY_FOG(i.fogCoord, col);
+                else if (isFire)
+                {
+                    float frameIndex = floor(fmod(_Time.y * 20.0, 32.0));
+                    float frameOffset = frameIndex / 32.0;
+                    float2 fireUV = float2(i.uvw.x, i.uvw.y + frameOffset);
+                    col = tex2D(_FireTex, fireUV);
+                }
+                else
+                {
+                    col = UNITY_SAMPLE_TEX2DARRAY(_MainTex, i.uvw).rgba;
+                }
+                fixed4 tintInput = fixed4(0,0,0,0);
+                fixed waterWeight = 0;
+                if (!isFire && !isLava)
+                {
+                    tintInput = UNITY_SAMPLE_TEX2DARRAY(_TintMask, i.uvw);
+                    fixed4 waterStill = tex2D(_WaterStillTex, i.uvw.xy).rgba;
+                    fixed4 waterFlow = tex2D(_WaterFlowTex, i.uvw.xy).rgba;
+                    fixed stillWeight = saturate(1.0 - abs(i.uvw.z - _WaterStillSlice) * 4.0);
+                    fixed flowWeight = saturate(1.0 - abs(i.uvw.z - _WaterFlowSlice) * 4.0) * (1.0 - stillWeight);
+                    waterWeight = saturate(stillWeight + flowWeight);
+                    fixed4 waterCol = lerp(waterFlow, waterStill, stillWeight);
+                    col = lerp(col, waterCol, waterWeight);
+
+                    fixed3 tintedColor = col.rgb * i.color.rgb;
+                    col.rgb = lerp(col.rgb, tintedColor, tintInput.a * (1.0 - waterWeight));
+                }
+                
+                half minLightLevel = 0.02;
+                half lightBrightness;
+                // Water/lava: MC uses max(lightAt(self), lightAt(above)) to avoid self-darkening
+                // from lightOpacity. Sample both the block's position and one block above.
+                if (isWater || isLava)
+                {
+                    half selfLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos);
+                    half aboveLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos + float3(0, 1, 0));
+                    half fluidLight = max(selfLight, aboveLight);
+                    // Atlas miss with the GPU pipeline ON -> skylit fallback (the vertex alpha is
+                    // a fullbright 1.0 placeholder on GPU-lit chunks — far-edge water glowed at
+                    // night). LAVA stays fullbright: it emits block light 15, so a hit always
+                    // resolves to 1.0 — a skylit fallback would make just-streamed lava go
+                    // near-black at night and pop when its light slot seeds (review-confirmed).
+                    // i.color.a remains the CPU-lit-world fallback.
+                    if (fluidLight < 0.0) fluidLight = _UdonVRCM_GpuEnabled >= 0.5
+                        ? (isLava ? 1.0 : gpuVoxelAtlasMissBrightness())
+                        : i.color.a;
+                    lightBrightness = max(minLightLevel, fluidLight);
+                }
+                else if (_UseGpuExactAo > 0.5)
+                {
+                    // Cross-shaped blocks have diagonal normals — AO basis doesn't apply.
+                    bool isCrossNormal = max(max(abs(i.normal.x), abs(i.normal.y)), abs(i.normal.z)) < 0.9;
+                    if (isCrossNormal)
+                    {
+                        half crossLight = gpuVoxelSampleLightBrightnessAtPosition(i.worldPos);
+                        // Miss -> skylit (decor/cross meshes carry alpha 1.0, which fullbrights at night).
+                        if (crossLight < 0.0) crossLight = gpuVoxelAtlasMissBrightness();
+                        lightBrightness = max(minLightLevel, crossLight);
+                    }
+                    else
+                    {
+                        // AO distance LOD: the full 4-corner exact AO is ~16 atlas samples per
+                        // fragment. Past _AoFullDistance, fall back to a single light sample — fog
+                        // hides the transition and the per-fragment cost drops a lot. Set
+                        // _AoFullDistance very large to disable the LOD (always full AO).
+                        half aoBrightness;
+                        if (distance(i.worldPos, _WorldSpaceCameraPos) > _AoFullDistance)
+                        {
+                            aoBrightness = gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
+                            // Atlas miss (e.g. a far chunk whose light slot has been evicted) returns
+                            // -1 -> skylit fallback (day-bright, night-dim), matching the exact-AO
+                            // corner policy — a constant floor was black-by-day, and i.color.a is ~0
+                            // on GPU-exact-AO meshes (vertex light isn't baked).
+                            if (aoBrightness < 0.0) aoBrightness = gpuVoxelAtlasMissBrightness();
+                        }
+                        else
+                            aoBrightness = gpuVoxelComputeExactAoBrightness(i.worldPos, i.normal);
+                        lightBrightness = max(minLightLevel, aoBrightness >= 0.0 ? aoBrightness : i.color.a);
+                    }
+                }
+                else if (_UseBakedAo > 0.5)
+                {
+                    // Geometric AO baked into vertex-color alpha at mesh time; light is ONE GPU atlas
+                    // sample. brightness = light x bakedAO. Cross blocks carry no baked AO -> light only.
+                    bool isCrossNormalB = max(max(abs(i.normal.x), abs(i.normal.y)), abs(i.normal.z)) < 0.9;
+                    half oneLight = isCrossNormalB
+                        ? gpuVoxelSampleLightBrightnessAtPosition(i.worldPos)
+                        : gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
+                    if (oneLight < 0.0) oneLight = gpuVoxelAtlasMissBrightness(); // atlas miss -> skylit
+                    half bakedAo = isCrossNormalB ? 1.0 : i.color.a;
+                    lightBrightness = max(minLightLevel, oneLight * bakedAo);
+                }
+                else if (_UseVertexLight > 0.5)
+                {
+                    lightBrightness = max(minLightLevel, i.color.a);
+                }
+                else
+                {
+                    half gpuLightBrightness = gpuVoxelSampleLightBrightness(i.worldPos, i.normal);
+                    if (gpuLightBrightness >= 0.0)
+                    {
+                        lightBrightness = max(minLightLevel, gpuLightBrightness);
+                    }
+                    else
+                    {
+                        // GPU ON but the sample missed -> skylit; GPU OFF -> CPU vertex light.
+                        lightBrightness = max(minLightLevel, _UdonVRCM_GpuEnabled >= 0.5 ? gpuVoxelAtlasMissBrightness() : i.color.a);
+                    }
+                }
+                
+                // Water and lava use faceBrightness=1.0 (MC behavior: no directional shading on fluid surfaces)
+                half faceBrightness = (isWater || isLava) ? 1.0 : calcBrightness(i.normal);
+                half combinedBrightness = lightBrightness * faceBrightness;
+                combinedBrightness = GammaToLinearSpace(combinedBrightness.xxx).x;
+                
+                col.rgb *= combinedBrightness;
+
+                #if defined(_SURFACETYPE_CUTOUT)
+                    clip(col.a - _Cutoff);
+                #endif
+
+                half fogFactor = calcMinecraftFog(i.worldPos);
+                col.rgb = lerp(_FogColor.rgb, col.rgb, fogFactor);
+
+                // (Built-in UNITY_APPLY_FOG removed: it stacked RenderSettings fog — which the
+                // day/night driver now publishes aggressively — on top of calcMinecraftFog,
+                // double-fogging this family while the instanced family fogs once.)
+
                 return col;
             }
             ENDCG
         }
     }
+    CustomEditor "MCTerrainCombinedShaderGUI" // ADDED: Link to custom shader GUI
 }

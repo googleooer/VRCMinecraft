@@ -11,7 +11,8 @@ Material:
   m_Shader: {fileID: 4800000, guid: 234396ca6c1c79f498edb7707d6654a0, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
-  m_ValidKeywords: []
+  m_ValidKeywords:
+  - _SURFACETYPE_OPAQUE
   m_InvalidKeywords: []
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
@@ -43,6 +44,14 @@ Material:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _FireTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _LavaTex:
+        m_Texture: {fileID: 2800000, guid: 0769ee0a4e2a07e49b3f67e709e9985c, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _MainTex:
         m_Texture: {fileID: 2800000, guid: 2ddff4772dd6c1840a2a3e71ead2d492, type: 3}
         m_Scale: {x: 1, y: 1}
@@ -63,28 +72,50 @@ Material:
         m_Texture: {fileID: 2800000, guid: 2ddff4772dd6c1840a2a3e71ead2d492, type: 3}
         m_Scale: {x: 1, y: 1}
         m_Offset: {x: 0, y: 0}
+    - _WaterFlowTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _WaterStillTex:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     m_Ints:
     - _SkyLight: 16
     m_Floats:
     - _BumpScale: 1
+    - _Cull: 2
     - _Cutoff: 0.5
     - _DayProgress: 0.5
     - _DetailNormalMapScale: 1
     - _DstBlend: 0
+    - _FireSpeed: 20
+    - _FogDensity: 0.02
+    - _FogEnd: 128
+    - _FogMode: 0
+    - _FogStart: 32
     - _GlossMapScale: 1
     - _Glossiness: 0.5
     - _GlossyReflections: 1
     - _Metallic: 0
     - _Mode: 0
     - _OcclusionStrength: 1
+    - _OffsetFactor: 0
+    - _OffsetUnits: 0
     - _Parallax: 0.02
     - _SmoothnessTextureChannel: 0
     - _SpecularHighlights: 1
     - _SrcBlend: 1
+    - _SurfaceType: 0
     - _UVSec: 0
+    - _UseGpuExactAo: 0
+    - _UseVertexLight: 1
+    - _WaterFlowSlice: -1
+    - _WaterStillSlice: -1
     - _ZWrite: 1
     m_Colors:
     - _BiomeColor: {r: 0.083333254, g: 1, b: 0, a: 0}
     - _Color: {r: 1, g: 1, b: 1, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 1}
+    - _FogColor: {r: 0.5, g: 0.6, b: 0.7, a: 1}
   m_BuildTextureStacks: []

@@ -34,21 +34,32 @@ public class MusicManager : UdonSharpBehaviour
         if(isMusicPlaying()) return;
         musicAudioSource.Stop();
         musicAudioSource.time = 0;
+        // Note: Random.Range(int, int) upper bound is EXCLUSIVE — must pass .Length, not .Length-1,
+        // otherwise the last track in the array can never be selected.
         switch (gamemode)
         {
             default:
-                musicAudioSource.clip = survivalTracks[Random.Range(0, survivalTracks.Length-1)];
-                musicAudioSource.Play();
+                if (survivalTracks != null && survivalTracks.Length > 0)
+                {
+                    musicAudioSource.clip = survivalTracks[Random.Range(0, survivalTracks.Length)];
+                    musicAudioSource.Play();
+                }
                 break;
             case Gamemode.CREATIVE:
-                musicAudioSource.clip = creativeTracks[Random.Range(0, creativeTracks.Length-1)];
-                musicAudioSource.Play();
+                if (creativeTracks != null && creativeTracks.Length > 0)
+                {
+                    musicAudioSource.clip = creativeTracks[Random.Range(0, creativeTracks.Length)];
+                    musicAudioSource.Play();
+                }
                 break;
             case Gamemode.MENU:
-                musicAudioSource.clip = menuTracks[Random.Range(0, menuTracks.Length-1)];
-                musicAudioSource.Play();
+                if (menuTracks != null && menuTracks.Length > 0)
+                {
+                    musicAudioSource.clip = menuTracks[Random.Range(0, menuTracks.Length)];
+                    musicAudioSource.Play();
+                }
                 break;
         }
-        
+
     }
 }

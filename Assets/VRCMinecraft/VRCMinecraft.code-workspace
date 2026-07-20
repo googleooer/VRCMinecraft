@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../VRCMinecraft_Beta173_Deobf/RetroMCP"
+		}
+	],
+	"settings": {
+		"dotnet.defaultSolution": "VRCMinecraft.sln"
+	}
+}

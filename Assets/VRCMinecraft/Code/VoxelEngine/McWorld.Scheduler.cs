@@ -1,0 +1,1346 @@
+#define LOGGING
+
+using UdonSharp;
+using UnityEngine;
+
+// Partial of McWorld holding the chunk scheduler (the fully merged former McCoordinator;
+// that class no longer exists). Start() calls _SchedulerInit and Update() calls
+// _RunSchedulerOnce — this file owns and drives the 16-worker pool end to end.
+// The perf summary still prints this subsystem under the legacy "Coordinator:" heading.
+// updateTimeBudgetMs and loadPhaseUpdateBudgetMs are NOT redeclared here — McWorld already owns them.
+public partial class McWorld
+{
+    // -------------------------------------------------------------------------
+    // Worker-pool state constants
+    // -------------------------------------------------------------------------
+    private const int SCH_STATE_IDLE             = 0;
+    private const int SCH_STATE_DATA_GEN         = 1;
+    private const int SCH_STATE_LIGHTING         = 2;
+    private const int SCH_STATE_WAITING_FOR_MESH = 3;
+    private const int SCH_STATE_MESHING          = 4;
+    private const int SCH_MESH_WATCHDOG_FRAMES   = 300;
+
+    // -------------------------------------------------------------------------
+    // Serialized tuning fields (mirrors McCoordinator inspector fields)
+    // -------------------------------------------------------------------------
+    [Header("Scheduler: Performance")]
+    public int maxConcurrentWorkers = 16;
+    // Concurrent GPU worldgen columns (each = one in-flight base readback, ~150ms latency). Workers
+    // parked on a readback cost no CPU, so more columns = more throughput without more per-frame work.
+    // (2 was too restrictive — it left workers idle and made the data-gen picker spin-scan ~12ms/cycle.)
+    public int maxConcurrentWorldgenColumns = 4;
+    public bool reserveWorkersForDataGenDuringLoad = false;
+    public int loadPhaseMeshWorkerCap = 8;
+    public int debugGenSlotHoldFrames = 0;
+    public int deferredMeshWakeQueueThreshold = 32;
+    public int deferredMeshWakeBurstPerCycle = 1;
+    public int maxChunkInstantiationsPerCycle = 16;
+    public int dataGenLookaheadWindow = 96;
+
+    // -------------------------------------------------------------------------
+    // Worker-pool runtime arrays (allocated in scheduler init)
+    // -------------------------------------------------------------------------
+    private int[]  worker_targetChunkIndex;
+    private int[]  worker_state;
+    private bool[] worker_usesExclusiveGenerator;
+    private bool[] worker_isDeferredMeshWake;
+    private int[]  worker_skipCheckCounter;
+    private int[]  worker_meshFrames;
+    private int[]  worker_generatorSlot;
+
+    // -------------------------------------------------------------------------
+    // Generator-slot tracking
+    // -------------------------------------------------------------------------
+    private bool[] genSlotBusy;
+    private int[]  genSlotReleaseDelay;
+
+    // -------------------------------------------------------------------------
+    // World-generation / picker state
+    // -------------------------------------------------------------------------
+    private int[]  radialChunkOrder;
+    private int    nextChunkIndexToAssign  = 0;
+    // Resumable cursor + per-cycle budget for the picker's anti-stall fallback scan. Bounds the
+    // far-position scan to O(budget)/cycle instead of O(world): when the look-ahead window is empty,
+    // the old code rescanned all ~8192 remaining positions every cycle (≈20ms/cycle once the near
+    // region fills — which happens fast under GPU residency). The cursor amortises the full scan
+    // across cycles, so any pickable far position is still found within a few frames.
+    private int    _fallbackScanCursor      = 0;
+    private const int DATAGEN_FALLBACK_SCAN_BUDGET = 256;
+    // totalWorldChunks: already declared in McWorld.cs (line 281) — reused, not redeclared.
+    private int    chunksCompletedCount    = 0;
+    private bool[] _positionAssigned;
+    private int    _lastPickedDataGenPos   = -1;
+    // Anti-spin: once the picker finds nothing pickable in a cycle, scanning again for every other
+    // idle worker that cycle is pure waste (state can't improve mid-assign) — it cost ~12ms/cycle with
+    // a restrictive column cap + many idle workers. Latched per assign cycle, reset at its start.
+    private bool   _pickerExhaustedThisCycle = false;
+
+    // -------------------------------------------------------------------------
+    // Initial-load plateau detection
+    // -------------------------------------------------------------------------
+    private bool  _initialBulkLoadDone          = false;
+    // Wall-clock of the previous scheduler cycle — feeds the plateau pause/hitch guard.
+    private float _lastSchedulerCycleTime       = -1f;
+    private int   _lastProgressCompletedCount   = -1;
+    private float _lastGenProgressTime          = -1f;
+
+    // -------------------------------------------------------------------------
+    // Rebuild / deferred-mesh queues
+    // -------------------------------------------------------------------------
+    private int[] chunkRebuildQueue;
+    private int   chunkRebuildQueue_head  = 0;
+    private int   chunkRebuildQueue_tail  = 0;
+    private int   chunkRebuildQueue_count = 0;
+    private const int MAX_REBUILD_QUEUE_SIZE = 256;
+
+    private int[] deferredMeshQueue;
+    private int   deferredMeshQueue_head  = 0;
+    private int   deferredMeshQueue_tail  = 0;
+    private int   deferredMeshQueue_count = 0;
+    private const int MAX_DEFERRED_MESH_QUEUE_SIZE = 256;
+
+    private int borderHealWorkerCursor = 0;
+    private readonly int[] _healDx = {  1, -1, 0,  0, 0,  0 };
+    private readonly int[] _healDy = {  0,  0, 1, -1, 0,  0 };
+    private readonly int[] _healDz = {  0,  0, 0,  0, 1, -1 };
+
+    // -------------------------------------------------------------------------
+    // Benchmark / near-region tracking
+    // -------------------------------------------------------------------------
+    private float  benchmarkStartTime  = 0f;
+    private bool[] _nearMeshCounted;
+    private int    _nearMeshDone       = 0;
+    private bool   _nearMeshLogged     = false;
+
+    // =========================================================================
+    // Picker methods (data-gen assignment: cache affinity, look-ahead, fallback scan)
+    // =========================================================================
+
+    // Scans forward from the assignment low-water-mark for the first chunk that
+    // can start data-gen RIGHT NOW: either its generator slot is free (a new
+    // column) or its column cache is already populated (a sibling Y-chunk of an
+    // in-flight/completed column). Returns true and sets _lastPickedDataGenPos on
+    // success. Forward order guarantees a column's cached siblings (earlier
+    // positions) are picked before any later column that would reuse the same
+    // generator, so the single-column cache is never evicted out from under
+    // un-drained siblings.
+    private bool _TryPickDataGenPosition()
+    {
+#if LOGGING
+        if (!sch_enableDetailedTimings && !sch_enableAggregateLogging) return _TryPickDataGenPositionImpl();
+        System.DateTime _pickT = System.DateTime.UtcNow;
+        bool _pickR = _TryPickDataGenPositionImpl();
+        sch_time_AssignPick += (float)(System.DateTime.UtcNow - _pickT).TotalMilliseconds;
+        sch_assign_PickCalls++;
+        return _pickR;
+#else
+        return _TryPickDataGenPositionImpl();
+#endif
+    }
+
+    // (The old memoized per-index slot cache is gone: with DYNAMIC GENERATOR ASSIGNMENT a
+    // column has no fixed slot to memoize — the picker gates on PickGeneratorSlotForNewColumn
+    // (per-frame free-slot early-out inside) and assignment reads the freshly written map.)
+
+    // PICKER PARKING: when a full pick attempt found nothing, no generator is mid-column, and the
+    // player hasn't entered a new chunk, eligibility cannot change — skip the scans for a few
+    // frames instead of burning ~0.65ms/frame re-scanning forever at idle.
+    private int _pickerParkCooldown = 0;
+    private int _pickerParkPlayerX = int.MinValue;
+    private int _pickerParkPlayerZ = int.MinValue;
+
+    private bool _TryPickDataGenPositionImpl()
+    {
+        if (radialChunkOrder == null || _positionAssigned == null) return false;
+        // Already scanned this cycle and found nothing — don't rescan for every other idle worker.
+        if (_pickerExhaustedThisCycle) return false;
+        if (_pickerParkCooldown > 0)
+        {
+            if (_streamPlayerKnown && (_streamPlayerChunkX != _pickerParkPlayerX || _streamPlayerChunkZ != _pickerParkPlayerZ))
+            {
+                _pickerParkCooldown = 0; // player entered a new chunk — new columns may be eligible
+            }
+            else
+            {
+                _pickerParkCooldown = _pickerParkCooldown - 1;
+                _pickerExhaustedThisCycle = true; // one decrement per cycle, not per idle worker
+                return false;
+            }
+        }
+        // THROTTLE: how many NEW worldgen columns may be in flight concurrently. Each
+        // new column holds a generator + an in-flight GPU base-readback; capping below
+        // the generator count leaves GPU readback bandwidth for mesh face-readbacks
+        // (which were being starved during load). Sibling chunks copied from an
+        // already-generated column cache add NO readback, so they bypass the cap.
+        bool canStartNewColumn = _BusyGeneratorCount() < maxConcurrentWorldgenColumns;
+        int scanEnd = nextChunkIndexToAssign + dataGenLookaheadWindow;
+        if (scanEnd > totalWorldChunks) scanEnd = totalWorldChunks;
+        // CACHE AFFINITY: a chunk whose column slice is already in its generator's cache copies in
+        // ~1ms with no readback — ALWAYS prefer it over starting a new column, even when a slot is
+        // free. Picking a new column first stomps that cache, forcing the cached siblings into full
+        // column re-generations. This was the end-of-load crawl: two straggler columns hashing to
+        // the same generator alternated picks, so EVERY remaining Y-chunk cost a whole fresh column
+        // (~300-700ms each, mostly idle readback latency).
+        int newColumnPos = -1;
+        for (int p = nextChunkIndexToAssign; p < scanEnd; p++)
+        {
+            if (_positionAssigned[p]) continue;
+            int ci = radialChunkOrder[p];
+            if (!ShouldGenerateChunkData(ci)) continue; // DATA-GEN STREAMING: defer chunks beyond render distance (+margin)
+            if (CanStartChunkDataGenerationWithoutExclusiveGenerator(ci))
+            {
+                _lastPickedDataGenPos = p; return true; // sibling from column cache — free; drain before any new column
+            }
+            if (newColumnPos < 0 && canStartNewColumn && _NewColumnPickAllowed(ci))
+            {
+                newColumnPos = p; // radially-first new-column candidate; used only if no cache-hit exists
+            }
+        }
+        if (newColumnPos >= 0) { _lastPickedDataGenPos = newColumnPos; return true; }
+
+        // FALLBACK (anti-stall): the windowed scan can come up empty when the next
+        // dataGenLookaheadWindow positions are all already-assigned or map to the few
+        // busy generator slots, while the pickable (unassigned + FREE-slot) positions
+        // sit further ahead. Scan the remaining order for an unassigned position whose
+        // generator slot is FREE — but BOUNDED to DATAGEN_FALLBACK_SCAN_BUDGET positions
+        // per cycle via a resumable cursor, so this is O(budget) not O(world) each cycle.
+        // The cursor wraps within [scanEnd, totalWorldChunks), so over a few cycles the
+        // whole remaining order is still covered (anti-stall preserved). A new column can
+        // only start when canStartNewColumn, so skip the scan entirely otherwise.
+        int remaining = totalWorldChunks - scanEnd;
+        if (canStartNewColumn && remaining > 0)
+        {
+            int budget = remaining < DATAGEN_FALLBACK_SCAN_BUDGET ? remaining : DATAGEN_FALLBACK_SCAN_BUDGET;
+            int p = _fallbackScanCursor;
+            if (p < scanEnd || p >= totalWorldChunks) p = scanEnd;
+            for (int s = 0; s < budget; s++)
+            {
+                if (p >= totalWorldChunks) p = scanEnd;
+                if (!_positionAssigned[p])
+                {
+                    int ci = radialChunkOrder[p];
+                    if (ShouldGenerateChunkData(ci) && _NewColumnPickAllowed(ci))
+                    {
+                        _lastPickedDataGenPos = p;
+                        _fallbackScanCursor = (p + 1 >= totalWorldChunks) ? scanEnd : p + 1;
+                        return true;
+                    }
+                }
+                p++;
+            }
+            _fallbackScanCursor = (p >= totalWorldChunks) ? scanEnd : p;
+        }
+        // Nothing pickable this cycle — latch so the remaining idle workers skip the rescan.
+        _pickerExhaustedThisCycle = true;
+        // PICKER PARKING: with nothing pickable and no column in flight, eligibility only changes
+        // when the player enters a new chunk (instant wake) or on the periodic retry (~15 cycles).
+        // Never park while a generator still has drainable cached siblings — the drain guard is
+        // refusing new columns right now, and parking 15 cycles would stall the drain itself.
+        if (_BusyGeneratorCount() == 0 && !_AnyGeneratorDrainPending())
+        {
+            _pickerParkCooldown = 15;
+            _pickerParkPlayerX = _streamPlayerKnown ? _streamPlayerChunkX : int.MinValue;
+            _pickerParkPlayerZ = _streamPlayerKnown ? _streamPlayerChunkZ : int.MinValue;
+        }
+        return false;
+    }
+
+    // DYNAMIC GENERATOR ASSIGNMENT (pick side): a new-column candidate is pickable when SOME
+    // free slot could take it — free (unreserved + idle machine) and not blocked by that
+    // slot's own cache drain (the guard exempts the candidate if it IS the slot's cached
+    // column). Subsumes the old fixed-hash slot gate; the actual binding happens at
+    // StartChunkDataGeneration via the same PickGeneratorSlotForNewColumn.
+    private bool _NewColumnPickAllowed(int ci)
+    {
+        // Coords from the INDEX: unassigned candidates have no ChunkData yet (lazy creation),
+        // and a "c == null -> allowed" bail here let every foreign new-column pick through the
+        // drain gate — which is most of them during the tail, when candidates are unassigned.
+        Chunk1DToArrrayCoords(ci, out int ax, out int ay, out int az);
+        int cx = ax - chunkOffsetX;
+        int cz = az - chunkOffsetZ;
+        return PickGeneratorSlotForNewColumn(cx, cz) >= 0;
+    }
+
+    // Any generator currently holding a copyable cache with pending siblings? (Used to keep the
+    // picker from parking mid-drain.)
+    private bool _AnyGeneratorDrainPending()
+    {
+        int n = GetGeneratorCount();
+        for (int s = 0; s < n; s++)
+        {
+            McTerrainGenerator g = (s == 0)
+                ? terrainGenerator
+                : ((extraGenerators != null && s - 1 < extraGenerators.Length) ? extraGenerators[s - 1] : null);
+            if (g != null && GenBlocksNewColumnForCacheDrain(g, s, int.MinValue, int.MinValue)) return true;
+        }
+        return false;
+    }
+
+    // A slot is free for a NEW exclusive column only when unreserved AND its generator's state
+    // machine is actually Idle. A column restarted by the multi-gen contract guard in
+    // StepChunkDataGeneration runs WITHOUT a reservation (its worker never held the slot), and
+    // starting a fresh column on top of it would stomp the restart mid-flight and churn both.
+    private bool _GenSlotIsFreeForNewColumn(int slot)
+    {
+        if (slot < 0 || genSlotBusy == null || slot >= genSlotBusy.Length) return false;
+        if (genSlotBusy[slot]) return false;
+        McTerrainGenerator g = (slot == 0)
+            ? terrainGenerator
+            : ((extraGenerators != null && slot - 1 < extraGenerators.Length) ? extraGenerators[slot - 1] : null);
+        return g == null || g.IsIdle();
+    }
+
+    // Number of generator slots currently mid-column (each = one in-flight GPU
+    // base-readback).
+    private int _BusyGeneratorCount()
+    {
+        if (genSlotBusy == null) return 0;
+        int n = 0;
+        for (int i = 0; i < genSlotBusy.Length; i++) if (genSlotBusy[i]) n++;
+        return n;
+    }
+
+    // =========================================================================
+    // Worker helper methods (pulled from McCoordinator — same rename rules)
+    // =========================================================================
+
+    // Releases the generator slot a worker was holding (clears genSlotBusy for that slot).
+    private void _ReleaseWorkerGeneratorSlot(int i)
+    {
+        int slot = worker_generatorSlot[i];
+        if (slot >= 0 && genSlotBusy != null && slot < genSlotBusy.Length)
+        {
+            // DEBUG: simulate Quest readback occupancy by holding the slot busy a few more frames.
+            if (debugGenSlotHoldFrames > 0 && genSlotReleaseDelay != null && slot < genSlotReleaseDelay.Length)
+                genSlotReleaseDelay[slot] = debugGenSlotHoldFrames;
+            else
+                genSlotBusy[slot] = false;
+        }
+        worker_generatorSlot[i] = -1;
+    }
+
+    // Count of workers currently in SCH_STATE_MESHING — used by the data-gen worker reservation
+    // to cap concurrent meshing during the bulk load.
+    private int _CountMeshingWorkers()
+    {
+        int c = 0;
+        for (int i = 0; i < maxConcurrentWorkers; i++) if (worker_state[i] == SCH_STATE_MESHING) c++;
+        return c;
+    }
+
+    // Count of workers currently in SCH_STATE_WAITING_FOR_MESH — used by the strict-neighbour mesh
+    // gate to detect a potential deadlock (all workers waiting, none free to instantiate the
+    // missing neighbour) and fall back to lenient (air-boundary) meshing to break it.
+    private int _CountWaitingWorkers()
+    {
+        int c = 0;
+        for (int i = 0; i < maxConcurrentWorkers; i++) if (worker_state[i] == SCH_STATE_WAITING_FOR_MESH) c++;
+        return c;
+    }
+
+    private bool _TryAssignDeferredMeshWake(int workerIndex, ChunkData[] chunks, int chunksLen)
+    {
+        int popLimit = deferredMeshQueue_count < 8 ? deferredMeshQueue_count : 8;
+        while (popLimit-- > 0 && deferredMeshQueue_count > 0)
+        {
+            int deferredChunkIndex = deferredMeshQueue[deferredMeshQueue_head];
+            deferredMeshQueue_head = (deferredMeshQueue_head + 1) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+            deferredMeshQueue_count--;
+
+            if (deferredChunkIndex == -1 || deferredChunkIndex >= chunksLen) continue;
+
+            ChunkData deferredChunk = chunks[deferredChunkIndex];
+            if (deferredChunk == null || !deferredChunk.isDataReady || deferredChunk.isBuildingMesh || !deferredChunk.isMeshDeferred) continue;
+
+            deferredChunk.isMeshDeferred = false;
+            // REBUILD-WAVE FIX: waking a deferred chunk must NOT schedule neighbor rebuilds.
+            // A chunk MESHING changes no block data — its neighbors' meshes were already built
+            // against its (long-present) data, so re-meshing them is pure waste. This flag made
+            // every wake fan out 6 redundant re-preps (measured: 46 wakes -> 361 neighbor
+            // triggers -> 663 rebuilds per 300 frames), monopolizing all 16 workers and starving
+            // data-gen. Genuine border healing (a neighbor meshed while this chunk's DATA was
+            // missing) is handled by the _borderMissingMask heal system.
+            worker_targetChunkIndex[workerIndex] = deferredChunkIndex;
+            worker_state[workerIndex] = SCH_STATE_WAITING_FOR_MESH;
+            worker_isDeferredMeshWake[workerIndex] = true;
+#if LOGGING
+            if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_deferredMeshWakeAssignments++;
+#endif
+            return true;
+        }
+
+        return false;
+    }
+
+    // =========================================================================
+    // Assignment loop (ported from McCoordinator.Update, lines 707–930)
+    // Assigns new work to idle workers: rebuilds (P1), border-heal (P1.5),
+    // initial worldgen (P2), deferred-mesh wakes (P3).
+    // =========================================================================
+    private void _SchedulerAssignWork(float cycleStartTime, float cycleBudget)
+    {
+        ChunkData[] chunks = chunks_1D;
+        int chunksLen = chunks != null ? chunks.Length : 0;
+
+#if LOGGING
+        System.DateTime _awStart = System.DateTime.MinValue;
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging) _awStart = System.DateTime.UtcNow;
+#endif
+
+        int assignedThisCycle = 0;
+        int rebuildAssignmentsThisCycle = 0;
+        int deferredWakeAssignmentsThisCycle = 0;
+        int chunkInstantiationsThisFrame = 0;
+        _pickerExhaustedThisCycle = false; // reset the per-cycle picker anti-spin latch
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break; // Don't exceed budget
+
+            if (worker_state[i] != SCH_STATE_IDLE) continue;
+
+            bool assigned = false;
+            bool canInterleaveDeferredWake =
+                deferredMeshQueue_count > 0
+                && chunkRebuildQueue_count > 0
+                && chunkRebuildQueue_count <= deferredMeshWakeQueueThreshold
+                && deferredWakeAssignmentsThisCycle < deferredMeshWakeBurstPerCycle
+                && rebuildAssignmentsThisCycle > deferredWakeAssignmentsThisCycle;
+
+            if (canInterleaveDeferredWake)
+            {
+                assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                if (assigned)
+                {
+                    assignedThisCycle++;
+                    deferredWakeAssignmentsThisCycle++;
+                }
+            }
+
+            // Priority 1: Process player-initiated rebuilds
+            if (!assigned && chunkRebuildQueue_count > 0)
+            {
+                int chunkIndexToRebuild = chunkRebuildQueue[chunkRebuildQueue_head];
+                chunkRebuildQueue_head = (chunkRebuildQueue_head + 1) % MAX_REBUILD_QUEUE_SIZE;
+                chunkRebuildQueue_count--;
+
+                if (chunkIndexToRebuild != -1)
+                {
+                    ChunkData rebuildChunk = chunks != null && chunkIndexToRebuild >= 0 && chunkIndexToRebuild < chunksLen ? chunks[chunkIndexToRebuild] : null;
+                    if (rebuildChunk != null) rebuildChunk.isQueuedForMeshRebuild = false;
+                    worker_targetChunkIndex[i] = chunkIndexToRebuild;
+                    worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                    worker_isDeferredMeshWake[i] = rebuildChunk != null && rebuildChunk.isMeshDeferred;
+                    if (rebuildChunk != null && rebuildChunk.isMeshDeferred)
+                    {
+                        // REBUILD-WAVE FIX: no neighbor fan-out on wake — see _TryAssignDeferredMeshWake.
+                        rebuildChunk.isMeshDeferred = false;
+                    }
+                    assigned = true;
+                    assignedThisCycle++;
+                    rebuildAssignmentsThisCycle++;
+#if LOGGING
+                    if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_rebuilds_Processed++;
+#endif
+                }
+            }
+            // Priority 1.5: Heal chunks with stale border data (bypass rebuild queue)
+            // Only after all chunks have been assigned for generation.
+            else if (!assigned && nextChunkIndexToAssign >= totalWorldChunks)
+            {
+                int scanLen = chunks != null ? chunksLen : 0;
+                for (int s = 0; s < 64 && scanLen > 0; s++)
+                {
+                    // Udon VM quirk: never post-increment a field as expression — split read/write.
+                    int healCursor = borderHealWorkerCursor;
+                    borderHealWorkerCursor = healCursor + 1;
+                    if (borderHealWorkerCursor >= scanLen) borderHealWorkerCursor = 0;
+                    ChunkData hc = chunks[borderHealWorkerCursor];
+                    if (hc == null || !hc.isDataReady || hc.isBuildingMesh || hc.isMeshDeferred) continue;
+                    if (hc._borderMissingMask == 0) continue;
+                    byte hm = hc._borderMissingMask;
+                    bool ready = true;
+                    for (int d = 0; d < 6; d++)
+                    {
+                        if ((hm & (1 << d)) == 0) continue;
+                        ChunkData nc = GetChunkAt(
+                            hc.chunkX_world + _healDx[d],
+                            hc.chunkY_world + _healDy[d],
+                            hc.chunkZ_world + _healDz[d]);
+                        if (nc == null || !nc.isDataReady) { ready = false; break; }
+                    }
+                    if (ready)
+                    {
+                        worker_targetChunkIndex[i] = borderHealWorkerCursor;
+                        worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                        assigned = true;
+                        assignedThisCycle++;
+                        break;
+                    }
+                }
+
+                // CRITICAL: once worldgen assignment is complete this border-heal branch is an
+                // else-if that captures every idle worker, so the chain never reaches Priority 3
+                // (deferred-mesh wake) below — leaving the deferred queue stranded at its cap and
+                // the world permanently incomplete. Drain it here when heal found nothing. (During
+                // load this branch isn't entered, so Priority 3 still drains the queue normally.)
+                if (!assigned && deferredMeshQueue_count > 0)
+                {
+                    assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                    if (assigned) assignedThisCycle++;
+                }
+            }
+            // Priority 2: Initial world generation
+            // Old limit was 1 instantiation per frame — that capped worldgen at framerate.
+            // With column caching (radial order visits all Y per (x,z) consecutively), the
+            // first chunk in a column waits for the GPU readback (~80ms), then 7 more
+            // sibling chunks can all be allocated to free workers immediately. Allowing
+            // a burst here removes the gap between readback completion and chunks actually
+            // entering the data-gen state.
+            else if (chunkInstantiationsThisFrame < maxChunkInstantiationsPerCycle && nextChunkIndexToAssign < totalWorldChunks && _TryPickDataGenPosition())
+            {
+                int pickedPos = _lastPickedDataGenPos;
+                _positionAssigned[pickedPos] = true;
+                int chunk1DIndex = radialChunkOrder[pickedPos];
+                // Advance the low-water-mark past any now-consumed leading positions.
+                while (nextChunkIndexToAssign < totalWorldChunks && _positionAssigned[nextChunkIndexToAssign]) nextChunkIndexToAssign++;
+
+                Chunk1DToArrrayCoords(chunk1DIndex, out int array_cx, out int array_cy, out int array_cz);
+
+                int newChunkIndex = InstantiateAndConfigureChunk(array_cx, array_cy, array_cz);
+                chunkInstantiationsThisFrame++;
+
+                if (newChunkIndex != -1)
+                {
+                    worker_targetChunkIndex[i] = newChunkIndex;
+                    worker_state[i] = SCH_STATE_DATA_GEN;
+#if LOGGING
+                    System.DateTime _startGenT = (sch_enableDetailedTimings || sch_enableAggregateLogging) ? System.DateTime.UtcNow : System.DateTime.MinValue;
+#endif
+                    worker_usesExclusiveGenerator[i] = StartChunkDataGeneration(newChunkIndex);
+#if LOGGING
+                    if (sch_enableDetailedTimings || sch_enableAggregateLogging) { sch_time_AssignStartGen += (float)(System.DateTime.UtcNow - _startGenT).TotalMilliseconds; sch_assign_NewColumns++; }
+#endif
+                    worker_isDeferredMeshWake[i] = false;
+                    if (worker_usesExclusiveGenerator[i])
+                    {
+                        // DYNAMIC ASSIGNMENT: read the map fresh — StartChunkDataGeneration
+                        // just bound this column to whichever slot was free.
+                        int genSlot = GeneratorSlotForChunkIndex(newChunkIndex);
+                        worker_generatorSlot[i] = genSlot;
+                        if (genSlot >= 0 && genSlot < genSlotBusy.Length) genSlotBusy[genSlot] = true;
+                    }
+                    assigned = true;
+                    assignedThisCycle++;
+#if LOGGING
+                    if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_worldChunks_Assigned++;
+#endif
+
+                    // Cached lower-Y GPU slices can complete immediately without holding the
+                    // exclusive generator. Collapse that handoff here so workers are freed
+                    // in the same coordinator cycle when possible.
+                    if (!worker_usesExclusiveGenerator[i])
+                    {
+                        ChunkData assignedChunk = chunks != null && newChunkIndex >= 0 && newChunkIndex < chunksLen ? chunks[newChunkIndex] : null;
+                        if (assignedChunk != null && assignedChunk.isGeneratingData)
+                        {
+#if LOGGING
+                            System.DateTime _stepGenT = (sch_enableDetailedTimings || sch_enableAggregateLogging) ? System.DateTime.UtcNow : System.DateTime.MinValue;
+#endif
+                            StepChunkDataGeneration(assignedChunk);
+#if LOGGING
+                            if (sch_enableDetailedTimings || sch_enableAggregateLogging) { sch_time_AssignStepGen += (float)(System.DateTime.UtcNow - _stepGenT).TotalMilliseconds; sch_assign_SiblingSteps++; }
+#endif
+
+                            if (!assignedChunk.isGeneratingData)
+                            {
+                                if (UsesGpuLightingBackend() && !RequiresCpuLightingForAmbientOcclusion())
+                                {
+                                    worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                                    worker_skipCheckCounter[i] = 0;
+                                    HandleChunkPostDataGpuLighting(assignedChunk);
+
+                                    if (AreAllNeighborsReady(newChunkIndex) && ShouldDeferChunkMesh(newChunkIndex))
+                                    {
+                                        MarkChunkMeshDeferred(newChunkIndex);
+                                        worker_targetChunkIndex[i] = -1;
+                                        worker_state[i] = SCH_STATE_IDLE;
+                                        worker_skipCheckCounter[i] = 0;
+
+                                        if (chunksCompletedCount < totalWorldChunks)
+                                        {
+                                            chunksCompletedCount++;
+                                        }
+#if LOGGING
+                                        if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_workers_MeshDeferred++;
+#endif
+                                    }
+                                }
+                                else
+                                {
+                                    worker_state[i] = SCH_STATE_LIGHTING;
+                                    worker_skipCheckCounter[i] = 0;
+                                    StartChunkLighting(newChunkIndex);
+                                }
+
+#if LOGGING
+                                if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_workers_DataGenCompleted++;
+#endif
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    chunksCompletedCount++; // already existed
+                }
+            }
+            // Priority 3: Wake deferred interior meshes on their own queue
+            else if (!assigned && deferredMeshQueue_count > 0)
+            {
+                assigned = _TryAssignDeferredMeshWake(i, chunks, chunksLen);
+                if (assigned)
+                {
+                    assignedThisCycle++;
+                }
+            }
+
+            // Keep filling idle workers until the frame budget says stop.
+            if (assignedThisCycle >= maxConcurrentWorkers) break;
+        }
+
+#if LOGGING
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging)
+        {
+            sch_time_AssignWork += (float)(System.DateTime.UtcNow - _awStart).TotalMilliseconds;
+        }
+#endif
+    }
+
+    // =========================================================================
+    // Worker state-machine loop (ported from McCoordinator.Update, lines 393–676)
+    // Called by _RunSchedulerOnce (wired in Task 6). McCoordinator still drives.
+    // =========================================================================
+    private void _SchedulerUpdateWorkers(float cycleStartTime, float cycleBudget)
+    {
+        // Cache chunks_1D array locally to avoid repeated field access
+        ChunkData[] chunks = chunks_1D;
+        int chunksLen = chunks != null ? chunks.Length : 0;
+
+#if LOGGING
+        System.DateTime _swStart = System.DateTime.UtcNow;
+#endif
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break; // Don't exceed budget
+
+            int state = worker_state[i];
+            if (state == SCH_STATE_IDLE) continue;
+
+            int chunkIndex = worker_targetChunkIndex[i];
+            if (chunkIndex == -1 || chunkIndex >= chunksLen) {
+                worker_state[i] = SCH_STATE_IDLE;
+                _ReleaseWorkerGeneratorSlot(i);
+                worker_usesExclusiveGenerator[i] = false;
+                worker_isDeferredMeshWake[i] = false;
+                worker_skipCheckCounter[i] = 0;
+                continue;
+            }
+
+            // Direct chunk access (already validated index)
+            ChunkData chunk = chunks[chunkIndex];
+            if (chunk == null)
+            {
+                worker_state[i] = SCH_STATE_IDLE;
+                worker_targetChunkIndex[i] = -1;
+                _ReleaseWorkerGeneratorSlot(i);
+                worker_usesExclusiveGenerator[i] = false;
+                worker_isDeferredMeshWake[i] = false;
+                continue;
+            }
+
+            // OPTIMIZATION: Re-evaluation loop — cascade state transitions within a single frame.
+            // When a worker finishes data gen, it can immediately check neighbors, start meshing, etc.
+            // without waiting for the next Update() call. Critical for cached Y-chunks that complete in <1ms.
+            bool recheck = true;
+            while (recheck)
+            {
+                recheck = false;
+                if (Time.realtimeSinceStartup - cycleStartTime > cycleBudget) break;
+
+                state = worker_state[i];
+
+                if (state == SCH_STATE_DATA_GEN)
+                {
+                    // OPTIMIZATION: Actively drive data gen forward instead of passively waiting.
+                    // This eliminates the cross-Update handoff delay between McWorld and coordinator.
+                    if (chunk.isGeneratingData)
+                    {
+                        StepChunkDataGeneration(chunk);
+                    }
+
+                    // Check if data generation is complete
+                    if (!chunk.isGeneratingData)
+                    {
+                        if (worker_usesExclusiveGenerator[i])
+                        {
+                            _ReleaseWorkerGeneratorSlot(i);
+                            worker_usesExclusiveGenerator[i] = false;
+                        }
+
+                        if (UsesGpuLightingBackend() && !RequiresCpuLightingForAmbientOcclusion())
+                        {
+                            worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                            worker_skipCheckCounter[i] = 0;
+                            // Trigger neighbor re-meshing so already-meshed neighbors
+                            // update their boundary faces with this chunk's data
+                            HandleChunkPostDataGpuLighting(chunk);
+                        }
+                        else
+                        {
+                            // Data generation is complete, move to lighting
+                            worker_state[i] = SCH_STATE_LIGHTING;
+                            worker_skipCheckCounter[i] = 0; // Start lighting immediately
+                            StartChunkLighting(chunkIndex);
+                        }
+                        recheck = true; // Re-evaluate the new state immediately
+#if LOGGING
+                        if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_workers_DataGenCompleted++;
+#endif
+                    }
+                }
+                else if (state == SCH_STATE_LIGHTING)
+                {
+                    if (UsesGpuLightingBackend() && !RequiresCpuLightingForAmbientOcclusion())
+                    {
+                        worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                        worker_skipCheckCounter[i] = 0;
+                        recheck = true;
+                        continue;
+                    }
+
+                    // FIXED: Step through lighting incrementally
+                    StepChunkLighting(chunkIndex);
+
+                    // Check if lighting is complete
+                    if (!chunk.isProcessingLighting)
+                    {
+                        // Lighting is complete, move to waiting for mesh
+                        worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                        worker_skipCheckCounter[i] = 0; // Check immediately for neighbors
+                        recheck = true;
+                    }
+                }
+                else if (state == SCH_STATE_WAITING_FOR_MESH)
+                {
+                    // OPTIMIZATION: Only check if not already building mesh
+                    if (!chunk.isBuildingMesh)
+                    {
+                        // Check if neighbors are ready. AreAllNeighborsReady is strict when
+                        // requireAllNeighborsForMesh is on (waits for unallocated in-world
+                        // neighbours so boundary faces cull correctly). If EVERY worker is stuck
+                        // waiting (none free to instantiate the missing neighbour) fall back to
+                        // the lenient air-boundary check to break the deadlock.
+                        bool neighborsReadyForMesh = (_CountWaitingWorkers() >= maxConcurrentWorkers)
+                            ? AreAllNeighborsReadyLenient(chunkIndex)
+                            : (AreAllNeighborsReady(chunkIndex) || CanMeshWithoutAllNeighbors(chunkIndex));
+                        if (neighborsReadyForMesh)
+                        {
+                            // Only defer mesh builds during initial worldgen, not rebuilds.
+                            // A chunk with _borderMissingMask != 0 needs re-meshing to fix
+                            // boundary artifacts — re-deferring it loops forever.
+                            // A chunk whose opaque mesh already has vertices was already
+                            // meshed once; this is a rebuild request, not a first build.
+                            bool isRebuild = chunk._borderMissingMask != 0
+                                || (chunk.opaqueMeshFilter != null && chunk.opaqueMeshFilter.sharedMesh != null && chunk.opaqueMeshFilter.sharedMesh.vertexCount > 0);
+                            if (!isRebuild && !worker_isDeferredMeshWake[i] && ShouldDeferChunkMesh(chunkIndex))
+                            {
+                                MarkChunkMeshDeferred(chunkIndex);
+                                worker_targetChunkIndex[i] = -1;
+                                worker_state[i] = SCH_STATE_IDLE;
+                                worker_isDeferredMeshWake[i] = false;
+                                worker_skipCheckCounter[i] = 0;
+
+                                if (chunksCompletedCount < totalWorldChunks)
+                                {
+                                    chunksCompletedCount++;
+                                }
+#if LOGGING
+                                if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_workers_MeshDeferred++;
+#endif
+                                continue;
+                            }
+                            // Data-gen worker reservation: during the bulk load, cap total mesh
+                            // OCCUPANCY (actively meshing + parked waiting-for-mesh) so the rest of
+                            // the pool stays free to feed the generators. The old check counted only
+                            // SCH_STATE_MESHING, so workers piled up in SCH_STATE_WAITING_FOR_MESH (e.g. 6
+                            // meshing + 10 waiting) and starved data-gen to ZERO -> the world hard-
+                            // stalled incomplete. This chunk already passed the neighbour check, so
+                            // deferring is fragmentation-safe (deferred scan + Priority 3 re-wake it).
+                            // Player edits (interactionMeshPriority) bypass. Checked BEFORE the
+                            // readback-slot gate so a capped worker frees instead of getting stuck.
+                            if (reserveWorkersForDataGenDuringLoad && chunksCompletedCount < totalWorldChunks
+                                && !chunk.interactionMeshPriority
+                                && (_CountMeshingWorkers() + _CountWaitingWorkers()) > loadPhaseMeshWorkerCap)
+                            {
+                                MarkChunkMeshDeferred(chunkIndex);
+                                worker_targetChunkIndex[i] = -1;
+                                worker_state[i] = SCH_STATE_IDLE;
+                                worker_isDeferredMeshWake[i] = false;
+                                worker_skipCheckCounter[i] = 0;
+                                if (chunksCompletedCount < totalWorldChunks) chunksCompletedCount++;
+                                continue;
+                            }
+                            if (!HasAvailableGpuMeshReadbackSlot())
+                            {
+                                // No readback buffer free. Do NOT spin in SCH_STATE_WAITING_FOR_MESH —
+                                // that parks the worker indefinitely and (with many such workers)
+                                // starves data-gen. Free it; the deferred-mesh scan re-wakes the
+                                // chunk once a slot frees. Keep isMeshDeferred so it isn't lost.
+                                MarkChunkMeshDeferred(chunkIndex);
+                                worker_targetChunkIndex[i] = -1;
+                                worker_state[i] = SCH_STATE_IDLE;
+                                worker_isDeferredMeshWake[i] = false;
+                                worker_skipCheckCounter[i] = 0;
+                                continue;
+                            }
+                            worker_isDeferredMeshWake[i] = false;
+                            BuildChunkMesh(chunkIndex);
+                            worker_state[i] = SCH_STATE_MESHING;
+                            worker_skipCheckCounter[i] = 0;
+                            // Don't recheck — meshing takes multiple frames
+                        }
+                        else
+                        {
+                            // Neighbours not ready (strict requireAllNeighborsForMesh). Do NOT hold
+                            // the worker in SCH_STATE_WAITING_FOR_MESH — that starves data-gen of the
+                            // very workers needed to GENERATE those neighbours (near-deadlock: all
+                            // workers wait, nothing generates). Defer the chunk and free the worker;
+                            // the deferred-mesh scan re-queues it once its neighbours are data-ready,
+                            // so it meshes cleanly (boundary faces culled). Not counted complete here
+                            // — it counts when it actually meshes.
+                            MarkChunkMeshDeferred(chunkIndex);
+                            worker_targetChunkIndex[i] = -1;
+                            worker_state[i] = SCH_STATE_IDLE;
+                            worker_isDeferredMeshWake[i] = false;
+                            worker_skipCheckCounter[i] = 0;
+                        }
+                    }
+                }
+                else if (state == SCH_STATE_MESHING)
+                {
+                    // Check if mesh building is complete
+                    if (!chunk.isBuildingMesh)
+                    {
+                        worker_meshFrames[i] = 0;
+                        if (chunk.pendingChunkMeshRebuild)
+                        {
+                            chunk.pendingChunkMeshRebuild = false;
+                            worker_state[i] = SCH_STATE_WAITING_FOR_MESH;
+                            worker_isDeferredMeshWake[i] = false;
+                            worker_skipCheckCounter[i] = 0;
+                            recheck = true;
+                            continue;
+                        }
+
+                        // Mesh building is complete
+                        worker_targetChunkIndex[i] = -1;
+                        worker_state[i] = SCH_STATE_IDLE;
+                        worker_isDeferredMeshWake[i] = false;
+                        worker_skipCheckCounter[i] = 0;
+
+                        if (chunksCompletedCount < totalWorldChunks)
+                        {
+                            chunksCompletedCount++;
+                        }
+
+                        // NEAR-REGION RENDER benchmark: this chunk just had its render mesh built.
+                        // Count it once if it's inside the near radius; log when the whole near
+                        // region (all Y of every column within nearRegionRadius) is meshed.
+                        if (!_nearMeshLogged && _nearMeshCounted != null && chunkIndex >= 0 && chunkIndex < _nearMeshCounted.Length
+                            && !_nearMeshCounted[chunkIndex]
+                            && chunk.chunkX_world >= -nearRegionRadius && chunk.chunkX_world <= nearRegionRadius
+                            && chunk.chunkZ_world >= -nearRegionRadius && chunk.chunkZ_world <= nearRegionRadius)
+                        {
+                            _nearMeshCounted[chunkIndex] = true;
+                            _nearMeshDone++;
+                            int nearRenderTotal = (nearRegionRadius * 2 + 1) * (nearRegionRadius * 2 + 1) * worldDimensionY;
+                            if (_nearMeshDone >= nearRenderTotal)
+                            {
+                                _nearMeshLogged = true;
+                                float nearElapsed = Time.realtimeSinceStartup - benchmarkStartTime;
+                                Debug.Log("[NEAR_RENDER] " + nearRegionRadius + "-radius region (" + nearRenderTotal + " chunks) GEN+RENDERED in " + nearElapsed.ToString("F2") + "s");
+                            }
+                        }
+
+                        // Benchmark: log time at 50% and 100% completion
+                        if (chunksCompletedCount == (totalWorldChunks + 1) / 2)
+                        {
+                            float elapsed = Time.realtimeSinceStartup - benchmarkStartTime;
+                            Debug.Log($"[BENCHMARK] 50% world gen at {elapsed:F3}s — chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) #{chunksCompletedCount}/{totalWorldChunks}");
+                        }
+                        else if (chunksCompletedCount == totalWorldChunks)
+                        {
+                            float elapsed = Time.realtimeSinceStartup - benchmarkStartTime;
+                            Debug.Log($"[BENCHMARK] 100% world gen at {elapsed:F3}s — last chunk ({chunk.chunkX_world},{chunk.chunkY_world},{chunk.chunkZ_world}) #{chunksCompletedCount}/{totalWorldChunks}");
+                        }
+#if LOGGING
+                        if (sch_enableDetailedTimings || sch_enableAggregateLogging) sch_workers_MeshCompleted++;
+#endif
+                        // Don't recheck — worker is now IDLE
+                    }
+                    else
+                    {
+                        // WATCHDOG: still building. A build that never completes must never wedge
+                        // the worker (and the mesh-pool slot it may hold) forever — force-release
+                        // after a frame cap so workers can never hang and the pool can't deadlock.
+                        worker_meshFrames[i]++;
+                        if (worker_meshFrames[i] > SCH_MESH_WATCHDOG_FRAMES)
+                        {
+                            int stuckIndex = worker_targetChunkIndex[i];
+                            ForceCompleteStuckMesh(stuckIndex);
+                            // CRITICAL: do NOT count this complete — the chunk has NO mesh. Re-queue
+                            // it so it is never lost (was a permanent hole + miscount before). The
+                            // deferred-mesh scan re-meshes it once budget frees up; with the meshing
+                            // budget guarantee in ProcessActiveChunks this should rarely fire at all.
+                            if (stuckIndex >= 0) MarkChunkMeshDeferred(stuckIndex);
+                            worker_meshFrames[i] = 0;
+                            worker_targetChunkIndex[i] = -1;
+                            worker_state[i] = SCH_STATE_IDLE;
+                            worker_isDeferredMeshWake[i] = false;
+                            worker_skipCheckCounter[i] = 0;
+                        }
+                    }
+                }
+            }
+        }
+
+#if LOGGING
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging)
+        {
+            float _uwMs = (float)(System.DateTime.UtcNow - _swStart).TotalMilliseconds;
+            sch_time_UpdateWorkers += _uwMs;
+            if (_uwMs > sch_time_UpdateWorkersMaxMs) sch_time_UpdateWorkersMaxMs = _uwMs;
+        }
+#endif
+    }
+
+    // =========================================================================
+    // Scheduler ready flag (set by _SchedulerInit; gates _RunSchedulerOnce)
+    // =========================================================================
+    private bool _schedulerReady = false;
+
+    // =========================================================================
+    // _SchedulerInit — ported from McCoordinator.InitializeAndStartProcessing.
+    // Allocates the worker-pool arrays and resets all scheduler cursors.
+    // Called by McWorld's init path (Task 7 will wire the call site).
+    // =========================================================================
+    private void _SchedulerInit()
+    {
+        // radialChunkOrder: generated fresh here because McWorld owns GenerateRadialChunkOrder()
+        // and _SchedulerInit is part of McWorld (partial class). In the original coordinator flow
+        // McWorld.Start() called GenerateRadialChunkOrder() then handed the result to the
+        // coordinator; here we do both steps in one place.
+        radialChunkOrder = GenerateRadialChunkOrder();
+
+        nextChunkIndexToAssign = 0;
+        chunksCompletedCount = 0;
+        benchmarkStartTime = Time.realtimeSinceStartup;
+        _nearMeshCounted = new bool[totalWorldChunks];
+        _nearMeshDone = 0;
+        _nearMeshLogged = false;
+#if LOGGING
+        sch_lastLoggedPercent = -1;
+#endif
+
+        worker_targetChunkIndex       = new int[maxConcurrentWorkers];
+        worker_state                  = new int[maxConcurrentWorkers];
+        worker_usesExclusiveGenerator = new bool[maxConcurrentWorkers];
+        worker_isDeferredMeshWake     = new bool[maxConcurrentWorkers];
+        worker_skipCheckCounter       = new int[maxConcurrentWorkers];
+        worker_meshFrames             = new int[maxConcurrentWorkers];
+
+        int genCount = Mathf.Max(1, GetGeneratorCount());
+        genSlotBusy         = new bool[genCount];
+        genSlotReleaseDelay = new int[genCount];
+        worker_generatorSlot = new int[maxConcurrentWorkers];
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            worker_targetChunkIndex[i]       = -1;
+            worker_state[i]                  = SCH_STATE_IDLE;
+            worker_usesExclusiveGenerator[i] = false;
+            worker_isDeferredMeshWake[i]     = false;
+            worker_skipCheckCounter[i]       = 0;
+            worker_generatorSlot[i]          = -1;
+        }
+
+        chunkRebuildQueue = new int[MAX_REBUILD_QUEUE_SIZE];
+        deferredMeshQueue = new int[MAX_DEFERRED_MESH_QUEUE_SIZE];
+        _positionAssigned = new bool[totalWorldChunks];
+        // DYNAMIC GENERATOR ASSIGNMENT: per-column slot map, -1 = never assigned (falls back
+        // to the legacy spread hash in _GeneratorSlotForColumn).
+        _columnGenSlot = new int[worldDimensionX * worldDimensionZ];
+        for (int i = 0; i < _columnGenSlot.Length; i++) _columnGenSlot[i] = -1;
+
+        _schedulerReady = true;
+    }
+
+    // =========================================================================
+    // _RunSchedulerOnce — ported from McCoordinator.Update().
+    // Contains: plateau/budget selection, debugGenSlotHoldFrames countdown,
+    // the three worker-loop calls, and the aggregate-log tail.
+    // NOT called anywhere yet — Task 7 wires this into McWorld.Update().
+    // =========================================================================
+    private void _RunSchedulerOnce()
+    {
+        if (!_schedulerReady) return;
+
+        // FRAME GOVERNOR: consume from the shared per-Update envelope (anchored in Update())
+        // instead of anchoring a fresh full budget here — the old fresh anchor stacked a
+        // second updateTimeBudgetMs on top of ProcessActiveChunks' envelope on busy frames.
+        float cycleStartTime = _frameStartSec;
+
+        // DATA-GEN STREAMING: detect end of the one-time initial load by completion PLATEAU.
+        // With streaming, chunksCompletedCount never reaches totalWorldChunks. Once completion
+        // has not advanced for 5 s the render-distance set around spawn is finished; latch
+        // one-way so the load-phase budget boost drops to steady-state.
+        if (!_initialBulkLoadDone)
+        {
+            // PAUSE/HITCH GUARD: a big gap between scheduler cycles means the app was paused
+            // or hard-stalled (Quest headset doff, OS pause, GPU device reset) — wall-clock
+            // kept running while no work COULD complete. Re-arm the plateau window instead of
+            // falsely latching end-of-load, which would permanently drop the load-phase
+            // budget boost (24ms -> 8ms) for the rest of the initial load. A genuine
+            // end-of-load plateau has cycles running every frame, so it is unaffected.
+            if (_lastSchedulerCycleTime >= 0f && cycleStartTime - _lastSchedulerCycleTime > 2f)
+            {
+                _lastGenProgressTime = cycleStartTime;
+            }
+            _lastSchedulerCycleTime = cycleStartTime;
+
+            if (chunksCompletedCount != _lastProgressCompletedCount)
+            {
+                _lastProgressCompletedCount = chunksCompletedCount;
+                _lastGenProgressTime = cycleStartTime;
+            }
+            else if (chunksCompletedCount > 0 && _lastGenProgressTime >= 0f
+                     && cycleStartTime - _lastGenProgressTime > 5f)
+            {
+                _initialBulkLoadDone = true;
+            }
+        }
+
+        // FRAME GOVERNOR: the scheduler gets schedulerBudgetShare of the shared envelope
+        // (updateTimeBudgetMs already carries the load-phase boost via the init/restore
+        // machinery in McWorld). The PAC lanes get the remainder of the same envelope.
+        // Floor: guarantee ~1ms of scheduler work from NOW even if pre-envelope mandatory
+        // work (collision/rehydration) already blew the share — data-gen liveness needs the
+        // per-worker poll step every frame (readback un-parking).
+        float shareBudget = updateTimeBudgetMs * Mathf.Clamp01(schedulerBudgetShare) * 0.001f;
+        float cycleBudget = Mathf.Max(shareBudget, (Time.realtimeSinceStartup - cycleStartTime) + 0.001f);
+
+        // DEBUG (debugGenSlotHoldFrames): release generator slots whose simulated
+        // readback-occupancy hold has elapsed. No-op when the knob is 0.
+        if (debugGenSlotHoldFrames > 0 && genSlotReleaseDelay != null && genSlotBusy != null)
+        {
+            for (int s = 0; s < genSlotReleaseDelay.Length; s++)
+            {
+                if (genSlotReleaseDelay[s] > 0)
+                {
+                    genSlotReleaseDelay[s] = genSlotReleaseDelay[s] - 1;
+                    if (genSlotReleaseDelay[s] == 0) genSlotBusy[s] = false;
+                }
+            }
+        }
+
+#if LOGGING
+        System.DateTime cycleStart = System.DateTime.MinValue;
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging)
+            cycleStart = System.DateTime.UtcNow;
+#endif
+
+        _SchedulerUpdateWorkers(cycleStartTime, cycleBudget);
+        _SchedulerGenSlotWatchdog();
+        _SchedulerAssignWork(cycleStartTime, cycleBudget);
+
+#if LOGGING
+        // Progress log (verbose)
+        if (chunksCompletedCount < totalWorldChunks)
+        {
+            int currentPercent = (chunksCompletedCount * 100) / totalWorldChunks;
+            if (currentPercent / 10 > sch_lastLoggedPercent / 10)
+            {
+                if (sch_enableVerboseLogging) Debug.Log($"[Scheduler] World Processing: ~{currentPercent}% complete ({chunksCompletedCount}/{totalWorldChunks} chunks finalized).");
+                sch_lastLoggedPercent = currentPercent;
+            }
+        }
+        else
+        {
+            if (sch_lastLoggedPercent != 100)
+            {
+                sch_lastLoggedPercent = 100;
+                if (sch_enableVerboseLogging) Debug.Log($"[Scheduler] Initial world generation complete. Now processing player edits.");
+            }
+        }
+
+        // Aggregate cycle stats
+        if (sch_enableDetailedTimings || sch_enableAggregateLogging)
+        {
+            float _cycMs = (float)(System.DateTime.UtcNow - cycleStart).TotalMilliseconds;
+            sch_time_TotalCycle += _cycMs;
+            if (_cycMs > sch_time_CycleMaxMs) sch_time_CycleMaxMs = _cycMs;
+            sch_cycles_Processed++;
+
+            int activeWorkers = 0;
+            int dataGenWorkers = 0;
+            int meshingWorkers = 0;
+            for (int i = 0; i < maxConcurrentWorkers; i++)
+            {
+                if (worker_state[i] != SCH_STATE_IDLE)      activeWorkers++;
+                if (worker_state[i] == SCH_STATE_DATA_GEN)  dataGenWorkers++;
+                if (worker_state[i] == SCH_STATE_MESHING)   meshingWorkers++;
+            }
+
+            if (activeWorkers  > sch_peak_ActiveWorkers)   sch_peak_ActiveWorkers  = activeWorkers;
+            if (dataGenWorkers > sch_peak_DataGenWorkers)  sch_peak_DataGenWorkers = dataGenWorkers;
+            if (meshingWorkers > sch_peak_MeshingWorkers)  sch_peak_MeshingWorkers = meshingWorkers;
+            if (chunkRebuildQueue_count > sch_peak_RebuildQueue)      sch_peak_RebuildQueue      = chunkRebuildQueue_count;
+            if (deferredMeshQueue_count > sch_peak_DeferredMeshQueue) sch_peak_DeferredMeshQueue = deferredMeshQueue_count;
+        }
+#endif
+    }
+
+    // =========================================================================
+    // Generator-slot watchdog (ported from McCoordinator.Update, lines 692–705)
+    // =========================================================================
+    private void _SchedulerGenSlotWatchdog()
+    {
+        // GENERATOR-SLOT WATCHDOG: release any generator slot marked busy that NO worker actually
+        // owns. An orphaned busy slot permanently blocks _TryPickDataGenPosition's look-ahead window
+        // (it only picks positions whose generator slot is free) -> data-gen can never be assigned
+        // -> workers starve in mesh-wait -> the world stalls incomplete (observed: 0 SCH_STATE_DATA_GEN
+        // workers, nextChunkIndexToAssign frozen, completed stuck). This self-heals so gen can never
+        // wedge. Safe: a slot a worker is actively generating with is "owned" and never released here.
+        if (genSlotBusy != null)
+        {
+            for (int s = 0; s < genSlotBusy.Length; s++)
+            {
+                if (!genSlotBusy[s]) continue;
+                if (genSlotReleaseDelay != null && s < genSlotReleaseDelay.Length && genSlotReleaseDelay[s] > 0) continue; // debug hold
+                bool owned = false;
+                for (int w = 0; w < maxConcurrentWorkers; w++)
+                {
+                    if (worker_state[w] == SCH_STATE_DATA_GEN && worker_generatorSlot[w] == s) { owned = true; break; }
+                }
+                if (!owned) genSlotBusy[s] = false;
+            }
+        }
+    }
+
+#if LOGGING
+    // -------------------------------------------------------------------------
+    // Scheduler aggregate-stat fields (#if LOGGING only)
+    // -------------------------------------------------------------------------
+    [Header("Scheduler: Debug")]
+    public bool sch_enableVerboseLogging    = true;
+
+    [Header("Scheduler: Performance Profiling")]
+    public bool sch_enableDetailedTimings   = false;
+    public bool sch_enableAggregateLogging  = true;
+
+    private int   sch_lastLoggedPercent     = -1;
+
+    // Detailed timing accumulators
+    private float sch_time_UpdateWorkers;
+    private float sch_time_AssignWork;
+    private float sch_time_AssignPick;
+    private float sch_time_AssignStartGen;
+    private float sch_time_AssignStepGen;
+    private int   sch_assign_PickCalls;
+    private int   sch_assign_NewColumns;
+    private int   sch_assign_SiblingSteps;
+    private float sch_time_RebuildQueue;
+    private float sch_time_WorldGen;
+    private float sch_time_TotalCycle;
+    // SPIKE ATTRIBUTION: worst single cycle / worst update-workers section, to tell whether
+    // load-phase Update maxes live in the coordinator (worker stepping) or the PAC phases.
+    private float sch_time_CycleMaxMs;
+    private float sch_time_UpdateWorkersMaxMs;
+    private int   sch_cycles_Processed;
+    private int   sch_workers_DataGenCompleted;
+    private int   sch_workers_MeshCompleted;
+    private int   sch_workers_MeshDeferred;
+    private int   sch_rebuilds_Processed;
+    private int   sch_deferredMeshWakeAssignments;
+    private int   sch_worldChunks_Assigned;
+    private int   sch_peak_ActiveWorkers;
+    private int   sch_peak_DataGenWorkers;
+    private int   sch_peak_MeshingWorkers;
+    private int   sch_peak_RebuildQueue;
+    private int   sch_peak_DeferredMeshQueue;
+#endif
+
+    // =========================================================================
+    // Scheduler API methods — moved from McCoordinator (Task 7 / Part A)
+    // =========================================================================
+
+    // 1. IsWorldGenComplete — no clash with McWorld; kept original name.
+    private bool IsWorldGenComplete()
+    {
+        return _initialBulkLoadDone || (chunksCompletedCount >= totalWorldChunks && totalWorldChunks > 0);
+    }
+
+    // 2. RequestChunkMeshUpdate (scheduler/queue version) — McWorld already has a
+    //    public RequestChunkMeshUpdate that handles direct builds + delegates here;
+    //    this is the queue-side implementation, prefixed _Sched to avoid clash.
+    private void _SchedRequestChunkMeshUpdate(int chunkIndexToUpdate)
+    {
+        if (chunkIndexToUpdate == -1) return;
+
+        ChunkData[] chunks = chunks_1D;
+        ChunkData chunk = chunks != null && chunkIndexToUpdate >= 0 && chunkIndexToUpdate < chunks.Length ? chunks[chunkIndexToUpdate] : null;
+        if (chunk == null) return;
+        bool interactionPriority = chunk != null && chunk.interactionMeshPriority;
+        if (chunk.isBuildingMesh)
+        {
+            chunk.pendingChunkMeshRebuild = true;
+            return;
+        }
+        if (chunk.isQueuedForMeshRebuild) return;
+
+        if (chunkRebuildQueue_count >= MAX_REBUILD_QUEUE_SIZE) return;
+
+        // Quick check: Avoid adding if it's already being processed by a worker
+        // Only check first few workers since most of the time only 1-2 are active
+        int checkLimit = maxConcurrentWorkers < 4 ? maxConcurrentWorkers : 4;
+        for (int i = 0; i < checkLimit; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToUpdate) return;
+        }
+
+        if (interactionPriority)
+        {
+            chunkRebuildQueue_head = (chunkRebuildQueue_head - 1 + MAX_REBUILD_QUEUE_SIZE) % MAX_REBUILD_QUEUE_SIZE;
+            chunkRebuildQueue[chunkRebuildQueue_head] = chunkIndexToUpdate;
+        }
+        else
+        {
+            chunkRebuildQueue[chunkRebuildQueue_tail] = chunkIndexToUpdate;
+            chunkRebuildQueue_tail = (chunkRebuildQueue_tail + 1) % MAX_REBUILD_QUEUE_SIZE;
+        }
+        chunk.isQueuedForMeshRebuild = true;
+        chunkRebuildQueue_count++;
+    }
+
+    // 3. RequestDeferredChunkMeshUpdate — no clash with McWorld; kept original name.
+    private bool RequestDeferredChunkMeshUpdate(int chunkIndexToUpdate)
+    {
+        if (chunkIndexToUpdate == -1 || deferredMeshQueue_count >= MAX_DEFERRED_MESH_QUEUE_SIZE) return false;
+
+        ChunkData[] chunks = chunks_1D;
+        ChunkData chunk = chunks != null && chunkIndexToUpdate >= 0 && chunkIndexToUpdate < chunks.Length ? chunks[chunkIndexToUpdate] : null;
+        if (chunk == null || !chunk.isMeshDeferred || chunk.isBuildingMesh) return false;
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToUpdate) return false;
+        }
+
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int queueIndex = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[queueIndex] == chunkIndexToUpdate) return false;
+        }
+
+        for (int i = 0; i < deferredMeshQueue_count; i++)
+        {
+            int queueIndex = (deferredMeshQueue_head + i) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+            if (deferredMeshQueue[queueIndex] == chunkIndexToUpdate) return false;
+        }
+
+        deferredMeshQueue[deferredMeshQueue_tail] = chunkIndexToUpdate;
+        deferredMeshQueue_tail = (deferredMeshQueue_tail + 1) % MAX_DEFERRED_MESH_QUEUE_SIZE;
+        deferredMeshQueue_count++;
+        return true;
+    }
+
+    // 4. IsChunkScheduledForMeshUpdate — no clash with McWorld; kept original name.
+    private bool IsChunkScheduledForMeshUpdate(int chunkIndexToCheck)
+    {
+        if (chunkIndexToCheck == -1) return false;
+
+        ChunkData[] chunks = chunks_1D;
+        ChunkData chunk = chunks != null && chunkIndexToCheck >= 0 && chunkIndexToCheck < chunks.Length ? chunks[chunkIndexToCheck] : null;
+        if (chunk != null && chunk.isQueuedForMeshRebuild) return true;
+
+        for (int i = 0; i < maxConcurrentWorkers; i++)
+        {
+            if (worker_targetChunkIndex[i] == chunkIndexToCheck) return true;
+        }
+
+        for (int i = 0; i < chunkRebuildQueue_count; i++)
+        {
+            int queueIndex = (chunkRebuildQueue_head + i) % MAX_REBUILD_QUEUE_SIZE;
+            if (chunkRebuildQueue[queueIndex] == chunkIndexToCheck) return true;
+        }
+        return false;
+    }
+
+#if LOGGING
+    // 5. AppendAggregatePerformanceStats — McWorld has a same-named method that *calls* this
+    //    (coordinator.AppendAggregatePerformanceStats); prefixed _Sched to avoid clash.
+    private void _SchedAppendAggregatePerformanceStats(System.Text.StringBuilder sb)
+    {
+        if (sb == null || (!sch_enableDetailedTimings && !sch_enableAggregateLogging) || sch_cycles_Processed <= 0) return;
+
+        float avgCycle  = sch_time_TotalCycle   / sch_cycles_Processed;
+        float avgUpdate = sch_time_UpdateWorkers / sch_cycles_Processed;
+        float avgAssign = sch_time_AssignWork    / sch_cycles_Processed;
+
+        sb.AppendLine("Coordinator:");
+        sb.AppendFormat("  Cycles: {0}, Avg cycle {1:F3}ms (max {2:F1}), update workers {3:F3}ms (max {4:F1}), assign work {5:F3}ms\n",
+            sch_cycles_Processed, avgCycle, sch_time_CycleMaxMs, avgUpdate, sch_time_UpdateWorkersMaxMs, avgAssign);
+        sb.AppendFormat("  Assign breakdown (per cycle): pick {0:F3}ms ({1} calls), startGen {2:F3}ms ({3} cols), siblingStep {4:F3}ms ({5}), rest {6:F3}ms\n",
+            sch_time_AssignPick / sch_cycles_Processed, sch_assign_PickCalls,
+            sch_time_AssignStartGen / sch_cycles_Processed, sch_assign_NewColumns,
+            sch_time_AssignStepGen / sch_cycles_Processed, sch_assign_SiblingSteps,
+            (sch_time_AssignWork - sch_time_AssignPick - sch_time_AssignStartGen - sch_time_AssignStepGen) / sch_cycles_Processed);
+        sb.AppendFormat("  Worker completions: data {0}, mesh {1}, deferred {2}, rebuilds {3}, deferred wakes {4}, world assigns {5}\n",
+            sch_workers_DataGenCompleted, sch_workers_MeshCompleted, sch_workers_MeshDeferred, sch_rebuilds_Processed, sch_deferredMeshWakeAssignments, sch_worldChunks_Assigned);
+        sb.AppendFormat("  Peaks: active {0}/{1}, data {2}, meshing {3}, rebuild queue {4}/{5}, deferred queue {6}/{7}\n",
+            sch_peak_ActiveWorkers, maxConcurrentWorkers, sch_peak_DataGenWorkers, sch_peak_MeshingWorkers, sch_peak_RebuildQueue, MAX_REBUILD_QUEUE_SIZE, sch_peak_DeferredMeshQueue, MAX_DEFERRED_MESH_QUEUE_SIZE);
+        sb.AppendFormat("  Progress: {0}/{1} chunks ({2:F1}%)\n",
+            chunksCompletedCount, totalWorldChunks,
+            totalWorldChunks > 0 ? (chunksCompletedCount * 100f / totalWorldChunks) : 0f);
+    }
+
+    // 6. ResetAggregatePerformanceStats — prefixed _Sched to avoid clash.
+    private void _SchedResetAggregatePerformanceStats()
+    {
+        sch_time_UpdateWorkers        = 0f;
+        sch_time_AssignWork           = 0f;
+        sch_time_AssignPick           = 0f;
+        sch_time_AssignStartGen       = 0f;
+        sch_time_AssignStepGen        = 0f;
+        sch_assign_PickCalls          = 0;
+        sch_assign_NewColumns         = 0;
+        sch_assign_SiblingSteps       = 0;
+        sch_time_TotalCycle           = 0f;
+        sch_time_CycleMaxMs           = 0f;
+        sch_time_UpdateWorkersMaxMs   = 0f;
+        sch_cycles_Processed          = 0;
+        sch_workers_DataGenCompleted  = 0;
+        sch_workers_MeshCompleted     = 0;
+        sch_workers_MeshDeferred      = 0;
+        sch_rebuilds_Processed        = 0;
+        sch_deferredMeshWakeAssignments = 0;
+        sch_worldChunks_Assigned      = 0;
+        sch_peak_ActiveWorkers        = 0;
+        sch_peak_DataGenWorkers       = 0;
+        sch_peak_MeshingWorkers       = 0;
+        sch_peak_RebuildQueue         = 0;
+        sch_peak_DeferredMeshQueue    = 0;
+    }
+#endif
+}
