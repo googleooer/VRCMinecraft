@@ -79,13 +79,13 @@ Material:
     - _ChunkZ: 1
     - _DivisorInv: 0.3125
     - _FlipXAxis: 1
-    - _FlowScroll: 516.8125
+    - _FlowScroll: 169.5
     - _IsFlowMode: 1
     - _Mode: 2
     - _ReadSlotIndex: 197
     - _SplashChance: 0.2
     - _SplashDecay: 0.3
-    - _Time2: 40490.797
+    - _Time2: 13223.393
     - _XSize: 5
     - _YSize: 17
     - _ZSize: 5

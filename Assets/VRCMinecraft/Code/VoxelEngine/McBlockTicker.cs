@@ -1242,6 +1242,16 @@ public class McBlockTicker : UdonSharpBehaviour
         return _flowDirResult;
     }
 
+    // ROOT CAUSE of the lava/water "wrong path" divergence (proven by the [FluidFlood1000]
+    // probe: correct cache==world inputs, impossible cost-1000 outputs): this method calls
+    // ITSELF, and UdonSharp does NOT preserve a method's locals across a recursive call
+    // unless it is marked [RecursiveMethod]. Without it, the inner call clobbers the outer
+    // call's d/nx/nz/best/depth, so after the first recursion returns, the remaining
+    // directions of the outer loop are scanned with corrupted state — deterministically
+    // missing real drops (cost 1000) and producing single-path / sideways-shelf flow.
+    // Direct drops (cost 0, no recursion) were always correct, which is why only the
+    // recursive cases diverged from the b1.7.3 reference.
+    [RecursiveMethod]
     private int _CalculateFlowCost(int gx, int gy, int gz, int depth, int fromDir, bool isWater)
     {
         int best = 1000;
