@@ -181,77 +181,11 @@ public class McBlockTicker : UdonSharpBehaviour
     private int stats_dispatchSnow;
     private int stats_dispatchCrops;
     private int stats_dispatchOther;
-
-    // Block changes caused by tick systems
-    private int stats_tickSetBlockCalls;
 #endif
 
     // --- Initialization ---
     private bool _initialized = false;
     private int _numAdjacentSources = 0;
-
-    // GPU OFFLOAD #7: Optional GPU fluid simulation. When the material is wired, fluid
-    // ticks are processed as cellular-automaton Blits per affected chunk instead of
-    // per-cell Udon code. Falls back to the CPU path if the material is null OR if the
-    // chunk doesn't have GPU-resident block/meta RTs yet.
-    [Header("GPU Offload (#7)")]
-    [Tooltip("Material running VRCM/GpuFluidTick. Null = CPU fluid path.")]
-    public Material gpuFluidTickMaterial;
-    [Tooltip("Tick counter for GPU sticky-flow RNG (advances each fluid GPU pass).")]
-    public int gpuFluidTickCounter = 0;
-#if LOGGING
-    private bool dbg_loggedFirstGpuFluidTick = false;
-#endif
-    [Header("GPU Offload (#8)")]
-    [Tooltip("Material running VRCM/GpuTickMaskWrite. Null = no GPU tick mask sync.")]
-    public Material gpuTickMaskWriteMaterial;
-
-    // GPU OFFLOAD #8: Update a chunk's tick-mask RT by Blitting one pixel toggle.
-    private void _GpuMaskWriteTick(ChunkData chunk, int localX, int localY, int localZ, bool setBit)
-    {
-        if (gpuTickMaskWriteMaterial == null || chunk == null) return;
-        if (chunk._gpuTickMaskRT == null)
-        {
-            int w = world.chunkSizeXZ;
-            int h = world.chunkSizeY * world.chunkSizeXZ;
-            chunk._gpuTickMaskRT = new UnityEngine.RenderTexture(w, h, 0, UnityEngine.RenderTextureFormat.R8);
-            chunk._gpuTickMaskRT.filterMode = UnityEngine.FilterMode.Point;
-            chunk._gpuTickMaskRT.Create();
-        }
-        gpuTickMaskWriteMaterial.SetTexture("_MainTex", chunk._gpuTickMaskRT);
-        gpuTickMaskWriteMaterial.SetInt("_ChunkSizeXZ", world.chunkSizeXZ);
-        gpuTickMaskWriteMaterial.SetInt("_ChunkSizeY", world.chunkSizeY);
-        gpuTickMaskWriteMaterial.SetInt("_WriteX", localX);
-        gpuTickMaskWriteMaterial.SetInt("_WriteY", localY);
-        gpuTickMaskWriteMaterial.SetInt("_WriteZ", localZ);
-        gpuTickMaskWriteMaterial.SetInt("_WriteValue", setBit ? 1 : 0);
-        VRC.SDKBase.VRCGraphics.Blit(chunk._gpuTickMaskRT, chunk._gpuTickMaskRT, gpuTickMaskWriteMaterial, 0);
-        chunk._gpuTickMaskDirty = true;
-    }
-
-    private bool _GpuFluidTickChunk(ChunkData chunk, bool isLava)
-    {
-        if (gpuFluidTickMaterial == null || chunk == null) return false;
-        // Requires the chunk's sentinel RT + block/meta RTs to be available. The GPU-resident
-        // chunk pivot (#2) makes the block atlas the source of truth — when integrated, this
-        // helper Blits the GpuFluidTick passes into the chunk's atlas slot.
-        // For now this is the entry point; full per-chunk RT plumbing happens in #12 below.
-        gpuFluidTickMaterial.SetInt("_IsLava", isLava ? 1 : 0);
-        gpuFluidTickMaterial.SetInt("_TickCounter", gpuFluidTickCounter++);
-        gpuFluidTickMaterial.SetInt("_ChunkX", chunk.chunkX_world);
-        gpuFluidTickMaterial.SetInt("_ChunkZ", chunk.chunkZ_world);
-        gpuFluidTickMaterial.SetInt("_ChunkSizeXZ", world.chunkSizeXZ);
-        gpuFluidTickMaterial.SetInt("_ChunkSizeY", world.chunkSizeY);
-        // (Block-ID constants are set once during initialization in Start.)
-#if LOGGING
-        if (!dbg_loggedFirstGpuFluidTick)
-        {
-            dbg_loggedFirstGpuFluidTick = true;
-            Debug.Log("[McBlockTicker][GPU] GPU fluid tick path entered (gpuFluidTickMaterial wired) -> fluid ticks routed to GPU instead of per-cell CPU code.");
-        }
-#endif
-        return true;
-    }
 
     // PERF: Pre-baked random-tick predicate as a flat array. Inner loop replaces
     // a 15-case switch with a single array index — Udon's switch is interpreted as
@@ -2157,7 +2091,6 @@ public class McBlockTicker : UdonSharpBehaviour
         stats_dispatchSnow = 0;
         stats_dispatchCrops = 0;
         stats_dispatchOther = 0;
-        stats_tickSetBlockCalls = 0;
     }
 #endif
 }

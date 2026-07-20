@@ -3,11 +3,10 @@
 using UdonSharp;
 using UnityEngine;
 
-// Partial of McWorld holding the in-VM scheduler merged from McCoordinator.
-// (Phase 1 of the McCoordinator merge — see docs/superpowers/plans/2026-06-19-voxel-rethink-p0-p1-merge.md)
-//
-// Task 2: worker-pool and scheduler STATE FIELDS only.
-// No logic moved yet; McCoordinator still owns and drives the scheduler.
+// Partial of McWorld holding the chunk scheduler (the fully merged former McCoordinator;
+// that class no longer exists). Start() calls _SchedulerInit and Update() calls
+// _RunSchedulerOnce — this file owns and drives the 16-worker pool end to end.
+// The perf summary still prints this subsystem under the legacy "Coordinator:" heading.
 // updateTimeBudgetMs and loadPhaseUpdateBudgetMs are NOT redeclared here — McWorld already owns them.
 public partial class McWorld
 {
@@ -114,8 +113,7 @@ public partial class McWorld
     private bool   _nearMeshLogged     = false;
 
     // =========================================================================
-    // Picker methods (moved from McCoordinator — McCoordinator still drives;
-    // these are dormant copies for compile verification. Task 5/6 will wire them.)
+    // Picker methods (data-gen assignment: cache affinity, look-ahead, fallback scan)
     // =========================================================================
 
     // Scans forward from the assignment low-water-mark for the first chunk that

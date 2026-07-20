@@ -246,12 +246,6 @@ public class McBlockTypeManager : UdonSharpBehaviour
         return false;
     }
 
-    // NEW: Build the three lookup tables so hot paths are constant-time array reads.
-    private void BuildMetadataCaches()
-    {
-        int total = (finalDataArray != null) ? finalDataArray.Length : 0;
-    }
-    
     /// <summary>
     /// Called from the editor script to bake source arrays into the final packed data array.
     /// </summary>

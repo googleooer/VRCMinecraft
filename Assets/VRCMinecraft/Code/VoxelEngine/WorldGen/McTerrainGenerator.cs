@@ -117,9 +117,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     public int gpuNoiseDiagnosticChunkZ = 0;
     public bool gpuNoiseDiagnosticRunOncePerChunk = true;
 
-    [Header("Structure & Feature Templates")]
-    public McStructureTemplate[] structureTemplates;
-
 #if LOGGING
     [Header("Debugging")]
     public bool enableVerboseLogging = true;

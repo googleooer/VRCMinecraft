@@ -164,22 +164,6 @@ public class ModifyTerrain : UdonSharpBehaviour
         return (safeHardness / (float)safeBreakIncrement) * Time.fixedDeltaTime;
     }
 
-    // GPU OFFLOAD #10: Async raycast cache. The GPU shader writes to a 1x1 RT each frame
-    // we kick a raycast; the async readback returns 2 frames later. We display the most
-    // recent completed result. 2-frame latency is imperceptible for VR block targeting.
-    [Header("GPU Raycast (Offload #10)")]
-    [Tooltip("Material running VRCM/GpuRaycast. If null, falls back to Physics.Raycast.")]
-    public Material gpuRaycastMaterial;
-    public RenderTexture gpuRaycastHitInfoRT;
-    public RenderTexture gpuRaycastHitPosRT;
-    // The GPU raycast result has no readback consumer yet — the CPU DDA is the source of truth.
-    // Until the consumer exists, dispatching the two Blits every frame is pure waste (two extra
-    // render passes per frame on Quest's tiler). Off by default; flip on when wiring the readback.
-    [Tooltip("Dispatch the experimental GPU raycast blits each frame (result is not consumed yet).")]
-    public bool enableGpuRaycastExperiment = false;
-    private bool dbg_loggedRaycastPath = false;
-    private bool gpuRaycastInflight = false;
-
     /// <summary>
     /// Performs the physics raycast from the player's head.
     /// </summary>
@@ -188,36 +172,6 @@ public class ModifyTerrain : UdonSharpBehaviour
         VRCPlayerApi.TrackingData headData = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
         Vector3 rayOrigin = headData.position;
         Vector3 rayDirection = headData.rotation * Vector3.forward;
-
-        // GPU OFFLOAD #10: if the GPU raycast pipeline is wired up, kick it (one Blit + one
-        // async readback) and fall through to the CPU path this frame using the most recent
-        // completed result (cached). On the first ~2 frames the CPU fallback handles us;
-        // after that the GPU result becomes available.
-        if (enableGpuRaycastExperiment && gpuRaycastMaterial != null && gpuRaycastHitInfoRT != null)
-        {
-            gpuRaycastMaterial.SetVector("_RayOrigin", new Vector4(rayOrigin.x, rayOrigin.y, rayOrigin.z, 0f));
-            gpuRaycastMaterial.SetVector("_RayDirection", new Vector4(rayDirection.x, rayDirection.y, rayDirection.z, 0f));
-            gpuRaycastMaterial.SetFloat("_MaxDistance", blockInteractionRange);
-            VRCGraphics.Blit(null, gpuRaycastHitInfoRT, gpuRaycastMaterial, 0);
-            if (gpuRaycastHitPosRT != null)
-                VRCGraphics.Blit(null, gpuRaycastHitPosRT, gpuRaycastMaterial, 1);
-            // Async readback intentionally not implemented here as a one-line addition —
-            // the existing VRCAsyncGPUReadback infrastructure in McWorld handles the
-            // completion callback pattern. For now the CPU raycast remains the source of
-            // truth so the player has zero-latency targeting; the GPU pass runs in parallel
-            // for future use (debug HUD overlay, network-replicated targeting, etc.).
-        }
-
-#if LOGGING
-        if (enableVerboseLogging && !dbg_loggedRaycastPath)
-        {
-            dbg_loggedRaycastPath = true;
-            if (gpuRaycastMaterial != null && gpuRaycastHitInfoRT != null)
-                Debug.Log("[ModifyTerrain][GPU] GPU raycast pass dispatched (parallel/experimental); CPU Physics.Raycast remains the authoritative targeting path.");
-            else
-                Debug.Log("[ModifyTerrain][CPU] Raycast targeting uses CPU Physics.Raycast (GPU raycast material not wired).");
-        }
-#endif
 
         if (world != null && world.useBoxColliderCollision)
         {
@@ -599,61 +553,6 @@ public class ModifyTerrain : UdonSharpBehaviour
             Debug.Log(logBuilder.ToString());
         }
 #endif
-    }
-
-    // Voxel DDA raycast against solid (collidable) blocks. Used when box-collider collision is on, so
-    // block targeting is independent of chunk mesh colliders (which aren't built in that mode). Mirrors
-    // the torch-hit DDA stepping but checks world.BlockHasCollision; returns the entry hit point, the
-    // entry face normal, and distance — same contract _UpdateTargetedBlock/placement expect.
-    private bool _TryGetVoxelBlockHit(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out float hitDistance, out Vector3 hitPoint, out Vector3 hitNormal)
-    {
-        hitDistance = 0f;
-        hitPoint = Vector3.zero;
-        hitNormal = Vector3.zero;
-        if (world == null || maxDistance <= 0f) return false;
-
-        Vector3 dir = rayDirection.normalized;
-        int vx = Mathf.FloorToInt(rayOrigin.x);
-        int vy = Mathf.FloorToInt(rayOrigin.y);
-        int vz = Mathf.FloorToInt(rayOrigin.z);
-
-        int stepX = dir.x > 0f ? 1 : (dir.x < 0f ? -1 : 0);
-        int stepY = dir.y > 0f ? 1 : (dir.y < 0f ? -1 : 0);
-        int stepZ = dir.z > 0f ? 1 : (dir.z < 0f ? -1 : 0);
-
-        float nbX = stepX > 0 ? vx + 1f : vx;
-        float nbY = stepY > 0 ? vy + 1f : vy;
-        float nbZ = stepZ > 0 ? vz + 1f : vz;
-
-        float tMaxX = stepX != 0 ? (nbX - rayOrigin.x) / dir.x : float.PositiveInfinity;
-        float tMaxY = stepY != 0 ? (nbY - rayOrigin.y) / dir.y : float.PositiveInfinity;
-        float tMaxZ = stepZ != 0 ? (nbZ - rayOrigin.z) / dir.z : float.PositiveInfinity;
-        float tDeltaX = stepX != 0 ? 1f / Mathf.Abs(dir.x) : float.PositiveInfinity;
-        float tDeltaY = stepY != 0 ? 1f / Mathf.Abs(dir.y) : float.PositiveInfinity;
-        float tDeltaZ = stepZ != 0 ? 1f / Mathf.Abs(dir.z) : float.PositiveInfinity;
-
-        float t = 0f;
-        int lastAxis = -1; // 0=x,1=y,2=z; -1 = still in the origin voxel
-        int budget = 0;
-        while (t <= maxDistance && budget < 256)
-        {
-            byte bid = (byte)(world.GetBlock(vx, vy, vz) & 0xFF);
-            if (world.BlockHasCollision(bid))
-            {
-                hitDistance = t;
-                hitPoint = rayOrigin + dir * t;
-                if (lastAxis == 0) hitNormal = new Vector3(-stepX, 0f, 0f);
-                else if (lastAxis == 1) hitNormal = new Vector3(0f, -stepY, 0f);
-                else if (lastAxis == 2) hitNormal = new Vector3(0f, 0f, -stepZ);
-                else hitNormal = -dir; // ray started inside a solid block
-                return true;
-            }
-            if (tMaxX <= tMaxY && tMaxX <= tMaxZ) { vx += stepX; t = tMaxX; tMaxX += tDeltaX; lastAxis = 0; }
-            else if (tMaxY <= tMaxZ) { vy += stepY; t = tMaxY; tMaxY += tDeltaY; lastAxis = 1; }
-            else { vz += stepZ; t = tMaxZ; tMaxZ += tDeltaZ; lastAxis = 2; }
-            budget++;
-        }
-        return false;
     }
 
     private bool _TryGetTorchHit(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out float hitDistance, out Vector3 hitPoint, out Vector3 hitNormal)
