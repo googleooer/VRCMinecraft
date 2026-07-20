@@ -8500,6 +8500,19 @@ public partial class McWorld : UdonSharpBehaviour
         return blockType;
     }
 
+    // Fluid-sim readiness probe: true only if the chunk containing this cell is loaded AND its block
+    // data is ready. GetBlock/GetBlockAndMeta return AIR (0) for a missing/not-ready chunk, but the
+    // fluid flood-fill must treat such a cell as flow-BLOCKING, not as air — otherwise an unloaded
+    // border neighbor (or its below-cell) fabricates a phantom cost-0 drop and water flows toward the
+    // streaming frontier instead of the real ledge (single-path / "flows to the side"). MC never hits
+    // this: b1.7.3 loads chunks synchronously during fluid ticks, so its flood-fill always sees real
+    // neighbour data. Uses the SAME chunk-coord derivation as GetBlockAndMeta above.
+    public bool IsCellDataReady(int globalX, int globalY, int globalZ)
+    {
+        ChunkData chunk = GetChunkAt(globalX >> CHUNK_SIZE_SHIFT, globalY >> CHUNK_SIZE_SHIFT, globalZ >> CHUNK_SIZE_SHIFT);
+        return chunk != null && chunk.isDataReady;
+    }
+
     public bool IsChunkMeshedAt(int globalX, int globalY, int globalZ)
     {
         int centeredChunkX = globalX >> CHUNK_SIZE_SHIFT;

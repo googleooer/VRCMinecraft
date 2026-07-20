@@ -59,5 +59,5 @@ Material:
     - _FogMode: 0
     - _FogStart: 32
     m_Colors:
-    - _FogColor: {r: 0.68701375, g: 0.79996777, b: 1, a: 1}
+    - _FogColor: {r: 0.034326695, g: 0.038617533, b: 0.06838522, a: 1}
   m_BuildTextureStacks: []

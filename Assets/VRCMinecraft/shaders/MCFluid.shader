@@ -105,10 +105,25 @@ Shader "VRCM/MCFluid"
             if (isLava)
             {
                 bool isFlowingLava = (i.color.r > 0.25);
-                float frameIndex = floor(fmod(_Time.y * 10.0, 64.0));
-                float frameOffset = frameIndex / 64.0;
-                float scrollOffset = isFlowingLava ? _Time.y * 1.25 : 0.0;
-                float2 lavaUV = float2(frac(i.uvw.x), frac(i.uvw.y - scrollOffset) / 64.0 + frameOffset);
+                float2 lavaUV;
+                if (isFlowingLava)
+                {
+                    // MC TextureLavaFlowFX scrolls the tiling pattern DOWN by a whole 16px ROW every
+                    // 3 ticks — a DISCRETE PER-PIXEL step, NOT a smooth slide (line 57:
+                    // field[var2 - tickCounter/3*16 & 255], where /3*16 = one row per 3 ticks). Each
+                    // baked lava_strip frame tiles vertically (CA wraps &15), so stepping the sample
+                    // by whole rows within one frame loops seamlessly. Quantize to 1/16 (one row)
+                    // increments, stepping every 3 ticks = 0.15s @20 TPS.
+                    float rows = floor(_Time.y / 0.15);   // 1 row per 3 ticks (20 TPS)
+                    float vOffset = fmod(rows, 16.0) / 16.0; // wrap every 16 rows (keeps precision)
+                    lavaUV = float2(frac(i.uvw.x), frac(i.uvw.y - vOffset) / 64.0);
+                }
+                else
+                {
+                    // Still lava: bubble by cycling the 64 CA frames (TextureLavaFX), no scroll.
+                    float frameIndex = floor(fmod(_Time.y * 10.0, 64.0));
+                    lavaUV = float2(frac(i.uvw.x), frac(i.uvw.y) / 64.0 + frameIndex / 64.0);
+                }
                 col = tex2D(_LavaTex, lavaUV);
                 if (col.r > 0.99 && col.g > 0.99 && col.b > 0.99) col = fixed4(1.0, 0.42, 0.0, 1.0);
                 col.a = 1.0;
@@ -166,8 +181,12 @@ Shader "VRCM/MCFluid"
         }
         ENDCG
 
-        // Pass 1 — LAVA, fully OPAQUE (ZWrite on, no blend). Cull Off + manual back-face reject
-        // (matches the original fluid material's Cull Off; safe regardless of quad winding).
+        // Pass 1 — LAVA, fully OPAQUE (ZWrite on, no blend). Cull Off: lava is opaque, so ZWrite +
+        // ZTest LEqual already depth-occlude the back faces of each block by its own front faces
+        // (nearer depth always wins under LEqual regardless of draw order) — no manual cull needed.
+        // The previous `dot(normal, viewDir) < 0` reject was a screen/grazing-angle hack that wrongly
+        // discarded top faces near the horizon (upper screen), so lava surfaces vanished when looked
+        // up at. Removed.
         Pass
         {
             Cull Off ZWrite On ZTest LEqual
@@ -178,8 +197,6 @@ Shader "VRCM/MCFluid"
             fixed4 fragLava(v2f i) : SV_Target
             {
                 if (!fluidIsLava(i)) discard;
-                float3 viewDir = normalize(_WorldSpaceCameraPos - i.worldPos);
-                if (dot(i.normal, viewDir) < 0) discard; // reject back faces (no hardware cull)
                 fixed4 c = fluidColor(i);
                 c.a = 1.0;
                 return c;
