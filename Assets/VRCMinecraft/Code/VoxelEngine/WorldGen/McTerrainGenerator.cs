@@ -541,7 +541,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
     private int gpuPropWaterBlockId;
     private int gpuPropIceBlockId;
     private int gpuPropBaseColumnTexId;
-    private int gpuPropSurfaceInfoTexId;
     private int gpuPropSurfaceParamsTexAId;
     private int gpuPropSurfaceParamsTexBId;
     private int gpuPropBedrockMaskTexId;
@@ -1521,7 +1520,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
         gpuPropWaterBlockId = VRCShader.PropertyToID("_WaterBlockId");
         gpuPropIceBlockId = VRCShader.PropertyToID("_IceBlockId");
         gpuPropBaseColumnTexId = VRCShader.PropertyToID("_BaseColumnTex");
-        gpuPropSurfaceInfoTexId = VRCShader.PropertyToID("_SurfaceInfoTex");
         gpuPropSurfaceParamsTexAId = VRCShader.PropertyToID("_SurfaceParamsTexA");
         gpuPropSurfaceParamsTexBId = VRCShader.PropertyToID("_SurfaceParamsTexB");
         gpuPropBedrockMaskTexId = VRCShader.PropertyToID("_BedrockMaskTex");
@@ -2705,7 +2703,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
         _BuildGpuSurfaceParamsFromSurfaceInfo();
 
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnBaseTexture);
-        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceInfoTexId, gpuColumnSurfaceInfoTexture);
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceParamsTexAId, gpuSurfaceParamsTextureA);
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceParamsTexBId, gpuSurfaceParamsTextureB);
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropBedrockMaskTexId, gpuBedrockMaskTexture);
@@ -3377,7 +3374,6 @@ public class McTerrainGenerator : UdonSharpBehaviour
         _BuildGpuSurfaceParamsFromSurfaceInfo();
 
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropBaseColumnTexId, gpuColumnBaseTexture);
-        gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceInfoTexId, gpuColumnSurfaceInfoTexture);
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceParamsTexAId, gpuSurfaceParamsTextureA);
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropSurfaceParamsTexBId, gpuSurfaceParamsTextureB);
         gpuColumnSurfaceReplaceMaterial.SetTexture(gpuPropBedrockMaskTexId, gpuBedrockMaskTexture);

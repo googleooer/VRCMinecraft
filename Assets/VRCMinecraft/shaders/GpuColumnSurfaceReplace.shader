@@ -3,7 +3,6 @@ Shader "VRCM/GpuColumnSurfaceReplace"
     Properties
     {
         _BaseColumnTex ("Base Column Texture", 2D) = "black" {}
-        _SurfaceInfoTex ("Surface Info Texture", 2D) = "black" {}
         _SurfaceParamsTexA ("Surface Params A", 2D) = "black" {}
         _SurfaceParamsTexB ("Surface Params B", 2D) = "black" {}
         _BedrockMaskTex ("Bedrock Mask", 2D) = "black" {}
@@ -35,7 +34,7 @@ Shader "VRCM/GpuColumnSurfaceReplace"
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
-            #pragma target 3.0
+            #pragma target 5.0
 
             #include "UnityCG.cginc"
 
@@ -52,7 +51,6 @@ Shader "VRCM/GpuColumnSurfaceReplace"
             };
 
             sampler2D _BaseColumnTex;
-            sampler2D _SurfaceInfoTex;
             sampler2D _SurfaceParamsTexA;
             sampler2D _SurfaceParamsTexB;
             sampler2D _BedrockMaskTex;
@@ -97,12 +95,6 @@ Shader "VRCM/GpuColumnSurfaceReplace"
                 return tex2Dlod(_SurfaceParamsTexB, float4(uv, 0, 0));
             }
 
-            float4 readSurfaceInfo(int x, int z)
-            {
-                float2 uv = float2((x + 0.5) / (float)_ChunkSizeXZ, (z + 0.5) / (float)_ChunkSizeXZ);
-                return tex2Dlod(_SurfaceInfoTex, float4(uv, 0, 0));
-            }
-
             float readNoiseValue(sampler2D noiseTex, int x, int z)
             {
                 int noiseX = _FlipXAxis == 1 ? (_ChunkSizeXZ - 1 - x) : x;
@@ -137,18 +129,10 @@ Shader "VRCM/GpuColumnSurfaceReplace"
                     return float4(baseBlockId / 255.0, 0, 0, 1);
                 }
 
-                float4 surfaceInfo = readSurfaceInfo(x, z);
                 float4 paramsA = readSurfaceParamsA(x, z);
                 float4 paramsB = readSurfaceParamsB(x, z);
-                int hasStone = surfaceInfo.a > 0.5 ? 1 : 0;
-                if (hasStone == 0)
-                {
-                    return float4(baseBlockId / 255.0, 0, 0, 1);
-                }
-
-                int surfaceY = (int)round(surfaceInfo.r * 255.0);
-                int topBlockId = (int)round(paramsA.r * 255.0);
-                int fillerBlockId = (int)round(paramsA.g * 255.0);
+                int biomeTopId = (int)round(paramsA.r * 255.0);
+                int biomeFillerId = (int)round(paramsA.g * 255.0);
                 float sandRand = paramsB.r;
                 float gravelRand = paramsB.g;
                 float depthRand = paramsB.b;
@@ -157,48 +141,87 @@ Shader "VRCM/GpuColumnSurfaceReplace"
                 bool gravel = readNoiseValue(_GravelNoiseTex, x, z) + gravelRand * 0.2 > 3.0;
                 int depth = (int)(readNoiseValue(_StoneNoiseTex, x, z) * 0.33333333 + 3.0 + depthRand * 0.25);
 
-                if (depth <= 0)
-                {
-                    topBlockId = 0;
-                    fillerBlockId = _StoneBlockId;
-                }
-                else if (surfaceY >= 60 && surfaceY <= 65)
-                {
-                    if (gravel)
-                    {
-                        topBlockId = 0;
-                        fillerBlockId = _GravelBlockId;
-                    }
-                    if (sand)
-                    {
-                        topBlockId = _SandBlockId;
-                        fillerBlockId = _SandBlockId;
-                    }
-                }
-
-                if (surfaceY < 64 && topBlockId == 0)
-                {
-                    topBlockId = _WaterBlockId;
-                }
-
-                if (y > surfaceY)
-                {
-                    return float4(baseBlockId / 255.0, 0, 0, 1);
-                }
-
-                int delta = surfaceY - y;
+                // Replay replaceBlocksForBiome's top-down column scan down to this
+                // voxel. The counter resets to -1 at every air block, so each
+                // air-delimited stone segment gets a fresh surface (grass under
+                // overhangs); top/filler carry mutated state across segments
+                // (sandstone exhaust, depth<=0 bare stone). Non-stone, non-air
+                // blocks (water, ice) neither reset nor consume the counter.
+                // MC re-rolls rand(4) at each sandstone exhaust event; we reuse
+                // the per-column pre-rolled value (multiple events per column
+                // are rare).
+                int topId = biomeTopId;
+                int fillerId = biomeFillerId;
+                int counter = -1;
                 int finalBlockId = baseBlockId;
-                if (delta == 0)
+
+                [loop]
+                for (int yy = _WorldHeight - 1; yy >= y; yy--)
                 {
-                    finalBlockId = surfaceY >= 63 ? topBlockId : fillerBlockId;
-                }
-                else if (delta <= depth)
-                {
-                    finalBlockId = fillerBlockId;
-                }
-                else if (fillerBlockId == _SandBlockId && sandstoneDepth > 0 && delta <= depth + sandstoneDepth)
-                {
-                    finalBlockId = _SandstoneBlockId;
+                    if (yy < 5 && readBedrockMask(x, yy, z) == 1)
+                    {
+                        continue; // bedrock write bypasses the state machine
+                    }
+
+                    int b = (yy == y) ? baseBlockId : readBaseBlockId(x, yy, z);
+                    if (b == 0)
+                    {
+                        counter = -1;
+                        continue;
+                    }
+                    if (b != _StoneBlockId)
+                    {
+                        continue;
+                    }
+
+                    if (counter == -1)
+                    {
+                        if (depth <= 0)
+                        {
+                            topId = 0;
+                            fillerId = _StoneBlockId;
+                        }
+                        else if (yy >= 60 && yy <= 65)
+                        {
+                            topId = biomeTopId;
+                            fillerId = biomeFillerId;
+                            if (gravel)
+                            {
+                                topId = 0;
+                                fillerId = _GravelBlockId;
+                            }
+                            if (sand)
+                            {
+                                topId = _SandBlockId;
+                                fillerId = _SandBlockId;
+                            }
+                        }
+
+                        if (yy < 64 && topId == 0)
+                        {
+                            topId = _WaterBlockId;
+                        }
+
+                        counter = depth;
+                        if (yy == y)
+                        {
+                            finalBlockId = (yy >= 63) ? topId : fillerId;
+                        }
+                    }
+                    else if (counter > 0)
+                    {
+                        counter--;
+                        if (yy == y)
+                        {
+                            finalBlockId = fillerId;
+                        }
+                        if (counter == 0 && fillerId == _SandBlockId)
+                        {
+                            counter = sandstoneDepth;
+                            fillerId = _SandstoneBlockId;
+                        }
+                    }
+                    // counter == 0: cell stays stone
                 }
 
                 return float4(finalBlockId / 255.0, 0, 0, 1);
