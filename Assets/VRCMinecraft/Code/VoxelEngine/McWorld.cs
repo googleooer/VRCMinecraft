@@ -13157,12 +13157,19 @@ public partial class McWorld : UdonSharpBehaviour
         chunk._transparentUVs[vertexIndex + 2] = new Vector3(uv2.x, uv2.y, textureSlice);
         chunk._transparentUVs[vertexIndex + 3] = new Vector3(uv3.x, uv3.y, textureSlice);
 
-        chunk._transparentTriangles[triangleIndex + 0] = vertexIndex;
-        chunk._transparentTriangles[triangleIndex + 1] = vertexIndex + 1;
-        chunk._transparentTriangles[triangleIndex + 2] = vertexIndex + 2;
-        chunk._transparentTriangles[triangleIndex + 3] = vertexIndex;
-        chunk._transparentTriangles[triangleIndex + 4] = vertexIndex + 2;
-        chunk._transparentTriangles[triangleIndex + 5] = vertexIndex + 3;
+        // Split the quad along the v1–v3 diagonal, NOT v0–v2. MC's tessellator fans its fluid
+        // top quad at v0, creasing along MC's (x,z)->(x+1,z+1) diagonal (concave on X-Z-/X+Z+
+        // descents). VRCM stores the world X-MIRRORED, so reproducing MC's LOCAL fan here
+        // showed the mirrored crease in-game (concave/convex swapped on diagonal falls).
+        // Fanning at v1 flips the split to VRCM's (x+1,z)->(x,z+1) anti-diagonal, which
+        // mirrors back to MC's visual. Same winding (cyclic rotation); side/bottom faces are
+        // planar so only the non-planar top face is affected.
+        chunk._transparentTriangles[triangleIndex + 0] = vertexIndex + 1;
+        chunk._transparentTriangles[triangleIndex + 1] = vertexIndex + 2;
+        chunk._transparentTriangles[triangleIndex + 2] = vertexIndex + 3;
+        chunk._transparentTriangles[triangleIndex + 3] = vertexIndex + 1;
+        chunk._transparentTriangles[triangleIndex + 4] = vertexIndex + 3;
+        chunk._transparentTriangles[triangleIndex + 5] = vertexIndex;
 
         chunk._transparentVertexCount += 4;
         chunk._transparentTriangleCount += 6;

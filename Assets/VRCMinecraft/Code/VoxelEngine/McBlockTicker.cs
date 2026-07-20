@@ -123,6 +123,10 @@ public class McBlockTicker : UdonSharpBehaviour
     // ~3.6x too fast at 72fps and framerate-dependent (lava flow was the most obvious).
     private const float MC_TICK_SECONDS = 0.05f; // 1/20s
     private const int MAX_CATCHUP_TICKS = 4;     // cap ticks/frame so a hitch can't avalanche
+    // Sticky-stalled lava retry interval (see the parity shim in _UpdateTick_FlowingFluid):
+    // mean 205 + 410/2 = 410 ticks = Beta's per-block random-tick expectation (32768/80).
+    private const int LAVA_STICKY_RETRY_MIN_TICKS = 205;
+    private const int LAVA_STICKY_RETRY_SPREAD_TICKS = 410;
     private float _tickAccumulator = 0f;
 
     // --- Random Tick State ---
@@ -790,7 +794,19 @@ public class McBlockTicker : UdonSharpBehaviour
                 ScheduleBlockUpdate(gx, gy, gz, blockId, 5);
                 break;
             case B_LAVA_FLOWING:
-                ScheduleBlockUpdate(gx, gy, gz, blockId, 30);
+                // MC BlockFlowing.onBlockAdded: BlockFluid.onBlockAdded (checkForHarden) runs
+                // FIRST — lava that just flowed into a cell touching water hardens IMMEDIATELY
+                // (source->obsidian, meta<=4->cobblestone; this is the cobblestone generator) —
+                // and the tick is scheduled only if the cell is still flowing lava afterwards.
+                _CheckForHarden(gx, gy, gz);
+                if (world.GetBlock(gx, gy, gz) == B_LAVA_FLOWING)
+                    ScheduleBlockUpdate(gx, gy, gz, blockId, 30);
+                break;
+            case B_LAVA_STILL:
+                // MC BlockStationary inherits BlockFluid.onBlockAdded: a lava SOURCE placed
+                // beside/under water hardens to obsidian on placement. Still lava schedules
+                // no tick of its own.
+                _CheckForHarden(gx, gy, gz);
                 break;
             case B_FIRE:
                 ScheduleBlockUpdate(gx, gy, gz, blockId, 40);
@@ -813,7 +829,13 @@ public class McBlockTicker : UdonSharpBehaviour
                 _OnNeighborChange_StationaryFluid(gx, gy, gz, true);
                 break;
             case B_LAVA_STILL:
-                _OnNeighborChange_StationaryFluid(gx, gy, gz, false);
+                // MC BlockStationary.onNeighborBlockChange calls super (checkForHarden) FIRST:
+                // water arriving beside/on top of a lava SOURCE makes OBSIDIAN. Only if the
+                // cell survived as lava does it convert to flowing and schedule (func_30004_j
+                // is gated on getBlockId == blockID in the Java).
+                _CheckForHarden(gx, gy, gz);
+                if (world.GetBlock(gx, gy, gz) == B_LAVA_STILL)
+                    _OnNeighborChange_StationaryFluid(gx, gy, gz, false);
                 break;
             // Strict b1.7.3 parity: BlockFlowing does NOT override onNeighborBlockChange — the
             // inherited BlockFluid.onNeighborBlockChange only runs checkForHarden, with NO
@@ -938,11 +960,21 @@ public class McBlockTicker : UdonSharpBehaviour
                     newDecay = 0;
             }
 
-            // Lava sticky randomness
+            // Lava sticky randomness (BlockFlowing.java:59): 75% of the time lava refuses to
+            // weaken, stays FLOWING, and does NOT reschedule itself. In MC the stalled cell is
+            // eventually re-tried by a RANDOM tick (Beta: 80 picks per 16x16x128 chunk per tick
+            // = one per block every ~410 ticks / ~20s). Udon cannot afford that density — the
+            // budgeted random-tick scan covers ~1-2% of chunks per tick, so a stalled cell would
+            // wait ~an hour for its retry and lava effectively never receded once its source was
+            // removed (water has no sticky, which is why water always dried fine).
+            // PARITY SHIM: schedule the retry explicitly with the SAME expected interval and
+            // randomized spread MC's random ticks would give (mean ~410 ticks). Same 25% accept
+            // odds per attempt, same expected recession rate, no random-tick dependence.
             if (!isWater && flowDecay < 8 && newDecay < 8 && newDecay > flowDecay && (_NextRandom() % 4) != 0)
             {
                 newDecay = flowDecay;
                 settled = false;
+                ScheduleBlockUpdate(gx, gy, gz, selfId, LAVA_STICKY_RETRY_MIN_TICKS + (_NextRandom() % LAVA_STICKY_RETRY_SPREAD_TICKS));
             }
 
             if (newDecay != flowDecay)
