@@ -34,7 +34,7 @@ Dependencies (resolved via VPM/UPM, see `Packages/vpm-manifest.json` and `Packag
 
 `Assets/csc.rsp` defines the `LOGGING` symbol. The verbose perf summaries and debug logs it gates are kept on intentionally; do not strip them as a perf fix.
 
-## The constraints that shaped everything
+## Main constraints and how i got around them
 
 Udon is slow and single-threaded, so per-voxel CPU work is unaffordable. Anything that touches all 4096 voxels of a chunk either runs as a GPU fragment shader pass or is time-sliced across many frames with hand-rolled cursor state machines (Udon has no coroutines; the `Coroutines/` folder is empty on purpose).
 
