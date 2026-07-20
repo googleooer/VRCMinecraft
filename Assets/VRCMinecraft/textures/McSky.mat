@@ -88,7 +88,7 @@ Material:
     m_Floats:
     - _BottomRatio: 1
     - _BumpScale: 1
-    - _CelestialAngle: 0.24229704
+    - _CelestialAngle: 0.55587786
     - _CelestialBodySize: 0.1
     - _Cutoff: 0.5
     - _DayProgress: 0.06745833
@@ -122,7 +122,7 @@ Material:
     - _SmoothnessTextureChannel: 0
     - _SpecularHighlights: 1
     - _SrcBlend: 1
-    - _StarBrightness: 0.011735928
+    - _StarBrightness: 0.5
     - _StarCount: 50
     - _StarDensity: 0.7
     - _StarDistance: 100
@@ -140,16 +140,16 @@ Material:
     - _Bottom: {r: 1, g: 1, b: 1, a: 0}
     - _Color: {r: 1, g: 1, b: 1, a: 1}
     - _EmissionColor: {r: 0, g: 0, b: 0, a: 1}
-    - _FluidFogColor: {r: 0.4238469, g: 0.49298736, b: 0.624368, a: 1}
+    - _FluidFogColor: {r: 0.034326695, g: 0.038617533, b: 0.06838522, a: 1}
     - _FogColorDay: {r: 0.6509804, g: 0.7686275, b: 0.9725491, a: 1}
     - _FogColorNight: {r: 0.039, g: 0.039, b: 0.09, a: 1}
-    - _McHorizonColor: {r: 0.4238469, g: 0.49298736, b: 0.624368, a: 1}
-    - _McSkyColor: {r: 0.28552532, g: 0.38850167, b: 0.5967947, a: 1}
+    - _McHorizonColor: {r: 0.034326695, g: 0.038617533, b: 0.06838522, a: 1}
+    - _McSkyColor: {r: 0, g: 0, b: 0, a: 1}
     - _NightColor: {r: 0, g: 0, b: 0, a: 0.5}
     - _SkyColor: {r: 0.466, g: 0.686, b: 1, a: 1}
     - _SkyColorDay: {r: 0.49803925, g: 0.67058825, b: 1, a: 1}
     - _SkyColorNight: {r: 0.003, g: 0.003, b: 0.003, a: 1}
-    - _SunriseColor: {r: 0.868149, g: 0.41990957, b: 0.2, a: 0.9646778}
+    - _SunriseColor: {r: 0, g: 0, b: 0, a: 0}
     - _SunsetColor: {r: 1, g: 0.5, b: 0, a: 1}
     - _Tint: {r: 0.46666667, g: 0.6862745, b: 1, a: 0.5}
     - _Top: {r: 0.468, g: 0.68773735, b: 1, a: 0}
