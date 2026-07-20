@@ -24,18 +24,30 @@ public class McBlockTicker : UdonSharpBehaviour
     [Header("Performance Tuning")]
     // CODE-OWNED TUNING: [System.NonSerialized] so the code initializers are authoritative and
     // scene/inspector values can't silently override tuning changes (see McWorld counterparts).
-    // Max scheduled ticks to process per frame
-    [System.NonSerialized] public int scheduledTickBudget = 200;
-    // Max time in ms for scheduled tick processing per frame
+    // Max scheduled ticks to process per world-tick. Raised from 200: a large receding fluid body
+    // schedules many ticks and lava (tickRate 30) drains slowly; too small a budget lets the heap
+    // grow toward TICK_QUEUE_CAPACITY and overflow-drop reschedules. Time-budget still caps cost.
+    [System.NonSerialized] public int scheduledTickBudget = 2048;
+    // Max time in ms for scheduled tick processing per world-tick
     [System.NonSerialized] public float scheduledTickTimeBudgetMs = 2.0f;
-    // Chunks to scan for random ticks per frame
-    [System.NonSerialized] public int randomTickChunksPerFrame = 4;
-    // Random voxel picks per chunk (MC uses 80 per section)
-    [System.NonSerialized] public int randomTicksPerChunk = 20;
-    // Max time in ms for random tick processing per frame
-    [System.NonSerialized] public float randomTickTimeBudgetMs = 1.0f;
+    // Strict b1.7.3 parity: MC random-ticks EVERY loaded section EVERY tick (80 picks per
+    // 16x16x128 section => ~10 picks per 16^3 chunk). Cover ALL resident chunks each world-tick
+    // (round-robin + budget so a break resumes next tick). The old 4-chunks/tick throttle starved
+    // the random-tick fallback, which is the ONLY re-trigger for a sticky-stalled (unscheduled)
+    // lava cell after its recession front passes -> isolated lava that never dried up. PERF: this
+    // is far more random-tick work than before; measure on Quest and dial randomTickChunksPerFrame /
+    // randomTickTimeBudgetMs back if it costs FPS.
+    [System.NonSerialized] public int randomTickChunksPerFrame = 4096;
+    // Random voxel picks per chunk (MC: 80 per 16x16x128 section => ~10 per 16^3 sub-chunk)
+    [System.NonSerialized] public int randomTicksPerChunk = 10;
+    // Max time in ms for random tick processing per world-tick
+    [System.NonSerialized] public float randomTickTimeBudgetMs = 2.0f;
     [Tooltip("Enable block tick processing")]
     public bool enableBlockTicks = true;
+
+    [Tooltip("DIAGNOSTIC: log the fluid flood-fill decision (per-direction neighbor/below/cost/optimal) " +
+        "for every horizontally-flowing fluid cell. Enable briefly, reproduce the bad flow, then disable.")]
+    public bool debugFluidFlow = false;
 
     // --- Block ID constants (Beta 1.7.3) ---
     private const byte B_AIR = 0;
@@ -85,14 +97,33 @@ public class McBlockTicker : UdonSharpBehaviour
     private const byte B_SIGN = 63;
 
     // --- Scheduled Tick Min-Heap (sorted by scheduledFrame, MC-matching dedup) ---
-    private const int TICK_QUEUE_CAPACITY = 8192;
+    private const int TICK_QUEUE_CAPACITY = 32768; // raised from 8192: a large receding lava body
+                                                   // (tickRate 30 holds ticks ~30 world-ticks) could
+                                                   // overflow and silently drop reschedules, leaving
+                                                   // cells that never re-tick. MC never drops.
     private int[] _tickX;
     private int[] _tickY;
     private int[] _tickZ;
     private byte[] _tickBlockId;
     private int[] _tickScheduledFrame;
+    // Monotonic insertion sequence per queued tick. MC's NextTickListEntry sorts by
+    // (scheduledTime, field_235_e) where field_235_e is a monotonic insertion id, so ties on the
+    // same tick process in INSERTION ORDER. A plain scheduledFrame heap breaks ties arbitrarily,
+    // which makes fluids fill cells in a different order -> different decay/path than vanilla. The
+    // heap compares (scheduledFrame, seq) so same-frame ticks pop FIFO exactly like MC.
+    private long[] _tickSeq;
+    private long _tickSeqCounter = 0;
     private int _tickCount = 0;
     private int _currentFrame = 0;
+
+    // --- Fixed 20 TPS world-tick gate ---
+    // MC runs scheduled + random block ticks at a FIXED 20 ticks/sec. This behaviour must be
+    // decoupled from the render framerate: the tick DELAYS (5=water, 30=lava, 3=sand, 40=fire)
+    // are MC tick counts, so advancing one "frame" per render frame made fluids/fire/crops run
+    // ~3.6x too fast at 72fps and framerate-dependent (lava flow was the most obvious).
+    private const float MC_TICK_SECONDS = 0.05f; // 1/20s
+    private const int MAX_CATCHUP_TICKS = 4;     // cap ticks/frame so a hitch can't avalanche
+    private float _tickAccumulator = 0f;
 
     // --- Random Tick State ---
     private int _randomTickSeed = 0;
@@ -230,9 +261,15 @@ public class McBlockTicker : UdonSharpBehaviour
     // PERF: Open-addressed hash set for tick dedup (replaces O(N) linear scan in
     // ScheduleBlockUpdate). Beta uses HashSet&lt;NextTickListEntry&gt;.contains() for the
     // same reason. Key = pack(x, y, z, blockId). Size kept power-of-two for &amp;-mask probing.
-    private const int TICK_HASH_CAPACITY = 16384; // 2x queue capacity, power of two
+    private const int TICK_HASH_CAPACITY = 65536; // 2x queue capacity, power of two
     private const int TICK_HASH_MASK = TICK_HASH_CAPACITY - 1;
-    private long[] _tickHashKeys;     // 0 = empty slot
+    // Deleted-slot marker. 0 = empty (terminates a probe); real keys are always negative (OR'd with
+    // long.MinValue in _TickHashKey), so 1L is distinct from both. A popped entry becomes a TOMBSTONE
+    // (not 0) so probe chains stay intact — writing 0 would short-circuit find() for any colliding key
+    // further down the chain, silently dropping its next re-schedule (a fluid cell that never re-ticks
+    // -> water that doesn't recede).
+    private const long TICK_HASH_TOMBSTONE = 1L;
+    private long[] _tickHashKeys;     // 0 = empty slot, TICK_HASH_TOMBSTONE = deleted, else a key
     private int[] _tickHashIndices;   // index into _tickX/_tickY/.../_tickScheduledFrame
 
     void Start()
@@ -249,6 +286,7 @@ public class McBlockTicker : UdonSharpBehaviour
         _tickZ = new int[TICK_QUEUE_CAPACITY];
         _tickBlockId = new byte[TICK_QUEUE_CAPACITY];
         _tickScheduledFrame = new int[TICK_QUEUE_CAPACITY];
+        _tickSeq = new long[TICK_QUEUE_CAPACITY];
 
         _tickHashKeys = new long[TICK_HASH_CAPACITY];
         _tickHashIndices = new int[TICK_HASH_CAPACITY];
@@ -361,13 +399,15 @@ public class McBlockTicker : UdonSharpBehaviour
         _tickZ[idx] = gz;
         _tickBlockId[idx] = blockId;
         _tickScheduledFrame[idx] = scheduledFrame;
+        _tickSeq[idx] = _tickSeqCounter;
+        _tickSeqCounter = _tickSeqCounter + 1;
         _tickCount++;
 
-        // Sift up to maintain min-heap on scheduledFrame
+        // Sift up to maintain min-heap on (scheduledFrame, seq) — ties pop in insertion order.
         while (idx > 0)
         {
             int parent = (idx - 1) >> 1;
-            if (_tickScheduledFrame[parent] <= _tickScheduledFrame[idx]) break;
+            if (!_TickBefore(idx, parent)) break;
             _HeapSwap(idx, parent);
             idx = parent;
         }
@@ -394,7 +434,11 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private int _TickHashFind(long key)
     {
-        // Linear probe. Returns slot index (regardless of hit/miss); caller checks key match.
+        // Linear probe WITH tombstone support. Returns the slot holding `key` if present; otherwise
+        // the first reusable slot (tombstone preferred, else the terminating empty) for insertion.
+        // Caller checks _tickHashKeys[slot] == key to tell a hit from an insert slot. A tombstone
+        // never terminates the search (the key may live further down the chain) but is remembered as
+        // a reuse target — this is what keeps deletion from breaking colliding keys' probe chains.
         // 32-bit fold-into-int mix; uses high bits which have better LCG entropy.
         // UDON-CHECKED-CAST: mask to positive int range before casting, since Udon's
         // SystemConvert.ToInt32(long) throws when value exceeds int.MaxValue.
@@ -404,18 +448,30 @@ public class McBlockTicker : UdonSharpBehaviour
         int h = (int)folded;
         h ^= h >> 16;
         int slot = h & TICK_HASH_MASK;
+        int firstFree = -1;
         for (int i = 0; i < TICK_HASH_CAPACITY; i++)
         {
             long existing = _tickHashKeys[slot];
-            if (existing == 0L || existing == key) return slot;
+            if (existing == 0L) return firstFree >= 0 ? firstFree : slot; // empty terminates chain
+            if (existing == key) return slot;                             // hit (past any tombstones)
+            if (existing == TICK_HASH_TOMBSTONE && firstFree < 0) firstFree = slot; // reuse target
             slot = (slot + 1) & TICK_HASH_MASK;
         }
-        return -1; // table full (should never happen with 2x oversize)
+        return firstFree; // saturated with keys+tombstones: reuse a tombstone if seen, else -1
     }
 
     private void _TickHashClear()
     {
         System.Array.Clear(_tickHashKeys, 0, TICK_HASH_CAPACITY);
+    }
+
+    // True if heap entry a sorts before b: earlier scheduledFrame, or same frame + earlier
+    // insertion seq. This is MC's NextTickListEntry.compareTo (scheduledTime, then field_235_e).
+    private bool _TickBefore(int a, int b)
+    {
+        if (_tickScheduledFrame[a] != _tickScheduledFrame[b])
+            return _tickScheduledFrame[a] < _tickScheduledFrame[b];
+        return _tickSeq[a] < _tickSeq[b];
     }
 
     private void _HeapSwap(int a, int b)
@@ -425,6 +481,7 @@ public class McBlockTicker : UdonSharpBehaviour
         t = _tickY[a]; _tickY[a] = _tickY[b]; _tickY[b] = t;
         t = _tickZ[a]; _tickZ[a] = _tickZ[b]; _tickZ[b] = t;
         t = _tickScheduledFrame[a]; _tickScheduledFrame[a] = _tickScheduledFrame[b]; _tickScheduledFrame[b] = t;
+        long ls = _tickSeq[a]; _tickSeq[a] = _tickSeq[b]; _tickSeq[b] = ls;
         byte bt = _tickBlockId[a]; _tickBlockId[a] = _tickBlockId[b]; _tickBlockId[b] = bt;
     }
 
@@ -438,17 +495,18 @@ public class McBlockTicker : UdonSharpBehaviour
             _tickZ[0] = _tickZ[_tickCount];
             _tickBlockId[0] = _tickBlockId[_tickCount];
             _tickScheduledFrame[0] = _tickScheduledFrame[_tickCount];
+            _tickSeq[0] = _tickSeq[_tickCount];
 
-            // Sift down
+            // Sift down on (scheduledFrame, seq)
             int idx = 0;
             while (true)
             {
                 int left = (idx << 1) + 1;
                 int right = left + 1;
                 int smallest = idx;
-                if (left < _tickCount && _tickScheduledFrame[left] < _tickScheduledFrame[smallest])
+                if (left < _tickCount && _TickBefore(left, smallest))
                     smallest = left;
-                if (right < _tickCount && _tickScheduledFrame[right] < _tickScheduledFrame[smallest])
+                if (right < _tickCount && _TickBefore(right, smallest))
                     smallest = right;
                 if (smallest == idx) break;
                 _HeapSwap(idx, smallest);
@@ -463,6 +521,40 @@ public class McBlockTicker : UdonSharpBehaviour
     public void Tick()
     {
         if (!_initialized || !enableBlockTicks) return;
+
+        // Run the world simulation (scheduled + random ticks) at MC's fixed 20 TPS regardless of
+        // render framerate. Accumulate real time and step 0..MAX_CATCHUP_TICKS whole ticks; a
+        // small cap prevents a frame hitch from triggering a tick avalanche.
+        _tickAccumulator += Time.deltaTime;
+        int steps = 0;
+        while (_tickAccumulator >= MC_TICK_SECONDS && steps < MAX_CATCHUP_TICKS)
+        {
+            _tickAccumulator -= MC_TICK_SECONDS;
+            steps++;
+            _WorldTickOnce();
+        }
+        if (steps >= MAX_CATCHUP_TICKS) _tickAccumulator = 0f; // shed backlog after a hitch
+
+        // Falling sand/gravel is dt-scaled entity physics (see _UpdateFallingBlocks); keep it
+        // per-frame for smooth motion, matching MC's per-frame-interpolated entity rendering.
+        float fallStart = Time.realtimeSinceStartup;
+        _UpdateFallingBlocks();
+#if LOGGING
+        stats_fallingBlockTimeMs += (Time.realtimeSinceStartup - fallStart) * 1000f;
+        int activeFalling = 0;
+        if (fallingBlockPool != null)
+        {
+            for (int i = 0; i < FALL_POOL_MAX && i < fallingBlockPool.Length; i++)
+                if (_fallActive[i]) activeFalling++;
+        }
+        if (activeFalling > stats_activeFallingPeak) stats_activeFallingPeak = activeFalling;
+#endif
+    }
+
+    // One MC world tick (20 TPS): advances the scheduling clock and runs all due scheduled +
+    // random block ticks. Invoked 0..N times per render frame by the fixed-timestep gate above.
+    private void _WorldTickOnce()
+    {
         _currentFrame++;
         _BlockCacheClearAll();
 
@@ -489,19 +581,7 @@ public class McBlockTicker : UdonSharpBehaviour
 #endif
         _ProcessRandomTicks(frameStart);
 #if LOGGING
-        float afterRandom = Time.realtimeSinceStartup;
-        stats_randomTickTimeMs += (afterRandom - afterFlush) * 1000f;
-#endif
-        _UpdateFallingBlocks();
-#if LOGGING
-        stats_fallingBlockTimeMs += (Time.realtimeSinceStartup - afterRandom) * 1000f;
-        int activeFalling = 0;
-        if (fallingBlockPool != null)
-        {
-            for (int i = 0; i < FALL_POOL_MAX && i < fallingBlockPool.Length; i++)
-                if (_fallActive[i]) activeFalling++;
-        }
-        if (activeFalling > stats_activeFallingPeak) stats_activeFallingPeak = activeFalling;
+        stats_randomTickTimeMs += (Time.realtimeSinceStartup - afterFlush) * 1000f;
 #endif
     }
 
@@ -532,14 +612,15 @@ public class McBlockTicker : UdonSharpBehaviour
             _HeapRemoveMin();
 
             // Free the hash slot so the dispatcher can re-schedule this coord+blockId again.
-            // (Linear probing requires a tombstone — we re-set to 0 and on lookup the probe
-            // continues past empty slots only if a later key hashed past this. Acceptable
-            // for our load factor: 8192 keys in 16384 slots = 50% max load.)
+            // Write a real TOMBSTONE (not 0): linear probing requires deleted slots to keep the
+            // chain walkable. Writing 0 (empty) would short-circuit _TickHashFind for any colliding
+            // key hashed further down the chain, so its next ScheduleBlockUpdate would be falsely
+            // deduped and dropped — a fluid cell that never re-ticks -> water that doesn't recede.
             long poppedKey = _TickHashKey(tx, ty, tz, tickBid);
             int poppedSlot = _TickHashFind(poppedKey);
             if (poppedSlot >= 0 && _tickHashKeys[poppedSlot] == poppedKey)
             {
-                _tickHashKeys[poppedSlot] = 0L;
+                _tickHashKeys[poppedSlot] = TICK_HASH_TOMBSTONE;
             }
 
             byte currentBlock = world.GetBlock(tx, ty, tz);
@@ -565,6 +646,12 @@ public class McBlockTicker : UdonSharpBehaviour
 
     private void _ProcessRandomTicks(float frameStart)
     {
+        // Random ticks get their OWN budget window measured from HERE, not from the world-tick
+        // start: scheduled ticks run first and could consume the shared window, which previously
+        // starved random ticks (crops/grass/fire/lava-recede-fallback) to ~zero whenever fluids
+        // were busy. That starvation, on top of the 4-chunk throttle, is why isolated lava never
+        // got its recovery tick. Measure elapsed from rtStart so random ticks always get their slice.
+        float rtStart = Time.realtimeSinceStartup;
         float budget = randomTickTimeBudgetMs * 0.001f;
         ChunkData[] chunks = world.chunks_1D;
         if (chunks == null) return;
@@ -575,9 +662,12 @@ public class McBlockTicker : UdonSharpBehaviour
 #if LOGGING
         int randomDispatches = 0;
 #endif
-        while (chunksProcessed < randomTickChunksPerFrame)
+        // Cap at one full pass over resident chunks per world-tick (randomTickChunksPerFrame is now
+        // large to cover all chunks; without this cap it would re-visit chunks when count < budget).
+        int maxChunksThisTick = randomTickChunksPerFrame < totalChunks ? randomTickChunksPerFrame : totalChunks;
+        while (chunksProcessed < maxChunksThisTick)
         {
-            if ((Time.realtimeSinceStartup - frameStart) > budget) break;
+            if ((Time.realtimeSinceStartup - rtStart) > budget) break;
 
             if (_randomTickChunkCursor >= totalChunks)
                 _randomTickChunkCursor = 0;
@@ -791,12 +881,17 @@ public class McBlockTicker : UdonSharpBehaviour
             case B_LAVA_STILL:
                 _OnNeighborChange_StationaryFluid(gx, gy, gz, false);
                 break;
+            // Strict b1.7.3 parity: BlockFlowing does NOT override onNeighborBlockChange — the
+            // inherited BlockFluid.onNeighborBlockChange only runs checkForHarden, with NO
+            // reschedule. VRCM used to reschedule flowing fluid here, which made recession ~13x
+            // faster than vanilla (not 1:1). Removed: recession now relies on the flowing cell's
+            // OWN reschedule while it is actively changing, the still-fluid notify cascade (still
+            // cases above, which MC does have), and random ticks (now at MC density) — exactly like
+            // vanilla. checkForHarden kept for lava (no-op for water).
             case B_WATER_FLOWING:
-                ScheduleBlockUpdate(gx, gy, gz, B_WATER_FLOWING, 5);
                 break;
             case B_LAVA_FLOWING:
                 _CheckForHarden(gx, gy, gz);
-                ScheduleBlockUpdate(gx, gy, gz, B_LAVA_FLOWING, 30);
                 break;
             case B_FIRE:
                 _OnNeighborChange_Fire(gx, gy, gz);
@@ -942,8 +1037,10 @@ public class McBlockTicker : UdonSharpBehaviour
             _ConvertToStationary(gx, gy, gz, isWater);
         }
 
-        // Flow downward
-        if (_LiquidCanDisplace(gx, gy - 1, gz, isWater))
+        // Flow downward — only into a LOADED below-cell. A not-ready chunk reads as AIR and would be
+        // a phantom drop into the void / unstreamed terrain (this crosses a chunk-Y border every 16
+        // blocks, and gy-1<0 is also not-ready, which conveniently blocks flow below the world).
+        if (world.IsCellDataReady(gx, gy - 1, gz) && _LiquidCanDisplace(gx, gy - 1, gz, isWater))
         {
             int downMeta = flowDecay >= 8 ? flowDecay : flowDecay + 8;
             world.SetBlockAndMetadata(gx, gy - 1, gz, selfId, (byte)downMeta);
@@ -957,6 +1054,64 @@ public class McBlockTicker : UdonSharpBehaviour
             if (hDecay >= 8) return;
 
             bool[] optimal = _GetOptimalFlowDirections(gx, gy, gz, isWater);
+            if (debugFluidFlow)
+            {
+                // _flowCostResult holds the per-direction flood-fill cost just computed above.
+                Debug.Log("[FluidFlow] " + (isWater ? "W" : "L") + " (" + gx + "," + gy + "," + gz + ") decay=" + flowDecay + " hDecay=" + hDecay
+                    + "  -X n=" + world.GetBlock(gx - 1, gy, gz) + " below=" + world.GetBlock(gx - 1, gy - 1, gz) + " cost=" + _flowCostResult[0] + " opt=" + optimal[0]
+                    + " | +X n=" + world.GetBlock(gx + 1, gy, gz) + " below=" + world.GetBlock(gx + 1, gy - 1, gz) + " cost=" + _flowCostResult[1] + " opt=" + optimal[1]
+                    + " | -Z n=" + world.GetBlock(gx, gy, gz - 1) + " below=" + world.GetBlock(gx, gy - 1, gz - 1) + " cost=" + _flowCostResult[2] + " opt=" + optimal[2]
+                    + " | +Z n=" + world.GetBlock(gx, gy, gz + 1) + " below=" + world.GetBlock(gx, gy - 1, gz + 1) + " cost=" + _flowCostResult[3] + " opt=" + optimal[3]);
+
+                // ANOMALY PROBE: an all-1000 result means the flood fill found no drop within
+                // range. When that happens, dump the 7x7 neighborhood at gy and gy-1 twice —
+                // once through the ticker's frame cache (what the scan actually read) and once
+                // through direct world reads (ground truth) — plus per-cell readiness. Any
+                // disagreement pinpoints WHICH layer lied to the flood fill and where.
+                if (_flowCostResult[0] == 1000 && _flowCostResult[1] == 1000
+                    && _flowCostResult[2] == 1000 && _flowCostResult[3] == 1000)
+                {
+                    string cacheRow = "";
+                    string worldRow = "";
+                    string cacheBelow = "";
+                    string worldBelow = "";
+                    string readyRow = "";
+                    for (int dz = -3; dz <= 3; dz++)
+                    {
+                        for (int dx = -3; dx <= 3; dx++)
+                        {
+                            int px = gx + dx;
+                            int pz = gz + dz;
+                            byte cb = _FlowCacheGetBlock(px, gy, pz);
+                            byte cm = _FlowCacheGetMeta(px, gy, pz);
+                            byte cbb = _FlowCacheGetBlock(px, gy - 1, pz);
+                            byte cbm = _FlowCacheGetMeta(px, gy - 1, pz);
+                            byte wb = world.GetBlockAndMeta(px, gy, pz);
+                            byte wm = world.lastMetaResult;
+                            byte wbb = world.GetBlockAndMeta(px, gy - 1, pz);
+                            byte wbm = world.lastMetaResult;
+                            cacheRow += cb + ":" + cm + " ";
+                            worldRow += wb + ":" + wm + " ";
+                            cacheBelow += cbb + ":" + cbm + " ";
+                            worldBelow += wbb + ":" + wbm + " ";
+                            readyRow += (world.IsCellDataReady(px, gy, pz) ? "1" : "0");
+                            readyRow += (world.IsCellDataReady(px, gy - 1, pz) ? "1" : "0");
+                            readyRow += " ";
+                        }
+                        cacheRow += "| ";
+                        worldRow += "| ";
+                        cacheBelow += "| ";
+                        worldBelow += "| ";
+                        readyRow += "| ";
+                    }
+                    Debug.Log("[FluidFlood1000] (" + gx + "," + gy + "," + gz + ") 7x7 rows z-3..z+3, cols x-3..x+3, cell=id:meta"
+                        + "\nCACHE  y=" + gy + " : " + cacheRow
+                        + "\nWORLD  y=" + gy + " : " + worldRow
+                        + "\nCACHE y-1=" + (gy - 1) + ": " + cacheBelow
+                        + "\nWORLD y-1=" + (gy - 1) + ": " + worldBelow
+                        + "\nREADY (y,y-1) : " + readyRow);
+                }
+            }
             if (optimal[0]) _FlowIntoBlock(gx - 1, gy, gz, hDecay, isWater);
             if (optimal[1]) _FlowIntoBlock(gx + 1, gy, gz, hDecay, isWater);
             if (optimal[2]) _FlowIntoBlock(gx, gy, gz - 1, hDecay, isWater);
@@ -1116,6 +1271,12 @@ public class McBlockTicker : UdonSharpBehaviour
             int nx = gx + _flowOffX[d];
             int nz = gz + _flowOffZ[d];
 
+            // A not-yet-loaded neighbour chunk reads as AIR (GetBlock returns 0), which fabricates a
+            // phantom open path AND (via its below-cell) a phantom cost-0 drop, pulling fluid toward
+            // the streaming frontier instead of the real ledge. MC loads chunks synchronously during
+            // fluid ticks so it never sees this; treat not-ready as flow-BLOCKING (leave cost 1000).
+            if (!world.IsCellDataReady(nx, gy, nz)) continue;
+
             // Inline _BlockBlocksFlow + _IsFluidBlock: single GetBlock instead of 2-3
             byte nb = _FlowCacheGetBlock(nx, gy, nz);
             if (nb == B_DOOR_WOOD || nb == B_DOOR_IRON || nb == B_SIGN || nb == B_LADDER || nb == B_REED) continue;
@@ -1127,8 +1288,10 @@ public class McBlockTicker : UdonSharpBehaviour
             byte belowNb = _FlowCacheGetBlock(nx, gy - 1, nz);
             if (belowNb == B_DOOR_WOOD || belowNb == B_DOOR_IRON || belowNb == B_SIGN || belowNb == B_LADDER || belowNb == B_REED)
             { /* blocks flow */ }
-            else if (belowNb == B_AIR || !blockTypeManager.GetBlockIsSolid(belowNb))
+            else if ((belowNb == B_AIR || !blockTypeManager.GetBlockIsSolid(belowNb)) && world.IsCellDataReady(nx, gy - 1, nz))
             {
+                // Real drop only if the below-cell's chunk is loaded; a not-ready below reads AIR and
+                // would be a phantom drop. If not ready, fall through to recurse (no phantom cost-0).
                 _flowCostResult[d] = 0;
                 continue;
             }
@@ -1156,6 +1319,9 @@ public class McBlockTicker : UdonSharpBehaviour
             int nx = gx + _flowOffX[d];
             int nz = gz + _flowOffZ[d];
 
+            // Not-ready neighbour chunk reads as AIR -> phantom path/drop; treat as flow-blocking.
+            if (!world.IsCellDataReady(nx, gy, nz)) continue;
+
             // Inline _BlockBlocksFlow + _IsFluidBlock: single GetBlock instead of 2-3
             byte nb = _FlowCacheGetBlock(nx, gy, nz);
             if (nb == B_DOOR_WOOD || nb == B_DOOR_IRON || nb == B_SIGN || nb == B_LADDER || nb == B_REED) continue;
@@ -1167,13 +1333,18 @@ public class McBlockTicker : UdonSharpBehaviour
             byte belowNb = _FlowCacheGetBlock(nx, gy - 1, nz);
             if (belowNb == B_DOOR_WOOD || belowNb == B_DOOR_IRON || belowNb == B_SIGN || belowNb == B_LADDER || belowNb == B_REED)
             { /* blocks flow, fall through to recurse */ }
-            else if (belowNb == B_AIR || !blockTypeManager.GetBlockIsSolid(belowNb))
-                return depth;
+            else if ((belowNb == B_AIR || !blockTypeManager.GetBlockIsSolid(belowNb)) && world.IsCellDataReady(nx, gy - 1, nz))
+                return depth; // real drop only if the below chunk is loaded (else recurse, no phantom)
 
             if (depth < 4)
             {
                 int cost = _CalculateFlowCost(nx, gy, nz, depth + 1, d, isWater);
-                if (cost < best) { best = cost; if (best == depth + 1) return best; }
+                // MC calculateFlowCost (BlockFlowing.java:162-164) scans ALL non-back directions and
+                // keeps the min with NO early out. A later direction can be a DIRECT drop (returns
+                // `depth`, cheaper than this recursion's depth+1); bailing at depth+1 inflated the cost
+                // and broke multi-drop ties -> dropped an optimal flow direction ("only one path goes
+                // down a block instead of multiple"). Match MC exactly: keep scanning.
+                if (cost < best) best = cost;
             }
         }
         return best;
